@@ -1,0 +1,52 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (keep for binary projects, ignore for libraries)
+# For this binary project, Cargo.lock should be committed
+# Cargo.lock
+
+# Debug and release builds
+debug/
+release/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.project
+.settings/
+.classpath
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.tmp
+*~
+
+# Audio files (if you want to exclude recorded files)
+# *.wav
+# *.mp3
+# recordings/
+
+# Environment and local config
+.env
+.env.local
+*.local
+
+# Test outputs
+test-output/
