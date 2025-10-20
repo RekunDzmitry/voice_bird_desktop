@@ -50,3 +50,5 @@ Desktop.ini
 
 # Test outputs
 test-output/
+recording_*
+transcript_*
