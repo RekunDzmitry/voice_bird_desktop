@@ -4,6 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavWriter, WavSpec};
 use crate::session::RecordingSession;
 use crate::transcription::{TranscriptionService, convert_to_mono_pcm16};
+use crate::server_streaming::ServerStreamingService;
 use std::sync::mpsc;
 
 // Calculate RMS (Root Mean Square) audio level from samples
@@ -108,6 +109,7 @@ pub fn start_input_recording(
     device: &Device,
     session: &mut RecordingSession,
     api_key: Option<String>,
+    server_config: Option<(String, String)>,
 ) -> Result<cpal::Stream> {
     let config = device.default_input_config()
         .context("Failed to get default input config")?;
@@ -145,10 +147,44 @@ pub fn start_input_recording(
         None
     };
 
+    // Setup server streaming if server config is provided
+    let server_tx = if let Some((server_url, server_api_key)) = server_config {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let session_id = session.id.to_string();
+        let device_name = session.device_name.clone();
+        let sample_rate = session.sample_rate;
+        let channels = session.channels;
+
+        // Spawn server streaming thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = ServerStreamingService::stream_to_server(
+                    server_url,
+                    server_api_key,
+                    session_id,
+                    device_name,
+                    rx,
+                    sample_rate,
+                    channels,
+                ).await {
+                    eprintln!("Server streaming error: {}", e);
+                }
+            });
+        });
+
+        Some(tx)
+    } else {
+        None
+    };
+
     let channels = config.channels();
     let transcription_tx_f32 = transcription_tx.clone();
     let transcription_tx_i16 = transcription_tx.clone();
     let transcription_tx_u16 = transcription_tx.clone();
+    let server_tx_f32 = server_tx.clone();
+    let server_tx_i16 = server_tx.clone();
+    let server_tx_u16 = server_tx.clone();
 
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
@@ -175,6 +211,11 @@ pub fn start_input_recording(
                     if let Some(ref tx) = transcription_tx_f32 {
                         let pcm16 = convert_to_mono_pcm16(data, channels);
                         let _ = tx.send(pcm16);
+                    }
+
+                    // Send to server streaming service
+                    if let Some(ref tx) = server_tx_f32 {
+                        let _ = tx.send(data.to_vec());
                     }
                 },
                 |err| eprintln!("Stream error: {}", err),
@@ -219,6 +260,11 @@ pub fn start_input_recording(
                             mono
                         };
                         let _ = tx.send(mono_samples);
+                    }
+
+                    // Send to server streaming service (convert to f32)
+                    if let Some(ref tx) = server_tx_i16 {
+                        let _ = tx.send(samples);
                     }
                 },
                 |err| eprintln!("Stream error: {}", err),
@@ -270,6 +316,11 @@ pub fn start_input_recording(
                         };
                         let _ = tx.send(mono_samples);
                     }
+
+                    // Send to server streaming service (already converted to f32)
+                    if let Some(ref tx) = server_tx_u16 {
+                        let _ = tx.send(samples);
+                    }
                 },
                 |err| eprintln!("Stream error: {}", err),
                 None,
@@ -290,6 +341,7 @@ pub fn start_output_recording(
     _device_name: &str,
     session: &mut RecordingSession,
     api_key: Option<String>,
+    server_config: Option<(String, String)>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
     use windows::{
         Win32::Media::Audio::*,
@@ -348,6 +400,35 @@ pub fn start_output_recording(
                     transcript_buffer,
                 ).await {
                     eprintln!("Transcription error: {}", e);
+                }
+            });
+        });
+
+        Some(tx)
+    } else {
+        None
+    };
+
+    // Setup server streaming if server config is provided
+    let server_tx = if let Some((server_url, server_api_key)) = server_config {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let session_id = session.id.to_string();
+        let device_name = session.device_name.clone();
+
+        // Spawn server streaming thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = ServerStreamingService::stream_to_server(
+                    server_url,
+                    server_api_key,
+                    session_id,
+                    device_name,
+                    rx,
+                    sample_rate,
+                    channels,
+                ).await {
+                    eprintln!("Server streaming error: {}", e);
                 }
             });
         });
@@ -448,6 +529,11 @@ pub fn start_output_recording(
                                 let _ = tx.send(pcm16);
                             }
 
+                            // Send to server streaming service
+                            if let Some(ref tx) = server_tx {
+                                let _ = tx.send(float_buffer.to_vec());
+                            }
+
                             capture_client.ReleaseBuffer(num_frames_available).ok();
                         }
                     }
@@ -477,6 +563,7 @@ pub fn start_output_recording(
     _device_name: &str,
     _session: &mut RecordingSession,
     _api_key: Option<String>,
+    _server_config: Option<(String, String)>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
     Err(anyhow::anyhow!("Output recording is only supported on Windows"))
 }

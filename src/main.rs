@@ -3,6 +3,7 @@ mod wasapi_sessions;
 mod ui;
 mod audio;
 mod transcription;
+mod server_streaming;
 
 use anyhow::{Result, Context};
 use console::style;
@@ -18,8 +19,23 @@ fn main() -> Result<()> {
     println!("{}", style("Initializing...").yellow());
     println!();
 
-    // Check for API key
+    // Check for API keys and server config
     let api_key = env::var("ASSEMBLYAI_API_KEY").ok();
+
+    // Load Voice Bird server configuration
+    let server_config = match (
+        env::var("VOICE_BIRD_SERVER_URL").ok(),
+        env::var("VOICE_BIRD_API_KEY").ok(),
+    ) {
+        (Some(url), Some(key)) if !url.is_empty() && !key.is_empty() => {
+            println!("{}", style("✓ Voice Bird server configuration loaded").green());
+            Some((url, key))
+        }
+        _ => {
+            println!("{}", style("ℹ Voice Bird server not configured (optional)").dim());
+            None
+        }
+    };
 
     // Enumerate available audio sessions
     let available_sessions = wasapi_sessions::enumerate_audio_sessions()
@@ -82,7 +98,7 @@ fn main() -> Result<()> {
             // Input device (microphone)
             match audio::get_input_device_by_name(&host, &session_info.device_name) {
                 Ok(device) => {
-                    audio::start_input_recording(&device, &mut recording_session, api_key.clone())
+                    audio::start_input_recording(&device, &mut recording_session, api_key.clone(), server_config.clone())
                         .map(|stream| (Some(stream), None))
                 }
                 Err(e) => {
@@ -94,7 +110,7 @@ fn main() -> Result<()> {
             // Output device (loopback)
             #[cfg(windows)]
             {
-                audio::start_output_recording(&session_info.device_name, &mut recording_session, api_key.clone())
+                audio::start_output_recording(&session_info.device_name, &mut recording_session, api_key.clone(), server_config.clone())
                     .map(|cleanup| (None, Some(cleanup)))
             }
             #[cfg(not(windows))]
