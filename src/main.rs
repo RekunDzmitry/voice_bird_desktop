@@ -2,7 +2,9 @@ mod session;
 mod wasapi_sessions;
 mod ui;
 mod audio;
-mod server_streaming;
+mod grpc_streaming;
+mod grpc_service;
+mod opus_encoder;
 
 use anyhow::{Result, Context};
 use console::style;

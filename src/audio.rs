@@ -3,7 +3,7 @@ use cpal::{Device, SampleFormat};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavWriter, WavSpec};
 use crate::session::RecordingSession;
-use crate::server_streaming::ServerStreamingService;
+use crate::grpc_service::GrpcStreamingService;
 use std::sync::mpsc;
 
 // Calculate RMS (Root Mean Square) audio level from samples
@@ -127,11 +127,11 @@ pub fn start_input_recording(
     let sample_rate = session.sample_rate;
     let channels = session.channels;
 
-    // Spawn server streaming thread
+    // Spawn gRPC streaming thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = ServerStreamingService::stream_to_server(
+            if let Err(e) = GrpcStreamingService::stream_to_server(
                 server_url,
                 server_api_key,
                 session_id,
@@ -140,7 +140,7 @@ pub fn start_input_recording(
                 sample_rate,
                 channels,
             ).await {
-                eprintln!("Server streaming error: {}", e);
+                eprintln!("gRPC streaming error: {}", e);
             }
         });
     });
@@ -299,11 +299,11 @@ pub fn start_output_recording(
         let session_id = session.id.to_string();
         let device_name = session.device_name.clone();
 
-        // Spawn server streaming thread
+        // Spawn gRPC streaming thread
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                if let Err(e) = ServerStreamingService::stream_to_server(
+                if let Err(e) = GrpcStreamingService::stream_to_server(
                     server_url,
                     server_api_key,
                     session_id,
@@ -312,7 +312,7 @@ pub fn start_output_recording(
                     sample_rate,
                     channels,
                 ).await {
-                    eprintln!("Server streaming error: {}", e);
+                    eprintln!("gRPC streaming error: {}", e);
                 }
             });
         });
