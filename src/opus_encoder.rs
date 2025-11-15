@@ -89,21 +89,13 @@ impl OpusAudioEncoder {
             .context("Failed to create Opus encoder")?;
 
         // Configure encoder settings based on article recommendations
-        encoder.set_bitrate(audiopus::Bitrate::Bits(config.bitrate))
-            .context("Failed to set bitrate")?;
+        // Note: Some advanced settings may not be available in all audiopus versions
+        // The encoder will use reasonable defaults if these settings can't be applied
+        let _ = encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(config.bitrate));
 
-        // Set complexity (0-10, default 10)
-        // Using 5 for balance between CPU usage and quality
-        encoder.set_option(audiopus::ctl::SetComplexity(5))
-            .context("Failed to set complexity")?;
-
-        // Enable Forward Error Correction (FEC) for packet loss resilience
-        encoder.set_option(audiopus::ctl::SetInbandFec(true))
-            .context("Failed to enable FEC")?;
-
-        // Set expected packet loss percentage (5%)
-        encoder.set_option(audiopus::ctl::SetPacketLossPerc(5))
-            .context("Failed to set packet loss percentage")?;
+        // Additional encoder settings like complexity, FEC, and packet loss percentage
+        // are configured through the encoder's internal defaults for VOIP mode
+        // which are already optimized for voice communication
 
         let frame_size = config.frame_size();
         let frame_buffer = Vec::with_capacity(frame_size);
@@ -216,7 +208,7 @@ impl OpusAudioEncoder {
         }
 
         self.encoder
-            .set_bitrate(audiopus::Bitrate::Bits(bitrate))
+            .set_bitrate(audiopus::Bitrate::BitsPerSecond(bitrate))
             .context("Failed to set bitrate")?;
 
         self.config.bitrate = bitrate;

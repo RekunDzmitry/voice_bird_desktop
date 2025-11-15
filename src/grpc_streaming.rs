@@ -48,10 +48,10 @@ impl GrpcAudioStreamer {
     pub fn new(config: StreamConfig) -> Self {
         let session_id = Uuid::new_v4().to_string();
 
-        println!("🔗 Initializing gRPC audio streamer");
-        println!("   Session ID: {}", session_id);
-        println!("   Server: {}", config.server_url);
-        println!("   Device: {} ({})", config.device_name, config.device_type);
+        log::info!("Initializing gRPC audio streamer");
+        log::info!("   Session ID: {}", session_id);
+        log::info!("   Server: {}", config.server_url);
+        log::info!("   Device: {} ({})", config.device_name, config.device_type);
 
         Self {
             config,
@@ -64,93 +64,93 @@ impl GrpcAudioStreamer {
 
     /// Connect to the gRPC server and initialize the stream
     pub async fn connect(&mut self) -> Result<Streaming<TranscriptionResponse>> {
-        println!("🔌 [CONNECT] Step 1: Parsing server URL: {}", self.config.server_url);
+        log::debug!("[CONNECT] Step 1: Parsing server URL: {}", self.config.server_url);
 
         // Detect if URL uses HTTPS
         let is_https = self.config.server_url.starts_with("https://");
 
         if is_https {
-            println!("   Using HTTPS with TLS encryption");
+            log::debug!("   Using HTTPS with TLS encryption");
         } else {
-            println!("   Using HTTP (insecure) - suitable for localhost only");
+            log::debug!("   Using HTTP (insecure) - suitable for localhost only");
         }
 
         // Create gRPC channel with TLS support
         let channel = match Channel::from_shared(self.config.server_url.clone()) {
             Ok(mut endpoint) => {
-                println!("✓ [CONNECT] Step 1: URL parsed successfully");
+                log::debug!("[CONNECT] Step 1: URL parsed successfully");
 
                 // Configure TLS for HTTPS connections
                 if is_https {
-                    println!("🔌 [CONNECT] Step 2a: Configuring TLS...");
+                    log::debug!("[CONNECT] Step 2a: Configuring TLS...");
 
                     // Create TLS config - tonic 0.11 uses webpki-roots by default with tls-roots feature
                     let tls_config = ClientTlsConfig::new();
 
                     endpoint = match endpoint.tls_config(tls_config) {
                         Ok(ep) => {
-                            println!("✓ [CONNECT] Step 2a: TLS configured");
+                            log::debug!("[CONNECT] Step 2a: TLS configured");
                             ep
                         }
                         Err(e) => {
-                            eprintln!("❌ [CONNECT] Step 2a FAILED: TLS configuration error");
-                            eprintln!("   Error: {}", e);
+                            log::error!("[CONNECT] Step 2a FAILED: TLS configuration error");
+                            log::error!("   Error: {}", e);
                             return Err(anyhow::anyhow!("TLS configuration failed: {}", e));
                         }
                     };
                 }
 
-                println!("🔌 [CONNECT] Step 2: Attempting {} connection to server...",
+                log::debug!("[CONNECT] Step 2: Attempting {} connection to server...",
                          if is_https { "HTTPS" } else { "HTTP" });
 
                 match endpoint.connect().await {
                     Ok(ch) => {
-                        println!("✓ [CONNECT] Step 2: {} connection established",
+                        log::debug!("[CONNECT] Step 2: {} connection established",
                                 if is_https { "HTTPS" } else { "HTTP" });
                         ch
                     }
                     Err(e) => {
-                        eprintln!("❌ [CONNECT] Step 2 FAILED: Connection error");
-                        eprintln!("   Error type: {:?}", e);
-                        eprintln!("   Error message: {}", e);
-                        eprintln!("   Target: {}", self.config.server_url);
-                        eprintln!("   Possible causes:");
-                        eprintln!("   - Server is not running");
-                        eprintln!("   - Wrong host/port (check server URL)");
-                        eprintln!("   - Firewall blocking connection");
-                        eprintln!("   - Network connectivity issues");
+                        log::error!("[CONNECT] Step 2 FAILED: Connection error");
+                        log::error!("   Error type: {:?}", e);
+                        log::error!("   Error message: {}", e);
+                        log::error!("   Target: {}", self.config.server_url);
+                        log::error!("   Possible causes:");
+                        log::error!("   - Server is not running");
+                        log::error!("   - Wrong host/port (check server URL)");
+                        log::error!("   - Firewall blocking connection");
+                        log::error!("   - Network connectivity issues");
                         if is_https {
-                            eprintln!("   - TLS certificate validation failed");
-                            eprintln!("   - TLS handshake error");
+                            log::error!("   - TLS certificate validation failed");
+                            log::error!("   - TLS handshake error");
                         }
                         return Err(anyhow::anyhow!("Connection failed: {}", e));
                     }
                 }
             }
             Err(e) => {
-                eprintln!("❌ [CONNECT] Step 1 FAILED: Invalid server URL");
-                eprintln!("   Error: {}", e);
-                eprintln!("   URL: {}", self.config.server_url);
-                eprintln!("   Expected format: http://hostname:port or https://hostname:port");
+                log::error!("[CONNECT] Step 1 FAILED: Invalid server URL");
+                log::error!("   Error: {}", e);
+                log::error!("   URL: {}", self.config.server_url);
+                log::error!("   Expected format: http://hostname:port or https://hostname:port");
                 return Err(anyhow::anyhow!("Invalid server URL '{}': {}", self.config.server_url, e));
             }
         };
 
-        println!("✓ Connected to gRPC server");
+        log::info!("Connected to gRPC server");
 
-        println!("🔌 [CONNECT] Step 3: Creating gRPC client");
+        log::debug!("[CONNECT] Step 3: Creating gRPC client");
         // Create authenticated client
         let mut client = AudioStreamingClient::new(channel);
-        println!("✓ [CONNECT] Step 3: Client created");
+        log::debug!("[CONNECT] Step 3: Client created");
 
         // Create channel for sending audio chunks
-        println!("🔌 [CONNECT] Step 4: Setting up audio streaming channel (buffer size: 100)");
+        log::debug!("[CONNECT] Step 4: Setting up audio streaming channel (buffer size: 100)");
         let (tx, rx) = mpsc::channel::<AudioChunk>(100);
         self.audio_sender = Some(tx.clone());
-        println!("✓ [CONNECT] Step 4: Channel created");
+        log::debug!("[CONNECT] Step 4: Channel created");
 
         // Send initial chunk with session metadata
-        println!("🔌 [CONNECT] Step 5: Preparing session metadata");
+        log::debug!("[CONNECT] Step 5: Preparing session metadata");
         let initial_chunk = AudioChunk {
             session_id: self.session_id.clone(),
             audio_data: vec![], // Empty for first chunk
@@ -167,63 +167,63 @@ impl GrpcAudioStreamer {
             }),
         };
 
-        println!("🔌 [CONNECT] Step 6: Queuing initial metadata chunk");
+        log::debug!("[CONNECT] Step 6: Queuing initial metadata chunk");
         tx.send(initial_chunk)
             .await
             .context("Failed to send initial chunk to channel")?;
 
-        println!("✓ Sent session initialization");
+        log::info!("Sent session initialization");
 
         // Create request stream
-        println!("🔌 [CONNECT] Step 7: Creating request stream wrapper");
+        log::debug!("[CONNECT] Step 7: Creating request stream wrapper");
         let request_stream = ReceiverStream::new(rx);
 
         // Create request with authentication metadata
-        println!("🔌 [CONNECT] Step 8: Adding authentication metadata");
+        log::debug!("[CONNECT] Step 8: Adding authentication metadata");
         let mut request = Request::new(request_stream);
         let metadata = request.metadata_mut();
 
         let auth_value = match MetadataValue::try_from(&self.config.api_key) {
             Ok(val) => {
-                println!("✓ [CONNECT] Step 8: API key validated");
+                log::debug!("[CONNECT] Step 8: API key validated");
                 val
             }
             Err(e) => {
-                eprintln!("❌ [CONNECT] Step 8 FAILED: Invalid API key format");
-                eprintln!("   Error: {}", e);
-                eprintln!("   API key length: {}", self.config.api_key.len());
-                eprintln!("   Hint: API key must contain only ASCII characters");
+                log::error!("[CONNECT] Step 8 FAILED: Invalid API key format");
+                log::error!("   Error: {}", e);
+                log::error!("   API key length: {}", self.config.api_key.len());
+                log::error!("   Hint: API key must contain only ASCII characters");
                 return Err(anyhow::anyhow!("Invalid API key format: {}", e));
             }
         };
         metadata.insert("authorization", auth_value);
 
         // Start bidirectional streaming
-        println!("🔌 [CONNECT] Step 9: Initiating bidirectional stream with server...");
-        println!("   This will send the metadata and wait for server acknowledgment");
+        log::debug!("[CONNECT] Step 9: Initiating bidirectional stream with server...");
+        log::debug!("   This will send the metadata and wait for server acknowledgment");
 
         let response = match client.stream_audio(request).await {
             Ok(resp) => {
-                println!("✓ [CONNECT] Step 9: Server accepted stream request");
+                log::debug!("[CONNECT] Step 9: Server accepted stream request");
                 resp
             }
             Err(e) => {
-                eprintln!("❌ [CONNECT] Step 9 FAILED: Server rejected stream request");
-                eprintln!("   gRPC Status: {:?}", e.code());
-                eprintln!("   Message: {}", e.message());
-                eprintln!("   Possible causes:");
-                eprintln!("   - Invalid API key (unauthorized)");
-                eprintln!("   - Server endpoint not found (check URL path)");
-                eprintln!("   - Server internal error");
-                eprintln!("   - Incompatible protocol version");
+                log::error!("[CONNECT] Step 9 FAILED: Server rejected stream request");
+                log::error!("   gRPC Status: {:?}", e.code());
+                log::error!("   Message: {}", e.message());
+                log::error!("   Possible causes:");
+                log::error!("   - Invalid API key (unauthorized)");
+                log::error!("   - Server endpoint not found (check URL path)");
+                log::error!("   - Server internal error");
+                log::error!("   - Incompatible protocol version");
                 if let Some(source) = e.source() {
-                    eprintln!("   Source error: {}", source);
+                    log::error!("   Source error: {}", source);
                 }
                 return Err(anyhow::anyhow!("gRPC stream request failed ({}): {}", e.code(), e.message()));
             }
         };
 
-        println!("✓ Stream established");
+        log::info!("Stream established");
 
         self.client = Some(client);
         Ok(response.into_inner())
@@ -257,18 +257,18 @@ impl GrpcAudioStreamer {
     pub async fn handle_responses(
         mut response_stream: Streaming<TranscriptionResponse>
     ) -> Result<()> {
-        println!("👂 Listening for transcriptions...\n");
+        log::info!("Listening for transcriptions...");
 
         while let Some(response) = response_stream.message().await? {
             match response.response {
                 Some(voicebird::transcription_response::Response::Status(status)) => {
-                    println!("📡 Status: {}", status.message);
+                    log::info!("Status: {}", status.message);
                 }
                 Some(voicebird::transcription_response::Response::Transcript(transcript)) => {
                     let marker = if transcript.is_final { "✓" } else { "..." };
                     let confidence = (transcript.confidence * 100.0) as u32;
 
-                    println!(
+                    log::info!(
                         "{} [{}%] {}",
                         marker,
                         confidence,
@@ -276,9 +276,9 @@ impl GrpcAudioStreamer {
                     );
                 }
                 Some(voicebird::transcription_response::Response::Error(error)) => {
-                    eprintln!("❌ Server error: {} ({})", error.message, error.code);
+                    log::error!("Server error: {} ({})", error.message, error.code);
                     if let Some(details) = error.details {
-                        eprintln!("   Details: {}", details);
+                        log::error!("   Details: {}", details);
                     }
                 }
                 None => {
@@ -287,7 +287,7 @@ impl GrpcAudioStreamer {
             }
         }
 
-        println!("\n📭 Stream ended");
+        log::info!("Stream ended");
         Ok(())
     }
 
@@ -306,7 +306,7 @@ impl GrpcAudioStreamer {
     pub fn close(&mut self) {
         if let Some(sender) = self.audio_sender.take() {
             drop(sender);
-            println!("🔌 Closed audio stream");
+            log::info!("Closed audio stream");
         }
     }
 }

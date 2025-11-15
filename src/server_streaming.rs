@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use console::style;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use tokio::time::{sleep, Duration as TokioDuration};
@@ -70,22 +69,10 @@ impl ServerStreamingService {
         } else {
             "****".to_string()
         };
-        println!(
-            "{}",
-            style(format!("🔗 Connecting to Voice Bird server...")).cyan()
-        );
-        println!(
-            "{}",
-            style(format!("   Server: {}", server_url)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   API Key: {}", api_key_preview)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Session: {}", session_id)).dim()
-        );
+        log::info!("Connecting to Voice Bird server...");
+        log::debug!("   Server: {}", server_url);
+        log::debug!("   API Key: {}", api_key_preview);
+        log::debug!("   Session: {}", session_id);
 
         // Convert HTTP(S) URL to WebSocket URL
         let ws_url = server_url
@@ -95,10 +82,7 @@ impl ServerStreamingService {
         // Construct WebSocket endpoint
         let full_ws_url = format!("{}/api/audio/stream", ws_url);
 
-        println!(
-            "{}",
-            style(format!("   WebSocket: {}", full_ws_url)).dim()
-        );
+        log::debug!("   WebSocket: {}", full_ws_url);
 
         // Create WebSocket request
         let mut request = full_ws_url
@@ -116,13 +100,10 @@ impl ServerStreamingService {
         // This ensures no compression is requested even if the library tries to add it
         request.headers_mut().remove("Sec-WebSocket-Extensions");
 
-        println!(
-            "{}",
-            style("🔧 Manually removed Sec-WebSocket-Extensions header (prevents compression)").yellow()
-        );
+        log::warn!("Manually removed Sec-WebSocket-Extensions header (prevents compression)");
 
         // Connect to WebSocket with timeout (10 seconds)
-        println!("{}", style("⏳ Attempting WebSocket connection...").dim());
+        log::debug!("Attempting WebSocket connection...");
 
         // Configure WebSocket to match server settings
         // CRITICAL: Server has perMessageDeflate: false (compression disabled)
@@ -135,26 +116,11 @@ impl ServerStreamingService {
             ..Default::default()
         };
 
-        println!(
-            "{}",
-            style("📋 WebSocket Config:").cyan()
-        );
-        println!(
-            "{}",
-            style(format!("   Max message size: {} bytes", ws_config.max_message_size.unwrap_or(0))).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Max frame size: {} bytes", ws_config.max_frame_size.unwrap_or(0))).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Write buffer size: {} bytes", ws_config.max_write_buffer_size)).dim()
-        );
-        println!(
-            "{}",
-            style("   Compression: DISABLED (via default-features = false)").green().bold()
-        );
+        log::debug!("WebSocket Config:");
+        log::debug!("   Max message size: {} bytes", ws_config.max_message_size.unwrap_or(0));
+        log::debug!("   Max frame size: {} bytes", ws_config.max_frame_size.unwrap_or(0));
+        log::debug!("   Write buffer size: {} bytes", ws_config.max_write_buffer_size);
+        log::debug!("   Compression: DISABLED (via default-features = false)");
 
         let connection_result = tokio::time::timeout(
             TokioDuration::from_secs(10),
@@ -163,73 +129,50 @@ impl ServerStreamingService {
 
         let (ws_stream, _response) = match connection_result {
             Ok(Ok(stream)) => {
-                println!("{}", style("✓ Connected to Voice Bird server!").green());
+                log::info!("Connected to Voice Bird server!");
 
                 // Log HTTP response details for debugging
-                println!(
-                    "{}",
-                    style(format!("📡 HTTP Response: {}", stream.1.status())).dim()
-                );
+                log::debug!("HTTP Response: {}", stream.1.status());
 
                 // Check for WebSocket extension headers (especially compression)
                 if let Some(extensions) = stream.1.headers().get("Sec-WebSocket-Extensions") {
-                    println!(
-                        "{}",
-                        style(format!("   Extensions negotiated: {:?}", extensions)).dim()
-                    );
+                    log::debug!("   Extensions negotiated: {:?}", extensions);
                 } else {
-                    println!(
-                        "{}",
-                        style("   Extensions: None (compression disabled)").dim()
-                    );
+                    log::debug!("   Extensions: None (compression disabled)");
                 }
 
                 // Log protocol if present
                 if let Some(protocol) = stream.1.headers().get("Sec-WebSocket-Protocol") {
-                    println!(
-                        "{}",
-                        style(format!("   Protocol: {:?}", protocol)).dim()
-                    );
+                    log::debug!("   Protocol: {:?}", protocol);
                 }
 
                 stream
             }
             Ok(Err(e)) => {
                 // WebSocket error (connection refused, invalid response, etc.)
-                eprintln!(
-                    "{}",
-                    style(format!("✗ WebSocket connection failed: {}", e)).red().bold()
-                );
-                eprintln!("{}", style("").dim());
-                eprintln!("{}", style("Possible causes:").yellow());
-                eprintln!("{}", style("  1. Server endpoint '/api/audio/stream' doesn't exist").yellow());
-                eprintln!("{}", style("  2. Server is not running or unreachable").yellow());
-                eprintln!("{}", style("  3. Server rejected the WebSocket upgrade request").yellow());
-                eprintln!("{}", style("  4. Network/firewall blocking the connection").yellow());
-                eprintln!("{}", style("").dim());
-                eprintln!("{}", style("Troubleshooting:").cyan());
-                eprintln!("{}", style(format!("  - Verify server is running at: {}", server_url)).cyan());
-                eprintln!("{}", style("  - Check server logs for incoming connection attempts").cyan());
-                eprintln!("{}", style("  - Ensure WebSocket endpoint is implemented and accessible").cyan());
-                eprintln!("{}", style("  - Test with: curl -i -N -H 'Connection: Upgrade' ...").cyan());
+                log::error!("WebSocket connection failed: {}", e);
+                log::error!("Possible causes:");
+                log::error!("  1. Server endpoint '/api/audio/stream' doesn't exist");
+                log::error!("  2. Server is not running or unreachable");
+                log::error!("  3. Server rejected the WebSocket upgrade request");
+                log::error!("  4. Network/firewall blocking the connection");
+                log::info!("Troubleshooting:");
+                log::info!("  - Verify server is running at: {}", server_url);
+                log::info!("  - Check server logs for incoming connection attempts");
+                log::info!("  - Ensure WebSocket endpoint is implemented and accessible");
+                log::info!("  - Test with: curl -i -N -H 'Connection: Upgrade' ...");
                 return Err(anyhow::anyhow!("WebSocket connection failed: {}", e));
             }
             Err(_) => {
                 // Timeout
-                eprintln!(
-                    "{}",
-                    style("✗ Connection timeout (10 seconds)").red().bold()
-                );
-                eprintln!("{}", style("").dim());
-                eprintln!("{}", style("The server did not respond within 10 seconds.").yellow());
-                eprintln!("{}", style("").dim());
-                eprintln!("{}", style("Most likely cause:").yellow());
-                eprintln!("{}", style("  → The WebSocket endpoint '/api/audio/stream' is NOT implemented on the server").yellow().bold());
-                eprintln!("{}", style("").dim());
-                eprintln!("{}", style("Action required:").cyan());
-                eprintln!("{}", style("  1. Check if your server has a WebSocket handler at '/api/audio/stream'").cyan());
-                eprintln!("{}", style("  2. See SERVER_ENDPOINT_SPEC.md for implementation requirements").cyan());
-                eprintln!("{}", style("  3. Verify server logs show NO incoming connection attempts").cyan());
+                log::error!("Connection timeout (10 seconds)");
+                log::warn!("The server did not respond within 10 seconds.");
+                log::warn!("Most likely cause:");
+                log::warn!("  → The WebSocket endpoint '/api/audio/stream' is NOT implemented on the server");
+                log::info!("Action required:");
+                log::info!("  1. Check if your server has a WebSocket handler at '/api/audio/stream'");
+                log::info!("  2. See SERVER_ENDPOINT_SPEC.md for implementation requirements");
+                log::info!("  3. Verify server logs show NO incoming connection attempts");
                 return Err(anyhow::anyhow!("Connection timeout - server endpoint may not exist"));
             }
         };
@@ -249,44 +192,20 @@ impl ServerStreamingService {
         let init_json = serde_json::to_string(&init_msg)
             .context("Failed to serialize init message")?;
 
-        println!(
-            "{}",
-            style(format!("📤 Sending init message ({} bytes)...", init_json.len())).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Session ID: {}", session_id)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Sample Rate: {} Hz", sample_rate)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Channels: {}", channels)).dim()
-        );
+        log::debug!("Sending init message ({} bytes)...", init_json.len());
+        log::debug!("   Session ID: {}", session_id);
+        log::debug!("   Sample Rate: {} Hz", sample_rate);
+        log::debug!("   Channels: {}", channels);
 
         if let Err(e) = write.send(Message::Text(init_json.clone())).await {
-            eprintln!(
-                "{}",
-                style(format!("✗ Failed to send init message: {}", e)).red()
-            );
-            eprintln!(
-                "{}",
-                style(format!("   Error type: {:?}", e)).red()
-            );
+            log::error!("Failed to send init message: {}", e);
+            log::error!("   Error type: {:?}", e);
             return Err(anyhow::anyhow!("Failed to send init message: {}", e));
         }
 
-        println!(
-            "{}",
-            style("✓ Init message sent successfully").green()
-        );
+        log::info!("Init message sent successfully");
 
-        println!(
-            "{}",
-            style(format!("📡 Streaming started for device: {}", device_name)).cyan()
-        );
+        log::info!("Streaming started for device: {}", device_name);
 
         // Create channel for sending pong responses from read task to write loop
         let (pong_tx, mut pong_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
@@ -301,75 +220,44 @@ impl ServerStreamingService {
                         if let Ok(response) = serde_json::from_str::<ServerResponse>(&text) {
                             match response.message_type.as_str() {
                                 "connected" => {
-                                    println!(
-                                        "{}",
-                                        style(format!("✓ Server acknowledged connection: {}", response.message))
-                                            .green()
-                                    );
+                                    log::info!("Server acknowledged connection: {}", response.message);
                                 }
                                 "error" => {
-                                    eprintln!(
-                                        "{}",
-                                        style(format!("✗ Server error: {}", response.error)).red()
-                                    );
+                                    log::error!("Server error: {}", response.error);
                                 }
                                 "transcription" => {
                                     // Server sent transcription result
-                                    println!(
-                                        "{}",
-                                        style(format!("📝 Transcription: {}", response.message)).cyan()
-                                    );
+                                    log::info!("Transcription: {}", response.message);
                                 }
                                 _ => {
                                     // Unknown message type, just log it
-                                    println!(
-                                        "{}",
-                                        style(format!("📨 Server: {}", text)).dim()
-                                    );
+                                    log::debug!("Server: {}", text);
                                 }
                             }
                         }
                     }
                     Ok(Message::Ping(payload)) => {
                         // Server sent ping - send pong response via channel to keep connection alive
-                        println!(
-                            "{}",
-                            style(format!("🏓 Received ping from server, responding with pong")).dim()
-                        );
+                        log::debug!("Received ping from server, responding with pong");
                         if let Err(e) = pong_tx.send(payload) {
-                            eprintln!(
-                                "{}",
-                                style(format!("✗ Failed to send pong via channel: {}", e)).red()
-                            );
+                            log::error!("Failed to send pong via channel: {}", e);
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        println!(
-                            "{}",
-                            style(format!("🔌 Server closed connection for session {}", session_id_clone))
-                                .yellow()
-                        );
+                        log::warn!("Server closed connection for session {}", session_id_clone);
                         break;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "{}",
-                            style(format!("✗ WebSocket error: {}", e)).red()
-                        );
-                        eprintln!(
-                            "{}",
-                            style(format!("   Error details: {:?}", e)).red()
-                        );
+                        log::error!("WebSocket error: {}", e);
+                        log::error!("   Error details: {:?}", e);
 
                         // Provide specific guidance for common errors
                         let error_msg = format!("{}", e);
                         if error_msg.contains("Reserved bits") {
-                            eprintln!("{}", style("").dim());
-                            eprintln!("{}", style("⚠️  COMPRESSION MISMATCH DETECTED").yellow().bold());
-                            eprintln!("{}", style("   This error indicates the client and server have mismatched compression settings.").yellow());
-                            eprintln!("{}", style("   Server has: perMessageDeflate: false (compression disabled)").yellow());
-                            eprintln!("{}", style("   Action: Check 'Sec-WebSocket-Extensions' header in connection log above").yellow());
-                            eprintln!("{}", style("").dim());
+                            log::warn!("COMPRESSION MISMATCH DETECTED");
+                            log::warn!("   This error indicates the client and server have mismatched compression settings.");
+                            log::warn!("   Server has: perMessageDeflate: false (compression disabled)");
+                            log::warn!("   Action: Check 'Sec-WebSocket-Extensions' header in connection log above");
                         }
                         break;
                     }
@@ -385,28 +273,19 @@ impl ServerStreamingService {
         let mut pong_count = 0u32;
         let start_time = std::time::Instant::now();
 
-        println!(
-            "{}",
-            style("🎵 Beginning audio streaming loop...").cyan()
-        );
+        log::info!("Beginning audio streaming loop...");
 
         // Main loop: send audio chunks and respond to pings
         loop {
             // Check for pending pong responses (non-blocking)
             while let Ok(pong_payload) = pong_rx.try_recv() {
                 if let Err(e) = write.send(Message::Pong(pong_payload)).await {
-                    eprintln!(
-                        "{}",
-                        style(format!("✗ Failed to send pong: {}", e)).red()
-                    );
+                    log::error!("Failed to send pong: {}", e);
                     break;
                 }
                 pong_count += 1;
                 if pong_count % 5 == 0 {
-                    println!(
-                        "{}",
-                        style(format!("🏓 Sent {} pong responses to keep connection alive", pong_count)).dim()
-                    );
+                    log::debug!("Sent {} pong responses to keep connection alive", pong_count);
                 }
             }
 
@@ -431,18 +310,14 @@ impl ServerStreamingService {
                     if should_log {
                         let elapsed = start_time.elapsed();
                         let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
-                        println!(
-                            "{}",
-                            style(format!(
-                                "📤 Chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} MB sent | Elapsed: {:.1}s",
-                                chunk_count,
-                                audio_chunk.len(),
-                                bytes_len,
-                                duration_secs,
-                                total_bytes_sent as f64 / 1_000_000.0,
-                                elapsed.as_secs_f32()
-                            ))
-                            .dim()
+                        log::debug!(
+                            "Chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} MB sent | Elapsed: {:.1}s",
+                            chunk_count,
+                            audio_chunk.len(),
+                            bytes_len,
+                            duration_secs,
+                            total_bytes_sent as f64 / 1_000_000.0,
+                            elapsed.as_secs_f32()
                         );
                     }
 
@@ -450,10 +325,7 @@ impl ServerStreamingService {
                     match write.send(Message::Binary(bytes)).await {
                         Ok(_) => {
                             if should_log {
-                                println!(
-                                    "{}",
-                                    style(format!("   ✓ Chunk #{} sent successfully", chunk_count)).dim()
-                                );
+                                log::debug!("   Chunk #{} sent successfully", chunk_count);
                             }
 
                             // Small delay to prevent overwhelming the WebSocket
@@ -461,32 +333,18 @@ impl ServerStreamingService {
                         }
                         Err(e) => {
                             let elapsed = start_time.elapsed();
-                            eprintln!(
-                                "{}",
-                                style(format!(
-                                    "✗ Failed to send audio chunk #{}: {}",
-                                    chunk_count, e
-                                ))
-                                .red()
+                            log::error!(
+                                "Failed to send audio chunk #{}: {}",
+                                chunk_count, e
                             );
-                            eprintln!(
-                                "{}",
-                                style(format!("   Error details: {:?}", e)).red()
+                            log::error!("   Error details: {:?}", e);
+                            log::error!(
+                                "   Sent {} chunks ({:.1}s of audio, {:.2} MB) before failure",
+                                chunk_count - 1,
+                                (total_samples - audio_chunk.len()) as f32 / (sample_rate * channels as u32) as f32,
+                                (total_bytes_sent - bytes_len as u64) as f64 / 1_000_000.0
                             );
-                            eprintln!(
-                                "{}",
-                                style(format!(
-                                    "   Sent {} chunks ({:.1}s of audio, {:.2} MB) before failure",
-                                    chunk_count - 1,
-                                    (total_samples - audio_chunk.len()) as f32 / (sample_rate * channels as u32) as f32,
-                                    (total_bytes_sent - bytes_len as u64) as f64 / 1_000_000.0
-                                ))
-                                .red()
-                            );
-                            eprintln!(
-                                "{}",
-                                style(format!("   Elapsed time: {:.1}s", elapsed.as_secs_f32())).red()
-                            );
+                            log::error!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                             break;
                         }
                     }
@@ -500,42 +358,14 @@ impl ServerStreamingService {
                     let elapsed = start_time.elapsed();
                     let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
 
-                    println!(
-                        "{}",
-                        style("📊 Audio stream ended, finalizing...").cyan()
+                    log::info!("Audio stream ended, finalizing...");
+                    log::info!("   Total chunks sent: {}", chunk_count);
+                    log::info!("   Total audio duration: {:.1}s", duration_secs);
+                    log::info!(
+                        "   Total bytes sent: {:.2} MB",
+                        total_bytes_sent as f64 / 1_000_000.0
                     );
-                    println!(
-                        "{}",
-                        style(format!(
-                            "   Total chunks sent: {}",
-                            chunk_count
-                        ))
-                        .dim()
-                    );
-                    println!(
-                        "{}",
-                        style(format!(
-                            "   Total audio duration: {:.1}s",
-                            duration_secs
-                        ))
-                        .dim()
-                    );
-                    println!(
-                        "{}",
-                        style(format!(
-                            "   Total bytes sent: {:.2} MB",
-                            total_bytes_sent as f64 / 1_000_000.0
-                        ))
-                        .dim()
-                    );
-                    println!(
-                        "{}",
-                        style(format!(
-                            "   Elapsed time: {:.1}s",
-                            elapsed.as_secs_f32()
-                        ))
-                        .dim()
-                    );
+                    log::info!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                     break;
                 }
             }
@@ -550,34 +380,20 @@ impl ServerStreamingService {
         let terminate_json = serde_json::to_string(&terminate_msg)
             .context("Failed to serialize terminate message")?;
 
-        println!(
-            "{}",
-            style(format!("📤 Sending terminate message ({} bytes)...", terminate_json.len())).dim()
-        );
+        log::debug!("Sending terminate message ({} bytes)...", terminate_json.len());
 
         let _ = write.send(Message::Text(terminate_json)).await;
 
         let final_duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
         let elapsed = start_time.elapsed();
 
-        println!(
-            "{}",
-            style(format!(
-                "✓ Streaming completed for session {}",
-                session_id
-            ))
-            .green()
-        );
-        println!(
-            "{}",
-            style(format!(
-                "   Final stats: {} chunks, {:.1}s audio, {:.2} MB in {:.1}s",
-                chunk_count,
-                final_duration_secs,
-                total_bytes_sent as f64 / 1_000_000.0,
-                elapsed.as_secs_f32()
-            ))
-            .green()
+        log::info!("Streaming completed for session {}", session_id);
+        log::info!(
+            "   Final stats: {} chunks, {:.1}s audio, {:.2} MB in {:.1}s",
+            chunk_count,
+            final_duration_secs,
+            total_bytes_sent as f64 / 1_000_000.0,
+            elapsed.as_secs_f32()
         );
 
         // Wait for read task to finish (with timeout)

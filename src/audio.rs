@@ -140,7 +140,7 @@ pub fn start_input_recording(
                 sample_rate,
                 channels,
             ).await {
-                eprintln!("gRPC streaming error: {}", e);
+                log::error!("gRPC streaming error: {}", e);
             }
         });
     });
@@ -175,7 +175,7 @@ pub fn start_input_recording(
                     // Send to server streaming service
                     let _ = server_tx_f32.send(data.to_vec());
                 },
-                |err| eprintln!("Stream error: {}", err),
+                |err| log::error!("Stream error: {}", err),
                 None,
             )?
         },
@@ -202,7 +202,7 @@ pub fn start_input_recording(
                     // Send to server streaming service (convert to f32)
                     let _ = server_tx_i16.send(samples);
                 },
-                |err| eprintln!("Stream error: {}", err),
+                |err| log::error!("Stream error: {}", err),
                 None,
             )?
         },
@@ -231,7 +231,7 @@ pub fn start_input_recording(
                     // Send to server streaming service (already converted to f32)
                     let _ = server_tx_u16.send(samples);
                 },
-                |err| eprintln!("Stream error: {}", err),
+                |err| log::error!("Stream error: {}", err),
                 None,
             )?
         },
@@ -312,7 +312,7 @@ pub fn start_output_recording(
                     sample_rate,
                     channels,
                 ).await {
-                    eprintln!("gRPC streaming error: {}", e);
+                    log::error!("gRPC streaming error: {}", e);
                 }
             });
         });
@@ -328,7 +328,7 @@ pub fn start_output_recording(
         unsafe {
             // Initialize COM for this thread
             if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-                eprintln!("Failed to initialize COM in audio thread");
+                log::error!("Failed to initialize COM in audio thread");
                 return;
             }
 
@@ -425,7 +425,7 @@ pub fn start_output_recording(
             })();
 
             if let Err(e) = result {
-                eprintln!("Audio recording error: {}", e);
+                log::error!("Audio recording error: {}", e);
             }
 
             // Uninitialize COM for this thread

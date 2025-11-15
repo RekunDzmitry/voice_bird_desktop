@@ -7,18 +7,21 @@ mod grpc_service;
 mod opus_encoder;
 
 use anyhow::{Result, Context};
-use console::style;
 use std::env;
 use session::{RecordingSession, SessionManager};
 use ui::{App, AppMode, RecordingInputAction};
 
 fn main() -> Result<()> {
+    // Initialize logger
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
     // Load .env file if present
     dotenvy::dotenv().ok();
 
-    println!("{}", style("=== Voice Bird Desktop ===").bold().cyan());
-    println!("{}", style("Initializing...").yellow());
-    println!();
+    log::info!("Voice Bird Desktop starting...");
+    log::info!("Initializing...");
 
     // Load Voice Bird server configuration (required)
     let server_config = match (
@@ -26,16 +29,15 @@ fn main() -> Result<()> {
         env::var("VOICE_BIRD_API_KEY").ok(),
     ) {
         (Some(url), Some(key)) if !url.is_empty() && !key.is_empty() => {
-            println!("{}", style("✓ Voice Bird server configuration loaded").green());
+            log::info!("Voice Bird server configuration loaded");
             (url, key)
         }
         _ => {
-            eprintln!("{}", style("❌ Voice Bird server not configured!").red().bold());
-            eprintln!("{}", style("Required environment variables:").yellow());
-            eprintln!("{}", style("  - VOICE_BIRD_SERVER_URL").yellow());
-            eprintln!("{}", style("  - VOICE_BIRD_API_KEY").yellow());
-            eprintln!();
-            eprintln!("{}", style("Create a .env file with these values.").dim());
+            log::error!("Voice Bird server not configured!");
+            log::error!("Required environment variables:");
+            log::error!("  - VOICE_BIRD_SERVER_URL");
+            log::error!("  - VOICE_BIRD_API_KEY");
+            log::error!("Create a .env file with these values.");
             return Err(anyhow::anyhow!("Voice Bird server configuration missing"));
         }
     };
@@ -45,12 +47,12 @@ fn main() -> Result<()> {
         .context("Failed to enumerate audio sessions")?;
 
     if available_sessions.is_empty() {
-        println!("{}", style("No active audio sessions found.").yellow());
-        println!("{}", style("Make sure applications are playing/recording audio.").yellow());
+        log::warn!("No active audio sessions found.");
+        log::warn!("Make sure applications are playing/recording audio.");
         return Ok(());
     }
 
-    println!("{}", style(format!("Found {} active audio session(s)", available_sessions.len())).green());
+    log::info!("Found {} active audio session(s)", available_sessions.len());
 
     // Initialize terminal UI
     let mut terminal = ui::init_terminal()?;
@@ -66,7 +68,7 @@ fn main() -> Result<()> {
 
         if should_quit {
             ui::restore_terminal(terminal)?;
-            println!("{}", style("Goodbye!").cyan());
+            log::info!("Application shutting down");
             return Ok(());
         }
 
@@ -80,7 +82,7 @@ fn main() -> Result<()> {
 
     if selected_session_infos.is_empty() {
         ui::restore_terminal(terminal)?;
-        println!("{}", style("No sessions selected.").yellow());
+        log::warn!("No sessions selected");
         return Ok(());
     }
 
@@ -105,7 +107,7 @@ fn main() -> Result<()> {
                         .map(|stream| (Some(stream), None))
                 }
                 Err(e) => {
-                    eprintln!("{}", style(format!("Failed to get input device: {}", e)).red());
+                    log::error!("Failed to get input device: {}", e);
                     continue;
                 }
             }
@@ -118,7 +120,7 @@ fn main() -> Result<()> {
             }
             #[cfg(not(windows))]
             {
-                eprintln!("{}", style("Output recording not supported on this platform").red());
+                log::error!("Output recording not supported on this platform");
                 continue;
             }
         };
@@ -133,14 +135,14 @@ fn main() -> Result<()> {
                 std::mem::forget(cleanup);
             }
             Err(e) => {
-                eprintln!("{}", style(format!("Failed to start recording: {}", e)).red());
+                log::error!("Failed to start recording: {}", e);
             }
         }
     }
 
     if session_manager.active_sessions.is_empty() {
         ui::restore_terminal(terminal)?;
-        println!("{}", style("No recording sessions started.").yellow());
+        log::warn!("No recording sessions started");
         return Ok(());
     }
 
@@ -161,9 +163,7 @@ fn main() -> Result<()> {
                 ui::restore_terminal(terminal)?;
 
                 // Save all recordings
-                println!();
-                println!("{}", style("=== Saving Recordings ===").bold().green());
-                println!();
+                log::info!("Saving recordings...");
 
                 for (_id, session) in &session_manager.active_sessions {
                     let prefix = session.get_filename_prefix();
@@ -174,18 +174,12 @@ fn main() -> Result<()> {
                             let audio_filename = format!("{}.wav", prefix);
                             match audio::save_audio_file(&buffer, session.sample_rate, session.channels, &audio_filename) {
                                 Ok(_) => {
-                                    println!("{} {}",
-                                        style("✓ Audio saved:").green().bold(),
-                                        style(&audio_filename).cyan()
-                                    );
                                     let duration = buffer.len() as f32 / (session.sample_rate * session.channels as u32) as f32;
-                                    println!("  Duration: {:.2}s, Samples: {}", duration, buffer.len());
+                                    log::info!("Audio saved: {} (Duration: {:.2}s, Samples: {})",
+                                        audio_filename, duration, buffer.len());
                                 }
                                 Err(e) => {
-                                    eprintln!("{} {}",
-                                        style("✗ Failed to save audio:").red().bold(),
-                                        e
-                                    );
+                                    log::error!("Failed to save audio: {}", e);
                                 }
                             }
                         }
@@ -197,32 +191,24 @@ fn main() -> Result<()> {
                             let transcript_filename = format!("{}.txt", prefix);
                             match audio::save_transcript_file(&segments, &transcript_filename) {
                                 Ok(_) => {
-                                    println!("{} {}",
-                                        style("✓ Transcript saved:").green().bold(),
-                                        style(&transcript_filename).cyan()
-                                    );
-                                    println!("  Segments: {}", segments.len());
+                                    log::info!("Transcript saved: {} (Segments: {})",
+                                        transcript_filename, segments.len());
                                 }
                                 Err(e) => {
-                                    eprintln!("{} {}",
-                                        style("✗ Failed to save transcript:").red().bold(),
-                                        e
-                                    );
+                                    log::error!("Failed to save transcript: {}", e);
                                 }
                             }
                         }
                     }
-
-                    println!();
                 }
 
-                println!("{}", style("All sessions saved successfully!").green().bold());
+                log::info!("All sessions saved successfully!");
                 break;
             }
             RecordingInputAction::QuitWithoutSaving => {
                 session_manager.stop_all();
                 ui::restore_terminal(terminal)?;
-                println!("{}", style("Exited without saving.").yellow());
+                log::warn!("Exited without saving");
                 break;
             }
             RecordingInputAction::Continue => {

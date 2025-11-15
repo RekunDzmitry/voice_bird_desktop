@@ -2,8 +2,6 @@
 /// Provides a similar interface to server_streaming.rs but uses gRPC instead of WebSocket
 
 use anyhow::{Context, Result};
-use console::style;
-use std::error::Error;
 use std::sync::mpsc;
 use crate::grpc_streaming::{GrpcAudioStreamer, StreamConfig};
 use crate::opus_encoder::{OpusAudioEncoder, OpusEncoderConfig};
@@ -38,24 +36,12 @@ impl GrpcStreamingService {
             "****".to_string()
         };
 
-        println!(
-            "{}",
-            style("🚀 Connecting to Voice Bird gRPC server...").cyan()
-        );
-        println!("{}", style(format!("   Server: {}", server_url)).dim());
-        println!(
-            "{}",
-            style(format!("   API Key: {}", api_key_preview)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Device: {}", device_name)).dim()
-        );
-        println!(
-            "{}",
-            style(format!("   Sample Rate: {} Hz", sample_rate)).dim()
-        );
-        println!("{}", style(format!("   Channels: {}", channels)).dim());
+        log::info!("Connecting to Voice Bird gRPC server...");
+        log::debug!("   Server: {}", server_url);
+        log::debug!("   API Key: {}", api_key_preview);
+        log::debug!("   Device: {}", device_name);
+        log::debug!("   Sample Rate: {} Hz", sample_rate);
+        log::debug!("   Channels: {}", channels);
 
         // Determine device type from name
         let device_type = if device_name.contains("Microphone")
@@ -80,13 +66,12 @@ impl GrpcStreamingService {
         let mut opus_encoder = OpusAudioEncoder::new(opus_config)
             .context("Failed to create Opus encoder")?;
 
-        println!("{}", style("").dim());
-        println!("{}", style("🎵 Opus Encoder Configuration:").cyan());
-        println!("{}", style(format!("   Sample Rate: {} Hz", opus_encoder.sample_rate())).dim());
-        println!("{}", style(format!("   Channels: {} (mono)", opus_encoder.channels())).dim());
-        println!("{}", style(format!("   Bitrate: {} kbps", opus_encoder.bitrate() / 1000)).dim());
-        println!("{}", style(format!("   Frame Duration: {}ms", opus_encoder.frame_duration_ms())).dim());
-        println!("{}", style(format!("   Frame Size: {} samples", opus_encoder.frame_size())).dim());
+        log::debug!("Opus Encoder Configuration:");
+        log::debug!("   Sample Rate: {} Hz", opus_encoder.sample_rate());
+        log::debug!("   Channels: {} (mono)", opus_encoder.channels());
+        log::debug!("   Bitrate: {} kbps", opus_encoder.bitrate() / 1000);
+        log::debug!("   Frame Duration: {}ms", opus_encoder.frame_duration_ms());
+        log::debug!("   Frame Size: {} samples", opus_encoder.frame_size());
 
         // Create stream config
         let config = StreamConfig {
@@ -105,62 +90,44 @@ impl GrpcStreamingService {
         let mut streamer = GrpcAudioStreamer::new(config);
 
         // Connect to server and get response stream
-        println!("{}", style("").dim());
-        println!("{}", style("═══════════════════════════════════════════").cyan());
-        println!("{}", style("  Starting gRPC Connection Sequence").cyan().bold());
-        println!("{}", style("═══════════════════════════════════════════").cyan());
-        println!("{}", style("").dim());
+        log::info!("Starting gRPC Connection Sequence");
 
         let response_stream = match streamer.connect().await {
             Ok(stream) => {
-                println!("{}", style("").dim());
-                println!("{}", style("═══════════════════════════════════════════").green());
-                println!("{}", style("  ✓ Connection Successful!").green().bold());
-                println!("{}", style("═══════════════════════════════════════════").green());
-                println!("{}", style("").dim());
+                log::info!("Connection Successful!");
                 stream
             }
             Err(e) => {
-                println!("{}", style("").dim());
-                println!("{}", style("═══════════════════════════════════════════").red());
-                println!("{}", style("  ✗ CONNECTION FAILED").red().bold());
-                println!("{}", style("═══════════════════════════════════════════").red());
-                eprintln!("\n{}", style("Error Details:").red().bold());
-                eprintln!("  {}", e);
+                log::error!("CONNECTION FAILED");
+                log::error!("Error Details:");
+                log::error!("  {}", e);
 
                 // Print the full error chain
                 let mut current_error = e.source();
                 let mut level = 1;
                 while let Some(source) = current_error {
-                    eprintln!("  {} Caused by: {}", "└─".repeat(level), source);
+                    log::error!("  {} Caused by: {}", "└─".repeat(level), source);
                     current_error = source.source();
                     level += 1;
                 }
 
-                eprintln!("\n{}", style("Troubleshooting Tips:").yellow().bold());
-                eprintln!("  1. Verify the web server (voice_bird) is running");
-                eprintln!("  2. Check the server URL is correct (default: http://localhost:50051)");
-                eprintln!("  3. Ensure no firewall is blocking port 50051");
-                eprintln!("  4. Verify the API key is valid");
-                eprintln!("  5. Check server logs for any errors");
+                log::warn!("Troubleshooting Tips:");
+                log::warn!("  1. Verify the web server (voice_bird) is running");
+                log::warn!("  2. Check the server URL is correct (default: http://localhost:50051)");
+                log::warn!("  3. Ensure no firewall is blocking port 50051");
+                log::warn!("  4. Verify the API key is valid");
+                log::warn!("  5. Check server logs for any errors");
 
                 return Err(e.context("Failed to establish gRPC connection - see details above"));
             }
         };
 
-        println!(
-            "{}",
-            style(format!(
-                "🎙️  Streaming started - Session: {}",
-                streamer.session_id()
-            ))
-            .green()
-        );
+        log::info!("Streaming started - Session: {}", streamer.session_id());
 
         // Spawn task to handle transcription responses
         let response_handle = tokio::spawn(async move {
             if let Err(e) = GrpcAudioStreamer::handle_responses(response_stream).await {
-                eprintln!("{}", style(format!("Response handler error: {}", e)).red());
+                log::error!("Response handler error: {}", e);
             }
         });
 
@@ -170,7 +137,7 @@ impl GrpcStreamingService {
         let mut total_bytes_sent = 0u64;
         let start_time = std::time::Instant::now();
 
-        println!("{}", style("🎵 Beginning audio streaming...").cyan());
+        log::info!("Beginning audio streaming...");
 
         // Main streaming loop
         let mut opus_chunk_count = 0u64;
@@ -190,28 +157,17 @@ impl GrpcStreamingService {
                             // Send Opus-encoded chunk to server
                             if let Err(e) = streamer.send_audio_chunk(opus_packet).await {
                                 let elapsed = start_time.elapsed();
-                                eprintln!(
-                                    "{}",
-                                    style(format!(
-                                        "✗ Failed to send audio chunk #{}: {}",
-                                        opus_chunk_count, e
-                                    ))
-                                    .red()
+                                log::error!(
+                                    "Failed to send audio chunk #{}: {}",
+                                    opus_chunk_count, e
                                 );
-                                eprintln!(
-                                    "{}",
-                                    style(format!(
-                                        "   Sent {} Opus packets ({:.1}s of audio, {:.2} MB) before failure",
-                                        opus_chunk_count - 1,
-                                        total_samples as f32 / opus_encoder.sample_rate() as f32,
-                                        total_bytes_sent as f64 / 1_000_000.0
-                                    ))
-                                    .red()
+                                log::error!(
+                                    "   Sent {} Opus packets ({:.1}s of audio, {:.2} MB) before failure",
+                                    opus_chunk_count - 1,
+                                    total_samples as f32 / opus_encoder.sample_rate() as f32,
+                                    total_bytes_sent as f64 / 1_000_000.0
                                 );
-                                eprintln!(
-                                    "{}",
-                                    style(format!("   Elapsed time: {:.1}s", elapsed.as_secs_f32())).red()
-                                );
+                                log::error!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                                 break;
                             }
 
@@ -220,18 +176,14 @@ impl GrpcStreamingService {
                                 let elapsed = start_time.elapsed();
                                 let duration_secs = total_samples as f32 / opus_encoder.sample_rate() as f32;
                                 let compression_ratio = (total_samples * 4) as f64 / total_bytes_sent as f64;
-                                println!(
-                                    "{}",
-                                    style(format!(
-                                        "📤 Opus Packet #{}: {} bytes | Total: {:.1}s audio, {:.2} MB sent | Compression: {:.1}x | Elapsed: {:.1}s",
-                                        opus_chunk_count,
-                                        bytes_len,
-                                        duration_secs,
-                                        total_bytes_sent as f64 / 1_000_000.0,
-                                        compression_ratio,
-                                        elapsed.as_secs_f32()
-                                    ))
-                                    .dim()
+                                log::debug!(
+                                    "Opus Packet #{}: {} bytes | Total: {:.1}s audio, {:.2} MB sent | Compression: {:.1}x | Elapsed: {:.1}s",
+                                    opus_chunk_count,
+                                    bytes_len,
+                                    duration_secs,
+                                    total_bytes_sent as f64 / 1_000_000.0,
+                                    compression_ratio,
+                                    elapsed.as_secs_f32()
                                 );
                             }
                         }
@@ -239,7 +191,7 @@ impl GrpcStreamingService {
                             // Buffering - no packet ready yet, continue
                         }
                         Err(e) => {
-                            eprintln!("{}", style(format!("✗ Opus encoding error: {}", e)).red());
+                            log::error!("Opus encoding error: {}", e);
                             break;
                         }
                     }
@@ -250,27 +202,14 @@ impl GrpcStreamingService {
                     let duration_secs =
                         total_samples as f32 / (sample_rate * channels as u32) as f32;
 
-                    println!("{}", style("📊 Audio stream ended").cyan());
-                    println!(
-                        "{}",
-                        style(format!("   Total chunks sent: {}", chunk_count)).dim()
+                    log::info!("Audio stream ended");
+                    log::info!("   Total chunks sent: {}", chunk_count);
+                    log::info!("   Total audio duration: {:.1}s", duration_secs);
+                    log::info!(
+                        "   Total bytes sent: {:.2} MB",
+                        total_bytes_sent as f64 / 1_000_000.0
                     );
-                    println!(
-                        "{}",
-                        style(format!("   Total audio duration: {:.1}s", duration_secs)).dim()
-                    );
-                    println!(
-                        "{}",
-                        style(format!(
-                            "   Total bytes sent: {:.2} MB",
-                            total_bytes_sent as f64 / 1_000_000.0
-                        ))
-                        .dim()
-                    );
-                    println!(
-                        "{}",
-                        style(format!("   Elapsed time: {:.1}s", elapsed.as_secs_f32())).dim()
-                    );
+                    log::info!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                     break;
                 }
             }
@@ -279,14 +218,7 @@ impl GrpcStreamingService {
         // Close the streamer
         streamer.close();
 
-        println!(
-            "{}",
-            style(format!(
-                "✓ gRPC streaming completed - Session: {}",
-                streamer.session_id()
-            ))
-            .green()
-        );
+        log::info!("gRPC streaming completed - Session: {}", streamer.session_id());
 
         // Wait for response handler to finish (with timeout)
         let _ = tokio::time::timeout(
