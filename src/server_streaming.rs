@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::header::HeaderValue;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio::sync::mpsc as tokio_mpsc; // For async channel communication
+use tokio::sync::oneshot; // For init acknowledgment synchronization
 
 /// Message sent to initialize a streaming session
 #[derive(Debug, Serialize)]
@@ -17,8 +18,11 @@ struct InitMessage {
     api_key: String,
     session_id: String,
     device_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_type: Option<String>,
     sample_rate: u32,
     channels: u16,
+    audio_format: String,
 }
 
 /// Message sent to terminate a streaming session
@@ -185,17 +189,21 @@ impl ServerStreamingService {
             api_key: api_key.clone(),
             session_id: session_id.clone(),
             device_name: device_name.clone(),
+            device_type: Some("output".to_string()),  // "input" for microphones, "output" for system audio
             sample_rate,
             channels,
+            audio_format: "f32le".to_string(),  // Raw f32 little-endian PCM
         };
 
         let init_json = serde_json::to_string(&init_msg)
             .context("Failed to serialize init message")?;
 
         log::debug!("Sending init message ({} bytes)...", init_json.len());
+        log::debug!("   Init message JSON: {}", init_json);
         log::debug!("   Session ID: {}", session_id);
         log::debug!("   Sample Rate: {} Hz", sample_rate);
         log::debug!("   Channels: {}", channels);
+        log::debug!("   Audio Format: f32le (raw PCM)");
 
         if let Err(e) = write.send(Message::Text(init_json.clone())).await {
             log::error!("Failed to send init message: {}", e);
@@ -207,8 +215,19 @@ impl ServerStreamingService {
 
         log::info!("Streaming started for device: {}", device_name);
 
+        // Note: We send raw f32 PCM samples for transcription compatibility
+        // This increases bandwidth but ensures reliable transcription with AssemblyAI
+        log::info!("Audio streaming mode: Raw f32 PCM");
+        log::info!("   Sample Rate: {} Hz", sample_rate);
+        log::info!("   Channels: {}", channels);
+
         // Create channel for sending pong responses from read task to write loop
         let (pong_tx, mut pong_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Create channel to signal when server confirms init was processed
+        let (init_ack_tx, init_ack_rx) = oneshot::channel::<Result<(), String>>();
+        let init_ack_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(init_ack_tx)));
+        let init_ack_tx_clone = init_ack_tx.clone();
 
         // Spawn task to handle server responses
         let session_id_clone = session_id.clone();
@@ -222,12 +241,31 @@ impl ServerStreamingService {
                                 "connected" => {
                                     log::info!("Server acknowledged connection: {}", response.message);
                                 }
-                                "error" => {
-                                    log::error!("Server error: {}", response.error);
+                                "init_success" => {
+                                    log::info!("Server confirmed session initialized: {}", response.message);
+                                    // Signal that init was successful
+                                    if let Ok(mut guard) = init_ack_tx_clone.lock() {
+                                        if let Some(tx) = guard.take() {
+                                            let _ = tx.send(Ok(()));
+                                        }
+                                    }
                                 }
-                                "transcription" => {
-                                    // Server sent transcription result
-                                    log::info!("Transcription: {}", response.message);
+                                "error" => {
+                                    // Server sends error messages in the "message" field, not "error" field
+                                    let error_msg = if !response.message.is_empty() {
+                                        response.message.clone()
+                                    } else if !response.error.is_empty() {
+                                        response.error.clone()
+                                    } else {
+                                        "Unknown error (no error message provided)".to_string()
+                                    };
+                                    log::error!("Server error: {}", error_msg);
+                                    // Signal init failure if this is an init-related error
+                                    if let Ok(mut guard) = init_ack_tx_clone.lock() {
+                                        if let Some(tx) = guard.take() {
+                                            let _ = tx.send(Err(error_msg));
+                                        }
+                                    }
                                 }
                                 _ => {
                                     // Unknown message type, just log it
@@ -273,7 +311,27 @@ impl ServerStreamingService {
         let mut pong_count = 0u32;
         let start_time = std::time::Instant::now();
 
-        log::info!("Beginning audio streaming loop...");
+        // Wait for server to confirm init was processed before streaming
+        log::info!("Waiting for server to confirm session initialization...");
+        match tokio::time::timeout(TokioDuration::from_secs(10), init_ack_rx).await {
+            Ok(Ok(Ok(()))) => {
+                log::info!("Server confirmed init, starting audio stream");
+            }
+            Ok(Ok(Err(e))) => {
+                log::error!("Server rejected init: {}", e);
+                return Err(anyhow::anyhow!("Session initialization rejected: {}", e));
+            }
+            Ok(Err(_)) => {
+                log::error!("Init acknowledgment channel closed unexpectedly");
+                return Err(anyhow::anyhow!("Init acknowledgment failed"));
+            }
+            Err(_) => {
+                log::error!("Timeout waiting for server init acknowledgment (10s)");
+                return Err(anyhow::anyhow!("Session initialization timeout"));
+            }
+        }
+
+        log::info!("Beginning audio streaming loop (raw f32 PCM)...");
 
         // Main loop: send audio chunks and respond to pings
         loop {
@@ -295,14 +353,14 @@ impl ServerStreamingService {
                     chunk_count += 1;
                     total_samples += audio_chunk.len();
 
-                    // Convert f32 samples to bytes (little-endian)
-                    let bytes: Vec<u8> = audio_chunk
+                    // Convert f32 samples to raw bytes (f32le format)
+                    let raw_bytes: Vec<u8> = audio_chunk
                         .iter()
                         .flat_map(|&sample| sample.to_le_bytes())
                         .collect();
 
-                    let bytes_len = bytes.len();
-                    total_bytes_sent += bytes_len as u64;
+                    let packet_len = raw_bytes.len();
+                    total_bytes_sent += packet_len as u64;
 
                     // Log every chunk for first 10 chunks, then every 100 chunks
                     let should_log = chunk_count <= 10 || chunk_count % 100 == 0;
@@ -311,25 +369,21 @@ impl ServerStreamingService {
                         let elapsed = start_time.elapsed();
                         let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
                         log::debug!(
-                            "Chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} MB sent | Elapsed: {:.1}s",
+                            "Audio chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} KB sent | Elapsed: {:.1}s",
                             chunk_count,
                             audio_chunk.len(),
-                            bytes_len,
+                            packet_len,
                             duration_secs,
-                            total_bytes_sent as f64 / 1_000_000.0,
+                            total_bytes_sent as f64 / 1_000.0,
                             elapsed.as_secs_f32()
                         );
                     }
 
                     // Send as binary WebSocket frame
-                    match write.send(Message::Binary(bytes)).await {
+                    match write.send(Message::Binary(raw_bytes)).await {
                         Ok(_) => {
-                            if should_log {
-                                log::debug!("   Chunk #{} sent successfully", chunk_count);
-                            }
-
                             // Small delay to prevent overwhelming the WebSocket
-                            sleep(TokioDuration::from_millis(10)).await;
+                            sleep(TokioDuration::from_millis(5)).await;
                         }
                         Err(e) => {
                             let elapsed = start_time.elapsed();
@@ -339,10 +393,10 @@ impl ServerStreamingService {
                             );
                             log::error!("   Error details: {:?}", e);
                             log::error!(
-                                "   Sent {} chunks ({:.1}s of audio, {:.2} MB) before failure",
+                                "   Sent {} chunks ({:.1}s of audio, {:.2} KB) before failure",
                                 chunk_count - 1,
-                                (total_samples - audio_chunk.len()) as f32 / (sample_rate * channels as u32) as f32,
-                                (total_bytes_sent - bytes_len as u64) as f64 / 1_000_000.0
+                                total_samples as f32 / (sample_rate * channels as u32) as f32,
+                                (total_bytes_sent - packet_len as u64) as f64 / 1_000.0
                             );
                             log::error!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                             break;
@@ -359,11 +413,11 @@ impl ServerStreamingService {
                     let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
 
                     log::info!("Audio stream ended, finalizing...");
-                    log::info!("   Total chunks sent: {}", chunk_count);
+                    log::info!("   Total audio chunks sent: {}", chunk_count);
                     log::info!("   Total audio duration: {:.1}s", duration_secs);
                     log::info!(
-                        "   Total bytes sent: {:.2} MB",
-                        total_bytes_sent as f64 / 1_000_000.0
+                        "   Total bytes sent: {:.2} KB",
+                        total_bytes_sent as f64 / 1_000.0
                     );
                     log::info!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
                     break;

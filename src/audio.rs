@@ -3,7 +3,7 @@ use cpal::{Device, SampleFormat};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavWriter, WavSpec};
 use crate::session::RecordingSession;
-use crate::grpc_service::GrpcStreamingService;
+use crate::server_streaming::ServerStreamingService;
 use std::sync::mpsc;
 
 // Calculate RMS (Root Mean Square) audio level from samples
@@ -62,31 +62,6 @@ pub fn save_audio_file(audio_buffer: &[f32], sample_rate: u32, channels: u16, fi
     Ok(())
 }
 
-// Save transcript buffer to TXT file
-pub fn save_transcript_file(transcript_segments: &[String], filename: &str) -> Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(filename)
-        .context("Failed to create transcript file")?;
-
-    writeln!(file, "Voice Bird Desktop - Transcript")?;
-    writeln!(file, "{}", "=".repeat(50))?;
-    writeln!(file)?;
-
-    for (i, segment) in transcript_segments.iter().enumerate() {
-        writeln!(file, "[{}] {}", i + 1, segment)?;
-    }
-
-    let word_count: usize = transcript_segments
-        .iter()
-        .map(|s| s.split_whitespace().count())
-        .sum();
-    writeln!(file)?;
-    writeln!(file, "{}", "=".repeat(50))?;
-    writeln!(file, "Total words: ~{}", word_count)?;
-
-    Ok(())
-}
-
 // Get device by name from host
 pub fn get_input_device_by_name(host: &cpal::Host, name: &str) -> Result<Device> {
     host.input_devices()
@@ -127,11 +102,11 @@ pub fn start_input_recording(
     let sample_rate = session.sample_rate;
     let channels = session.channels;
 
-    // Spawn gRPC streaming thread
+    // Spawn WebSocket streaming thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = GrpcStreamingService::stream_to_server(
+            if let Err(e) = ServerStreamingService::stream_to_server(
                 server_url,
                 server_api_key,
                 session_id,
@@ -140,7 +115,7 @@ pub fn start_input_recording(
                 sample_rate,
                 channels,
             ).await {
-                log::error!("gRPC streaming error: {}", e);
+                log::error!("WebSocket streaming error: {}", e);
             }
         });
     });
@@ -299,11 +274,11 @@ pub fn start_output_recording(
         let session_id = session.id.to_string();
         let device_name = session.device_name.clone();
 
-        // Spawn gRPC streaming thread
+        // Spawn WebSocket streaming thread
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                if let Err(e) = GrpcStreamingService::stream_to_server(
+                if let Err(e) = ServerStreamingService::stream_to_server(
                     server_url,
                     server_api_key,
                     session_id,
@@ -312,7 +287,7 @@ pub fn start_output_recording(
                     sample_rate,
                     channels,
                 ).await {
-                    log::error!("gRPC streaming error: {}", e);
+                    log::error!("WebSocket streaming error: {}", e);
                 }
             });
         });

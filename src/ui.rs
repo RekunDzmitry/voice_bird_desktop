@@ -202,7 +202,6 @@ pub fn render_recording_dashboard(frame: &mut Frame, sessions: &[&RecordingSessi
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(6),
             Constraint::Length(3),
         ])
         .split(frame.area());
@@ -216,9 +215,6 @@ pub fn render_recording_dashboard(frame: &mut Frame, sessions: &[&RecordingSessi
     // Active sessions panel
     render_active_sessions(frame, chunks[1], sessions);
 
-    // Transcripts panel
-    render_transcripts(frame, chunks[2], sessions);
-
     // Controls
     let controls = Paragraph::new(vec![
         Line::from(vec![
@@ -229,7 +225,7 @@ pub fn render_recording_dashboard(frame: &mut Frame, sessions: &[&RecordingSessi
         ]),
     ])
     .block(Block::default().borders(Borders::ALL).title("Controls"));
-    frame.render_widget(controls, chunks[3]);
+    frame.render_widget(controls, chunks[2]);
 }
 
 fn render_active_sessions(frame: &mut Frame, area: Rect, sessions: &[&RecordingSession]) {
@@ -326,51 +322,6 @@ fn render_session_row(frame: &mut Frame, area: Rect, index: usize, session: &Rec
     };
 
     frame.render_widget(gauge, gauge_area);
-}
-
-fn render_transcripts(frame: &mut Frame, area: Rect, sessions: &[&RecordingSession]) {
-    let block = Block::default()
-        .title("Transcripts (last 3 segments)")
-        .borders(Borders::ALL);
-
-    let mut lines = Vec::new();
-
-    for session in sessions {
-        if let Ok(segments) = session.transcript_buffer.lock() {
-            if !segments.is_empty() {
-                // Get last 3 segments
-                let display_count = segments.len().min(3);
-                let start_idx = segments.len() - display_count;
-
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("[{}]", session.app_name),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-
-                for segment in &segments[start_idx..] {
-                    // Truncate long segments
-                    let display_text = if segment.len() > 80 {
-                        format!("  {}...", &segment[..77])
-                    } else {
-                        format!("  {}", segment)
-                    };
-                    lines.push(Line::from(Span::raw(display_text)));
-                }
-            }
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No transcripts yet...",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    let transcript = Paragraph::new(lines).block(block);
-    frame.render_widget(transcript, area);
 }
 
 pub fn handle_session_browser_input(app: &mut App) -> Result<bool> {

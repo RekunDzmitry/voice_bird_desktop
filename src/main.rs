@@ -2,9 +2,9 @@ mod session;
 mod wasapi_sessions;
 mod ui;
 mod audio;
-mod grpc_streaming;
-mod grpc_service;
+mod server_streaming;
 mod opus_encoder;
+mod logger;
 
 use anyhow::{Result, Context};
 use std::env;
@@ -12,10 +12,8 @@ use session::{RecordingSession, SessionManager};
 use ui::{App, AppMode, RecordingInputAction};
 
 fn main() -> Result<()> {
-    // Initialize logger
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    // Initialize file-based logging
+    logger::init().context("Failed to initialize logger")?;
 
     // Load .env file if present
     dotenvy::dotenv().ok();
@@ -38,6 +36,14 @@ fn main() -> Result<()> {
             log::error!("  - VOICE_BIRD_SERVER_URL");
             log::error!("  - VOICE_BIRD_API_KEY");
             log::error!("Create a .env file with these values.");
+
+            // Print user-friendly error to terminal
+            logger::print_error("Voice Bird server not configured!");
+            logger::print_info("Required environment variables:");
+            logger::print_info("  - VOICE_BIRD_SERVER_URL");
+            logger::print_info("  - VOICE_BIRD_API_KEY");
+            logger::print_info("Create a .env file with these values.");
+
             return Err(anyhow::anyhow!("Voice Bird server configuration missing"));
         }
     };
@@ -49,6 +55,11 @@ fn main() -> Result<()> {
     if available_sessions.is_empty() {
         log::warn!("No active audio sessions found.");
         log::warn!("Make sure applications are playing/recording audio.");
+
+        // Print user-friendly message to terminal
+        logger::print_warning("No active audio sessions found.");
+        logger::print_info("Make sure applications are playing/recording audio.");
+
         return Ok(());
     }
 
@@ -108,6 +119,7 @@ fn main() -> Result<()> {
                 }
                 Err(e) => {
                     log::error!("Failed to get input device: {}", e);
+                    logger::print_error(&format!("Failed to get input device '{}': {}", session_info.device_name, e));
                     continue;
                 }
             }
@@ -121,6 +133,7 @@ fn main() -> Result<()> {
             #[cfg(not(windows))]
             {
                 log::error!("Output recording not supported on this platform");
+                logger::print_error("Output recording is only supported on Windows");
                 continue;
             }
         };
@@ -128,6 +141,10 @@ fn main() -> Result<()> {
         match stream_result {
             Ok((stream, cleanup)) => {
                 recording_session.start_recording();
+
+                // Print user-friendly success message
+                logger::print_connection_status("Connected", &format!("{} streaming started", session_info.device_name));
+
                 session_manager.add_session(recording_session);
 
                 // Keep stream alive (will be handled by session manager in real implementation)
@@ -136,6 +153,7 @@ fn main() -> Result<()> {
             }
             Err(e) => {
                 log::error!("Failed to start recording: {}", e);
+                logger::print_error(&format!("Failed to start recording '{}': {}", session_info.device_name, e));
             }
         }
     }
@@ -143,6 +161,7 @@ fn main() -> Result<()> {
     if session_manager.active_sessions.is_empty() {
         ui::restore_terminal(terminal)?;
         log::warn!("No recording sessions started");
+        logger::print_warning("No recording sessions were started successfully");
         return Ok(());
     }
 
@@ -157,58 +176,20 @@ fn main() -> Result<()> {
                 // Stop all sessions
                 session_manager.stop_all();
 
-                // Wait a moment for audio buffers to finish
+                // Wait a moment for streaming to finish
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
                 ui::restore_terminal(terminal)?;
 
-                // Save all recordings
-                log::info!("Saving recordings...");
-
-                for (_id, session) in &session_manager.active_sessions {
-                    let prefix = session.get_filename_prefix();
-
-                    // Save audio
-                    if let Ok(buffer) = session.audio_buffer.lock() {
-                        if !buffer.is_empty() {
-                            let audio_filename = format!("{}.wav", prefix);
-                            match audio::save_audio_file(&buffer, session.sample_rate, session.channels, &audio_filename) {
-                                Ok(_) => {
-                                    let duration = buffer.len() as f32 / (session.sample_rate * session.channels as u32) as f32;
-                                    log::info!("Audio saved: {} (Duration: {:.2}s, Samples: {})",
-                                        audio_filename, duration, buffer.len());
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to save audio: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Save transcript
-                    if let Ok(segments) = session.transcript_buffer.lock() {
-                        if !segments.is_empty() {
-                            let transcript_filename = format!("{}.txt", prefix);
-                            match audio::save_transcript_file(&segments, &transcript_filename) {
-                                Ok(_) => {
-                                    log::info!("Transcript saved: {} (Segments: {})",
-                                        transcript_filename, segments.len());
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to save transcript: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                log::info!("All sessions saved successfully!");
+                log::info!("All streaming sessions stopped successfully!");
+                logger::print_info("✓ All streaming sessions stopped successfully!");
                 break;
             }
             RecordingInputAction::QuitWithoutSaving => {
                 session_manager.stop_all();
                 ui::restore_terminal(terminal)?;
                 log::warn!("Exited without saving");
+                logger::print_warning("Exited without saving");
                 break;
             }
             RecordingInputAction::Continue => {
