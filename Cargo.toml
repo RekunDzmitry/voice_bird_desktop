@@ -12,7 +12,7 @@ anyhow = "1.0"
 hound = "3.5"
 chrono = "0.4"
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.23", features = ["connect", "native-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
@@ -21,6 +21,12 @@ dotenvy = "0.15"
 http = "1.0"
 ratatui = "0.29"
 uuid = { version = "1.0", features = ["v4"] }
+log = "0.4"
+env_logger = "0.11"
+fern = { version = "0.7", features = ["colored"] }
+
+# Opus audio codec
+audiopus = "0.3.0-rc.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
