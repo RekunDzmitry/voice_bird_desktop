@@ -28,6 +28,9 @@ fern = { version = "0.7", features = ["colored"] }
 # Opus audio codec
 audiopus = "0.3.0-rc.0"
 
+# High-quality audio resampling
+rubato = "0.14"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Media_Audio",

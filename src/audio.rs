@@ -348,7 +348,8 @@ pub fn start_output_recording(
                         }
                     }
 
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // Reduced from 10ms to 5ms for lower latency
+                    std::thread::sleep(std::time::Duration::from_millis(5));
 
                     loop {
                         let packet_size = capture_client.GetNextPacketSize().ok().unwrap_or(0);
