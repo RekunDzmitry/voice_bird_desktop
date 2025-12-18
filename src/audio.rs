@@ -412,12 +412,187 @@ pub fn start_output_recording(
     Ok(Box::new(move || {}))
 }
 
-#[cfg(not(windows))]
+// macOS implementation using ScreenCaptureKit
+#[cfg(target_os = "macos")]
+pub fn start_output_recording(
+    device_name: &str,
+    session: &mut RecordingSession,
+    _api_key: Option<String>,
+    server_config: Option<(String, String)>,
+) -> Result<Box<dyn FnOnce() + Send>> {
+    use screencapturekit::sc_shareable_content::SCShareableContent;
+    use screencapturekit::sc_stream_configuration::SCStreamConfiguration;
+    use screencapturekit::sc_content_filter::{SCContentFilter, InitParams};
+    use screencapturekit::sc_stream::SCStream;
+    use screencapturekit::sc_output_handler::{SCStreamOutputType, StreamOutput};
+    use screencapturekit::cm_sample_buffer::CMSampleBuffer;
+    use std::sync::mpsc;
+
+    const DEFAULT_SAMPLE_RATE: u32 = 48000;
+    const DEFAULT_CHANNELS: u16 = 2;
+
+    // Check screen recording permission by attempting to get shareable content
+    let content = SCShareableContent::current()
+        .map_err(|e| anyhow::anyhow!(
+            "Screen Recording permission required.\n\
+            Please grant permission in:\n\
+            System Preferences > Privacy & Security > Screen Recording\n\
+            Then restart the application.\n\
+            Error: {:?}", e
+        ))?;
+
+    // Set session parameters
+    session.sample_rate = DEFAULT_SAMPLE_RATE;
+    session.channels = DEFAULT_CHANNELS;
+
+    let audio_level = session.audio_level.clone();
+    let audio_buffer = session.audio_buffer.clone();
+    let stop_signal = session.stop_signal.clone();
+
+    // Setup server streaming if server config is provided
+    let server_tx = if let Some((server_url, server_api_key)) = server_config {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let session_id = session.id.to_string();
+        let device_name_clone = session.device_name.clone();
+
+        // Spawn WebSocket streaming thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = ServerStreamingService::stream_to_server(
+                    server_url,
+                    server_api_key,
+                    session_id,
+                    device_name_clone,
+                    rx,
+                    DEFAULT_SAMPLE_RATE,
+                    DEFAULT_CHANNELS,
+                ).await {
+                    log::error!("WebSocket streaming error: {}", e);
+                }
+            });
+        });
+
+        Some(tx)
+    } else {
+        None
+    };
+
+    // Create content filter based on device_name
+    let filter = if device_name.contains("All Applications") || device_name.contains("System Audio") {
+        // Capture all system audio via display
+        let display = content.displays()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No displays found"))?
+            .clone();
+
+        SCContentFilter::new(InitParams::Display(display))
+    } else {
+        // Try to find specific application by name
+        let app = content.applications()
+            .into_iter()
+            .find(|app| {
+                app.application_name()
+                    .map(|name| device_name.contains(&name))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Application '{}' not found", device_name))?;
+
+        SCContentFilter::new(InitParams::Application(app))
+    };
+
+    // Configure stream for audio-only capture
+    let config = SCStreamConfiguration {
+        captures_audio: true,
+        sample_rate: DEFAULT_SAMPLE_RATE,
+        channel_count: DEFAULT_CHANNELS as u32,
+        excludes_current_process_audio: true,
+        // Minimal video settings (required but we ignore video)
+        width: 1,
+        height: 1,
+        ..Default::default()
+    };
+
+    // Create output handler for audio samples
+    struct AudioOutputHandler {
+        audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
+        audio_buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+        stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
+        server_tx: Option<mpsc::Sender<Vec<f32>>>,
+    }
+
+    impl StreamOutput for AudioOutputHandler {
+        fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+            // Only process audio samples
+            if of_type != SCStreamOutputType::Audio {
+                return;
+            }
+
+            // Check stop signal
+            if let Ok(stop) = self.stop_signal.lock() {
+                if *stop {
+                    return;
+                }
+            }
+
+            // Extract audio samples from CMSampleBuffer
+            // The buffer contains interleaved f32 samples at the configured sample rate
+            if let Some(audio_data) = sample.get_audio_buffer_list() {
+                let samples: Vec<f32> = audio_data.into_iter().collect();
+
+                if samples.is_empty() {
+                    return;
+                }
+
+                // Calculate RMS and update audio level
+                let rms = crate::audio::calculate_rms(&samples);
+                if let Ok(mut level) = self.audio_level.lock() {
+                    *level = rms;
+                }
+
+                // Store in local buffer (for potential WAV export)
+                if let Ok(mut buffer) = self.audio_buffer.lock() {
+                    buffer.extend_from_slice(&samples);
+                }
+
+                // Send to server streaming service
+                if let Some(ref tx) = self.server_tx {
+                    let _ = tx.send(samples);
+                }
+            }
+        }
+    }
+
+    let handler = AudioOutputHandler {
+        audio_level,
+        audio_buffer,
+        stop_signal: stop_signal.clone(),
+        server_tx,
+    };
+
+    // Create and start the stream
+    let mut stream = SCStream::new(filter, config, handler);
+    stream.start_capture()
+        .map_err(|e| anyhow::anyhow!("Failed to start screen capture: {:?}", e))?;
+
+    // Return cleanup closure that stops the stream
+    let stop_signal_cleanup = stop_signal.clone();
+    Ok(Box::new(move || {
+        if let Ok(mut stop) = stop_signal_cleanup.lock() {
+            *stop = true;
+        }
+        // Stream will be dropped here, stopping capture
+        drop(stream);
+    }))
+}
+
+// Fallback for unsupported platforms
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn start_output_recording(
     _device_name: &str,
     _session: &mut RecordingSession,
     _api_key: Option<String>,
     _server_config: Option<(String, String)>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    Err(anyhow::anyhow!("Output recording is only supported on Windows"))
+    Err(anyhow::anyhow!("Output recording is only supported on Windows and macOS"))
 }

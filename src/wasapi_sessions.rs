@@ -150,8 +150,80 @@ unsafe fn get_process_name(process_id: u32) -> Result<String> {
     Ok(path.split('\\').last().unwrap_or(&path).to_string())
 }
 
-// Non-Windows platforms: return empty list
-#[cfg(not(windows))]
+// macOS implementation using ScreenCaptureKit
+#[cfg(target_os = "macos")]
+pub fn enumerate_audio_sessions() -> Result<Vec<AudioSessionInfo>> {
+    use screencapturekit::sc_shareable_content::SCShareableContent;
+
+    // Check screen recording permission by attempting to get shareable content
+    let content = SCShareableContent::current()
+        .map_err(|e| anyhow::anyhow!(
+            "Screen Recording permission required.\n\
+            Please grant permission in:\n\
+            System Preferences > Privacy & Security > Screen Recording\n\
+            Then restart the application.\n\
+            Error: {:?}", e
+        ))?;
+
+    let mut sessions = Vec::new();
+
+    // Add option to capture all system audio first
+    sessions.push(AudioSessionInfo {
+        device_name: "System Audio - All Applications".to_string(),
+        app_name: "All Applications".to_string(),
+        process_id: 0,
+        is_input: false,
+    });
+
+    // List running applications that can be captured
+    for app in content.applications() {
+        // Get application info
+        let app_name = match app.application_name() {
+            Some(name) => name,
+            None => continue, // Skip apps without names
+        };
+
+        let bundle_id = app.bundle_identifier().unwrap_or_default();
+        let process_id = app.process_id() as u32;
+
+        // Skip system processes and background apps
+        let skip_bundles = [
+            "com.apple.finder",
+            "com.apple.dock",
+            "com.apple.controlcenter",
+            "com.apple.notificationcenterui",
+            "com.apple.loginwindow",
+            "com.apple.WindowManager",
+            "com.apple.SystemUIServer",
+        ];
+
+        if skip_bundles.iter().any(|b| bundle_id.contains(b)) {
+            continue;
+        }
+
+        // Skip our own app
+        if bundle_id.contains("voicebird") || bundle_id.contains("voice_bird") {
+            continue;
+        }
+
+        // Skip if process ID is 0 (invalid)
+        if process_id == 0 {
+            continue;
+        }
+
+        sessions.push(AudioSessionInfo {
+            device_name: format!("System Audio - {}", app_name),
+            app_name,
+            process_id,
+            is_input: false,
+        });
+    }
+
+    Ok(sessions)
+}
+
+// Fallback for unsupported platforms: return empty list
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSessionInfo>> {
     Ok(Vec::new())
 }
