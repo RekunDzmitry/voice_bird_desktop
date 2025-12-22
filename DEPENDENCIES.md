@@ -623,11 +623,53 @@ VOICE_BIRD_API_KEY=your-api-key-here
 - **Dependencies**: Static linking (no runtime dependencies besides OS libraries)
 - **Platform**: Windows x64 (full support), macOS (full support, requires macOS 12.3+), Linux x64 (input only)
 
+### Tauri Desktop Application
+
+The application uses **Tauri 2** for cross-platform desktop packaging:
+
+**Configuration**: `tauri.conf.json`
+- Product: Voice Bird Desktop v0.1.0
+- Identifier: `com.voicebird.desktop`
+- Bundle targets: all (msi, dmg, app)
+- macOS minimum: 10.13
+
 ### Release Build
 
 ```bash
+# Direct Rust build
 cargo build --release
 # Binary: target/release/voice_bird_desktop.exe
+
+# Tauri build (recommended for distribution)
+cargo tauri build
+# Outputs: target/release/bundle/{msi,dmg,macos}/
+```
+
+### macOS Build
+
+See `BUILD_MACOS.md` for detailed instructions. Quick start:
+
+```bash
+# On macOS machine
+./scripts/build-macos.sh      # Build .app and .dmg
+./scripts/upload-to-wasabi.sh # Upload to Wasabi S3
+```
+
+### Distribution (Wasabi S3)
+
+Build artifacts are uploaded to Wasabi S3-compatible storage:
+
+- **Bucket**: `voice-bird-europe` (eu-central-2)
+- **Path**: `releases/{platform}/v{version}/`
+- **Latest**: `releases/{platform}/latest/`
+
+Configuration in `.env`:
+```bash
+WASABI_ACCESS_KEY_ID=...
+WASABI_SECRET_ACCESS_KEY=...
+WASABI_REGION=eu-central-2
+WASABI_BUCKET_NAME=voice-bird-europe
+WASABI_ENDPOINT=https://s3.eu-central-2.wasabisys.com
 ```
 
 ### Optimization Flags (Cargo.toml)
