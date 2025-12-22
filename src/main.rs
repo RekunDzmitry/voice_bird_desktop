@@ -4,6 +4,7 @@ mod ui;
 mod audio;
 mod server_streaming;
 mod opus_encoder;
+mod audio_converter;
 mod logger;
 
 use anyhow::{Result, Context};

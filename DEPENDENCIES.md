@@ -19,14 +19,14 @@
 
 ## Overview
 
-**Voice Bird Desktop** is a Rust-based real-time audio recording application for Windows. It captures audio from multiple sources simultaneously (microphones and system audio via WASAPI loopback), encodes it with Opus compression, and streams it to a remote server via WebSocket.
+**Voice Bird Desktop** is a Rust-based real-time audio recording application for Windows and macOS. It captures audio from multiple sources simultaneously (microphones and system audio via platform-specific APIs), encodes it with Opus compression, and streams it to a remote server via WebSocket.
 
 ### Key Technologies
 - **Language**: Rust (async/sync hybrid)
-- **Audio**: cpal (input), WASAPI (output), Opus codec
+- **Audio**: cpal (input), WASAPI (Windows output), ScreenCaptureKit (macOS output), Opus codec
 - **Networking**: WebSocket (tokio-tungstenite)
-- **UI**: ratatui (terminal-based)
-- **Platform**: Windows-focused (with Linux/macOS input support)
+- **UI**: Tauri (desktop application)
+- **Platform**: Windows and macOS (full support), Linux (input only)
 
 ---
 
@@ -58,9 +58,9 @@ graph TB
 |--------|---------|-------------|
 | **main.rs** | Application entry point, orchestrates session management and recording lifecycle | `main()`, session initialization |
 | **session.rs** | Recording session data structures and state management | `SessionManager`, `RecordingSession`, `AudioSessionInfo`, `SessionStatus` |
-| **wasapi_sessions.rs** | Windows WASAPI audio session enumeration using COM APIs | `enumerate_audio_sessions()` |
+| **wasapi_sessions.rs** | Platform-specific audio session enumeration (WASAPI on Windows, ScreenCaptureKit on macOS) | `enumerate_audio_sessions()` |
 | **ui.rs** | Terminal UI using ratatui (session browser, recording dashboard) | `App`, `AppMode`, `render_*` functions |
-| **audio.rs** | Audio device capture (cpal for input, WASAPI for output loopback) | `start_input_recording()`, `start_output_recording()` |
+| **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()` |
 | **server_streaming.rs** | WebSocket streaming client with Opus encoding | `ServerStreamingService::stream_to_server()` |
 | **opus_encoder.rs** | Opus audio codec encoder with buffering | `OpusAudioEncoder` |
 
@@ -72,7 +72,7 @@ graph TB
 flowchart LR
     subgraph Input["Audio Input Sources"]
         mic[Microphone<br/>cpal]
-        sys[System Audio<br/>WASAPI Loopback]
+        sys[System Audio<br/>WASAPI/ScreenCaptureKit]
     end
 
     subgraph Capture["Audio Capture"]
@@ -112,7 +112,7 @@ flowchart LR
 
 ### Data Flow Steps
 
-1. **Audio Capture**: cpal (input devices) or WASAPI (output loopback) captures f32 audio samples at device sample rate
+1. **Audio Capture**: cpal (input devices) or platform-specific loopback (WASAPI on Windows, ScreenCaptureKit on macOS) captures f32 audio samples at device sample rate
 2. **Sample Buffering**: Audio callback thread sends samples via `mpsc::channel` to encoder thread
 3. **Opus Encoding**: `OpusAudioEncoder` buffers samples until complete frame (960 samples @ 48kHz = 20ms), then encodes to Opus packet
 4. **WebSocket Streaming**: Encoded Opus packets sent as binary WebSocket frames to server
@@ -208,6 +208,10 @@ windows = { version = "0.58", features = [
     # ... other features
 ] }
 windows-core = "0.58"
+
+# macOS-specific
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "0.3"   # System audio capture via ScreenCaptureKit (macOS 12.3+)
 ```
 
 ---
@@ -262,6 +266,32 @@ loop {
 - Captures system audio (games, music, browser)
 - AUDCLNT_STREAMFLAGS_LOOPBACK flag for output capture
 - Packet-based buffer processing
+
+### 2b. Audio Capture (ScreenCaptureKit - macOS Output Loopback)
+
+**File**: `src/audio.rs` (Lines 415-587)
+
+```rust
+// macOS ScreenCaptureKit capture
+let content = SCShareableContent::current()?;
+let filter = SCContentFilter::new(InitParams::Display(display));
+let config = SCStreamConfiguration {
+    captures_audio: true,
+    sample_rate: 48000,
+    channel_count: 2,
+    excludes_current_process_audio: true,
+    ..Default::default()
+};
+
+let stream = SCStream::new(filter, config, handler);
+stream.start_capture()?;
+```
+
+**Key Points**:
+- macOS 12.3+ feature using Apple's ScreenCaptureKit framework
+- Requires Screen Recording permission
+- Can capture audio from specific applications or all system audio
+- Supports both display-wide and per-application audio capture
 
 ### 3. Opus Encoding
 
@@ -380,7 +410,7 @@ graph TB
 
     subgraph Audio["Audio Callback Threads"]
         cpal_thread[cpal Audio Thread<br/>f32 samples]
-        wasapi_thread[WASAPI COM Thread<br/>f32 samples]
+        wasapi_thread[WASAPI/SCK Thread<br/>f32 samples]
     end
 
     subgraph Encoder["Encoder Thread"]
@@ -410,7 +440,8 @@ graph TB
 
 2. **Audio Callback Threads** (per device):
    - cpal: Separate thread per audio stream
-   - WASAPI: Custom thread for COM operations
+   - WASAPI (Windows): Custom thread for COM operations
+   - ScreenCaptureKit (macOS): SCStreamOutput delegate callbacks
    - Real-time priority for low latency
    - Send samples to encoder via `mpsc::channel`
 
@@ -590,13 +621,55 @@ VOICE_BIRD_API_KEY=your-api-key-here
 
 - **Binary Size**: ~4-6 MB (release build with optimizations)
 - **Dependencies**: Static linking (no runtime dependencies besides OS libraries)
-- **Platform**: Windows x64 (primary), Linux x64 (input only), macOS (input only)
+- **Platform**: Windows x64 (full support), macOS (full support, requires macOS 12.3+), Linux x64 (input only)
+
+### Tauri Desktop Application
+
+The application uses **Tauri 2** for cross-platform desktop packaging:
+
+**Configuration**: `tauri.conf.json`
+- Product: Voice Bird Desktop v0.1.0
+- Identifier: `com.voicebird.desktop`
+- Bundle targets: all (msi, dmg, app)
+- macOS minimum: 10.13
 
 ### Release Build
 
 ```bash
+# Direct Rust build
 cargo build --release
 # Binary: target/release/voice_bird_desktop.exe
+
+# Tauri build (recommended for distribution)
+cargo tauri build
+# Outputs: target/release/bundle/{msi,dmg,macos}/
+```
+
+### macOS Build
+
+See `BUILD_MACOS.md` for detailed instructions. Quick start:
+
+```bash
+# On macOS machine
+./scripts/build-macos.sh      # Build .app and .dmg
+./scripts/upload-to-wasabi.sh # Upload to Wasabi S3
+```
+
+### Distribution (Wasabi S3)
+
+Build artifacts are uploaded to Wasabi S3-compatible storage:
+
+- **Bucket**: `voice-bird-europe` (eu-central-2)
+- **Path**: `releases/{platform}/v{version}/`
+- **Latest**: `releases/{platform}/latest/`
+
+Configuration in `.env`:
+```bash
+WASABI_ACCESS_KEY_ID=...
+WASABI_SECRET_ACCESS_KEY=...
+WASABI_REGION=eu-central-2
+WASABI_BUCKET_NAME=voice-bird-europe
+WASABI_ENDPOINT=https://s3.eu-central-2.wasabisys.com
 ```
 
 ### Optimization Flags (Cargo.toml)
@@ -616,7 +689,8 @@ strip = true           # Remove debug symbols
 - [ ] HTTP/2 streaming as alternative to WebSocket
 - [ ] Adaptive bitrate based on network conditions
 - [ ] Multiple codec support (Opus, AAC, MP3)
-- [ ] Linux/macOS output loopback (PulseAudio, CoreAudio)
+- [x] macOS output loopback (ScreenCaptureKit) - **Implemented**
+- [ ] Linux output loopback (PulseAudio/PipeWire)
 - [ ] Persistent session resumption
 - [ ] Audio filters (noise reduction, AGC)
 - [ ] Multi-track recording UI

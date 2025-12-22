@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
-use tokio::time::{sleep, Duration as TokioDuration};
+use tokio::time::Duration as TokioDuration;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use futures_util::{SinkExt, StreamExt};
@@ -9,6 +9,7 @@ use http::header::HeaderValue;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio::sync::mpsc as tokio_mpsc; // For async channel communication
 use tokio::sync::oneshot; // For init acknowledgment synchronization
+use crate::audio_converter::SimpleAudioConverter;
 
 /// Message sent to initialize a streaming session
 #[derive(Debug, Serialize)]
@@ -183,16 +184,21 @@ impl ServerStreamingService {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Send initialization message
+        // Create audio converter for pre-conversion (48kHz stereo → 16kHz mono)
+        // This reduces bandwidth 6x and eliminates backend conversion overhead
+        let audio_converter = SimpleAudioConverter::new(sample_rate, channels, 16000);
+        let output_sample_rate = audio_converter.output_sample_rate();
+
+        // Send initialization message with converted format
         let init_msg = InitMessage {
             message_type: "init".to_string(),
             api_key: api_key.clone(),
             session_id: session_id.clone(),
             device_name: device_name.clone(),
             device_type: Some("output".to_string()),  // "input" for microphones, "output" for system audio
-            sample_rate,
-            channels,
-            audio_format: "f32le".to_string(),  // Raw f32 little-endian PCM
+            sample_rate: output_sample_rate,  // 16kHz after conversion
+            channels: 1,                       // Mono after conversion
+            audio_format: "pcm16le".to_string(),  // PCM16 little-endian after conversion
         };
 
         let init_json = serde_json::to_string(&init_msg)
@@ -348,18 +354,25 @@ impl ServerStreamingService {
             }
 
             // Try to receive audio chunk with timeout to allow pong handling
-            match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            // Reduced from 50ms to 10ms for lower latency
+            match audio_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(audio_chunk) => {
                     chunk_count += 1;
                     total_samples += audio_chunk.len();
 
-                    // Convert f32 samples to raw bytes (f32le format)
-                    let raw_bytes: Vec<u8> = audio_chunk
-                        .iter()
-                        .flat_map(|&sample| sample.to_le_bytes())
-                        .collect();
+                    // Convert audio: 48kHz stereo f32 → 16kHz mono PCM16LE
+                    // This reduces bandwidth ~6x and eliminates backend conversion
+                    let converted_bytes = audio_converter.convert(&audio_chunk);
 
-                    let packet_len = raw_bytes.len();
+                    // Prepend timestamp for latency measurement (8 bytes)
+                    let timestamp_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mut packet = timestamp_ms.to_le_bytes().to_vec();
+                    packet.extend(&converted_bytes);
+
+                    let packet_len = packet.len();
                     total_bytes_sent += packet_len as u64;
 
                     // Log every chunk for first 10 chunks, then every 100 chunks
@@ -379,11 +392,10 @@ impl ServerStreamingService {
                         );
                     }
 
-                    // Send as binary WebSocket frame
-                    match write.send(Message::Binary(raw_bytes)).await {
+                    // Send as binary WebSocket frame (packet includes 8-byte timestamp header)
+                    match write.send(Message::Binary(packet)).await {
                         Ok(_) => {
-                            // Small delay to prevent overwhelming the WebSocket
-                            sleep(TokioDuration::from_millis(5)).await;
+                            // Removed 5ms delay for lower latency - WebSocket handles buffering
                         }
                         Err(e) => {
                             let elapsed = start_time.elapsed();
