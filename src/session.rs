@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use uuid::Uuid;
 use chrono::Local;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionStatus {
     Idle,
     Recording,
@@ -12,7 +13,7 @@ pub enum SessionStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSessionInfo {
     pub device_name: String,
     pub app_name: String,
