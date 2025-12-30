@@ -34,35 +34,55 @@
 
 ```mermaid
 graph TB
-    main[main.rs<br/>Entry Point & Orchestration]
+    main[main.rs<br/>Entry Point & Tauri App]
 
+    main --> commands[commands.rs<br/>Tauri IPC Commands]
+    main --> state[state.rs<br/>AppState Management]
+    main --> config[config.rs<br/>Persistent Config]
     main --> session[session.rs<br/>SessionManager, RecordingSession]
     main --> wasapi[wasapi_sessions.rs<br/>WASAPI Enumeration]
-    main --> ui[ui.rs<br/>Terminal UI]
     main --> audio[audio.rs<br/>Audio Capture]
+    main --> events[events.rs<br/>Tauri Events]
 
+    commands --> state
+    commands --> session
+    state --> session
     audio --> server_streaming[server_streaming.rs<br/>WebSocket Streaming]
     server_streaming --> opus[opus_encoder.rs<br/>OpusAudioEncoder]
 
+    subgraph UI["Tauri Web Frontend (ui/)"]
+        html[index.html]
+        js[main.js]
+        css[styles.css]
+    end
+
+    commands -.->|IPC| UI
+
     style main fill:#e1f5ff
+    style commands fill:#e2d3f8
+    style state fill:#e2d3f8
     style audio fill:#fff3cd
     style server_streaming fill:#d4edda
     style opus fill:#d4edda
     style session fill:#f8d7da
-    style ui fill:#e2d3f8
+    style UI fill:#f0f0f0
 ```
 
 ### Module Descriptions
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
-| **main.rs** | Application entry point, orchestrates session management and recording lifecycle | `main()`, session initialization |
+| **main.rs** | Application entry point, Tauri app initialization and command registration | `main()`, Tauri builder |
+| **commands.rs** | Tauri IPC command handlers for frontend communication | `enumerate_sessions`, `start_recording`, `stop_session`, `save_api_key` |
+| **state.rs** | Application state management with thread-safe access | `AppState` |
+| **config.rs** | Persistent configuration storage (JSON file in user config dir) | `AppConfig` |
+| **events.rs** | Tauri event definitions for frontend notifications | `AudioLevelEvent`, `SessionStatusEvent` |
 | **session.rs** | Recording session data structures and state management | `SessionManager`, `RecordingSession`, `AudioSessionInfo`, `SessionStatus` |
 | **wasapi_sessions.rs** | Platform-specific audio session enumeration (WASAPI on Windows, ScreenCaptureKit on macOS) | `enumerate_audio_sessions()` |
-| **ui.rs** | Terminal UI using ratatui (session browser, recording dashboard) | `App`, `AppMode`, `render_*` functions |
 | **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()` |
 | **server_streaming.rs** | WebSocket streaming client with Opus encoding | `ServerStreamingService::stream_to_server()` |
 | **opus_encoder.rs** | Opus audio codec encoder with buffering | `OpusAudioEncoder` |
+| **ui/** | Tauri web frontend (HTML/JS/CSS) | Session browser, recording controls, settings UI |
 
 ---
 
@@ -170,6 +190,9 @@ classDiagram
 
 ```toml
 [dependencies]
+# Desktop Application Framework
+tauri = { version = "2", features = [] }
+
 # Audio I/O
 cpal = "0.15"              # Cross-platform audio capture
 audiopus = "0.3.0-rc.0"    # Opus codec encoder
@@ -185,11 +208,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 
-# UI
-ratatui = "0.29"
-crossterm = "0.27"
-dialoguer = "0.11"
-console = "0.15"
+# Configuration
+dirs = "5.0"               # Platform-specific config directories
 
 # Utilities
 anyhow = "1.0"
@@ -197,7 +217,8 @@ chrono = "0.4"
 uuid = { version = "1.0", features = ["v4"] }
 dotenvy = "0.15"
 log = "0.4"
-env_logger = "0.11"
+fern = "0.7"               # File-based logging
+colored = "2.0"            # Colored log output
 hound = "3.5"              # WAV file utilities
 
 # Windows-specific
@@ -212,6 +233,9 @@ windows-core = "0.58"
 # macOS-specific
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "0.3"   # System audio capture via ScreenCaptureKit (macOS 12.3+)
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
 ```
 
 ---
@@ -404,8 +428,13 @@ sequenceDiagram
 
 ```mermaid
 graph TB
-    subgraph Main["Main Thread"]
-        main_loop[Main Event Loop<br/>UI Rendering]
+    subgraph Main["Main Thread (Tauri)"]
+        tauri_app[Tauri Application<br/>Window Management]
+        ipc[IPC Command Handlers<br/>commands.rs]
+    end
+
+    subgraph WebView["WebView Thread"]
+        ui[Web UI<br/>HTML/JS/CSS]
     end
 
     subgraph Audio["Audio Callback Threads"]
@@ -420,32 +449,43 @@ graph TB
         ws[WebSocket Client]
     end
 
+    ui <-->|Tauri IPC| ipc
+    ipc --> Audio
     cpal_thread -->|mpsc::channel| mpsc_rx
     wasapi_thread -->|mpsc::channel| mpsc_rx
     mpsc_rx --> opus
     opus --> ws
     ws --> tokio_rt
+    ipc -.->|Events| ui
 
     style Main fill:#e3f2fd
+    style WebView fill:#e2d3f8
     style Audio fill:#fff3cd
     style Encoder fill:#d4edda
 ```
 
 ### Thread Descriptions
 
-1. **Main Thread**:
-   - UI rendering with ratatui
-   - Keyboard input handling
-   - Session management coordination
+1. **Main Thread (Tauri)**:
+   - Tauri application lifecycle management
+   - IPC command handlers (`commands.rs`)
+   - State management (`AppState`)
+   - Window and webview coordination
 
-2. **Audio Callback Threads** (per device):
+2. **WebView Thread**:
+   - Renders HTML/JS/CSS frontend (`ui/`)
+   - Handles user interactions
+   - Communicates with backend via Tauri IPC
+   - Receives events for audio level updates
+
+3. **Audio Callback Threads** (per device):
    - cpal: Separate thread per audio stream
    - WASAPI (Windows): Custom thread for COM operations
    - ScreenCaptureKit (macOS): SCStreamOutput delegate callbacks
    - Real-time priority for low latency
    - Send samples to encoder via `mpsc::channel`
 
-3. **Encoder Thread** (per session):
+4. **Encoder Thread** (per session):
    - Receives f32 samples from audio threads
    - Buffers samples to complete Opus frames
    - Encodes to Opus packets
@@ -595,7 +635,7 @@ async fn stream_to_server(
 - **Audio Capture**: <1% (hardware DMA)
 - **Opus Encoding**: ~2-5% per session (complexity=5)
 - **WebSocket**: <1% (async I/O)
-- **UI Rendering**: <1% (terminal updates)
+- **UI Rendering**: ~1-2% (Tauri WebView)
 
 **Total**: ~5-10% CPU for single session on modern processor
 
@@ -690,6 +730,7 @@ strip = true           # Remove debug symbols
 - [ ] Adaptive bitrate based on network conditions
 - [ ] Multiple codec support (Opus, AAC, MP3)
 - [x] macOS output loopback (ScreenCaptureKit) - **Implemented**
+- [x] Tauri desktop UI (replaced terminal UI) - **Implemented**
 - [ ] Linux output loopback (PulseAudio/PipeWire)
 - [ ] Persistent session resumption
 - [ ] Audio filters (noise reduction, AGC)
