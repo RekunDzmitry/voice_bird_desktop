@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Bird Desktop</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>Voice Bird Desktop</h1>
+            <div id="server-status" class="status-indicator disconnected">Setup</div>
+        </header>
+
+        <main>
+            <!-- API Key Configuration View -->
+            <section id="api-key-section" class="view hidden">
+                <h2>Configure API Key</h2>
+                <p class="hint">Enter your API key to connect to Voice Bird server. You can generate an API key from the web dashboard.</p>
+                <div class="input-group">
+                    <input type="password" id="api-key-input" placeholder="Paste your API key here" autocomplete="off">
+                    <button id="toggle-visibility" class="btn icon" title="Show/Hide">Show</button>
+                </div>
+                <div class="controls">
+                    <button id="back-btn" class="btn secondary hidden">Back</button>
+                    <button id="save-key-btn" class="btn primary" disabled>Save API Key</button>
+                </div>
+            </section>
+
+            <!-- Session Browser View -->
+            <section id="session-browser" class="view hidden">
+                <h2>Available Audio Sessions</h2>
+                <p class="hint">Select audio sources to stream to server</p>
+                <div id="session-list" class="session-list">
+                    <p class="loading">Loading sessions...</p>
+                </div>
+                <div class="controls">
+                    <button id="refresh-btn" class="btn secondary">Refresh</button>
+                    <button id="start-btn" class="btn primary" disabled>Start Recording</button>
+                    <button id="settings-btn" class="btn secondary">Settings</button>
+                </div>
+            </section>
+
+            <!-- Recording Dashboard View -->
+            <section id="recording-dashboard" class="view hidden">
+                <h2>Recording Dashboard</h2>
+                <div id="active-sessions" class="active-sessions"></div>
+                <div class="controls">
+                    <button id="stop-all-btn" class="btn danger">Stop All</button>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <span id="status-message"></span>
+        </footer>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html>
