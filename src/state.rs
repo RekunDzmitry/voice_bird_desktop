@@ -84,6 +84,12 @@ impl AppState {
         session_info: AudioSessionInfo,
         app_handle: AppHandle,
     ) -> Result<Uuid> {
+        log::info!("=== Starting Recording Session ===");
+        log::info!("  App Name: {}", session_info.app_name);
+        log::info!("  Device Name: {}", session_info.device_name);
+        log::info!("  Process ID: {}", session_info.process_id);
+        log::info!("  Is Input: {}", session_info.is_input);
+
         let server_config = self
             .server_config
             .lock()
@@ -110,8 +116,10 @@ impl AppState {
         } else {
             #[cfg(any(windows, target_os = "macos"))]
             {
+                // Pass process_id for per-application audio capture
                 let cleanup = audio::start_output_recording(
                     &session_info.device_name,
+                    session_info.process_id,
                     &mut session,
                     None,
                     Some(server_config),
