@@ -41,9 +41,9 @@
       "digestAlgorithm": "sha256"
     },
     "macOS": {
-      "minimumSystemVersion": "10.13",
+      "minimumSystemVersion": "13.0",
       "frameworks": [],
-      "entitlements": null,
+      "entitlements": "Voice_Bird_Desktop.entitlements",
       "exceptionDomain": null,
       "signingIdentity": null,
       "providerShortName": null

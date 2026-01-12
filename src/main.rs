@@ -1,203 +1,137 @@
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod session;
 mod wasapi_sessions;
-mod ui;
 mod audio;
 mod server_streaming;
 mod opus_encoder;
 mod audio_converter;
 mod logger;
 
-use anyhow::{Result, Context};
 use std::env;
-use session::{RecordingSession, SessionManager};
-use ui::{App, AppMode, RecordingInputAction};
+use tauri::Manager;
 
-fn main() -> Result<()> {
+fn main() {
     // Initialize file-based logging
-    logger::init().context("Failed to initialize logger")?;
+    logger::init().ok();
 
     // Load .env file if present
     dotenvy::dotenv().ok();
 
-    log::info!("Voice Bird Desktop starting...");
-    log::info!("Initializing...");
+    log::info!("Voice Bird Desktop (GUI) starting...");
 
-    // Load Voice Bird server configuration (required)
-    let server_config = match (
-        env::var("VOICE_BIRD_SERVER_URL").ok(),
-        env::var("VOICE_BIRD_API_KEY").ok(),
-    ) {
-        (Some(url), Some(key)) if !url.is_empty() && !key.is_empty() => {
-            log::info!("Voice Bird server configuration loaded");
-            (url, key)
-        }
-        _ => {
-            log::error!("Voice Bird server not configured!");
-            log::error!("Required environment variables:");
-            log::error!("  - VOICE_BIRD_SERVER_URL");
-            log::error!("  - VOICE_BIRD_API_KEY");
-            log::error!("Create a .env file with these values.");
+    tauri::Builder::default()
+        .setup(|app| {
+            let _window = app.get_webview_window("main").unwrap();
 
-            // Print user-friendly error to terminal
-            logger::print_error("Voice Bird server not configured!");
-            logger::print_info("Required environment variables:");
-            logger::print_info("  - VOICE_BIRD_SERVER_URL");
-            logger::print_info("  - VOICE_BIRD_API_KEY");
-            logger::print_info("Create a .env file with these values.");
-
-            return Err(anyhow::anyhow!("Voice Bird server configuration missing"));
-        }
-    };
-
-    // Enumerate available audio sessions
-    let available_sessions = wasapi_sessions::enumerate_audio_sessions()
-        .context("Failed to enumerate audio sessions")?;
-
-    if available_sessions.is_empty() {
-        log::warn!("No active audio sessions found.");
-        log::warn!("Make sure applications are playing/recording audio.");
-
-        // Print user-friendly message to terminal
-        logger::print_warning("No active audio sessions found.");
-        logger::print_info("Make sure applications are playing/recording audio.");
-
-        return Ok(());
-    }
-
-    log::info!("Found {} active audio session(s)", available_sessions.len());
-
-    // Initialize terminal UI
-    let mut terminal = ui::init_terminal()?;
-
-    // Create app state
-    let mut app = App::new(available_sessions);
-
-    // Session browser loop
-    loop {
-        terminal.draw(|f| ui::render_session_browser(f, &mut app))?;
-
-        let should_quit = ui::handle_session_browser_input(&mut app)?;
-
-        if should_quit {
-            ui::restore_terminal(terminal)?;
-            log::info!("Application shutting down");
-            return Ok(());
-        }
-
-        if app.mode == AppMode::Recording {
-            break;
-        }
-    }
-
-    // Get selected sessions
-    let selected_session_infos = app.get_selected_sessions();
-
-    if selected_session_infos.is_empty() {
-        ui::restore_terminal(terminal)?;
-        log::warn!("No sessions selected");
-        return Ok(());
-    }
-
-    // Create recording sessions
-    let mut session_manager = SessionManager::new();
-    let host = cpal::default_host();
-
-    for session_info in selected_session_infos {
-        // Create recording session
-        let mut recording_session = RecordingSession::new(
-            session_info.clone(),
-            48000, // Default sample rate, will be updated
-            2,     // Default channels, will be updated
-        );
-
-        // Start recording based on device type
-        let stream_result = if session_info.is_input {
-            // Input device (microphone)
-            match audio::get_input_device_by_name(&host, &session_info.device_name) {
-                Ok(device) => {
-                    audio::start_input_recording(&device, &mut recording_session, server_config.clone())
-                        .map(|stream| (Some(stream), None))
+            // Check permissions and show status
+            match check_permissions() {
+                Ok(status) => {
+                    log::info!("Permission check: {}", status);
                 }
                 Err(e) => {
-                    log::error!("Failed to get input device: {}", e);
-                    logger::print_error(&format!("Failed to get input device '{}': {}", session_info.device_name, e));
-                    continue;
+                    log::error!("Permission check failed: {}", e);
                 }
             }
-        } else {
-            // Output device (loopback)
-            #[cfg(windows)]
-            {
-                audio::start_output_recording(&session_info.device_name, &mut recording_session, None, Some(server_config.clone()))
-                    .map(|cleanup| (None, Some(cleanup)))
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            check_permissions_command,
+            get_audio_sessions,
+            start_recording,
+            get_settings,
+            save_settings
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[tauri::command]
+fn check_permissions_command() -> Result<String, String> {
+    check_permissions().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_audio_sessions() -> Result<Vec<String>, String> {
+    match wasapi_sessions::enumerate_audio_sessions() {
+        Ok(sessions) => {
+            Ok(sessions.iter().map(|s| {
+                if s.app_name.is_empty() {
+                    s.device_name.clone()
+                } else {
+                    format!("{} - {}", s.app_name, s.device_name)
+                }
+            }).collect())
+        }
+        Err(e) => Err(format!("Failed to get audio sessions: {}", e))
+    }
+}
+
+#[tauri::command]
+fn start_recording(sessions: Vec<String>) -> Result<String, String> {
+    log::info!("Starting recording for {} session(s)", sessions.len());
+    for session in &sessions {
+        log::info!("  - {}", session);
+    }
+    Ok(format!("Recording started for {} session(s)", sessions.len()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    api_key: String,
+    server_url: String,
+}
+
+#[tauri::command]
+fn get_settings() -> Result<Settings, String> {
+    let api_key = env::var("VOICE_BIRD_API_KEY").unwrap_or_default();
+    let server_url = env::var("VOICE_BIRD_SERVER_URL").unwrap_or_else(|_| "https://api.voicebird.io".to_string());
+
+    Ok(Settings { api_key, server_url })
+}
+
+#[tauri::command]
+fn save_settings(api_key: String, server_url: String) -> Result<String, String> {
+    use std::fs;
+    use std::io::Write;
+
+    // Create or update .env file
+    let env_content = format!(
+        "VOICE_BIRD_API_KEY={}\nVOICE_BIRD_SERVER_URL={}\n",
+        api_key, server_url
+    );
+
+    fs::write(".env", env_content)
+        .map_err(|e| format!("Failed to save settings: {}", e))?;
+
+    // Update environment variables for current session
+    env::set_var("VOICE_BIRD_API_KEY", &api_key);
+    env::set_var("VOICE_BIRD_SERVER_URL", &server_url);
+
+    log::info!("Settings saved successfully");
+
+    Ok("Settings saved successfully".to_string())
+}
+
+fn check_permissions() -> Result<String, String> {
+    // Try to enumerate audio sessions to check permissions
+    match wasapi_sessions::enumerate_audio_sessions() {
+        Ok(sessions) => {
+            if sessions.is_empty() {
+                Ok("Permissions OK - No active audio sessions found".to_string())
+            } else {
+                Ok(format!("Permissions OK - Found {} audio session(s)", sessions.len()))
             }
-            #[cfg(not(windows))]
-            {
-                log::error!("Output recording not supported on this platform");
-                logger::print_error("Output recording is only supported on Windows");
-                continue;
-            }
-        };
-
-        match stream_result {
-            Ok((stream, cleanup)) => {
-                recording_session.start_recording();
-
-                // Print user-friendly success message
-                logger::print_connection_status("Connected", &format!("{} streaming started", session_info.device_name));
-
-                session_manager.add_session(recording_session);
-
-                // Keep stream alive (will be handled by session manager in real implementation)
-                std::mem::forget(stream);
-                std::mem::forget(cleanup);
-            }
-            Err(e) => {
-                log::error!("Failed to start recording: {}", e);
-                logger::print_error(&format!("Failed to start recording '{}': {}", session_info.device_name, e));
+        }
+        Err(e) => {
+            let error_msg = format!("{}", e);
+            if error_msg.contains("Screen Recording permission") || error_msg.contains("условия") {
+                Err("Screen Recording permission required. Please grant permission in System Settings > Privacy & Security > Screen Recording".to_string())
+            } else {
+                Err(format!("Error checking permissions: {}", e))
             }
         }
     }
-
-    if session_manager.active_sessions.is_empty() {
-        ui::restore_terminal(terminal)?;
-        log::warn!("No recording sessions started");
-        logger::print_warning("No recording sessions were started successfully");
-        return Ok(());
-    }
-
-    // Recording dashboard loop
-    loop {
-        let sessions: Vec<&RecordingSession> = session_manager.get_all_sessions();
-
-        terminal.draw(|f| ui::render_recording_dashboard(f, &sessions))?;
-
-        match ui::handle_recording_input()? {
-            RecordingInputAction::StopAndSave => {
-                // Stop all sessions
-                session_manager.stop_all();
-
-                // Wait a moment for streaming to finish
-                std::thread::sleep(std::time::Duration::from_millis(500));
-
-                ui::restore_terminal(terminal)?;
-
-                log::info!("All streaming sessions stopped successfully!");
-                logger::print_info("✓ All streaming sessions stopped successfully!");
-                break;
-            }
-            RecordingInputAction::QuitWithoutSaving => {
-                session_manager.stop_all();
-                ui::restore_terminal(terminal)?;
-                log::warn!("Exited without saving");
-                logger::print_warning("Exited without saving");
-                break;
-            }
-            RecordingInputAction::Continue => {
-                // Continue recording
-            }
-        }
-    }
-
-    Ok(())
 }

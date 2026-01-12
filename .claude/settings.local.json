@@ -5,7 +5,14 @@
       "WebSearch",
       "WebFetch(domain:code.claude.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:www.brethorsting.com)"
+      "WebFetch(domain:www.brethorsting.com)",
+      "Bash(export PATH=\"$HOME/bin:$HOME/.cargo/bin:/usr/bin:/bin:$PATH\")",
+      "Bash(cargo clean:*)",
+      "Bash(cargo build:*)",
+      "Bash(xcode-select:*)",
+      "Bash(export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk)",
+      "Bash(xcrun --show-sdk-path:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

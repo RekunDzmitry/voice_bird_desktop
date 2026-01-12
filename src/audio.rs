@@ -420,19 +420,14 @@ pub fn start_output_recording(
     _api_key: Option<String>,
     server_config: Option<(String, String)>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    use screencapturekit::sc_shareable_content::SCShareableContent;
-    use screencapturekit::sc_stream_configuration::SCStreamConfiguration;
-    use screencapturekit::sc_content_filter::{SCContentFilter, InitParams};
-    use screencapturekit::sc_stream::SCStream;
-    use screencapturekit::sc_output_handler::{SCStreamOutputType, StreamOutput};
-    use screencapturekit::cm_sample_buffer::CMSampleBuffer;
+    use screencapturekit::prelude::*;
     use std::sync::mpsc;
 
     const DEFAULT_SAMPLE_RATE: u32 = 48000;
     const DEFAULT_CHANNELS: u16 = 2;
 
     // Check screen recording permission by attempting to get shareable content
-    let content = SCShareableContent::current()
+    let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!(
             "Screen Recording permission required.\n\
             Please grant permission in:\n\
@@ -478,40 +473,49 @@ pub fn start_output_recording(
         None
     };
 
+    // Get displays and applications - these need to outlive the filter creation
+    let displays = content.displays();
+    let applications = content.applications();
+
     // Create content filter based on device_name
     let filter = if device_name.contains("All Applications") || device_name.contains("System Audio") {
         // Capture all system audio via display
-        let display = content.displays()
+        let display = displays
             .first()
-            .ok_or_else(|| anyhow::anyhow!("No displays found"))?
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("No displays found"))?;
 
-        SCContentFilter::new(InitParams::Display(display))
+        SCContentFilter::create()
+            .with_display(display)
+            .build()
     } else {
         // Try to find specific application by name
-        let app = content.applications()
-            .into_iter()
+        let app = applications
+            .iter()
             .find(|app| {
-                app.application_name()
-                    .map(|name| device_name.contains(&name))
-                    .unwrap_or(false)
+                let name = app.application_name();
+                device_name.contains(&name)
             })
             .ok_or_else(|| anyhow::anyhow!("Application '{}' not found", device_name))?;
 
-        SCContentFilter::new(InitParams::Application(app))
+        let display = displays
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No displays found"))?;
+
+        SCContentFilter::create()
+            .with_display(display)
+            .with_including_applications(&[app], &[])
+            .build()
     };
 
     // Configure stream for audio-only capture
-    let config = SCStreamConfiguration {
-        captures_audio: true,
-        sample_rate: DEFAULT_SAMPLE_RATE,
-        channel_count: DEFAULT_CHANNELS as u32,
-        excludes_current_process_audio: true,
+    let config = SCStreamConfiguration::new()
+        .with_captures_audio(true)
+        .with_sample_rate(DEFAULT_SAMPLE_RATE as i32)
+        .with_channel_count(DEFAULT_CHANNELS as i32)
+        .with_excludes_current_process_audio(true)
         // Minimal video settings (required but we ignore video)
-        width: 1,
-        height: 1,
-        ..Default::default()
-    };
+        .with_width(1)
+        .with_height(1);
 
     // Create output handler for audio samples
     struct AudioOutputHandler {
@@ -521,7 +525,7 @@ pub fn start_output_recording(
         server_tx: Option<mpsc::Sender<Vec<f32>>>,
     }
 
-    impl StreamOutput for AudioOutputHandler {
+    impl SCStreamOutputTrait for AudioOutputHandler {
         fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
             // Only process audio samples
             if of_type != SCStreamOutputType::Audio {
@@ -537,8 +541,23 @@ pub fn start_output_recording(
 
             // Extract audio samples from CMSampleBuffer
             // The buffer contains interleaved f32 samples at the configured sample rate
-            if let Some(audio_data) = sample.get_audio_buffer_list() {
-                let samples: Vec<f32> = audio_data.into_iter().collect();
+            if let Some(audio_data) = sample.audio_buffer_list() {
+                let mut samples = Vec::new();
+
+                // Iterate over all audio buffers and extract f32 samples
+                for i in 0..audio_data.num_buffers() {
+                    if let Some(buffer) = audio_data.get(i) {
+                        let data = buffer.data();
+                        // Convert bytes to f32 samples (assuming little-endian f32)
+                        let f32_samples = data.chunks_exact(4)
+                            .map(|chunk| {
+                                let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                                f32::from_le_bytes(bytes)
+                            })
+                            .collect::<Vec<f32>>();
+                        samples.extend(f32_samples);
+                    }
+                }
 
                 if samples.is_empty() {
                     return;
@@ -571,7 +590,8 @@ pub fn start_output_recording(
     };
 
     // Create and start the stream
-    let mut stream = SCStream::new(filter, config, handler);
+    let mut stream = SCStream::new(&filter, &config);
+    stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("Failed to start screen capture: {:?}", e))?;
 

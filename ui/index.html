@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Bird Desktop</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .header {
+            background: #1e293b;
+            padding: 20px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .status-badge {
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .status-badge.connected {
+            background: #10b98120;
+            color: #10b981;
+            border: 1px solid #10b981;
+        }
+
+        .status-badge.disconnected {
+            background: #ef444420;
+            color: #ef4444;
+            border: 1px solid #ef4444;
+        }
+
+        .main-content {
+            padding: 30px;
+            height: calc(100vh - 140px);
+            overflow-y: auto;
+        }
+
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .section-subtitle {
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 20px;
+        }
+
+        .sessions-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 30px;
+        }
+
+        .session-item {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            transition: all 0.2s;
+        }
+
+        .session-item:hover {
+            border-color: #475569;
+            background: #334155;
+        }
+
+        .session-item input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .session-info {
+            flex: 1;
+        }
+
+        .session-name {
+            font-size: 16px;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+
+        .session-device {
+            font-size: 14px;
+            color: #94a3b8;
+        }
+
+        .session-type {
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .session-type.output {
+            background: #7c3aed20;
+            color: #a78bfa;
+        }
+
+        .session-type.input {
+            background: #3b82f620;
+            color: #60a5fa;
+        }
+
+        .footer {
+            background: #1e293b;
+            padding: 20px 30px;
+            border-top: 1px solid #334155;
+            display: flex;
+            gap: 15px;
+        }
+
+        .button {
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+
+        .button:hover {
+            transform: translateY(-1px);
+        }
+
+        .button:active {
+            transform: translateY(0);
+        }
+
+        .button-primary {
+            background: #10b981;
+            color: white;
+        }
+
+        .button-primary:hover {
+            background: #059669;
+        }
+
+        .button-secondary {
+            background: #334155;
+            color: #e2e8f0;
+        }
+
+        .button-secondary:hover {
+            background: #475569;
+        }
+
+        /* Settings Screen */
+        .settings-screen {
+            display: none;
+        }
+
+        .settings-screen.active {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 15px;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+
+        .form-description {
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 15px;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        .input-field {
+            flex: 1;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #e2e8f0;
+            font-size: 15px;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: #10b981;
+        }
+
+        .button-show {
+            background: #334155;
+            color: #e2e8f0;
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-size: 15px;
+        }
+
+        .button-show:hover {
+            background: #475569;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #94a3b8;
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #94a3b8;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #334155;
+            border-radius: 50%;
+            border-top-color: #10b981;
+            animation: spin 1s linear infinite;
+            margin-bottom: 16px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Main Screen -->
+    <div id="main-screen">
+        <div class="header">
+            <h1>🎙️ Voice Bird Desktop</h1>
+            <div id="connection-status" class="status-badge disconnected">Disconnected</div>
+        </div>
+
+        <div class="main-content">
+            <h2 class="section-title">Available Audio Sessions</h2>
+            <p class="section-subtitle">Select audio sources to stream to server</p>
+
+            <div id="sessions-container">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <div>Loading audio sessions...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <button class="button button-secondary" onclick="refreshSessions()">Refresh</button>
+            <button class="button button-primary" onclick="startRecording()">Start Recording</button>
+            <button class="button button-secondary" onclick="showSettings()" style="margin-left: auto;">Settings</button>
+        </div>
+    </div>
+
+    <!-- Settings Screen -->
+    <div id="settings-screen" class="settings-screen">
+        <div class="header">
+            <h1>⚙️ Voice Bird Desktop</h1>
+            <div id="settings-connection-status" class="status-badge disconnected">Disconnected</div>
+        </div>
+
+        <div class="main-content">
+            <h2 class="section-title">Configure API Key</h2>
+            <p class="section-subtitle">Enter your API key to connect to Voice Bird server. You can generate an API key from the web dashboard.</p>
+
+            <div class="form-group">
+                <label class="form-label">API Key</label>
+                <div class="input-group">
+                    <input type="password" id="api-key-input" class="input-field" placeholder="Paste your API key here">
+                    <button class="button-show" onclick="toggleApiKeyVisibility()">Show</button>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Server URL</label>
+                <input type="text" id="server-url-input" class="input-field" placeholder="https://api.voicebird.io" value="https://api.voicebird.io">
+            </div>
+        </div>
+
+        <div class="footer">
+            <button class="button button-secondary" onclick="showMain()">Back</button>
+            <button class="button button-primary" onclick="saveSettings()">Save API Key</button>
+        </div>
+    </div>
+
+    <script>
+        const { invoke } = window.__TAURI__.core;
+
+        let selectedSessions = new Set();
+
+        // Show/hide screens
+        function showSettings() {
+            document.getElementById('main-screen').style.display = 'none';
+            document.getElementById('settings-screen').classList.add('active');
+            loadSettings();
+        }
+
+        function showMain() {
+            document.getElementById('main-screen').style.display = 'block';
+            document.getElementById('settings-screen').classList.remove('active');
+        }
+
+        function toggleApiKeyVisibility() {
+            const input = document.getElementById('api-key-input');
+            const button = event.target;
+            if (input.type === 'password') {
+                input.type = 'text';
+                button.textContent = 'Hide';
+            } else {
+                input.type = 'password';
+                button.textContent = 'Show';
+            }
+        }
+
+        async function loadSettings() {
+            try {
+                const settings = await invoke('get_settings');
+                document.getElementById('api-key-input').value = settings.api_key || '';
+                document.getElementById('server-url-input').value = settings.server_url || 'https://api.voicebird.io';
+                updateConnectionStatus(settings.api_key && settings.server_url);
+            } catch (error) {
+                console.error('Failed to load settings:', error);
+            }
+        }
+
+        async function saveSettings() {
+            const apiKey = document.getElementById('api-key-input').value;
+            const serverUrl = document.getElementById('server-url-input').value;
+
+            if (!apiKey) {
+                alert('Please enter an API key');
+                return;
+            }
+
+            try {
+                await invoke('save_settings', { apiKey, serverUrl });
+                updateConnectionStatus(true);
+                showMain();
+            } catch (error) {
+                alert('Failed to save settings: ' + error);
+            }
+        }
+
+        async function refreshSessions() {
+            await loadSessions();
+        }
+
+        async function loadSessions() {
+            const container = document.getElementById('sessions-container');
+            container.innerHTML = '<div class="loading"><div class="spinner"></div><div>Loading audio sessions...</div></div>';
+
+            try {
+                const sessions = await invoke('get_audio_sessions');
+
+                if (sessions.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">🔇</div>
+                            <div>No active audio sessions found</div>
+                            <div style="margin-top: 8px; font-size: 14px;">Make sure applications are playing audio</div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = '<div class="sessions-list"></div>';
+                const sessionsList = container.querySelector('.sessions-list');
+
+                sessions.forEach((session, index) => {
+                    const parts = session.split(' - ');
+                    const appName = parts[0] || 'Unknown';
+                    const deviceName = parts[1] || session;
+                    const isInput = session.includes('Microphone') || session.includes('INPUT');
+
+                    const sessionEl = document.createElement('div');
+                    sessionEl.className = 'session-item';
+                    sessionEl.innerHTML = `
+                        <input type="checkbox" id="session-${index}" onchange="toggleSession('${session}', this.checked)">
+                        <div class="session-info">
+                            <div class="session-name">${appName}</div>
+                            <div class="session-device">${deviceName}</div>
+                        </div>
+                        <div class="session-type ${isInput ? 'input' : 'output'}">${isInput ? 'INPUT' : 'OUTPUT'}</div>
+                    `;
+                    sessionsList.appendChild(sessionEl);
+                });
+            } catch (error) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">⚠️</div>
+                        <div>Failed to load audio sessions</div>
+                        <div style="margin-top: 8px; font-size: 14px;">${error}</div>
+                        <div style="margin-top: 16px; font-size: 13px; color: #64748b;">
+                            Grant Screen Recording permission in:<br>
+                            System Settings > Privacy & Security > Screen Recording
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function toggleSession(session, checked) {
+            if (checked) {
+                selectedSessions.add(session);
+            } else {
+                selectedSessions.delete(session);
+            }
+        }
+
+        async function startRecording() {
+            if (selectedSessions.size === 0) {
+                alert('Please select at least one audio session');
+                return;
+            }
+
+            try {
+                const sessions = Array.from(selectedSessions);
+                await invoke('start_recording', { sessions });
+                alert('Recording started for ' + sessions.length + ' session(s)');
+            } catch (error) {
+                alert('Failed to start recording: ' + error);
+            }
+        }
+
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('connection-status');
+            const settingsStatusEl = document.getElementById('settings-connection-status');
+
+            const className = connected ? 'status-badge connected' : 'status-badge disconnected';
+            const text = connected ? 'Connected' : 'Disconnected';
+
+            statusEl.className = className;
+            statusEl.textContent = text;
+            settingsStatusEl.className = className;
+            settingsStatusEl.textContent = text;
+        }
+
+        // Load on startup
+        window.addEventListener('DOMContentLoaded', async () => {
+            await loadSessions();
+            try {
+                const settings = await invoke('get_settings');
+                updateConnectionStatus(settings.api_key && settings.server_url);
+            } catch (e) {
+                updateConnectionStatus(false);
+            }
+        });
+    </script>
+</body>
+</html>
