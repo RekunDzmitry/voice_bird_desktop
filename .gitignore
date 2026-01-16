@@ -53,3 +53,11 @@ test-output/
 recording_*
 transcript_*
 logs/
+
+# Build artifacts
+dist/
+debug.log
+screenshots/
+
+# Stub crate build artifacts
+voice-bird-desktop-crate/target/

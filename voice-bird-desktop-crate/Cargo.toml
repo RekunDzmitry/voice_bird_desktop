@@ -1,0 +1,33 @@
+[package]
+name = "voice-bird-desktop"
+version = "0.1.1"
+edition = "2021"
+description = "Voice Bird Desktop - Audio streaming application for voice transcription"
+license-file = "LICENSE"
+repository = "https://github.com/RekunDzmitry/voice-bird-releases"
+readme = "README.md"
+keywords = ["audio", "streaming", "transcription", "voice"]
+categories = ["multimedia::audio"]
+
+[[bin]]
+name = "voice-bird-desktop"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# cargo-binstall configuration
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/voice-bird-desktop-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["compile", "quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-fmt = "zip"
