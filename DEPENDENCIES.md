@@ -712,6 +712,29 @@ WASABI_BUCKET_NAME=voice-bird-europe
 WASABI_ENDPOINT=https://s3.eu-central-2.wasabisys.com
 ```
 
+### Distribution (cargo-binstall)
+
+Users can install pre-built binaries via Rust's cargo-binstall:
+
+```bash
+cargo binstall voice-bird-desktop
+```
+
+**Architecture**:
+- **Stub crate** (`voice-bird-desktop-crate/`): Published to crates.io with binstall metadata only (no source code)
+- **Binaries**: Hosted on GitHub Releases at `RekunDzmitry/voice-bird-releases`
+- **Naming convention**: `voice-bird-desktop-{target}.zip` (e.g., `voice-bird-desktop-x86_64-pc-windows-msvc.zip`)
+
+**Release workflow**:
+1. Build binaries on target platforms
+2. Package into ZIPs with correct naming
+3. Create GitHub release with binaries
+4. Update and publish stub crate to crates.io
+
+**Manual script**: `scripts/publish-release.sh` - Interactive menu for release tasks
+
+**GitHub Actions**: `.github/workflows/release.yml` - Automated build and release on tags (optional)
+
 ### Optimization Flags (Cargo.toml)
 
 ```toml
