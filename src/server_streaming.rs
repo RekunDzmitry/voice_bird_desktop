@@ -21,6 +21,8 @@ struct InitMessage {
     device_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     device_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_name: Option<String>,
     sample_rate: u32,
     channels: u16,
     audio_format: String,
@@ -56,6 +58,7 @@ impl ServerStreamingService {
     /// * `api_key` - User's API key for authentication
     /// * `session_id` - Unique identifier for this recording session
     /// * `device_name` - Name of the audio device being recorded
+    /// * `app_name` - Name of the application being recorded (e.g., "chrome.exe", "msedge.exe")
     /// * `audio_rx` - Channel receiver for f32 audio samples
     /// * `sample_rate` - Audio sample rate
     /// * `channels` - Number of audio channels
@@ -64,6 +67,7 @@ impl ServerStreamingService {
         api_key: String,
         session_id: String,
         device_name: String,
+        app_name: Option<String>,
         audio_rx: mpsc::Receiver<Vec<f32>>,
         sample_rate: u32,
         channels: u16,
@@ -196,6 +200,7 @@ impl ServerStreamingService {
             session_id: session_id.clone(),
             device_name: device_name.clone(),
             device_type: Some("output".to_string()),  // "input" for microphones, "output" for system audio
+            app_name,  // Application name (e.g., "chrome.exe", "msedge.exe") for source identification
             sample_rate: output_sample_rate,  // 16kHz after conversion
             channels: 1,                       // Mono after conversion
             audio_format: "pcm16le".to_string(),  // PCM16 little-endian after conversion

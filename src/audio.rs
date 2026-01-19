@@ -99,6 +99,7 @@ pub fn start_input_recording(
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
     let session_id = session.id.to_string();
     let device_name = session.device_name.clone();
+    let app_name = Some(session.app_name.clone());
     let sample_rate = session.sample_rate;
     let channels = session.channels;
 
@@ -111,6 +112,7 @@ pub fn start_input_recording(
                 server_api_key,
                 session_id,
                 device_name,
+                app_name,
                 rx,
                 sample_rate,
                 channels,
@@ -436,6 +438,7 @@ pub fn start_output_recording(
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let session_id = session.id.to_string();
         let device_name = session.device_name.clone();
+        let app_name = Some(session.app_name.clone());
 
         // Spawn WebSocket streaming thread
         std::thread::spawn(move || {
@@ -446,6 +449,7 @@ pub fn start_output_recording(
                     server_api_key,
                     session_id,
                     device_name,
+                    app_name,
                     rx,
                     sample_rate,
                     channels,
@@ -662,6 +666,7 @@ fn start_output_recording_device_loopback(
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let session_id = session.id.to_string();
         let device_name = session.device_name.clone();
+        let app_name = Some(session.app_name.clone());
 
         // Spawn WebSocket streaming thread
         std::thread::spawn(move || {
@@ -672,6 +677,7 @@ fn start_output_recording_device_loopback(
                     server_api_key,
                     session_id,
                     device_name,
+                    app_name,
                     rx,
                     sample_rate,
                     channels,
@@ -837,6 +843,7 @@ pub fn start_output_recording(
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let session_id = session.id.to_string();
         let device_name_clone = session.device_name.clone();
+        let app_name = Some(session.app_name.clone());
 
         // Spawn WebSocket streaming thread
         std::thread::spawn(move || {
@@ -847,6 +854,7 @@ pub fn start_output_recording(
                     server_api_key,
                     session_id,
                     device_name_clone,
+                    app_name,
                     rx,
                     DEFAULT_SAMPLE_RATE,
                     DEFAULT_CHANNELS,

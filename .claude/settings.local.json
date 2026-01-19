@@ -5,7 +5,16 @@
       "WebSearch",
       "WebFetch(domain:code.claude.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:www.brethorsting.com)"
+      "WebFetch(domain:www.brethorsting.com)",
+      "Bash(xargs:*)",
+      "Bash(file:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)",
+      "Bash(gh release create:*)",
+      "Bash(ls:*)",
+      "Bash(zip:*)",
+      "Bash(ssh voicebird-root:*)"
     ],
     "deny": [],
     "ask": []

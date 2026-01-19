@@ -59,5 +59,6 @@ dist/
 debug.log
 screenshots/
 
-# Stub crate build artifacts
-voice-bird-desktop-crate/target/
+# CLI crate build artifacts
+voice-bird-cli/target/
+voice-bird-cli-crate/target/

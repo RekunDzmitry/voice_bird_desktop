@@ -712,28 +712,32 @@ WASABI_BUCKET_NAME=voice-bird-europe
 WASABI_ENDPOINT=https://s3.eu-central-2.wasabisys.com
 ```
 
-### Distribution (cargo-binstall)
+### Distribution (cargo-binstall) - CLI Tool
 
-Users can install pre-built binaries via Rust's cargo-binstall:
+Developers can install the Voice Bird CLI via Rust's cargo-binstall:
 
 ```bash
-cargo binstall voice-bird-desktop
+cargo binstall voice-bird-cli
 ```
 
 **Architecture**:
-- **Stub crate** (`voice-bird-desktop-crate/`): Published to crates.io with binstall metadata only (no source code)
+- **CLI implementation** (`voice-bird-cli/`): Full ratatui TUI application (source kept private)
+- **Stub crate** (`voice-bird-cli-crate/`): Published to crates.io with binstall metadata only (no source code)
 - **Binaries**: Hosted on GitHub Releases at `RekunDzmitry/voice-bird-releases`
-- **Naming convention**: `voice-bird-desktop-{target}.zip` (e.g., `voice-bird-desktop-x86_64-pc-windows-msvc.zip`)
+- **Naming convention**: `voice-bird-cli-{target}.zip` (e.g., `voice-bird-cli-x86_64-pc-windows-msvc.zip`)
+
+**CLI Features**:
+- Interactive TUI with ratatui
+- Audio device/process enumeration
+- Per-application audio capture (Windows/macOS)
+- Server streaming with API key authentication
+- Real-time audio level visualization
 
 **Release workflow**:
-1. Build binaries on target platforms
+1. Build CLI binaries on target platforms (`voice-bird-cli/`)
 2. Package into ZIPs with correct naming
-3. Create GitHub release with binaries
-4. Update and publish stub crate to crates.io
-
-**Manual script**: `scripts/publish-release.sh` - Interactive menu for release tasks
-
-**GitHub Actions**: `.github/workflows/release.yml` - Automated build and release on tags (optional)
+3. Create GitHub release with binaries at voice-bird-releases repo
+4. Publish stub crate to crates.io (`voice-bird-cli-crate/`)
 
 ### Optimization Flags (Cargo.toml)
 

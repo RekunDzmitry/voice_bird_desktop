@@ -1,16 +1,16 @@
 [package]
-name = "voice-bird-desktop"
-version = "0.1.1"
+name = "voice-bird-cli"
+version = "0.1.0"
 edition = "2021"
-description = "Voice Bird Desktop - Audio streaming application for voice transcription"
+description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
 license-file = "LICENSE"
 repository = "https://github.com/RekunDzmitry/voice-bird-releases"
 readme = "README.md"
-keywords = ["audio", "streaming", "transcription", "voice"]
-categories = ["multimedia::audio"]
+keywords = ["audio", "streaming", "transcription", "voice", "cli"]
+categories = ["multimedia::audio", "command-line-utilities"]
 
 [[bin]]
-name = "voice-bird-desktop"
+name = "voice-bird-cli"
 path = "src/main.rs"
 
 [lib]
@@ -18,7 +18,7 @@ path = "src/lib.rs"
 
 # cargo-binstall configuration
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/voice-bird-desktop-{ target }.zip"
+pkg-url = "{ repo }/releases/download/v{ version }-cli/voice-bird-cli-{ target }.zip"
 pkg-fmt = "zip"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["compile", "quick-install"]
