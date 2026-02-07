@@ -62,3 +62,15 @@ screenshots/
 # CLI crate build artifacts
 voice-bird-cli/target/
 voice-bird-cli-crate/target/
+
+# npm platform package binaries (populated by CI only)
+npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
+npm/@voice-bird/cli-darwin-x64/voice-bird-cli
+npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
+npm/@voice-bird/cli-linux-x64/voice-bird-cli
+npm/voice-bird-cli/downloaded/
+npm/voice-bird-cli/.npm-install-tmp/
+
+# Python build artifacts
+*.whl
+*.egg-info/

@@ -1,0 +1,16 @@
+{
+  "name": "@voice-bird/cli-darwin-x64",
+  "version": "0.1.0",
+  "description": "macOS Intel binary for voice-bird-cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RekunDzmitry/voice-bird-releases.git"
+  },
+  "license": "MIT",
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=16"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"]
+}
