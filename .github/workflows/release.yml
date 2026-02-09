@@ -231,7 +231,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
-          gh release create "$TAG" artifacts/*.zip \
+          RELEASE_TAG="${TAG}-cli"
+          gh release create "$RELEASE_TAG" artifacts/*.zip \
             --repo RekunDzmitry/voice-bird-releases \
             --title "Voice Bird CLI $TAG" \
             --generate-notes
