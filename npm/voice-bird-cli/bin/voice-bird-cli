@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+
+const os = require("os");
+const path = require("path");
+const fs = require("fs");
+
+const PLATFORM_PACKAGES = {
+  "win32 x64": {
+    pkg: "@voice-bird/cli-win32-x64",
+    bin: "voice-bird-cli.exe",
+  },
+  "darwin x64": {
+    pkg: "@voice-bird/cli-darwin-x64",
+    bin: "voice-bird-cli",
+  },
+  "darwin arm64": {
+    pkg: "@voice-bird/cli-darwin-arm64",
+    bin: "voice-bird-cli",
+  },
+  "linux x64": {
+    pkg: "@voice-bird/cli-linux-x64",
+    bin: "voice-bird-cli",
+  },
+};
+
+function getBinaryPath() {
+  if (process.env.VOICE_BIRD_CLI_BINARY_PATH) {
+    return process.env.VOICE_BIRD_CLI_BINARY_PATH;
+  }
+
+  const platformKey = `${process.platform} ${os.arch()}`;
+  const entry = PLATFORM_PACKAGES[platformKey];
+
+  if (!entry) {
+    console.error(
+      `Unsupported platform: ${process.platform} ${os.arch()}\n` +
+        `Supported: win32-x64, darwin-x64, darwin-arm64, linux-x64`
+    );
+    process.exit(1);
+  }
+
+  // Try resolving from the platform-specific optional dependency
+  try {
+    return require.resolve(path.join(entry.pkg, entry.bin));
+  } catch {
+    // Fallback: check if postinstall downloaded it
+    const downloadedPath = path.join(__dirname, "..", "bin", entry.bin);
+    if (fs.existsSync(downloadedPath)) {
+      return downloadedPath;
+    }
+  }
+
+  console.error(
+    `Could not find the voice-bird-cli binary for ${platformKey}.\n` +
+      `The package "${entry.pkg}" should have been installed as an optionalDependency.\n` +
+      `Try reinstalling: npm install -g voice-bird-cli`
+  );
+  process.exit(1);
+}
+
+const binPath = getBinaryPath();
+const result = require("child_process").spawnSync(binPath, process.argv.slice(2), {
+  stdio: "inherit",
+});
+
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(1);
+}
+
+process.exit(result.status ?? 1);

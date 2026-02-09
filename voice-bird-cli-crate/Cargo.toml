@@ -1,0 +1,33 @@
+[package]
+name = "voice-bird-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
+license-file = "LICENSE"
+repository = "https://github.com/RekunDzmitry/voice-bird-releases"
+readme = "README.md"
+keywords = ["audio", "streaming", "transcription", "voice", "cli"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[[bin]]
+name = "voice-bird-cli"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# cargo-binstall configuration
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }-cli/voice-bird-cli-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["compile", "quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-fmt = "zip"

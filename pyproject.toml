@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "voice-bird-cli"
+version = "0.1.0"
+description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
+authors = [{ name = "Dzmitry Rekun" }]
+readme = "voice-bird-cli/README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["audio", "streaming", "transcription", "voice", "cli", "tui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.urls]
+Homepage = "https://voicebird.app"
+Repository = "https://github.com/RekunDzmitry/voice-bird-releases"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "voice-bird-cli/Cargo.toml"
+module-name = "voice_bird_cli"
+python-source = "python"
+strip = true
