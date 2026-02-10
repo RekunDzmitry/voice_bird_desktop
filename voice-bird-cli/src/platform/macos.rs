@@ -5,19 +5,20 @@ use super::AudioSession;
 use crate::audio::calculate_rms;
 use crate::streaming;
 
-use screencapturekit::sc_shareable_content::SCShareableContent;
-use screencapturekit::sc_stream_configuration::SCStreamConfiguration;
-use screencapturekit::sc_content_filter::{SCContentFilter, InitParams};
-use screencapturekit::sc_stream::SCStream;
-use screencapturekit::sc_output_handler::{SCStreamOutputType, StreamOutput};
-use screencapturekit::cm_sample_buffer::CMSampleBuffer;
+use screencapturekit::shareable_content::SCShareableContent;
+use screencapturekit::stream::configuration::SCStreamConfiguration;
+use screencapturekit::stream::content_filter::SCContentFilter;
+use screencapturekit::stream::SCStream;
+use screencapturekit::stream::output_trait::SCStreamOutputTrait;
+use screencapturekit::stream::output_type::SCStreamOutputType;
+use screencapturekit::output::CMSampleBuffer;
 
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
 const DEFAULT_CHANNELS: u16 = 2;
 
 /// Enumerate audio sessions on macOS using ScreenCaptureKit
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
-    let content = SCShareableContent::current()
+    let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!(
             "Screen Recording permission required.\n\
             Please grant permission in:\n\
@@ -37,12 +38,12 @@ pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
 
     // List running applications
     for app in content.applications() {
-        let app_name = match app.application_name() {
-            Some(name) => name,
-            None => continue,
-        };
+        let app_name = app.application_name();
+        if app_name.is_empty() {
+            continue;
+        }
 
-        let bundle_id = app.bundle_identifier().unwrap_or_default();
+        let bundle_id = app.bundle_identifier();
         let process_id = app.process_id() as u32;
 
         // Skip system processes
@@ -88,7 +89,7 @@ pub fn start_output_recording(
     audio_level: Arc<Mutex<f32>>,
     stop_signal: Arc<Mutex<bool>>,
 ) -> Result<()> {
-    let content = SCShareableContent::current()
+    let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!("Screen Recording permission required: {:?}", e))?;
 
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
@@ -113,35 +114,41 @@ pub fn start_output_recording(
         });
     });
 
+    let display = content.displays()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No displays found"))?
+        .clone();
+
     // Create content filter
     let filter = if session.app_name.contains("All Applications") {
-        let display = content.displays()
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No displays found"))?
-            .clone();
-        SCContentFilter::new(InitParams::Display(display))
+        SCContentFilter::new()
+            .with_display_excluding_windows(&display, &[])
     } else {
         let app = content.applications()
             .into_iter()
             .find(|app| {
-                app.application_name()
-                    .map(|name| session.app_name.contains(&name))
-                    .unwrap_or(false)
+                let name = app.application_name();
+                !name.is_empty() && session.app_name.contains(&name)
             })
             .ok_or_else(|| anyhow::anyhow!("Application not found"))?;
-        SCContentFilter::new(InitParams::Application(app))
+        SCContentFilter::new()
+            .with_display_including_application_excepting_windows(&display, &[&app], &[])
     };
 
     // Configure stream
-    let config = SCStreamConfiguration {
-        captures_audio: true,
-        sample_rate: DEFAULT_SAMPLE_RATE,
-        channel_count: DEFAULT_CHANNELS as u32,
-        excludes_current_process_audio: true,
-        width: 1,
-        height: 1,
-        ..Default::default()
-    };
+    let config = SCStreamConfiguration::new()
+        .set_captures_audio(true)
+        .map_err(|e| anyhow::anyhow!("Failed to set captures_audio: {:?}", e))?
+        .set_sample_rate(DEFAULT_SAMPLE_RATE)
+        .map_err(|e| anyhow::anyhow!("Failed to set sample_rate: {:?}", e))?
+        .set_channel_count(DEFAULT_CHANNELS as u8)
+        .map_err(|e| anyhow::anyhow!("Failed to set channel_count: {:?}", e))?
+        .set_excludes_current_process_audio(true)
+        .map_err(|e| anyhow::anyhow!("Failed to set excludes_current_process_audio: {:?}", e))?
+        .set_width(1)
+        .map_err(|e| anyhow::anyhow!("Failed to set width: {:?}", e))?
+        .set_height(1)
+        .map_err(|e| anyhow::anyhow!("Failed to set height: {:?}", e))?;
 
     // Output handler
     struct AudioHandler {
@@ -150,7 +157,7 @@ pub fn start_output_recording(
         tx: mpsc::Sender<Vec<f32>>,
     }
 
-    impl StreamOutput for AudioHandler {
+    impl SCStreamOutputTrait for AudioHandler {
         fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
             if of_type != SCStreamOutputType::Audio {
                 return;
@@ -184,7 +191,8 @@ pub fn start_output_recording(
         tx,
     };
 
-    let mut stream = SCStream::new(filter, config, handler);
+    let mut stream = SCStream::new(filter, config);
+    stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("Failed to start capture: {:?}", e))?;
 
