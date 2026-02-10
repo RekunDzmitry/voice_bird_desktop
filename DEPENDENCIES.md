@@ -712,6 +712,33 @@ WASABI_BUCKET_NAME=voice-bird-europe
 WASABI_ENDPOINT=https://s3.eu-central-2.wasabisys.com
 ```
 
+### Distribution (cargo-binstall) - CLI Tool
+
+Developers can install the Voice Bird CLI via Rust's cargo-binstall:
+
+```bash
+cargo binstall voice-bird-cli
+```
+
+**Architecture**:
+- **CLI implementation** (`voice-bird-cli/`): Full ratatui TUI application (source kept private)
+- **Stub crate** (`voice-bird-cli-crate/`): Published to crates.io with binstall metadata only (no source code)
+- **Binaries**: Hosted on GitHub Releases at `RekunDzmitry/voice-bird-releases`
+- **Naming convention**: `voice-bird-cli-{target}.zip` (e.g., `voice-bird-cli-x86_64-pc-windows-msvc.zip`)
+
+**CLI Features**:
+- Interactive TUI with ratatui
+- Audio device/process enumeration
+- Per-application audio capture (Windows/macOS)
+- Server streaming with API key authentication
+- Real-time audio level visualization
+
+**Release workflow**:
+1. Build CLI binaries on target platforms (`voice-bird-cli/`)
+2. Package into ZIPs with correct naming
+3. Create GitHub release with binaries at voice-bird-releases repo
+4. Publish stub crate to crates.io (`voice-bird-cli-crate/`)
+
 ### Optimization Flags (Cargo.toml)
 
 ```toml

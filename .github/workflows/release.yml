@@ -1,0 +1,312 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Stage 1: Build CLI binaries ──────────────────────────────────
+
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: cli-x86_64-pc-windows-msvc
+
+      - name: Build CLI
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/x86_64-pc-windows-msvc/release/voice-bird-cli.exe staging/
+          cd staging && 7z a ../voice-bird-cli-x86_64-pc-windows-msvc.zip voice-bird-cli.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-win32-x64
+          path: |
+            staging/voice-bird-cli.exe
+            voice-bird-cli-x86_64-pc-windows-msvc.zip
+
+  build-darwin-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: cli-x86_64-apple-darwin
+
+      - name: Build CLI
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-apple-darwin
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/x86_64-apple-darwin/release/voice-bird-cli staging/
+          cd staging && zip ../voice-bird-cli-x86_64-apple-darwin.zip voice-bird-cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-darwin-x64
+          path: |
+            staging/voice-bird-cli
+            voice-bird-cli-x86_64-apple-darwin.zip
+
+  build-darwin-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: cli-aarch64-apple-darwin
+
+      - name: Build CLI
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/aarch64-apple-darwin/release/voice-bird-cli staging/
+          cd staging && zip ../voice-bird-cli-aarch64-apple-darwin.zip voice-bird-cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-darwin-arm64
+          path: |
+            staging/voice-bird-cli
+            voice-bird-cli-aarch64-apple-darwin.zip
+
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: cli-x86_64-unknown-linux-gnu
+
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build CLI
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/x86_64-unknown-linux-gnu/release/voice-bird-cli staging/
+          cd staging && zip ../voice-bird-cli-x86_64-unknown-linux-gnu.zip voice-bird-cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux-x64
+          path: |
+            staging/voice-bird-cli
+            voice-bird-cli-x86_64-unknown-linux-gnu.zip
+
+  # ── Stage 2: Build Python wheels ─────────────────────────────────
+
+  build-wheels-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  build-wheels-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  build-wheels-macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-apple-darwin
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-x64
+          path: dist
+
+  build-wheels-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-apple-darwin
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-arm64
+          path: dist
+
+  build-wheels-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_17"
+          args: --release --out dist
+          before-script-linux: yum install -y alsa-lib-devel || apt-get update && apt-get install -y libasound2-dev
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x64
+          path: dist
+
+  # ── Stage 3: Publish to GitHub Releases ──────────────────────────
+
+  publish-github:
+    needs: [build-windows-x64, build-darwin-x64, build-darwin-arm64, build-linux-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          RELEASE_TAG="${TAG}-cli"
+          gh release create "$RELEASE_TAG" artifacts/*.zip \
+            --repo RekunDzmitry/voice-bird-releases \
+            --title "Voice Bird CLI $TAG" \
+            --generate-notes
+
+  # ── Stage 4: Publish to npm ──────────────────────────────────────
+
+  publish-npm:
+    needs: [build-windows-x64, build-darwin-x64, build-darwin-arm64, build-linux-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: artifacts/
+
+      - name: Populate platform packages with binaries
+        run: |
+          cp artifacts/binary-win32-x64/voice-bird-cli.exe \
+            npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
+
+          cp artifacts/binary-darwin-x64/voice-bird-cli \
+            npm/@voice-bird/cli-darwin-x64/voice-bird-cli
+          chmod +x npm/@voice-bird/cli-darwin-x64/voice-bird-cli
+
+          cp artifacts/binary-darwin-arm64/voice-bird-cli \
+            npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
+          chmod +x npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
+
+          cp artifacts/binary-linux-x64/voice-bird-cli \
+            npm/@voice-bird/cli-linux-x64/voice-bird-cli
+          chmod +x npm/@voice-bird/cli-linux-x64/voice-bird-cli
+
+      # Platform packages first, then main package
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in npm/@voice-bird/cli-*; do
+            echo "Publishing $(basename $pkg)..."
+            cd "$pkg"
+            npm publish --access public || true
+            cd -
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm/voice-bird-cli
+          npm publish --access public
+
+  # ── Stage 5: Publish to PyPI ─────────────────────────────────────
+
+  publish-pypi:
+    needs: [build-wheels-sdist, build-wheels-windows, build-wheels-macos-x64, build-wheels-macos-arm64, build-wheels-linux]
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        run: uv publish dist/*
