@@ -33,7 +33,7 @@ jobs:
           key: cli-x86_64-pc-windows-msvc
 
       - name: Build CLI
-        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-pc-windows-msvc
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-pc-windows-msvc --target-dir target
 
       - name: Package
         shell: bash
@@ -61,7 +61,7 @@ jobs:
           key: cli-x86_64-apple-darwin
 
       - name: Build CLI
-        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-apple-darwin
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-apple-darwin --target-dir target
 
       - name: Package
         run: |
@@ -88,7 +88,7 @@ jobs:
           key: cli-aarch64-apple-darwin
 
       - name: Build CLI
-        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target aarch64-apple-darwin
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target aarch64-apple-darwin --target-dir target
 
       - name: Package
         run: |
@@ -118,7 +118,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Build CLI
-        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-unknown-linux-gnu
+        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-unknown-linux-gnu --target-dir target
 
       - name: Package
         run: |
@@ -206,9 +206,9 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64-unknown-linux-gnu
-          manylinux: "2_17"
+          manylinux: "2_28"
           args: --release --out dist
-          before-script-linux: yum install -y alsa-lib-devel || apt-get update && apt-get install -y libasound2-dev
+          before-script-linux: dnf install -y alsa-lib-devel || yum install -y alsa-lib-devel
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-x64
