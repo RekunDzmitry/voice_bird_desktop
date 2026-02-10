@@ -310,4 +310,4 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        run: uv publish dist/*
+        run: uv publish dist/* --check-url https://pypi.org/simple/
