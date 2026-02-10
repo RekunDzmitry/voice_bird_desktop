@@ -170,7 +170,18 @@ pub fn start_output_recording(
             }
 
             if let Ok(audio_data) = sample.get_audio_buffer_list() {
-                let samples: Vec<f32> = audio_data.into_iter().collect();
+                let mut samples = Vec::new();
+                for buf in audio_data.buffers() {
+                    let bytes = buf.data();
+                    // Reinterpret bytes as f32 samples (CoreAudio uses 32-bit float)
+                    let float_samples: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            bytes.as_ptr() as *const f32,
+                            bytes.len() / std::mem::size_of::<f32>(),
+                        )
+                    };
+                    samples.extend_from_slice(float_samples);
+                }
                 if samples.is_empty() {
                     return;
                 }
@@ -191,7 +202,7 @@ pub fn start_output_recording(
         tx,
     };
 
-    let mut stream = SCStream::new(filter, &config);
+    let mut stream = SCStream::new(&filter, &config);
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("Failed to start capture: {:?}", e))?;
