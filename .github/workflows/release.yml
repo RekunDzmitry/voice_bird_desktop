@@ -232,6 +232,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
           RELEASE_TAG="${TAG}-cli"
+          gh release delete "$RELEASE_TAG" --repo RekunDzmitry/voice-bird-releases --yes 2>/dev/null || true
           gh release create "$RELEASE_TAG" artifacts/*.zip \
             --repo RekunDzmitry/voice-bird-releases \
             --title "Voice Bird CLI $TAG" \
@@ -256,18 +257,18 @@ jobs:
 
       - name: Populate platform packages with binaries
         run: |
-          cp artifacts/binary-win32-x64/voice-bird-cli.exe \
+          cp artifacts/binary-win32-x64/staging/voice-bird-cli.exe \
             npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
 
-          cp artifacts/binary-darwin-x64/voice-bird-cli \
+          cp artifacts/binary-darwin-x64/staging/voice-bird-cli \
             npm/@voice-bird/cli-darwin-x64/voice-bird-cli
           chmod +x npm/@voice-bird/cli-darwin-x64/voice-bird-cli
 
-          cp artifacts/binary-darwin-arm64/voice-bird-cli \
+          cp artifacts/binary-darwin-arm64/staging/voice-bird-cli \
             npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
           chmod +x npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
 
-          cp artifacts/binary-linux-x64/voice-bird-cli \
+          cp artifacts/binary-linux-x64/staging/voice-bird-cli \
             npm/@voice-bird/cli-linux-x64/voice-bird-cli
           chmod +x npm/@voice-bird/cli-linux-x64/voice-bird-cli
 
