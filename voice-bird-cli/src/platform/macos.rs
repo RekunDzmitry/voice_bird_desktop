@@ -169,7 +169,7 @@ pub fn start_output_recording(
                 }
             }
 
-            if let Some(audio_data) = sample.get_audio_buffer_list() {
+            if let Ok(audio_data) = sample.get_audio_buffer_list() {
                 let samples: Vec<f32> = audio_data.into_iter().collect();
                 if samples.is_empty() {
                     return;
@@ -191,7 +191,7 @@ pub fn start_output_recording(
         tx,
     };
 
-    let mut stream = SCStream::new(filter, config);
+    let mut stream = SCStream::new(filter, &config);
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("Failed to start capture: {:?}", e))?;
