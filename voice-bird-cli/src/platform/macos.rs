@@ -15,15 +15,46 @@ use screencapturekit::output::CMSampleBuffer;
 
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
 const DEFAULT_CHANNELS: u16 = 2;
+const MIN_MACOS_MAJOR_VERSION: u32 = 13;
+
+/// Check that macOS version supports SCStream audio capture (requires 13.0+)
+fn check_macos_version() -> Result<String> {
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to check macOS version: {}", e))?;
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    if major < MIN_MACOS_MAJOR_VERSION {
+        return Err(anyhow::anyhow!(
+            "macOS {}.0 (Ventura) or later is required for audio capture.\n\
+             Current version: {}\n\
+             ScreenCaptureKit audio capture was introduced in macOS 13.0.",
+            MIN_MACOS_MAJOR_VERSION,
+            version
+        ));
+    }
+
+    Ok(version)
+}
 
 /// Enumerate audio sessions on macOS using ScreenCaptureKit
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
+    check_macos_version()?;
+
     let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!(
-            "Screen Recording permission required.\n\
-            Please grant permission in:\n\
-            System Preferences > Privacy & Security > Screen Recording\n\
-            Error: {:?}", e
+            "Screen Recording permission is required for audio capture.\n\n\
+             Grant permission in:\n  \
+             System Settings > Privacy & Security > Screen Recording\n\n\
+             After granting permission, restart the application.\n\
+             Error: {:?}", e
         ))?;
 
     let mut sessions = Vec::new();
@@ -89,8 +120,16 @@ pub fn start_output_recording(
     audio_level: Arc<Mutex<f32>>,
     stop_signal: Arc<Mutex<bool>>,
 ) -> Result<()> {
+    let macos_version = check_macos_version()?;
+
     let content = SCShareableContent::get()
-        .map_err(|e| anyhow::anyhow!("Screen Recording permission required: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!(
+            "Screen Recording permission is required for audio capture.\n\n\
+             Grant permission in:\n  \
+             System Settings > Privacy & Security > Screen Recording\n\n\
+             After granting permission, restart the application.\n\
+             Error: {:?}", e
+        ))?;
 
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
 
@@ -205,7 +244,27 @@ pub fn start_output_recording(
     let mut stream = SCStream::new(&filter, &config);
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
-        .map_err(|e| anyhow::anyhow!("Failed to start capture: {:?}", e))?;
+        .map_err(|e| {
+            let err_str = format!("{:?}", e);
+            let hint = if err_str.contains("CoreGraphicsErrorDomain") || err_str.contains("1003") {
+                format!(
+                    "Failed to start audio capture (macOS {}).\n\n\
+                     This typically means Screen Recording permission was not fully granted.\n\n\
+                     Troubleshooting steps:\n  \
+                     1. Open System Settings > Privacy & Security > Screen Recording\n  \
+                     2. Remove voice-bird-cli from the list if present, then re-add it\n  \
+                     3. Ensure the toggle is ON\n  \
+                     4. Completely quit and restart the application\n  \
+                     5. If using a terminal (iTerm, Terminal.app), the TERMINAL itself\n     \
+                        may need Screen Recording permission, not just voice-bird-cli\n\n\
+                     Raw error: {}",
+                    macos_version, err_str
+                )
+            } else {
+                format!("Failed to start capture (macOS {}): {}", macos_version, err_str)
+            };
+            anyhow::anyhow!(hint)
+        })?;
 
     // Keep stream alive until stop signal
     loop {

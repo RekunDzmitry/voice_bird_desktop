@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ci-windows
+
+      - name: Check CLI
+        run: cargo check --manifest-path voice-bird-cli/Cargo.toml
+
+      - name: Clippy CLI
+        run: cargo clippy --manifest-path voice-bird-cli/Cargo.toml -- -D warnings
+
+      - name: Test CLI
+        run: cargo test --manifest-path voice-bird-cli/Cargo.toml
+
+  check-macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.target }}
+
+      - name: Check CLI
+        run: cargo check --manifest-path voice-bird-cli/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Clippy CLI
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo clippy --manifest-path voice-bird-cli/Cargo.toml --target ${{ matrix.target }} -- -D warnings
+
+      - name: Test CLI
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --manifest-path voice-bird-cli/Cargo.toml --target ${{ matrix.target }}
+
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ci-linux
+
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Check CLI
+        run: cargo check --manifest-path voice-bird-cli/Cargo.toml
+
+      - name: Clippy CLI
+        run: cargo clippy --manifest-path voice-bird-cli/Cargo.toml -- -D warnings
+
+      - name: Test CLI
+        run: cargo test --manifest-path voice-bird-cli/Cargo.toml
