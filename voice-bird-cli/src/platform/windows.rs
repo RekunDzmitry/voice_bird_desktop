@@ -139,7 +139,7 @@ unsafe fn get_process_name(process_id: u32) -> Result<String> {
     }
 
     let path = String::from_utf16_lossy(&exe_path[..result as usize]);
-    Ok(path.split('\\').last().unwrap_or(&path).to_string())
+    Ok(path.split('\\').next_back().unwrap_or(&path).to_string())
 }
 
 // Virtual device ID for process loopback
@@ -158,10 +158,12 @@ struct PropVariantBlob {
 
 #[windows::core::implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
+    #[allow(clippy::arc_with_non_send_sync)]
     result_tx: Arc<Mutex<Option<mpsc::Sender<Result<IAudioClient>>>>>,
 }
 
 impl ActivationHandler {
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new(tx: mpsc::Sender<Result<IAudioClient>>) -> Self {
         Self {
             result_tx: Arc::new(Mutex::new(Some(tx))),
