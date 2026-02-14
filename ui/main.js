@@ -6,6 +6,8 @@ let availableSessions = [];
 let selectedSessions = new Set();
 let activeSessions = new Map();
 let currentView = 'api-key'; // 'api-key' | 'browser' | 'recording'
+let pickerSessions = [];
+let pickerSelected = new Set();
 
 // DOM Elements
 const apiKeySection = document.getElementById('api-key-section');
@@ -23,6 +25,13 @@ const apiKeyInput = document.getElementById('api-key-input');
 const toggleVisibilityBtn = document.getElementById('toggle-visibility');
 const saveKeyBtn = document.getElementById('save-key-btn');
 const backBtn = document.getElementById('back-btn');
+const addSourceBtn = document.getElementById('add-source-btn');
+const sourcePicker = document.getElementById('source-picker');
+const addSourceList = document.getElementById('add-source-list');
+const sourcePickerRefresh = document.getElementById('source-picker-refresh');
+const sourcePickerCancel = document.getElementById('source-picker-cancel');
+const sourcePickerAdd = document.getElementById('source-picker-add');
+const sourcePickerClose = document.getElementById('source-picker-close');
 
 // Initialize
 async function init() {
@@ -244,6 +253,7 @@ async function stopAllRecording() {
     try {
         await invoke('stop_all_sessions');
         activeSessions.clear();
+        hideSourcePicker();
         setStatus('Recording stopped');
         showSessionBrowser();
         await refreshSessions();
@@ -280,12 +290,18 @@ function renderActiveSessions() {
                     <span class="recording-dot"></span>
                     <span>Recording</span>
                 </div>
+                <button class="stop-session-btn" title="Stop this session">&times;</button>
             </div>
             <div class="audio-meter">
                 <div class="audio-meter-fill" style="width: 0%"></div>
             </div>
             <div class="duration">0:00</div>
         `;
+
+        card.querySelector('.stop-session-btn').addEventListener('click', () => {
+            stopSingleSession(id);
+        });
+
         activeSessContainer.appendChild(card);
     });
 }
@@ -318,6 +334,152 @@ function updateDuration(sessionId, duration) {
 
     const durationEl = card.querySelector('.duration');
     durationEl.textContent = formatDuration(duration);
+}
+
+// === Per-Session Stop ===
+
+async function stopSingleSession(sessionId) {
+    try {
+        await invoke('stop_session', { sessionId });
+        activeSessions.delete(sessionId);
+
+        if (activeSessions.size === 0) {
+            hideSourcePicker();
+            setStatus('All sessions stopped');
+            showSessionBrowser();
+            await refreshSessions();
+        } else {
+            renderActiveSessions();
+            setStatus(`Recording ${activeSessions.size} session(s)`);
+        }
+    } catch (e) {
+        console.error('Failed to stop session:', e);
+        setStatus('Failed to stop session: ' + e);
+    }
+}
+
+// === Source Picker ===
+
+function getRecordingIdentifiers() {
+    const ids = new Set();
+    activeSessions.forEach((session) => {
+        ids.add(`${session.process_id}:${session.device_name}`);
+    });
+    return ids;
+}
+
+async function showSourcePicker() {
+    pickerSessions = [];
+    pickerSelected.clear();
+    sourcePicker.classList.remove('hidden');
+    addSourceList.innerHTML = '<p class="loading">Loading sessions...</p>';
+
+    try {
+        const allSessions = await invoke('enumerate_sessions');
+        const recordingIds = getRecordingIdentifiers();
+
+        pickerSessions = allSessions.filter(
+            (s) => !recordingIds.has(`${s.process_id}:${s.device_name}`)
+        );
+
+        renderPickerList();
+    } catch (e) {
+        console.error('Failed to enumerate sessions for picker:', e);
+        addSourceList.innerHTML = '<p class="empty">Failed to load sessions.</p>';
+    }
+}
+
+function hideSourcePicker() {
+    sourcePicker.classList.add('hidden');
+    pickerSessions = [];
+    pickerSelected.clear();
+}
+
+function renderPickerList() {
+    addSourceList.innerHTML = '';
+
+    if (pickerSessions.length === 0) {
+        addSourceList.innerHTML = '<p class="empty">No additional audio sources found.</p>';
+        sourcePickerAdd.disabled = true;
+        return;
+    }
+
+    pickerSessions.forEach((session, index) => {
+        const item = document.createElement('div');
+        item.className = 'session-item' + (pickerSelected.has(index) ? ' selected' : '');
+        item.innerHTML = `
+            <input type="checkbox" class="session-checkbox"
+                   ${pickerSelected.has(index) ? 'checked' : ''}>
+            <div class="session-info">
+                <div class="session-name">${escapeHtml(session.app_name)}</div>
+                <div class="session-device">${escapeHtml(session.device_name)}</div>
+            </div>
+            <span class="session-type ${session.is_input ? 'input' : 'output'}">${session.is_input ? 'Input' : 'Output'}</span>
+        `;
+
+        item.addEventListener('click', (e) => {
+            if (e.target.type !== 'checkbox') {
+                togglePickerSession(index);
+            }
+        });
+
+        const checkbox = item.querySelector('.session-checkbox');
+        checkbox.addEventListener('change', () => togglePickerSession(index));
+
+        addSourceList.appendChild(item);
+    });
+
+    updatePickerAddButton();
+}
+
+function togglePickerSession(index) {
+    if (pickerSelected.has(index)) {
+        pickerSelected.delete(index);
+    } else {
+        pickerSelected.add(index);
+    }
+    renderPickerList();
+}
+
+function updatePickerAddButton() {
+    const count = pickerSelected.size;
+    sourcePickerAdd.disabled = count === 0;
+    sourcePickerAdd.textContent = count > 0 ? `Add Selected (${count})` : 'Add Selected';
+}
+
+async function addSelectedSources() {
+    const sessionsToAdd = Array.from(pickerSelected).map(i => pickerSessions[i]);
+
+    if (sessionsToAdd.length === 0) return;
+
+    sourcePickerAdd.disabled = true;
+    sourcePickerAdd.textContent = 'Adding...';
+
+    try {
+        const sessionIds = await invoke('start_recording', { sessions: sessionsToAdd });
+
+        sessionIds.forEach((id, i) => {
+            const sessionInfo = sessionsToAdd[i];
+            if (sessionInfo) {
+                activeSessions.set(id, {
+                    ...sessionInfo,
+                    id,
+                    level: 0,
+                    duration: 0,
+                    status: 'Recording'
+                });
+            }
+        });
+
+        hideSourcePicker();
+        renderActiveSessions();
+        setStatus(`Recording ${activeSessions.size} session(s)`);
+    } catch (e) {
+        console.error('Failed to add sources:', e);
+        setStatus('Failed to add sources: ' + e);
+        sourcePickerAdd.disabled = false;
+        sourcePickerAdd.textContent = 'Add Selected';
+    }
 }
 
 // === Utilities ===
@@ -359,6 +521,11 @@ function setupEventListeners() {
 
     // Recording dashboard
     stopAllBtn.addEventListener('click', stopAllRecording);
+    addSourceBtn.addEventListener('click', showSourcePicker);
+    sourcePickerRefresh.addEventListener('click', showSourcePicker);
+    sourcePickerCancel.addEventListener('click', hideSourcePicker);
+    sourcePickerClose.addEventListener('click', hideSourcePicker);
+    sourcePickerAdd.addEventListener('click', addSelectedSources);
 }
 
 async function setupTauriListeners() {

@@ -170,14 +170,14 @@ impl AppState {
         Ok(session_id)
     }
 
-    /// Stop a specific session
+    /// Stop a specific session and remove it from the HashMap
     pub fn stop_session(&self, id: &Uuid) -> Result<()> {
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
 
-        if let Some(session) = sessions.get_mut(id) {
+        if let Some(mut session) = sessions.remove(id) {
             session.stop_recording();
         }
 

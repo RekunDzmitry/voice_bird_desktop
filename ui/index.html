@@ -47,7 +47,22 @@
                 <h2>Recording Dashboard</h2>
                 <div id="active-sessions" class="active-sessions"></div>
                 <div class="controls">
+                    <button id="add-source-btn" class="btn secondary">Add Source</button>
                     <button id="stop-all-btn" class="btn danger">Stop All</button>
+                </div>
+
+                <!-- Source Picker (hidden by default) -->
+                <div id="source-picker" class="source-picker hidden">
+                    <div class="source-picker-header">
+                        <h3>Add Audio Source</h3>
+                        <button id="source-picker-close" class="btn icon" title="Close">&times;</button>
+                    </div>
+                    <div id="add-source-list" class="session-list"></div>
+                    <div class="controls">
+                        <button id="source-picker-refresh" class="btn secondary">Refresh</button>
+                        <button id="source-picker-cancel" class="btn secondary">Cancel</button>
+                        <button id="source-picker-add" class="btn primary" disabled>Add Selected</button>
+                    </div>
                 </div>
             </section>
         </main>
