@@ -49,6 +49,7 @@ struct ServerResponse {
 }
 
 /// Stream audio to Voice Bird server via WebSocket
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_to_server(
     server_url: String,
     api_key: String,

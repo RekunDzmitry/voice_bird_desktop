@@ -22,6 +22,7 @@ pub enum RecordingStatus {
 }
 
 /// Active recording session
+#[allow(dead_code)]
 pub struct ActiveSession {
     pub id: Uuid,
     pub session: AudioSession,
