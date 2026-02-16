@@ -1,6 +1,6 @@
 {
   "name": "@voice-bird/cli-darwin-x64",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "macOS Intel binary for voice-bird-cli",
   "repository": {
     "type": "git",

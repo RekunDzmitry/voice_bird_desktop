@@ -1,6 +1,6 @@
 [package]
 name = "voice-bird-cli"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
 

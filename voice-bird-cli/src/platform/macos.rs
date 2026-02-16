@@ -166,16 +166,17 @@ pub fn start_output_recording(
         .ok_or_else(|| anyhow::anyhow!("No displays found"))?;
 
     // Create content filter
+    let apps = content.applications();
     let filter = if session.app_name.contains("All Applications") {
         // Capture all applications on the display
-        let all_apps: Vec<_> = content.applications().iter().collect();
+        let all_apps: Vec<_> = apps.iter().collect();
         SCContentFilter::create()
             .with_display(&display)
             .with_including_applications(&all_apps, &[])
             .build()
     } else {
-        let app = content.applications()
-            .into_iter()
+        let app = apps
+            .iter()
             .find(|app| {
                 let name = app.application_name();
                 !name.is_empty() && session.app_name.contains(&name)
@@ -183,7 +184,7 @@ pub fn start_output_recording(
             .ok_or_else(|| anyhow::anyhow!("Application not found"))?;
         SCContentFilter::create()
             .with_display(&display)
-            .with_including_applications(&[&app], &[])
+            .with_including_applications(&[app], &[])
             .build()
     };
 
