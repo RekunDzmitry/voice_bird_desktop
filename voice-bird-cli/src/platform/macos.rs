@@ -5,13 +5,7 @@ use super::AudioSession;
 use crate::audio::calculate_rms;
 use crate::streaming;
 
-use screencapturekit::shareable_content::SCShareableContent;
-use screencapturekit::stream::configuration::SCStreamConfiguration;
-use screencapturekit::stream::content_filter::SCContentFilter;
-use screencapturekit::stream::SCStream;
-use screencapturekit::stream::output_trait::SCStreamOutputTrait;
-use screencapturekit::stream::output_type::SCStreamOutputType;
-use screencapturekit::output::CMSampleBuffer;
+use screencapturekit::prelude::*;
 
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
 const DEFAULT_CHANNELS: u16 = 2;
@@ -167,14 +161,18 @@ pub fn start_output_recording(
     });
 
     let display = content.displays()
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No displays found"))?
-        .clone();
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No displays found"))?;
 
     // Create content filter
     let filter = if session.app_name.contains("All Applications") {
-        SCContentFilter::new()
-            .with_display_excluding_windows(&display, &[])
+        // Capture all applications on the display
+        let all_apps: Vec<_> = content.applications().iter().collect();
+        SCContentFilter::create()
+            .with_display(&display)
+            .with_including_applications(&all_apps, &[])
+            .build()
     } else {
         let app = content.applications()
             .into_iter()
@@ -183,24 +181,20 @@ pub fn start_output_recording(
                 !name.is_empty() && session.app_name.contains(&name)
             })
             .ok_or_else(|| anyhow::anyhow!("Application not found"))?;
-        SCContentFilter::new()
-            .with_display_including_application_excepting_windows(&display, &[&app], &[])
+        SCContentFilter::create()
+            .with_display(&display)
+            .with_including_applications(&[&app], &[])
+            .build()
     };
 
-    // Configure stream
+    // Configure stream — audio only, minimal video (1x1)
     let config = SCStreamConfiguration::new()
-        .set_captures_audio(true)
-        .map_err(|e| anyhow::anyhow!("Failed to set captures_audio: {:?}", e))?
-        .set_sample_rate(DEFAULT_SAMPLE_RATE)
-        .map_err(|e| anyhow::anyhow!("Failed to set sample_rate: {:?}", e))?
-        .set_channel_count(DEFAULT_CHANNELS as u8)
-        .map_err(|e| anyhow::anyhow!("Failed to set channel_count: {:?}", e))?
-        .set_excludes_current_process_audio(true)
-        .map_err(|e| anyhow::anyhow!("Failed to set excludes_current_process_audio: {:?}", e))?
-        .set_width(1)
-        .map_err(|e| anyhow::anyhow!("Failed to set width: {:?}", e))?
-        .set_height(1)
-        .map_err(|e| anyhow::anyhow!("Failed to set height: {:?}", e))?;
+        .with_width(1)
+        .with_height(1)
+        .with_captures_audio(true)
+        .with_sample_rate(DEFAULT_SAMPLE_RATE as i32)
+        .with_channel_count(DEFAULT_CHANNELS as i32)
+        .with_excludes_current_process_audio(true);
 
     // Output handler
     struct AudioHandler {
@@ -221,9 +215,9 @@ pub fn start_output_recording(
                 }
             }
 
-            if let Ok(audio_data) = sample.get_audio_buffer_list() {
+            if let Some(audio_data) = sample.audio_buffer_list() {
                 let mut samples = Vec::new();
-                for buf in audio_data.buffers() {
+                for buf in &audio_data {
                     let bytes = buf.data();
                     // Reinterpret bytes as f32 samples (CoreAudio uses 32-bit float)
                     let float_samples: &[f32] = unsafe {

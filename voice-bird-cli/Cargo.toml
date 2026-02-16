@@ -1,6 +1,6 @@
 [package]
 name = "voice-bird-cli"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
 
@@ -54,4 +54,4 @@ windows = { version = "0.58", features = [
 windows-core = "0.58"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "0.3"
+screencapturekit = "1.5"
