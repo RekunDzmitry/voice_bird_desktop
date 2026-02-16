@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -69,6 +70,12 @@ pub struct App {
 
     /// Status message to display
     pub status_message: Option<String>,
+
+    /// Shared error channel — recording threads write errors here
+    pub error_channel: Arc<Mutex<Option<String>>>,
+
+    /// Path to the current log file
+    pub log_path: Option<PathBuf>,
 }
 
 impl App {
@@ -90,6 +97,8 @@ impl App {
             api_key_input: String::new(),
             should_quit: false,
             status_message: None,
+            error_channel: Arc::new(Mutex::new(None)),
+            log_path: None,
         }
     }
 
@@ -189,6 +198,15 @@ impl App {
     pub fn cancel_config(&mut self) {
         self.mode = AppMode::Normal;
         self.api_key_input.clear();
+    }
+
+    /// Check for errors from recording threads and update status
+    pub fn check_error(&mut self) {
+        if let Ok(mut err) = self.error_channel.lock() {
+            if let Some(msg) = err.take() {
+                self.status = RecordingStatus::Error(msg);
+            }
+        }
     }
 
     /// Toggle help display

@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod config;
+mod logger;
 mod platform;
 mod streaming;
 mod ui;
@@ -21,6 +22,17 @@ use uuid::Uuid;
 use app::{App, AppMode, RecordingStatus, ActiveSession};
 
 fn main() -> Result<()> {
+    // Initialize file logger before TUI takes over the screen
+    let log_path = match logger::init() {
+        Ok(path) => Some(path),
+        Err(e) => {
+            eprintln!("Warning: failed to initialize logger: {}", e);
+            None
+        }
+    };
+
+    log::info!("Voice Bird CLI starting");
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -30,7 +42,10 @@ fn main() -> Result<()> {
 
     // Create app and run
     let mut app = App::new();
+    app.log_path = log_path;
     app.refresh_sessions();
+
+    log::info!("Found {} audio sessions", app.sessions.len());
 
     let result = run_app(&mut terminal, &mut app);
 
@@ -44,8 +59,11 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     if let Err(e) = result {
+        log::error!("Application error: {}", e);
         eprintln!("Error: {}", e);
     }
+
+    log::info!("Voice Bird CLI exiting");
 
     Ok(())
 }
@@ -54,6 +72,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
     loop {
         // Update duration if recording
         app.update_duration();
+
+        // Check for errors from recording threads
+        app.check_error();
 
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
@@ -109,6 +130,12 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Enter => {
             toggle_recording(app);
         }
+        KeyCode::Char('l') => {
+            copy_error_to_clipboard(app);
+        }
+        KeyCode::Char('L') => {
+            copy_log_path_to_clipboard(app);
+        }
         _ => {}
     }
 }
@@ -137,6 +164,36 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
             app.toggle_help();
         }
         _ => {}
+    }
+}
+
+fn copy_error_to_clipboard(app: &mut App) {
+    if let RecordingStatus::Error(ref msg) = app.status {
+        let text = msg.clone();
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+            Ok(()) => {
+                app.status_message = Some("Error copied to clipboard".to_string());
+            }
+            Err(e) => {
+                log::warn!("Failed to copy to clipboard: {}", e);
+                app.status_message = Some(format!("Clipboard error: {}", e));
+            }
+        }
+    }
+}
+
+fn copy_log_path_to_clipboard(app: &mut App) {
+    if let Some(ref path) = app.log_path {
+        let text = path.display().to_string();
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+            Ok(()) => {
+                app.status_message = Some("Log path copied to clipboard".to_string());
+            }
+            Err(e) => {
+                log::warn!("Failed to copy to clipboard: {}", e);
+                app.status_message = Some(format!("Clipboard error: {}", e));
+            }
+        }
     }
 }
 
@@ -176,6 +233,7 @@ fn start_recording(app: &mut App) {
             let session_id = Uuid::new_v4();
             let stop_signal = Arc::new(Mutex::new(false));
             let audio_level = app.audio_level.clone();
+            let error_channel = app.error_channel.clone();
 
             let server_url_clone = server_url.clone();
             let api_key_clone = api_key.clone();
@@ -183,6 +241,11 @@ fn start_recording(app: &mut App) {
             let session_clone = session.clone();
             let stop_signal_clone = stop_signal.clone();
             let audio_level_clone = audio_level.clone();
+
+            log::info!(
+                "Starting recording: session={}, device={}, input={}",
+                session_id_str, session_clone.device_name, session_clone.is_input
+            );
 
             // Spawn recording thread
             std::thread::spawn(move || {
@@ -209,7 +272,11 @@ fn start_recording(app: &mut App) {
                 };
 
                 if let Err(e) = result {
-                    eprintln!("Recording error: {}", e);
+                    let msg = format!("Recording error: {}", e);
+                    log::error!("{}", msg);
+                    if let Ok(mut err) = error_channel.lock() {
+                        *err = Some(msg);
+                    }
                 }
             });
 
@@ -229,6 +296,8 @@ fn start_recording(app: &mut App) {
 }
 
 fn stop_all_sessions(app: &mut App) {
+    log::info!("Stopping all sessions");
+
     for session in &app.active_sessions {
         if let Ok(mut stop) = session.stop_signal.lock() {
             *stop = true;
