@@ -49,33 +49,6 @@ jobs:
             staging/voice-bird-cli.exe
             voice-bird-cli-x86_64-pc-windows-msvc.zip
 
-  build-darwin-x64:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-      - uses: swatinem/rust-cache@v2
-        with:
-          key: cli-x86_64-apple-darwin
-
-      - name: Build CLI
-        run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target x86_64-apple-darwin --target-dir target
-
-      - name: Package
-        run: |
-          mkdir -p staging
-          cp target/x86_64-apple-darwin/release/voice-bird-cli staging/
-          cd staging && zip ../voice-bird-cli-x86_64-apple-darwin.zip voice-bird-cli
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: binary-darwin-x64
-          path: |
-            staging/voice-bird-cli
-            voice-bird-cli-x86_64-apple-darwin.zip
-
   build-darwin-arm64:
     runs-on: macos-14
     steps:
@@ -164,22 +137,6 @@ jobs:
           name: wheels-windows-x64
           path: dist
 
-  build-wheels-macos-x64:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64-apple-darwin
-          args: --release --out dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-x64
-          path: dist
-
   build-wheels-macos-arm64:
     runs-on: macos-14
     steps:
@@ -217,7 +174,7 @@ jobs:
   # ── Stage 3: Publish to GitHub Releases ──────────────────────────
 
   publish-github:
-    needs: [build-windows-x64, build-darwin-x64, build-darwin-arm64, build-linux-x64]
+    needs: [build-windows-x64, build-darwin-arm64, build-linux-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -241,7 +198,7 @@ jobs:
   # ── Stage 4: Publish to npm ──────────────────────────────────────
 
   publish-npm:
-    needs: [build-windows-x64, build-darwin-x64, build-darwin-arm64, build-linux-x64]
+    needs: [build-windows-x64, build-darwin-arm64, build-linux-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -259,10 +216,6 @@ jobs:
         run: |
           cp artifacts/binary-win32-x64/staging/voice-bird-cli.exe \
             npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
-
-          cp artifacts/binary-darwin-x64/staging/voice-bird-cli \
-            npm/@voice-bird/cli-darwin-x64/voice-bird-cli
-          chmod +x npm/@voice-bird/cli-darwin-x64/voice-bird-cli
 
           cp artifacts/binary-darwin-arm64/staging/voice-bird-cli \
             npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
@@ -294,7 +247,7 @@ jobs:
   # ── Stage 5: Publish to PyPI ─────────────────────────────────────
 
   publish-pypi:
-    needs: [build-wheels-sdist, build-wheels-windows, build-wheels-macos-x64, build-wheels-macos-arm64, build-wheels-linux]
+    needs: [build-wheels-sdist, build-wheels-windows, build-wheels-macos-arm64, build-wheels-linux]
     runs-on: ubuntu-latest
     environment:
       name: release

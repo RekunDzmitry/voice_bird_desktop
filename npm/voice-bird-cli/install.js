@@ -7,7 +7,6 @@ const VERSION = require("./package.json").version;
 
 const PLATFORM_MAP = {
   "win32 x64": { pkg: "@voice-bird/cli-win32-x64", bin: "voice-bird-cli.exe" },
-  "darwin x64": { pkg: "@voice-bird/cli-darwin-x64", bin: "voice-bird-cli" },
   "darwin arm64": { pkg: "@voice-bird/cli-darwin-arm64", bin: "voice-bird-cli" },
   "linux x64": { pkg: "@voice-bird/cli-linux-x64", bin: "voice-bird-cli" },
 };
