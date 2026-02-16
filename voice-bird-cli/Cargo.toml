@@ -24,6 +24,13 @@ tokio-tungstenite = { version = "0.23", features = ["connect", "native-tls"], de
 futures-util = "0.3"
 http = "1.0"
 
+# Logging
+log = "0.4"
+fern = "0.7"
+
+# Clipboard
+arboard = "3"
+
 # Utilities
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

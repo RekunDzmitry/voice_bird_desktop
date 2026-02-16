@@ -40,12 +40,22 @@ fn render_title(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" [API Key: Not Set]", Style::default().fg(Color::Yellow))
     };
 
+    let log_info = if let Some(ref path) = app.log_path {
+        Span::styled(
+            format!(" [log: {}]", path.display()),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw("")
+    };
+
     let title = Line::from(vec![
         Span::styled(
             format!(" Voice Bird CLI v{} ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         api_status,
+        log_info,
         Span::raw("  "),
         Span::styled("[q]", Style::default().fg(Color::DarkGray)),
         Span::raw("uit  "),
@@ -185,6 +195,20 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("onfig  "),
     ]);
 
+    // Show copy controls when there's an error or log path
+    if matches!(app.status, RecordingStatus::Error(_)) {
+        all_controls.extend(vec![
+            Span::styled("[l]", Style::default().fg(Color::Yellow)),
+            Span::raw(" copy error  "),
+        ]);
+    }
+    if app.log_path.is_some() {
+        all_controls.extend(vec![
+            Span::styled("[L]", Style::default().fg(Color::Yellow)),
+            Span::raw(" copy log path  "),
+        ]);
+    }
+
     let controls_line = Line::from(all_controls);
 
     let block = Block::default()
@@ -258,6 +282,10 @@ fn render_help_dialog(frame: &mut Frame) {
         "",
         "  Configuration:",
         "    c          Configure API key",
+        "",
+        "  Diagnostics:",
+        "    l          Copy error text to clipboard",
+        "    L          Copy log file path to clipboard",
         "",
         "  Other:",
         "    ?          Toggle this help",

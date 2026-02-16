@@ -46,16 +46,21 @@ fn check_macos_version() -> Result<String> {
 
 /// Enumerate audio sessions on macOS using ScreenCaptureKit
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
-    check_macos_version()?;
+    let version = check_macos_version()?;
+
+    log::info!("Enumerating macOS audio sessions (macOS {})", version);
 
     let content = SCShareableContent::get()
-        .map_err(|e| anyhow::anyhow!(
-            "Screen Recording permission is required for audio capture.\n\n\
-             Grant permission in:\n  \
-             System Settings > Privacy & Security > Screen Recording\n\n\
-             After granting permission, restart the application.\n\
-             Error: {:?}", e
-        ))?;
+        .map_err(|e| {
+            log::error!("SCShareableContent::get() failed: {:?}", e);
+            anyhow::anyhow!(
+                "Screen Recording permission is required for audio capture.\n\n\
+                 Grant permission in:\n  \
+                 System Settings > Privacy & Security > Screen Recording\n\n\
+                 After granting permission, restart the application.\n\
+                 Error: {:?}", e
+            )
+        })?;
 
     let mut sessions = Vec::new();
 
@@ -122,14 +127,22 @@ pub fn start_output_recording(
 ) -> Result<()> {
     let macos_version = check_macos_version()?;
 
+    log::info!(
+        "Starting macOS output recording: app={}, device={}, macOS {}",
+        session.app_name, session.device_name, macos_version
+    );
+
     let content = SCShareableContent::get()
-        .map_err(|e| anyhow::anyhow!(
-            "Screen Recording permission is required for audio capture.\n\n\
-             Grant permission in:\n  \
-             System Settings > Privacy & Security > Screen Recording\n\n\
-             After granting permission, restart the application.\n\
-             Error: {:?}", e
-        ))?;
+        .map_err(|e| {
+            log::error!("SCShareableContent::get() failed in start_output_recording: {:?}", e);
+            anyhow::anyhow!(
+                "Screen Recording permission is required for audio capture.\n\n\
+                 Grant permission in:\n  \
+                 System Settings > Privacy & Security > Screen Recording\n\n\
+                 After granting permission, restart the application.\n\
+                 Error: {:?}", e
+            )
+        })?;
 
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
 
@@ -245,6 +258,7 @@ pub fn start_output_recording(
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
     stream.start_capture()
         .map_err(|e| {
+            log::error!("SCStream::start_capture() failed: {:?}", e);
             let err_str = format!("{:?}", e);
             let hint = if err_str.contains("CoreGraphicsErrorDomain") || err_str.contains("1003") {
                 format!(
