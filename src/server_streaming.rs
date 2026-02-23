@@ -347,17 +347,14 @@ impl ServerStreamingService {
         // Drain all pre-buffered audio chunks accumulated during WebSocket setup
         let backlog = audio_consumer.drain_all();
         log::info!("Draining {} pre-buffered audio chunks", backlog.len());
-        for audio_chunk in backlog {
+        for (capture_timestamp_ms, audio_chunk) in backlog {
             chunk_count += 1;
             total_samples += audio_chunk.len();
 
             let converted_bytes = audio_converter.convert(&audio_chunk);
 
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let mut packet = timestamp_ms.to_le_bytes().to_vec();
+            // Use the actual capture timestamp (not current time) for accurate latency tracking
+            let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
             packet.extend(&converted_bytes);
 
             total_bytes_sent += packet.len() as u64;
@@ -388,17 +385,13 @@ impl ServerStreamingService {
             // Check if audio capture has stopped
             if audio_consumer.is_stopped() {
                 let remaining = audio_consumer.drain_all();
-                for audio_chunk in &remaining {
+                for (capture_timestamp_ms, audio_chunk) in &remaining {
                     chunk_count += 1;
                     total_samples += audio_chunk.len();
 
                     let converted_bytes = audio_converter.convert(audio_chunk);
 
-                    let timestamp_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let mut packet = timestamp_ms.to_le_bytes().to_vec();
+                    let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
                     packet.extend(&converted_bytes);
 
                     total_bytes_sent += packet.len() as u64;
@@ -426,7 +419,7 @@ impl ServerStreamingService {
             }
 
             let mut send_failed = false;
-            for audio_chunk in chunks {
+            for (capture_timestamp_ms, audio_chunk) in chunks {
                 chunk_count += 1;
                 total_samples += audio_chunk.len();
 
@@ -434,12 +427,8 @@ impl ServerStreamingService {
                 // This reduces bandwidth ~6x and eliminates backend conversion
                 let converted_bytes = audio_converter.convert(&audio_chunk);
 
-                // Prepend timestamp for latency measurement (8 bytes)
-                let timestamp_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let mut packet = timestamp_ms.to_le_bytes().to_vec();
+                // Prepend capture timestamp for latency measurement (8 bytes)
+                let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
                 packet.extend(&converted_bytes);
 
                 let packet_len = packet.len();

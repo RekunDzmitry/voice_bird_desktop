@@ -4,7 +4,44 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavWriter, WavSpec};
 use crate::session::RecordingSession;
 use crate::server_streaming::ServerStreamingService;
-use crate::audio_buffer::AudioPreBuffer;
+use crate::audio_buffer::{AudioPreBuffer, AudioConsumer};
+
+/// Spawn a thread that connects to the WebSocket server and streams audio from the consumer.
+/// `pre_buffer.stop()` is called automatically when the thread exits (including on panic)
+/// via the `Drop` impl on `AudioPreBuffer`.
+fn spawn_streaming_thread(
+    consumer: AudioConsumer,
+    pre_buffer: AudioPreBuffer,
+    server_url: String,
+    server_api_key: String,
+    session_id: String,
+    device_name: String,
+    app_name: Option<String>,
+    sample_rate: u32,
+    channels: u16,
+) {
+    std::thread::spawn(move || {
+        // pre_buffer is moved into this closure; its Drop impl will call stop()
+        // even if the thread panics (e.g., Tokio runtime creation fails)
+        let _pre_buffer = pre_buffer;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = ServerStreamingService::stream_to_server(
+                server_url,
+                server_api_key,
+                session_id,
+                device_name,
+                app_name,
+                consumer,
+                sample_rate,
+                channels,
+            ).await {
+                log::error!("WebSocket streaming error: {}", e);
+            }
+        });
+    });
+}
 
 // Calculate RMS (Root Mean Square) audio level from samples
 pub fn calculate_rms(samples: &[f32]) -> f32 {
@@ -203,25 +240,7 @@ pub fn start_input_recording(
     let sample_rate = session.sample_rate;
     let channels = session.channels;
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = ServerStreamingService::stream_to_server(
-                server_url,
-                server_api_key,
-                session_id,
-                device_name,
-                app_name,
-                consumer,
-                sample_rate,
-                channels,
-            ).await {
-                log::error!("WebSocket streaming error: {}", e);
-            }
-        });
-        // Signal stop so pre_buffer cleanup is complete
-        pre_buffer.stop();
-    });
+    spawn_streaming_thread(consumer, pre_buffer, server_url, server_api_key, session_id, device_name, app_name, sample_rate, channels);
 
     Ok(stream)
 }
@@ -438,16 +457,14 @@ pub fn start_output_recording(
     let audio_buffer = session.audio_buffer.clone();
     let stop_signal = session.stop_signal.clone();
 
-    // Setup pre-buffer for audio capture before WebSocket is ready
-    let pre_buffer = AudioPreBuffer::new();
-    let producer = pre_buffer.producer();
-
-    // Setup server streaming if server config is provided
-    let consumer_and_config = if let Some((server_url, server_api_key)) = server_config {
+    // Setup pre-buffer only when streaming is configured (avoids silent memory accumulation)
+    let (producer, streaming_ctx) = if let Some((server_url, server_api_key)) = server_config {
+        let pre_buffer = AudioPreBuffer::new();
+        let producer = pre_buffer.producer();
         let consumer = pre_buffer.consumer();
-        Some((consumer, server_url, server_api_key))
+        (Some(producer), Some((consumer, pre_buffer, server_url, server_api_key)))
     } else {
-        None
+        (None, None)
     };
 
     // Spawn thread to process audio packets
@@ -559,8 +576,10 @@ pub fn start_output_recording(
                                 buffer.extend_from_slice(float_buffer);
                             }
 
-                            // Push to pre-buffer (captured even before WebSocket is ready)
-                            producer.push(float_buffer.to_vec());
+                            // Push to pre-buffer if streaming is configured
+                            if let Some(ref producer) = producer {
+                                producer.push(float_buffer.to_vec());
+                            }
 
                             packet_count += 1;
                             // Log every 200 packets (roughly every 1 second at 5ms intervals)
@@ -591,29 +610,12 @@ pub fn start_output_recording(
     });
 
     // Spawn WebSocket streaming thread AFTER audio capture has started
-    if let Some((consumer, server_url, server_api_key)) = consumer_and_config {
+    if let Some((consumer, pre_buffer, server_url, server_api_key)) = streaming_ctx {
         let session_id = session.id.to_string();
         let device_name_clone = session.device_name.clone();
         let app_name = Some(session.app_name.clone());
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Err(e) = ServerStreamingService::stream_to_server(
-                    server_url,
-                    server_api_key,
-                    session_id,
-                    device_name_clone,
-                    app_name,
-                    consumer,
-                    sample_rate,
-                    channels,
-                ).await {
-                    log::error!("WebSocket streaming error: {}", e);
-                }
-            });
-            pre_buffer.stop();
-        });
+        spawn_streaming_thread(consumer, pre_buffer, server_url, server_api_key, session_id, device_name_clone, app_name, sample_rate, channels);
     }
 
     Ok(Box::new(move || {}))
@@ -672,16 +674,14 @@ fn start_output_recording_device_loopback(
     let audio_buffer = session.audio_buffer.clone();
     let stop_signal = session.stop_signal.clone();
 
-    // Setup pre-buffer for audio capture before WebSocket is ready
-    let pre_buffer = AudioPreBuffer::new();
-    let producer = pre_buffer.producer();
-
-    // Setup server streaming if server config is provided
-    let consumer_and_config = if let Some((server_url, server_api_key)) = server_config {
+    // Setup pre-buffer only when streaming is configured (avoids silent memory accumulation)
+    let (producer, streaming_ctx) = if let Some((server_url, server_api_key)) = server_config {
+        let pre_buffer = AudioPreBuffer::new();
+        let producer = pre_buffer.producer();
         let consumer = pre_buffer.consumer();
-        Some((consumer, server_url, server_api_key))
+        (Some(producer), Some((consumer, pre_buffer, server_url, server_api_key)))
     } else {
-        None
+        (None, None)
     };
 
     // Spawn thread to process audio packets — capture starts HERE
@@ -766,8 +766,10 @@ fn start_output_recording_device_loopback(
                                 buffer.extend_from_slice(float_buffer);
                             }
 
-                            // Push to pre-buffer (captured even before WebSocket is ready)
-                            producer.push(float_buffer.to_vec());
+                            // Push to pre-buffer if streaming is configured
+                            if let Some(ref producer) = producer {
+                                producer.push(float_buffer.to_vec());
+                            }
 
                             capture_client.ReleaseBuffer(num_frames_available).ok();
                         }
@@ -789,29 +791,12 @@ fn start_output_recording_device_loopback(
     });
 
     // Spawn WebSocket streaming thread AFTER audio capture has started
-    if let Some((consumer, server_url, server_api_key)) = consumer_and_config {
+    if let Some((consumer, pre_buffer, server_url, server_api_key)) = streaming_ctx {
         let session_id = session.id.to_string();
         let device_name = session.device_name.clone();
         let app_name = Some(session.app_name.clone());
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Err(e) = ServerStreamingService::stream_to_server(
-                    server_url,
-                    server_api_key,
-                    session_id,
-                    device_name,
-                    app_name,
-                    consumer,
-                    sample_rate,
-                    channels,
-                ).await {
-                    log::error!("WebSocket streaming error: {}", e);
-                }
-            });
-            pre_buffer.stop();
-        });
+        spawn_streaming_thread(consumer, pre_buffer, server_url, server_api_key, session_id, device_name, app_name, sample_rate, channels);
     }
 
     Ok(Box::new(move || {}))
@@ -857,9 +842,15 @@ pub fn start_output_recording(
     let audio_buffer = session.audio_buffer.clone();
     let stop_signal = session.stop_signal.clone();
 
-    // Setup pre-buffer for audio capture before WebSocket is ready
-    let pre_buffer = AudioPreBuffer::new();
-    let producer = pre_buffer.producer();
+    // Setup pre-buffer only when streaming is configured (avoids silent memory accumulation)
+    let (producer, streaming_ctx) = if let Some((ref server_url, ref server_api_key)) = server_config {
+        let pre_buffer = AudioPreBuffer::new();
+        let producer = pre_buffer.producer();
+        let consumer = pre_buffer.consumer();
+        (Some(producer), Some((consumer, pre_buffer, server_url.clone(), server_api_key.clone())))
+    } else {
+        (None, None)
+    };
 
     // Create content filter based on device_name
     // NOTE: We use application-based filters instead of window-based filters because
@@ -915,12 +906,12 @@ pub fn start_output_recording(
         .set_height(2)
         .map_err(|e| anyhow::anyhow!("Failed to set height: {:?}", e))?;
 
-    // Create output handler for audio samples — writes to AudioProducer
+    // Create output handler for audio samples — writes to AudioProducer if streaming
     struct AudioOutputHandler {
         audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
         audio_buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
         stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
-        producer: AudioProducer,
+        producer: Option<AudioProducer>,
     }
 
     impl SCStreamOutputTrait for AudioOutputHandler {
@@ -944,7 +935,9 @@ pub fn start_output_recording(
                 let mut samples = Vec::new();
                 for buf in audio_data.buffers() {
                     let byte_data = buf.data();
-                    // Reinterpret raw bytes as f32 samples (ScreenCaptureKit delivers f32 PCM)
+                    // Safety: ScreenCaptureKit delivers f32 PCM; verify alignment as a safety net
+                    debug_assert!(byte_data.as_ptr() as usize % std::mem::align_of::<f32>() == 0,
+                        "SCK audio buffer not aligned to f32 boundary");
                     let float_slice = unsafe {
                         std::slice::from_raw_parts(
                             byte_data.as_ptr() as *const f32,
@@ -969,8 +962,10 @@ pub fn start_output_recording(
                     buffer.extend_from_slice(&samples);
                 }
 
-                // Push to pre-buffer (captured even before WebSocket is ready)
-                self.producer.push(samples);
+                // Push to pre-buffer if streaming is configured
+                if let Some(ref producer) = self.producer {
+                    producer.push(samples);
+                }
             }
         }
     }
@@ -991,30 +986,12 @@ pub fn start_output_recording(
     log::info!("ScreenCaptureKit audio capture started, samples are being pre-buffered");
 
     // THEN spawn WebSocket streaming thread (audio is already being captured)
-    if let Some((server_url, server_api_key)) = server_config {
-        let consumer = pre_buffer.consumer();
+    if let Some((consumer, pre_buffer, server_url, server_api_key)) = streaming_ctx {
         let session_id = session.id.to_string();
         let device_name_clone = session.device_name.clone();
         let app_name = Some(session.app_name.clone());
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Err(e) = ServerStreamingService::stream_to_server(
-                    server_url,
-                    server_api_key,
-                    session_id,
-                    device_name_clone,
-                    app_name,
-                    consumer,
-                    DEFAULT_SAMPLE_RATE,
-                    DEFAULT_CHANNELS,
-                ).await {
-                    log::error!("WebSocket streaming error: {}", e);
-                }
-            });
-            pre_buffer.stop();
-        });
+        spawn_streaming_thread(consumer, pre_buffer, server_url, server_api_key, session_id, device_name_clone, app_name, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS);
     }
 
     // Return cleanup closure that stops the stream

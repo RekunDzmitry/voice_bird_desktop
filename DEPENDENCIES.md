@@ -81,7 +81,7 @@ graph TB
 | **events.rs** | Tauri event definitions for frontend notifications | `AudioLevelEvent`, `SessionStatusEvent` |
 | **session.rs** | Recording session data structures and state management | `SessionManager`, `RecordingSession`, `AudioSessionInfo`, `SessionStatus` |
 | **wasapi_sessions.rs** | Platform-specific audio session enumeration (WASAPI on Windows, ScreenCaptureKit on macOS) | `enumerate_audio_sessions()` |
-| **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()` |
+| **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()`, `spawn_streaming_thread()` |
 | **audio_buffer.rs** | Thread-safe pre-buffer decoupling audio capture from WebSocket readiness | `AudioPreBuffer`, `AudioProducer`, `AudioConsumer` |
 | **server_streaming.rs** | WebSocket streaming client with Opus encoding | `ServerStreamingService::stream_to_server()` |
 | **opus_encoder.rs** | Opus audio codec encoder with buffering | `OpusAudioEncoder` |
@@ -520,7 +520,7 @@ graph TB
 ### Synchronization Primitives
 
 - `Arc<Mutex<T>>`: Shared state (audio_level, audio_buffer, status, stop_signal)
-- `AudioPreBuffer` (`Arc<(Mutex<SharedState>, Condvar)>`): Lock-free-ish pre-buffer decoupling audio capture from WebSocket readiness; replaces `mpsc::channel`
+- `AudioPreBuffer` (`Arc<(Mutex<SharedState>, Condvar)>`): Lock-free-ish pre-buffer decoupling audio capture from WebSocket readiness; stores `TimestampedChunk` for accurate latency tracking; implements `Drop` for panic-safe cleanup; only allocated when streaming is configured
 - `tokio_mpsc::unbounded_channel`: Pong messages from read task → write loop
 - `stop_signal`: Graceful shutdown coordination
 
@@ -611,9 +611,10 @@ stateDiagram-v2
 **Purpose**: Thread-safe pre-buffer that decouples audio capture from WebSocket readiness. Audio callbacks push samples via `AudioProducer` immediately when capture starts; the streaming thread drains buffered chunks via `AudioConsumer` once the WebSocket connection is established.
 
 **Key Types**:
-- `AudioPreBuffer` - Owns the shared buffer state; creates `AudioProducer` and `AudioConsumer` handles
-- `AudioProducer` - Cloneable handle for pushing `Vec<f32>` sample chunks (used by audio callback threads)
-- `AudioConsumer` - Handle for draining buffered chunks with blocking `recv()` (used by streaming thread)
+- `AudioPreBuffer` - Owns the shared buffer state; creates `AudioProducer` and `AudioConsumer` handles. Implements `Drop` to auto-signal stop on panic/unwind. Only created when `server_config` is provided (avoids silent memory accumulation when streaming is not configured).
+- `AudioProducer` - Cloneable handle for pushing `Vec<f32>` sample chunks with capture timestamps (used by audio callback threads)
+- `AudioConsumer` - Handle for draining `TimestampedChunk = (u64, Vec<f32>)` with blocking `wait_and_drain()` (used by streaming thread)
+- `TimestampedChunk` - Type alias `(u64, Vec<f32>)`: capture timestamp (ms since epoch) paired with audio samples
 
 **Capacity**: ~500 chunks (~5 seconds at ~100 chunks/sec)
 

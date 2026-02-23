@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Maximum number of chunks to buffer (~5 seconds at ~100 chunks/sec)
 const MAX_BUFFER_CHUNKS: usize = 500;
 
+/// A timestamped audio chunk: (capture_timestamp_ms, samples)
+pub type TimestampedChunk = (u64, Vec<f32>);
+
 struct SharedState {
-    buffer: VecDeque<Vec<f32>>,
+    buffer: VecDeque<TimestampedChunk>,
     stopped: bool,
 }
 
@@ -56,6 +59,12 @@ impl AudioPreBuffer {
     }
 }
 
+impl Drop for AudioPreBuffer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Producer end — used by audio callbacks to push sample chunks.
 /// Cloneable so multiple callbacks can share it.
 #[derive(Clone)]
@@ -64,9 +73,14 @@ pub struct AudioProducer {
 }
 
 impl AudioProducer {
-    /// Push a chunk of audio samples into the buffer.
+    /// Push a chunk of audio samples into the buffer with a capture timestamp.
     /// If the buffer is full, the oldest chunk is dropped to make room.
     pub fn push(&self, samples: Vec<f32>) {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         let (lock, cvar) = &*self.state;
         if let Ok(mut shared) = lock.lock() {
             if shared.stopped {
@@ -75,7 +89,7 @@ impl AudioProducer {
             if shared.buffer.len() >= MAX_BUFFER_CHUNKS {
                 shared.buffer.pop_front();
             }
-            shared.buffer.push_back(samples);
+            shared.buffer.push_back((timestamp_ms, samples));
         }
         cvar.notify_one();
     }
@@ -87,8 +101,8 @@ pub struct AudioConsumer {
 }
 
 impl AudioConsumer {
-    /// Non-blocking: drain all currently buffered chunks.
-    pub fn drain_all(&self) -> Vec<Vec<f32>> {
+    /// Non-blocking: drain all currently buffered chunks with their capture timestamps.
+    pub fn drain_all(&self) -> Vec<TimestampedChunk> {
         let (lock, _) = &*self.state;
         if let Ok(mut shared) = lock.lock() {
             shared.buffer.drain(..).collect()
@@ -99,7 +113,7 @@ impl AudioConsumer {
 
     /// Blocking: wait up to `timeout` for chunks to arrive, then drain all available.
     /// Returns an empty vec on timeout or if stopped.
-    pub fn wait_and_drain(&self, timeout: Duration) -> Vec<Vec<f32>> {
+    pub fn wait_and_drain(&self, timeout: Duration) -> Vec<TimestampedChunk> {
         let (lock, cvar) = &*self.state;
         if let Ok(mut shared) = lock.lock() {
             if shared.buffer.is_empty() && !shared.stopped {
@@ -141,8 +155,11 @@ mod tests {
 
         let chunks = consumer.drain_all();
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], vec![1.0, 2.0, 3.0]);
-        assert_eq!(chunks[1], vec![4.0, 5.0]);
+        assert_eq!(chunks[0].1, vec![1.0, 2.0, 3.0]);
+        assert_eq!(chunks[1].1, vec![4.0, 5.0]);
+        // Timestamps should be non-zero
+        assert!(chunks[0].0 > 0);
+        assert!(chunks[1].0 > 0);
 
         // Drain again should be empty
         let chunks = consumer.drain_all();
@@ -162,7 +179,7 @@ mod tests {
         let chunks = consumer.drain_all();
         assert_eq!(chunks.len(), MAX_BUFFER_CHUNKS);
         // First chunk should be the 11th one pushed (index 10)
-        assert_eq!(chunks[0], vec![10.0]);
+        assert_eq!(chunks[0].1, vec![10.0]);
     }
 
     #[test]
@@ -198,7 +215,7 @@ mod tests {
 
         let chunks = consumer.wait_and_drain(Duration::from_millis(100));
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], vec![1.0, 2.0]);
+        assert_eq!(chunks[0].1, vec![1.0, 2.0]);
     }
 
     #[test]
