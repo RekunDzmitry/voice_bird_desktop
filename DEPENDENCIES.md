@@ -43,11 +43,13 @@ graph TB
     main --> wasapi[wasapi_sessions.rs<br/>WASAPI Enumeration]
     main --> audio[audio.rs<br/>Audio Capture]
     main --> events[events.rs<br/>Tauri Events]
+    main --> audio_buffer[audio_buffer.rs<br/>AudioPreBuffer]
 
     commands --> state
     commands --> session
     state --> session
-    audio --> server_streaming[server_streaming.rs<br/>WebSocket Streaming]
+    audio --> audio_buffer
+    audio_buffer --> server_streaming[server_streaming.rs<br/>WebSocket Streaming]
     server_streaming --> opus[opus_encoder.rs<br/>OpusAudioEncoder]
 
     subgraph UI["Tauri Web Frontend (ui/)"]
@@ -79,7 +81,8 @@ graph TB
 | **events.rs** | Tauri event definitions for frontend notifications | `AudioLevelEvent`, `SessionStatusEvent` |
 | **session.rs** | Recording session data structures and state management | `SessionManager`, `RecordingSession`, `AudioSessionInfo`, `SessionStatus` |
 | **wasapi_sessions.rs** | Platform-specific audio session enumeration (WASAPI on Windows, ScreenCaptureKit on macOS) | `enumerate_audio_sessions()` |
-| **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()` |
+| **audio.rs** | Audio device capture (cpal for input, WASAPI/ScreenCaptureKit for output loopback) | `start_input_recording()`, `start_output_recording()`, `spawn_streaming_thread()` |
+| **audio_buffer.rs** | Thread-safe pre-buffer decoupling audio capture from WebSocket readiness | `AudioPreBuffer`, `AudioProducer`, `AudioConsumer` |
 | **server_streaming.rs** | WebSocket streaming client with Opus encoding | `ServerStreamingService::stream_to_server()` |
 | **opus_encoder.rs** | Opus audio codec encoder with buffering | `OpusAudioEncoder` |
 | **ui/** | Tauri web frontend (HTML/JS/CSS) | Session browser, recording controls, settings UI |
@@ -133,7 +136,7 @@ flowchart LR
 ### Data Flow Steps
 
 1. **Audio Capture**: cpal (input devices) or platform-specific loopback (WASAPI on Windows, ScreenCaptureKit on macOS) captures f32 audio samples at device sample rate
-2. **Sample Buffering**: Audio callback thread sends samples via `mpsc::channel` to encoder thread
+2. **Pre-Buffering**: Audio callback thread pushes samples to `AudioPreBuffer` via `AudioProducer`. Samples are captured immediately, even before the WebSocket connection is established, preventing audio loss during setup
 3. **Opus Encoding**: `OpusAudioEncoder` buffers samples until complete frame (960 samples @ 48kHz = 20ms), then encodes to Opus packet
 4. **WebSocket Streaming**: Encoded Opus packets sent as binary WebSocket frames to server
 5. **Server Processing**: Server receives Opus audio for transcription or other processing
@@ -293,29 +296,47 @@ loop {
 
 ### 2b. Audio Capture (ScreenCaptureKit - macOS Output Loopback)
 
-**File**: `src/audio.rs` (Lines 415-587)
+**File**: `src/audio.rs` (Lines 827-1013)
 
 ```rust
 // macOS ScreenCaptureKit capture
-let content = SCShareableContent::current()?;
-let filter = SCContentFilter::new(InitParams::Display(display));
-let config = SCStreamConfiguration {
-    captures_audio: true,
-    sample_rate: 48000,
-    channel_count: 2,
-    excludes_current_process_audio: true,
-    ..Default::default()
+let content = SCShareableContent::get()?;
+let display = content.displays().first()?.clone();
+let applications = content.applications();
+
+// Application-based filters avoid kCGErrorInvalidContext (1003)
+let filter = if device_name.contains("All Applications") {
+    let app_refs: Vec<&_> = applications.iter().collect();
+    SCContentFilter::new()
+        .with_display_including_application_excepting_windows(&display, &app_refs, &[])
+} else {
+    // Exclude all OTHER apps (avoids invalid context when target has no visible windows)
+    let excluded: Vec<&_> = applications.iter()
+        .filter(|a| a.process_id() != target.process_id()).collect();
+    SCContentFilter::new()
+        .with_display_excluding_applications_excepting_windows(&display, &excluded, &[])
 };
 
-let stream = SCStream::new(filter, config, handler);
+let config = SCStreamConfiguration::new()
+    .set_captures_audio(true)?
+    .set_sample_rate(48000)?
+    .set_channel_count(2)?
+    .set_excludes_current_process_audio(true)?
+    .set_width(2)?.set_height(2)?;
+
+let mut stream = SCStream::new(&filter, &config);
+stream.add_output_handler(handler, SCStreamOutputType::Audio);
 stream.start_capture()?;
 ```
 
 **Key Points**:
 - macOS 12.3+ feature using Apple's ScreenCaptureKit framework
 - Requires Screen Recording permission
-- Can capture audio from specific applications or all system audio
-- Supports both display-wide and per-application audio capture
+- Uses **application-based** SCContentFilter (not window-based) to avoid `kCGErrorInvalidContext` (1003)
+- For all-system audio: includes all apps explicitly via `with_display_including_application_excepting_windows`
+- For per-app audio: excludes all other apps via `with_display_excluding_applications_excepting_windows`
+- Minimum capture dimensions set to 2x2 (avoids degenerate context rejection on some macOS versions)
+- Audio capture starts **before** WebSocket connection via `AudioPreBuffer`, preventing sample loss
 
 ### 3. Opus Encoding
 
@@ -442,8 +463,12 @@ graph TB
         wasapi_thread[WASAPI/SCK Thread<br/>f32 samples]
     end
 
-    subgraph Encoder["Encoder Thread"]
-        mpsc_rx[mpsc::Receiver]
+    subgraph PreBuffer["AudioPreBuffer"]
+        producer[AudioProducer<br/>push samples]
+        consumer[AudioConsumer<br/>drain on ready]
+    end
+
+    subgraph Encoder["Streaming Thread"]
         tokio_rt[Tokio Runtime]
         opus[Opus Encoder]
         ws[WebSocket Client]
@@ -451,9 +476,9 @@ graph TB
 
     ui <-->|Tauri IPC| ipc
     ipc --> Audio
-    cpal_thread -->|mpsc::channel| mpsc_rx
-    wasapi_thread -->|mpsc::channel| mpsc_rx
-    mpsc_rx --> opus
+    cpal_thread -->|AudioProducer| producer
+    wasapi_thread -->|AudioProducer| producer
+    consumer --> opus
     opus --> ws
     ws --> tokio_rt
     ipc -.->|Events| ui
@@ -483,10 +508,10 @@ graph TB
    - WASAPI (Windows): Custom thread for COM operations
    - ScreenCaptureKit (macOS): SCStreamOutput delegate callbacks
    - Real-time priority for low latency
-   - Send samples to encoder via `mpsc::channel`
+   - Push samples to `AudioPreBuffer` via `AudioProducer`
 
-4. **Encoder Thread** (per session):
-   - Receives f32 samples from audio threads
+4. **Streaming Thread** (per session):
+   - Drains pre-buffered samples via `AudioConsumer` once WebSocket is ready
    - Buffers samples to complete Opus frames
    - Encodes to Opus packets
    - Streams via WebSocket to server
@@ -495,7 +520,7 @@ graph TB
 ### Synchronization Primitives
 
 - `Arc<Mutex<T>>`: Shared state (audio_level, audio_buffer, status, stop_signal)
-- `mpsc::channel`: Audio samples from callback → encoder thread
+- `AudioPreBuffer` (`Arc<(Mutex<SharedState>, Condvar)>`): Lock-free-ish pre-buffer decoupling audio capture from WebSocket readiness; stores `TimestampedChunk` for accurate latency tracking; implements `Drop` for panic-safe cleanup; only allocated when streaming is configured
 - `tokio_mpsc::unbounded_channel`: Pong messages from read task → write loop
 - `stop_signal`: Graceful shutdown coordination
 
@@ -579,9 +604,23 @@ stateDiagram-v2
 - `encode(&mut self, samples: &[f32]) -> Result<Vec<u8>>`
   - Direct encoding (requires exact frame size)
 
+### AudioPreBuffer
+
+**Location**: `src/audio_buffer.rs`
+
+**Purpose**: Thread-safe pre-buffer that decouples audio capture from WebSocket readiness. Audio callbacks push samples via `AudioProducer` immediately when capture starts; the streaming thread drains buffered chunks via `AudioConsumer` once the WebSocket connection is established.
+
+**Key Types**:
+- `AudioPreBuffer` - Owns the shared buffer state; creates `AudioProducer` and `AudioConsumer` handles. Implements `Drop` to auto-signal stop on panic/unwind. Only created when `server_config` is provided (avoids silent memory accumulation when streaming is not configured).
+- `AudioProducer` - Cloneable handle for pushing `Vec<f32>` sample chunks with capture timestamps (used by audio callback threads)
+- `AudioConsumer` - Handle for draining `TimestampedChunk = (u64, Vec<f32>)` with blocking `wait_and_drain()` (used by streaming thread)
+- `TimestampedChunk` - Type alias `(u64, Vec<f32>)`: capture timestamp (ms since epoch) paired with audio samples
+
+**Capacity**: ~500 chunks (~5 seconds at ~100 chunks/sec)
+
 ### ServerStreamingService
 
-**Location**: `src/server_streaming.rs` (Lines 44-404)
+**Location**: `src/server_streaming.rs`
 
 **Purpose**: WebSocket client for streaming Opus audio to server
 
@@ -592,7 +631,7 @@ async fn stream_to_server(
     api_key: String,
     session_id: String,
     device_name: String,
-    audio_rx: mpsc::Receiver<Vec<f32>>,
+    audio_consumer: AudioConsumer,
     sample_rate: u32,
     channels: u16,
 ) -> Result<()>

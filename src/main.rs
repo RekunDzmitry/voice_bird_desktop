@@ -3,6 +3,7 @@
 mod session;
 mod wasapi_sessions;
 mod audio;
+mod audio_buffer;
 mod server_streaming;
 mod opus_encoder;
 mod audio_converter;

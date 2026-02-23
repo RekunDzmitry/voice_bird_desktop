@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
 use tokio::time::Duration as TokioDuration;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -10,6 +9,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio::sync::mpsc as tokio_mpsc; // For async channel communication
 use tokio::sync::oneshot; // For init acknowledgment synchronization
 use crate::audio_converter::SimpleAudioConverter;
+use crate::audio_buffer::AudioConsumer;
 
 /// Message sent to initialize a streaming session
 #[derive(Debug, Serialize)]
@@ -59,7 +59,7 @@ impl ServerStreamingService {
     /// * `session_id` - Unique identifier for this recording session
     /// * `device_name` - Name of the audio device being recorded
     /// * `app_name` - Name of the application being recorded (e.g., "chrome.exe", "msedge.exe")
-    /// * `audio_rx` - Channel receiver for f32 audio samples
+    /// * `audio_consumer` - AudioConsumer for receiving pre-buffered f32 audio samples
     /// * `sample_rate` - Audio sample rate
     /// * `channels` - Number of audio channels
     pub async fn stream_to_server(
@@ -68,7 +68,7 @@ impl ServerStreamingService {
         session_id: String,
         device_name: String,
         app_name: Option<String>,
-        audio_rx: mpsc::Receiver<Vec<f32>>,
+        audio_consumer: AudioConsumer,
         sample_rate: u32,
         channels: u16,
     ) -> Result<()> {
@@ -344,6 +344,30 @@ impl ServerStreamingService {
 
         log::info!("Beginning audio streaming loop (raw f32 PCM)...");
 
+        // Drain all pre-buffered audio chunks accumulated during WebSocket setup
+        let backlog = audio_consumer.drain_all();
+        log::info!("Draining {} pre-buffered audio chunks", backlog.len());
+        for (capture_timestamp_ms, audio_chunk) in backlog {
+            chunk_count += 1;
+            total_samples += audio_chunk.len();
+
+            let converted_bytes = audio_converter.convert(&audio_chunk);
+
+            // Use the actual capture timestamp (not current time) for accurate latency tracking
+            let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
+            packet.extend(&converted_bytes);
+
+            total_bytes_sent += packet.len() as u64;
+
+            if let Err(e) = write.send(Message::Binary(packet)).await {
+                log::error!("Failed to send pre-buffered audio chunk #{}: {}", chunk_count, e);
+                break;
+            }
+        }
+        if chunk_count > 0 {
+            log::info!("Pre-buffered audio sent: {} chunks", chunk_count);
+        }
+
         // Main loop: send audio chunks and respond to pings
         loop {
             // Check for pending pong responses (non-blocking)
@@ -358,87 +382,99 @@ impl ServerStreamingService {
                 }
             }
 
-            // Try to receive audio chunk with timeout to allow pong handling
-            // Reduced from 50ms to 10ms for lower latency
-            match audio_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(audio_chunk) => {
+            // Check if audio capture has stopped
+            if audio_consumer.is_stopped() {
+                let remaining = audio_consumer.drain_all();
+                for (capture_timestamp_ms, audio_chunk) in &remaining {
                     chunk_count += 1;
                     total_samples += audio_chunk.len();
 
-                    // Convert audio: 48kHz stereo f32 → 16kHz mono PCM16LE
-                    // This reduces bandwidth ~6x and eliminates backend conversion
-                    let converted_bytes = audio_converter.convert(&audio_chunk);
+                    let converted_bytes = audio_converter.convert(audio_chunk);
 
-                    // Prepend timestamp for latency measurement (8 bytes)
-                    let timestamp_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let mut packet = timestamp_ms.to_le_bytes().to_vec();
+                    let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
                     packet.extend(&converted_bytes);
 
-                    let packet_len = packet.len();
-                    total_bytes_sent += packet_len as u64;
+                    total_bytes_sent += packet.len() as u64;
 
-                    // Log every chunk for first 10 chunks, then every 100 chunks
-                    let should_log = chunk_count <= 10 || chunk_count % 100 == 0;
-
-                    if should_log {
-                        let elapsed = start_time.elapsed();
-                        let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
-                        log::debug!(
-                            "Audio chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} KB sent | Elapsed: {:.1}s",
-                            chunk_count,
-                            audio_chunk.len(),
-                            packet_len,
-                            duration_secs,
-                            total_bytes_sent as f64 / 1_000.0,
-                            elapsed.as_secs_f32()
-                        );
-                    }
-
-                    // Send as binary WebSocket frame (packet includes 8-byte timestamp header)
-                    match write.send(Message::Binary(packet)).await {
-                        Ok(_) => {
-                            // Removed 5ms delay for lower latency - WebSocket handles buffering
-                        }
-                        Err(e) => {
-                            let elapsed = start_time.elapsed();
-                            log::error!(
-                                "Failed to send audio chunk #{}: {}",
-                                chunk_count, e
-                            );
-                            log::error!("   Error details: {:?}", e);
-                            log::error!(
-                                "   Sent {} chunks ({:.1}s of audio, {:.2} KB) before failure",
-                                chunk_count - 1,
-                                total_samples as f32 / (sample_rate * channels as u32) as f32,
-                                (total_bytes_sent - packet_len as u64) as f64 / 1_000.0
-                            );
-                            log::error!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
-                            break;
-                        }
+                    if let Err(e) = write.send(Message::Binary(packet)).await {
+                        log::error!("Failed to send final audio chunk #{}: {}", chunk_count, e);
+                        break;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // No audio chunk available, continue to check for pongs
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Audio sender disconnected, exit loop
+
+                let elapsed = start_time.elapsed();
+                let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
+                log::info!("Audio stream ended (capture stopped), finalizing...");
+                log::info!("   Total audio chunks sent: {}", chunk_count);
+                log::info!("   Total audio duration: {:.1}s", duration_secs);
+                log::info!("   Total bytes sent: {:.2} KB", total_bytes_sent as f64 / 1_000.0);
+                log::info!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
+                break;
+            }
+
+            // Wait for audio chunks with timeout to allow pong handling
+            let chunks = audio_consumer.wait_and_drain(std::time::Duration::from_millis(10));
+            if chunks.is_empty() {
+                continue;
+            }
+
+            let mut send_failed = false;
+            for (capture_timestamp_ms, audio_chunk) in chunks {
+                chunk_count += 1;
+                total_samples += audio_chunk.len();
+
+                // Convert audio: 48kHz stereo f32 → 16kHz mono PCM16LE
+                // This reduces bandwidth ~6x and eliminates backend conversion
+                let converted_bytes = audio_converter.convert(&audio_chunk);
+
+                // Prepend capture timestamp for latency measurement (8 bytes)
+                let mut packet = capture_timestamp_ms.to_le_bytes().to_vec();
+                packet.extend(&converted_bytes);
+
+                let packet_len = packet.len();
+                total_bytes_sent += packet_len as u64;
+
+                // Log every chunk for first 10 chunks, then every 100 chunks
+                let should_log = chunk_count <= 10 || chunk_count % 100 == 0;
+
+                if should_log {
                     let elapsed = start_time.elapsed();
                     let duration_secs = total_samples as f32 / (sample_rate * channels as u32) as f32;
-
-                    log::info!("Audio stream ended, finalizing...");
-                    log::info!("   Total audio chunks sent: {}", chunk_count);
-                    log::info!("   Total audio duration: {:.1}s", duration_secs);
-                    log::info!(
-                        "   Total bytes sent: {:.2} KB",
-                        total_bytes_sent as f64 / 1_000.0
+                    log::debug!(
+                        "Audio chunk #{}: {} samples ({} bytes) | Total: {:.1}s audio, {:.2} KB sent | Elapsed: {:.1}s",
+                        chunk_count,
+                        audio_chunk.len(),
+                        packet_len,
+                        duration_secs,
+                        total_bytes_sent as f64 / 1_000.0,
+                        elapsed.as_secs_f32()
                     );
-                    log::info!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
-                    break;
                 }
+
+                // Send as binary WebSocket frame (packet includes 8-byte timestamp header)
+                match write.send(Message::Binary(packet)).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let elapsed = start_time.elapsed();
+                        log::error!(
+                            "Failed to send audio chunk #{}: {}",
+                            chunk_count, e
+                        );
+                        log::error!("   Error details: {:?}", e);
+                        log::error!(
+                            "   Sent {} chunks ({:.1}s of audio, {:.2} KB) before failure",
+                            chunk_count - 1,
+                            total_samples as f32 / (sample_rate * channels as u32) as f32,
+                            (total_bytes_sent - packet_len as u64) as f64 / 1_000.0
+                        );
+                        log::error!("   Elapsed time: {:.1}s", elapsed.as_secs_f32());
+                        send_failed = true;
+                        break;
+                    }
+                }
+            }
+            if send_failed {
+                break;
             }
         }
 
