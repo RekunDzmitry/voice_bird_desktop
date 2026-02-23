@@ -153,10 +153,10 @@ unsafe fn get_process_name(process_id: u32) -> Result<String> {
 // macOS implementation using ScreenCaptureKit
 #[cfg(target_os = "macos")]
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSessionInfo>> {
-    use screencapturekit::sc_shareable_content::SCShareableContent;
+    use screencapturekit::shareable_content::SCShareableContent;
 
     // Check screen recording permission by attempting to get shareable content
-    let content = SCShareableContent::current()
+    let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!(
             "Screen Recording permission required.\n\
             Please grant permission in:\n\
@@ -178,12 +178,12 @@ pub fn enumerate_audio_sessions() -> Result<Vec<AudioSessionInfo>> {
     // List running applications that can be captured
     for app in content.applications() {
         // Get application info
-        let app_name = match app.application_name() {
-            Some(name) => name,
-            None => continue, // Skip apps without names
-        };
+        let app_name = app.application_name();
+        if app_name.is_empty() {
+            continue; // Skip apps without names
+        }
 
-        let bundle_id = app.bundle_identifier().unwrap_or_default();
+        let bundle_id = app.bundle_identifier();
         let process_id = app.process_id() as u32;
 
         // Skip system processes and background apps
