@@ -778,6 +778,33 @@ cargo binstall voice-bird-cli
 3. Create GitHub release with binaries at voice-bird-releases repo
 4. Publish stub crate to crates.io (`voice-bird-cli-crate/`)
 
+### Distribution (npm) - CLI Tool
+
+```bash
+npm install -g voice-bird-cli
+```
+
+**Architecture**:
+- **Main package** (`npm/voice-bird-cli/`): Node.js wrapper script + postinstall fallback downloader
+- **Platform packages** (`npm/@voice-bird/cli-{platform}/`): Optional dependencies containing platform binaries
+- **Wrapper script** (`npm/voice-bird-cli/bin/voice-bird-cli`): Resolves platform binary and launches it
+
+**macOS .app Bundle (TCC Compatibility)**:
+
+On macOS 15+ (Sequoia/Tahoe), plain CLI binaries cannot receive Screen Recording permissions via TCC. The npm package addresses this by wrapping the binary in a `.app` bundle:
+
+- **Bundle**: `VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli` with `Info.plist` (`CFBundleIdentifier: com.voicebird.cli`)
+- **Launch method**: `open -W -n -g --stdin/--stdout/--stderr <tty>` via the Node.js wrapper, so the app is parented under `launchd` (not the terminal) for proper TCC attribution
+- **Fallback**: `VOICE_BIRD_NO_OPEN=1` bypasses the `.app` launcher and runs the binary directly (user must grant Screen Recording to their terminal instead)
+- **Build config**: `voice-bird-cli/.cargo/config.toml` sets `-rpath /usr/lib/swift` for Swift runtime (`libswift_Concurrency.dylib`); CI also runs `install_name_tool -add_rpath` as a safety net
+- **Codesigning**: Ad-hoc codesign (`codesign --force --deep --sign -`) in CI
+
+**Key Files**:
+- `npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app/Contents/Info.plist` — Bundle identity for TCC
+- `npm/voice-bird-cli/bin/voice-bird-cli` — Wrapper with `launchViaMacOSOpen()` for TTY forwarding
+- `npm/voice-bird-cli/install.js` — Postinstall fallback with `.app` directory copy support
+- `voice-bird-cli/.cargo/config.toml` — Swift runtime rpath linker flags
+
 ### Optimization Flags (Cargo.toml)
 
 ```toml
