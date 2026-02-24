@@ -1,6 +1,6 @@
 {
   "name": "@voice-bird/cli-darwin-arm64",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "macOS Apple Silicon binary for voice-bird-cli",
   "repository": {
     "type": "git",

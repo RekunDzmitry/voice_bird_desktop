@@ -166,32 +166,45 @@ pub fn start_output_recording(
         .ok_or_else(|| anyhow::anyhow!("No displays found"))?;
 
     // Create content filter
+    // NOTE: We use application-based filters (exclusion strategy for specific apps) instead
+    // of inclusion-based filters because including a single app can cause
+    // "Start stream failed" on macOS when the app has no visible windows or the
+    // graphics context is invalid. Excluding all OTHER apps is more reliable.
     let apps = content.applications();
     let filter = if session.app_name.contains("All Applications") {
-        // Capture all applications on the display
+        // Capture all system audio: include all applications on the display
         let all_apps: Vec<_> = apps.iter().collect();
         SCContentFilter::create()
             .with_display(&display)
             .with_including_applications(&all_apps, &[])
             .build()
     } else {
-        let app = apps
+        // Capture specific application: exclude all OTHER apps from the display
+        let target_app = apps
             .iter()
             .find(|app| {
                 let name = app.application_name();
                 !name.is_empty() && session.app_name.contains(&name)
             })
-            .ok_or_else(|| anyhow::anyhow!("Application not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("Application '{}' not found", session.app_name))?;
+
+        log::info!("Found target application: {} (pid: {})", target_app.application_name(), target_app.process_id());
+
+        let excluded_apps: Vec<_> = apps
+            .iter()
+            .filter(|app| app.process_id() != target_app.process_id())
+            .collect();
+
         SCContentFilter::create()
             .with_display(&display)
-            .with_including_applications(&[app], &[])
+            .with_excluding_applications(&excluded_apps, &[])
             .build()
     };
 
-    // Configure stream — audio only, minimal video (1x1)
+    // Configure stream — audio only, minimal video (2x2 to avoid kCGErrorInvalidContext)
     let config = SCStreamConfiguration::new()
-        .with_width(1)
-        .with_height(1)
+        .with_width(2)
+        .with_height(2)
         .with_captures_audio(true)
         .with_sample_rate(DEFAULT_SAMPLE_RATE as i32)
         .with_channel_count(DEFAULT_CHANNELS as i32)
