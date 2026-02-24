@@ -7,9 +7,29 @@ const VERSION = require("./package.json").version;
 
 const PLATFORM_MAP = {
   "win32 x64": { pkg: "@voice-bird/cli-win32-x64", bin: "voice-bird-cli.exe" },
-  "darwin arm64": { pkg: "@voice-bird/cli-darwin-arm64", bin: "voice-bird-cli" },
+  "darwin arm64": {
+    pkg: "@voice-bird/cli-darwin-arm64",
+    bin: "VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli",
+    app: "VoiceBirdCLI.app",
+  },
   "linux x64": { pkg: "@voice-bird/cli-linux-x64", bin: "voice-bird-cli" },
 };
+
+function copyDirSync(src, dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      copyDirSync(srcPath, destPath);
+    } else {
+      fs.copyFileSync(srcPath, destPath);
+      // Preserve executable permissions
+      const stat = fs.statSync(srcPath);
+      fs.chmodSync(destPath, stat.mode);
+    }
+  }
+}
 
 function main() {
   const platformKey = `${process.platform} ${os.arch()}`;
@@ -38,12 +58,21 @@ function main() {
       { cwd: installDir, stdio: "pipe" }
     );
 
-    const installedBin = path.join(installDir, "node_modules", entry.pkg, entry.bin);
     const targetDir = path.join(__dirname, "bin");
     fs.mkdirSync(targetDir, { recursive: true });
-    const targetPath = path.join(targetDir, entry.bin);
-    fs.copyFileSync(installedBin, targetPath);
-    fs.chmodSync(targetPath, 0o755);
+
+    if (entry.app) {
+      // Copy the entire .app bundle directory
+      const installedApp = path.join(installDir, "node_modules", entry.pkg, entry.app);
+      const targetApp = path.join(targetDir, entry.app);
+      copyDirSync(installedApp, targetApp);
+    } else {
+      // Copy single binary
+      const installedBin = path.join(installDir, "node_modules", entry.pkg, entry.bin);
+      const targetPath = path.join(targetDir, entry.bin);
+      fs.copyFileSync(installedBin, targetPath);
+      fs.chmodSync(targetPath, 0o755);
+    }
 
     fs.rmSync(installDir, { recursive: true, force: true });
     console.log(`[voice-bird-cli] Installed successfully.`);
