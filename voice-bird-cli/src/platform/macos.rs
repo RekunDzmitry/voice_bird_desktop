@@ -268,7 +268,10 @@ pub fn start_output_recording(
         .map_err(|e| {
             log::error!("SCStream::start_capture() failed: {:?}", e);
             let err_str = format!("{:?}", e);
-            let hint = if err_str.contains("CoreGraphicsErrorDomain") || err_str.contains("1003") {
+            let hint = if err_str.contains("CoreGraphicsErrorDomain")
+                || err_str.contains("1003")
+                || err_str.contains("Start stream failed")
+            {
                 format!(
                     "Failed to start audio capture (macOS {}).\n\n\
                      This typically means Screen Recording permission was not fully granted.\n\n\
@@ -279,6 +282,11 @@ pub fn start_output_recording(
                      4. Completely quit and restart the application\n  \
                      5. If using a terminal (iTerm, Terminal.app), the TERMINAL itself\n     \
                         may need Screen Recording permission, not just voice-bird-cli\n\n\
+                     On macOS 15+ (Sequoia/Tahoe): Plain CLI binaries may not receive\n  \
+                     Screen Recording permissions correctly. Use the npm package\n  \
+                     (npm i -g voice-bird-cli) which wraps the binary in a .app bundle\n  \
+                     for proper TCC attribution, or set VOICE_BIRD_NO_OPEN=1 to bypass\n  \
+                     the .app launcher and grant permission to your terminal instead.\n\n\
                      Raw error: {}",
                     macos_version, err_str
                 )

@@ -12,5 +12,6 @@
     "node": ">=16"
   },
   "os": ["darwin"],
-  "cpu": ["arm64"]
+  "cpu": ["arm64"],
+  "files": ["VoiceBirdCLI.app"]
 }

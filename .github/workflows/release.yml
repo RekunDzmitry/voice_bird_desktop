@@ -63,17 +63,35 @@ jobs:
       - name: Build CLI
         run: cargo build --release --manifest-path voice-bird-cli/Cargo.toml --target aarch64-apple-darwin --target-dir target
 
+      - name: Create .app bundle
+        run: |
+          mkdir -p staging/VoiceBirdCLI.app/Contents/MacOS
+
+          # Copy Info.plist from repo
+          cp npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app/Contents/Info.plist \
+            staging/VoiceBirdCLI.app/Contents/Info.plist
+
+          # Copy binary into bundle
+          cp target/aarch64-apple-darwin/release/voice-bird-cli \
+            staging/VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli
+          chmod +x staging/VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli
+
+          # Ensure Swift runtime rpath is set (for libswift_Concurrency.dylib)
+          install_name_tool -add_rpath /usr/lib/swift \
+            staging/VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli 2>/dev/null || true
+
+          # Ad-hoc codesign the bundle
+          codesign --force --deep --sign - staging/VoiceBirdCLI.app
+
       - name: Package
         run: |
-          mkdir -p staging
-          cp target/aarch64-apple-darwin/release/voice-bird-cli staging/
-          cd staging && zip ../voice-bird-cli-aarch64-apple-darwin.zip voice-bird-cli
+          cd staging && zip -r ../voice-bird-cli-aarch64-apple-darwin.zip VoiceBirdCLI.app
 
       - uses: actions/upload-artifact@v4
         with:
           name: binary-darwin-arm64
           path: |
-            staging/voice-bird-cli
+            staging/VoiceBirdCLI.app
             voice-bird-cli-aarch64-apple-darwin.zip
 
   build-linux-x64:
@@ -217,9 +235,8 @@ jobs:
           cp artifacts/binary-win32-x64/staging/voice-bird-cli.exe \
             npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
 
-          cp artifacts/binary-darwin-arm64/staging/voice-bird-cli \
-            npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
-          chmod +x npm/@voice-bird/cli-darwin-arm64/voice-bird-cli
+          cp -R artifacts/binary-darwin-arm64/staging/VoiceBirdCLI.app \
+            npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app
 
           cp artifacts/binary-linux-x64/staging/voice-bird-cli \
             npm/@voice-bird/cli-linux-x64/voice-bird-cli
