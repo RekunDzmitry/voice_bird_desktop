@@ -1,6 +1,6 @@
 {
   "name": "@voice-bird/cli-win32-x64",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "Windows x64 binary for voice-bird-cli",
   "repository": {
     "type": "git",

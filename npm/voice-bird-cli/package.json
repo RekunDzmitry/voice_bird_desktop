@@ -1,6 +1,6 @@
 {
   "name": "voice-bird-cli",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "Voice Bird CLI - Terminal audio streaming for voice transcription",
   "repository": {
     "type": "git",
@@ -18,8 +18,8 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@voice-bird/cli-win32-x64": "0.2.5",
-    "@voice-bird/cli-darwin-arm64": "0.2.5",
-    "@voice-bird/cli-linux-x64": "0.2.5"
+    "@voice-bird/cli-win32-x64": "0.2.7",
+    "@voice-bird/cli-darwin-arm64": "0.2.7",
+    "@voice-bird/cli-linux-x64": "0.2.7"
   }
 }
