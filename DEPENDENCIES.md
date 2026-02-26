@@ -75,7 +75,7 @@ graph TB
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
 | **main.rs** | Application entry point, Tauri app initialization and command registration | `main()`, Tauri builder |
-| **commands.rs** | Tauri IPC command handlers for frontend communication | `enumerate_sessions`, `start_recording`, `stop_session`, `save_api_key` |
+| **commands.rs** | Tauri IPC command handlers for frontend communication | `enumerate_sessions`, `start_recording`, `stop_session`, `save_api_key`, `get_masked_api_key` |
 | **state.rs** | Application state management with thread-safe access | `AppState` |
 | **config.rs** | Persistent configuration storage (JSON file in user config dir) | `AppConfig` |
 | **events.rs** | Tauri event definitions for frontend notifications | `AudioLevelEvent`, `SessionStatusEvent` |
