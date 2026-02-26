@@ -65,6 +65,9 @@ pub struct App {
     /// API key input buffer (for config mode)
     pub api_key_input: String,
 
+    /// Whether the API key is visible in config dialog
+    pub api_key_visible: bool,
+
     /// Should the app quit?
     pub should_quit: bool,
 
@@ -95,6 +98,7 @@ impl App {
             active_sessions: Vec::new(),
             config,
             api_key_input: String::new(),
+            api_key_visible: false,
             should_quit: false,
             status_message: None,
             error_channel: Arc::new(Mutex::new(None)),
@@ -173,7 +177,44 @@ impl App {
     /// Enter config input mode
     pub fn enter_config_mode(&mut self) {
         self.mode = AppMode::ConfigInput;
-        self.api_key_input = self.config.api_key.clone().unwrap_or_default();
+        self.api_key_input.clear();
+        self.api_key_visible = false;
+    }
+
+    /// Toggle API key visibility in config dialog
+    pub fn toggle_api_key_visibility(&mut self) {
+        self.api_key_visible = !self.api_key_visible;
+    }
+
+    /// Get a masked version of the currently stored API key for display
+    pub fn masked_stored_key(&self) -> Option<String> {
+        self.config.api_key.as_ref().filter(|k| !k.is_empty()).map(|key| {
+            let len = key.len();
+            if len <= 8 {
+                "*".repeat(len)
+            } else {
+                let prefix = &key[..4];
+                let suffix = &key[len - 4..];
+                format!("{}...{}", prefix, suffix)
+            }
+        })
+    }
+
+    /// Paste from clipboard, replacing current input entirely
+    pub fn paste_from_clipboard(&mut self) {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+            Ok(text) => {
+                let trimmed = text.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.api_key_input = trimmed;
+                    self.status_message = Some("Pasted from clipboard".to_string());
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to paste from clipboard: {}", e);
+                self.status_message = Some(format!("Clipboard error: {}", e));
+            }
+        }
     }
 
     /// Save API key from input

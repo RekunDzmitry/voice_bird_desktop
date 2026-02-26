@@ -23,8 +23,11 @@ const settingsBtn = document.getElementById('settings-btn');
 const statusMessage = document.getElementById('status-message');
 const apiKeyInput = document.getElementById('api-key-input');
 const toggleVisibilityBtn = document.getElementById('toggle-visibility');
+const clearKeyBtn = document.getElementById('clear-key-btn');
 const saveKeyBtn = document.getElementById('save-key-btn');
 const backBtn = document.getElementById('back-btn');
+const currentKeyInfo = document.getElementById('current-key-info');
+const currentKeyValue = document.getElementById('current-key-value');
 const addSourceBtn = document.getElementById('add-source-btn');
 const sourcePicker = document.getElementById('source-picker');
 const addSourceList = document.getElementById('add-source-list');
@@ -57,19 +60,35 @@ async function init() {
 
 // === View Management ===
 
-function showApiKeySection(canGoBack = false) {
+async function showApiKeySection(canGoBack = false) {
     currentView = 'api-key';
     apiKeySection.classList.remove('hidden');
     sessionBrowser.classList.add('hidden');
     recordingDashboard.classList.add('hidden');
     apiKeyInput.value = '';
+    apiKeyInput.type = 'password';
+    toggleVisibilityBtn.textContent = 'Show';
     apiKeyInput.focus();
+    updateSaveButton();
 
     // Show back button only if user can return (already configured)
     if (canGoBack) {
         backBtn.classList.remove('hidden');
     } else {
         backBtn.classList.add('hidden');
+    }
+
+    // Show current masked key if one is configured
+    try {
+        const masked = await invoke('get_masked_api_key');
+        if (masked) {
+            currentKeyValue.textContent = masked;
+            currentKeyInfo.classList.remove('hidden');
+        } else {
+            currentKeyInfo.classList.add('hidden');
+        }
+    } catch (e) {
+        currentKeyInfo.classList.add('hidden');
     }
 }
 
@@ -130,6 +149,14 @@ function toggleApiKeyVisibility() {
         apiKeyInput.type = 'password';
         toggleVisibilityBtn.textContent = 'Show';
     }
+}
+
+function clearApiKeyInput() {
+    apiKeyInput.value = '';
+    apiKeyInput.type = 'password';
+    toggleVisibilityBtn.textContent = 'Show';
+    apiKeyInput.focus();
+    updateSaveButton();
 }
 
 function updateSaveButton() {
@@ -510,13 +537,21 @@ function setupEventListeners() {
             saveApiKey();
         }
     });
+    // On paste, replace entire field content to prevent concatenation
+    apiKeyInput.addEventListener('paste', (e) => {
+        e.preventDefault();
+        const pasted = (e.clipboardData || window.clipboardData).getData('text');
+        apiKeyInput.value = pasted;
+        updateSaveButton();
+    });
     toggleVisibilityBtn.addEventListener('click', toggleApiKeyVisibility);
+    clearKeyBtn.addEventListener('click', clearApiKeyInput);
     saveKeyBtn.addEventListener('click', saveApiKey);
 
     // Session browser
     refreshBtn.addEventListener('click', refreshSessions);
     startBtn.addEventListener('click', startRecording);
-    settingsBtn.addEventListener('click', () => showApiKeySection(true));
+    settingsBtn.addEventListener('click', async () => await showApiKeySection(true));
     backBtn.addEventListener('click', goBackFromSettings);
 
     // Recording dashboard

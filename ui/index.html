@@ -18,9 +18,14 @@
             <section id="api-key-section" class="view hidden">
                 <h2>Configure API Key</h2>
                 <p class="hint">Enter your API key to connect to Voice Bird server. You can generate an API key from the web dashboard.</p>
+                <div id="current-key-info" class="current-key-info hidden">
+                    <span class="current-key-label">Current key:</span>
+                    <code id="current-key-value"></code>
+                </div>
                 <div class="input-group">
                     <input type="password" id="api-key-input" placeholder="Paste your API key here" autocomplete="off">
                     <button id="toggle-visibility" class="btn icon" title="Show/Hide">Show</button>
+                    <button id="clear-key-btn" class="btn icon" title="Clear">Clear</button>
                 </div>
                 <div class="controls">
                     <button id="back-btn" class="btn secondary hidden">Back</button>

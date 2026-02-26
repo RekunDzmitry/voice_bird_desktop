@@ -241,6 +241,35 @@ h2 {
     min-width: 60px;
 }
 
+/* Current Key Info */
+.current-key-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: rgba(78, 204, 163, 0.08);
+    border: 1px solid rgba(78, 204, 163, 0.2);
+    border-radius: 6px;
+    margin: 12px 0 4px;
+    font-size: 0.85rem;
+}
+
+.current-key-info.hidden {
+    display: none;
+}
+
+.current-key-label {
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.current-key-info code {
+    color: var(--accent-green);
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.85rem;
+    letter-spacing: 0.5px;
+}
+
 /* Input Group */
 .input-group {
     display: flex;

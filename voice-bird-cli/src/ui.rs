@@ -220,7 +220,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_config_dialog(frame: &mut Frame, app: &App) {
-    let area = centered_rect(60, 30, frame.area());
+    let area = centered_rect(60, 45, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -232,20 +232,42 @@ fn render_config_dialog(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),  // Current key status
             Constraint::Length(2),  // Instructions
             Constraint::Length(3),  // Input
-            Constraint::Length(2),  // Actions
+            Constraint::Length(2),  // Actions line 1
+            Constraint::Length(1),  // Actions line 2
         ])
         .margin(1)
         .split(area);
 
-    let instructions = Paragraph::new("Enter your Voice Bird API key:")
+    // Show current stored key (masked)
+    let current_key_line = if let Some(masked) = app.masked_stored_key() {
+        Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(masked, Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(Span::styled("No API key configured", Style::default().fg(Color::Yellow)))
+    };
+    let current_key = Paragraph::new(current_key_line);
+
+    let instructions = Paragraph::new("Enter new API key (paste replaces all):")
         .style(Style::default().fg(Color::White));
 
     let input_display = if app.api_key_input.is_empty() {
-        "(empty)".to_string()
+        "(empty — type or Ctrl+V to paste)".to_string()
+    } else if app.api_key_visible {
+        app.api_key_input.clone()
     } else {
-        "*".repeat(app.api_key_input.len().min(40))
+        let len = app.api_key_input.len();
+        if len <= 8 {
+            "*".repeat(len)
+        } else {
+            let prefix = &app.api_key_input[..4];
+            let suffix = &app.api_key_input[len.saturating_sub(4)..];
+            format!("{}...{} ({}ch)", prefix, suffix, len)
+        }
     };
 
     let input = Paragraph::new(input_display)
@@ -256,13 +278,18 @@ fn render_config_dialog(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
-    let actions = Paragraph::new("[Enter] Save  [Esc] Cancel")
+    let actions1 = Paragraph::new("[Enter] Save  [Esc] Cancel  [Tab] Show/Hide")
+        .style(Style::default().fg(Color::DarkGray));
+
+    let actions2 = Paragraph::new("[Ctrl+V] Paste  [Ctrl+U] Clear all  [Bksp] Delete char")
         .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(block, area);
-    frame.render_widget(instructions, chunks[0]);
-    frame.render_widget(input, chunks[1]);
-    frame.render_widget(actions, chunks[2]);
+    frame.render_widget(current_key, chunks[0]);
+    frame.render_widget(instructions, chunks[1]);
+    frame.render_widget(input, chunks[2]);
+    frame.render_widget(actions1, chunks[3]);
+    frame.render_widget(actions2, chunks[4]);
 }
 
 fn render_help_dialog(frame: &mut Frame) {
@@ -280,8 +307,11 @@ fn render_help_dialog(frame: &mut Frame) {
         "    Enter      Start/stop streaming",
         "    r          Refresh session list",
         "",
-        "  Configuration:",
+        "  Configuration (press 'c' to open):",
         "    c          Configure API key",
+        "    Tab        Show/hide key value",
+        "    Ctrl+V     Paste from clipboard",
+        "    Ctrl+U     Clear input",
         "",
         "  Diagnostics:",
         "    l          Copy error text to clipboard",
