@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -88,7 +88,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
                 match app.mode {
                     AppMode::Normal => handle_normal_mode(app, key.code),
-                    AppMode::ConfigInput => handle_config_mode(app, key.code),
+                    AppMode::ConfigInput => handle_config_mode(app, key.code, key.modifiers),
                     AppMode::Help => handle_help_mode(app, key.code),
                 }
             }
@@ -140,7 +140,22 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
     }
 }
 
-fn handle_config_mode(app: &mut App, key: KeyCode) {
+fn handle_config_mode(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    // Ctrl+U clears entire input
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match key {
+            KeyCode::Char('u') => {
+                app.api_key_input.clear();
+                return;
+            }
+            KeyCode::Char('v') => {
+                app.paste_from_clipboard();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key {
         KeyCode::Enter => {
             app.save_api_key();
@@ -150,6 +165,9 @@ fn handle_config_mode(app: &mut App, key: KeyCode) {
         }
         KeyCode::Backspace => {
             app.api_key_input.pop();
+        }
+        KeyCode::Tab => {
+            app.toggle_api_key_visibility();
         }
         KeyCode::Char(c) => {
             app.api_key_input.push(c);

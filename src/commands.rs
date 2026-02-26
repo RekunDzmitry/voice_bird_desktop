@@ -164,3 +164,20 @@ pub fn get_api_key_status(state: State<'_, AppState>) -> (bool, String) {
     let url = state.get_server_url().unwrap_or_default();
     (configured, url)
 }
+
+/// Get a masked version of the stored API key for display purposes.
+/// Returns None if no key is configured, or a masked string like "sk-...a1b2".
+#[tauri::command]
+pub fn get_masked_api_key() -> Option<String> {
+    let config = crate::config::AppConfig::load().unwrap_or_default();
+    config.api_key.as_ref().filter(|k| !k.is_empty()).map(|key| {
+        let len = key.len();
+        if len <= 8 {
+            "*".repeat(len)
+        } else {
+            let prefix = &key[..4];
+            let suffix = &key[len - 4..];
+            format!("{}...{}", prefix, suffix)
+        }
+    })
+}
