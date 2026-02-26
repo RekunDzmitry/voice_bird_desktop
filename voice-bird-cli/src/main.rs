@@ -21,7 +21,59 @@ use uuid::Uuid;
 
 use app::{App, AppMode, RecordingStatus, ActiveSession};
 
+/// On macOS, when launched via `open` as an .app bundle, macOS expects
+/// the process to initialize NSApplication and process Apple Events.
+/// Without this, Finder shows "application is not responding" dialogs.
+/// We spin up a background thread to satisfy macOS while the TUI runs
+/// on the main thread.
+#[cfg(target_os = "macos")]
+fn init_macos_app_event_handler() {
+    use std::ffi::CString;
+
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {
+        fn NSApplicationLoad() -> bool;
+    }
+
+    #[link(name = "objc", kind = "dylib")]
+    extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        fn objc_msgSend(obj: *mut std::ffi::c_void, sel: *mut std::ffi::c_void, ...) -> *mut std::ffi::c_void;
+    }
+
+    std::thread::spawn(|| {
+        unsafe {
+            // Initialize the NSApplication shared instance
+            NSApplicationLoad();
+
+            let cls_name = CString::new("NSApplication").unwrap();
+            let cls = objc_getClass(cls_name.as_ptr());
+            if cls.is_null() {
+                return;
+            }
+
+            let sel_shared = CString::new("sharedApplication").unwrap();
+            let app = objc_msgSend(cls, sel_registerName(sel_shared.as_ptr()));
+            if app.is_null() {
+                return;
+            }
+
+            // Tell macOS we've finished launching — suppresses "not responding"
+            let sel_finish = CString::new("finishLaunching").unwrap();
+            objc_msgSend(app, sel_registerName(sel_finish.as_ptr()));
+        }
+    });
+
+    // Give the background thread a moment to initialize
+    std::thread::sleep(Duration::from_millis(50));
+}
+
 fn main() -> Result<()> {
+    // On macOS, satisfy Apple Event expectations to prevent "not responding" dialogs
+    #[cfg(target_os = "macos")]
+    init_macos_app_event_handler();
+
     // Initialize file logger before TUI takes over the screen
     let log_path = match logger::init() {
         Ok(path) => Some(path),
