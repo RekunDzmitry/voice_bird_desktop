@@ -258,6 +258,7 @@ pub fn start_output_recording(
     session_id: String,
     audio_level: Arc<Mutex<f32>>,
     stop_signal: Arc<Mutex<bool>>,
+    init_result_tx: mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
     let process_id = session.process_id;
     let app_name = Some(session.app_name.clone());
@@ -282,6 +283,7 @@ pub fn start_output_recording(
                 rx,
                 sample_rate,
                 channels,
+                init_result_tx,
             ).await;
         });
     });

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
 use crate::platform::AudioSession;
+use crate::streaming::{InitSuccess, StreamError, UsageInfo};
 
 /// Application running mode
 #[derive(Debug, Clone, PartialEq)]
@@ -13,13 +14,97 @@ pub enum AppMode {
     Help,
 }
 
+/// Structured recording errors with user-friendly messages
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum RecordingError {
+    QuotaExceeded {
+        message: String,
+        usage: Option<UsageInfo>,
+    },
+    InvalidApiKey {
+        message: String,
+    },
+    ConnectionFailed {
+        message: String,
+    },
+    InitTimeout,
+    NoApiKey,
+    NoSelection,
+    NoSessionsStarted,
+    Other(String),
+}
+
+impl RecordingError {
+    pub fn display_message(&self) -> String {
+        match self {
+            RecordingError::QuotaExceeded { usage, .. } => {
+                if let Some(u) = usage {
+                    let used_mins = (u.seconds_used / 60.0).round() as u32;
+                    let limit_mins = (u.seconds_limit / 60.0).round() as u32;
+                    format!(
+                        "Quota exceeded: {}m/{}m used ({}). Upgrade at voicebird.app/pricing",
+                        used_mins, limit_mins, u.plan
+                    )
+                } else {
+                    "Quota exceeded. Upgrade at voicebird.app/pricing".to_string()
+                }
+            }
+            RecordingError::InvalidApiKey { .. } => {
+                "Invalid API key. Press 'c' to reconfigure.".to_string()
+            }
+            RecordingError::ConnectionFailed { message } => {
+                format!("Connection failed: {}", message)
+            }
+            RecordingError::InitTimeout => {
+                "Server initialization timed out. Check your connection.".to_string()
+            }
+            RecordingError::NoApiKey => {
+                "API key not configured. Press 'c' to configure.".to_string()
+            }
+            RecordingError::NoSelection => {
+                "No sessions selected. Press Space to select.".to_string()
+            }
+            RecordingError::NoSessionsStarted => {
+                "Failed to start any sessions".to_string()
+            }
+            RecordingError::Other(msg) => msg.clone(),
+        }
+    }
+}
+
+impl PartialEq for RecordingError {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by display message for simplicity
+        self.display_message() == other.display_message()
+    }
+}
+
+impl From<StreamError> for RecordingError {
+    fn from(err: StreamError) -> Self {
+        match err {
+            StreamError::QuotaExceeded { message, usage } => {
+                RecordingError::QuotaExceeded { message, usage }
+            }
+            StreamError::InvalidApiKey { message } => {
+                RecordingError::InvalidApiKey { message }
+            }
+            StreamError::ConnectionFailed { message } => {
+                RecordingError::ConnectionFailed { message }
+            }
+            StreamError::InitTimeout => RecordingError::InitTimeout,
+            StreamError::Other { message } => RecordingError::Other(message),
+        }
+    }
+}
+
 /// Recording status
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordingStatus {
     Idle,
     Connecting,
-    Streaming,
-    Error(String),
+    Streaming { usage: Option<UsageInfo> },
+    Error(RecordingError),
 }
 
 /// Active recording session
@@ -79,6 +164,9 @@ pub struct App {
 
     /// Path to the current log file
     pub log_path: Option<PathBuf>,
+
+    /// Channel to receive init results from streaming threads
+    pub init_result_rx: Option<mpsc::Receiver<Result<InitSuccess, StreamError>>>,
 }
 
 impl App {
@@ -103,6 +191,7 @@ impl App {
             status_message: None,
             error_channel: Arc::new(Mutex::new(None)),
             log_path: None,
+            init_result_rx: None,
         }
     }
 
@@ -184,6 +273,11 @@ impl App {
     /// Toggle API key visibility in config dialog
     pub fn toggle_api_key_visibility(&mut self) {
         self.api_key_visible = !self.api_key_visible;
+        self.status_message = Some(if self.api_key_visible {
+            "Key visible".to_string()
+        } else {
+            "Key hidden".to_string()
+        });
     }
 
     /// Get a masked version of the currently stored API key for display
@@ -245,7 +339,50 @@ impl App {
     pub fn check_error(&mut self) {
         if let Ok(mut err) = self.error_channel.lock() {
             if let Some(msg) = err.take() {
-                self.status = RecordingStatus::Error(msg);
+                self.status = RecordingStatus::Error(RecordingError::Other(msg));
+            }
+        }
+    }
+
+    /// Check for init results from streaming threads
+    pub fn check_init_result(&mut self) {
+        let result = if let Some(ref rx) = self.init_result_rx {
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed while still Connecting
+                    if self.status == RecordingStatus::Connecting {
+                        Some(Err(StreamError::Other {
+                            message: "Recording thread terminated unexpectedly".to_string(),
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(init_result) = result {
+            match init_result {
+                Ok(success) => {
+                    self.status = RecordingStatus::Streaming { usage: success.usage };
+                }
+                Err(err) => {
+                    log::error!("Init failed: {}", err);
+                    self.status = RecordingStatus::Error(RecordingError::from(err));
+                    // Stop active sessions since init failed
+                    for session in &self.active_sessions {
+                        if let Ok(mut stop) = session.stop_signal.lock() {
+                            *stop = true;
+                        }
+                    }
+                    self.active_sessions.clear();
+                    self.start_time = None;
+                    self.init_result_rx = None;
+                }
             }
         }
     }
