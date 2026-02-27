@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "voice-bird-cli"
-version = "0.2.11"
+version = "0.2.12"
 description = "Voice Bird CLI - Terminal audio streaming for voice transcription"
 authors = [{ name = "Dzmitry Rekun" }]
 readme = "voice-bird-cli/README.md"
