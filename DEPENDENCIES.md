@@ -440,9 +440,23 @@ sequenceDiagram
 - `pong`: Response to server pings
 
 **Server → Client**:
-- `connected` (JSON): Acknowledgment of init
-- `error` (JSON): Error notifications
+- `init_success` (JSON): Acknowledgment of init, may include `usage: {seconds_remaining, seconds_limit, seconds_used, plan}`
+- `error` (JSON): Error notifications with optional `code` (`QUOTA_EXCEEDED`, `INVALID_API_KEY`) and `usage` fields
 - `ping`: Keepalive checks
+
+### Init Result Channel (CLI)
+
+The CLI app (`voice-bird-cli/`) uses an `mpsc::channel` to report init results from streaming threads back to the UI thread. This prevents the UI from showing "Streaming" before the server confirms the session:
+
+1. **Connecting**: UI stays in `Connecting` state while `stream_to_server()` awaits init response
+2. **Init Success**: Server sends `init_success` → channel receives `Ok(InitSuccess { usage })` → UI transitions to `Streaming { usage }`
+3. **Init Error**: Server sends `error` with `code` → channel receives `Err(StreamError)` → UI shows structured `RecordingError`
+
+**Structured errors** (`RecordingError` in `app.rs`):
+- `QuotaExceeded`: Shows plan, usage, and upgrade URL
+- `InvalidApiKey`: Prompts user to reconfigure
+- `ConnectionFailed`: Shows connection error details
+- `InitTimeout`: Suggests checking network connection
 
 ---
 
