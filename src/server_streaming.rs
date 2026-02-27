@@ -412,8 +412,10 @@ impl ServerStreamingService {
                 break;
             }
 
-            // Wait for audio chunks with timeout to allow pong handling
-            let chunks = audio_consumer.wait_and_drain(std::time::Duration::from_millis(10));
+            // Wait for audio chunks with timeout to allow pong handling.
+            // 50ms reduces idle polling from 100/sec to 20/sec; condvar early-wake
+            // from the producer ensures data-driven wake-ups remain prompt.
+            let chunks = audio_consumer.wait_and_drain(std::time::Duration::from_millis(50));
             if chunks.is_empty() {
                 continue;
             }
