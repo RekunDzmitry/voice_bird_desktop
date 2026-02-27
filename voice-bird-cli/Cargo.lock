@@ -2015,6 +2015,7 @@ dependencies = [
  "futures-util",
  "hound",
  "http",
+ "libc",
  "log",
  "ratatui",
  "rubato",
