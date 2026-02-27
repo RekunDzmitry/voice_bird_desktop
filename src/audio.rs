@@ -2,6 +2,7 @@ use anyhow::{Result, Context};
 use cpal::{Device, SampleFormat};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavWriter, WavSpec};
+use std::sync::atomic::Ordering;
 use crate::session::RecordingSession;
 use crate::server_streaming::ServerStreamingService;
 use crate::audio_buffer::{AudioPreBuffer, AudioConsumer};
@@ -144,17 +145,12 @@ pub fn start_input_recording(
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &_| {
-                    // Check stop signal
-                    if let Ok(stop) = stop_signal.lock() {
-                        if *stop {
-                            return;
-                        }
+                    if stop_signal.load(Ordering::Acquire) {
+                        return;
                     }
 
                     let rms = calculate_rms(data);
-                    if let Ok(mut level) = audio_level.lock() {
-                        *level = rms;
-                    }
+                    audio_level.store(rms.to_bits(), Ordering::Relaxed);
 
                     if let Ok(mut buffer) = audio_buffer.lock() {
                         buffer.extend_from_slice(data);
@@ -171,17 +167,13 @@ pub fn start_input_recording(
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &_| {
-                    if let Ok(stop) = stop_signal.lock() {
-                        if *stop {
-                            return;
-                        }
+                    if stop_signal.load(Ordering::Acquire) {
+                        return;
                     }
 
                     let samples: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                     let rms = calculate_rms(&samples);
-                    if let Ok(mut level) = audio_level.lock() {
-                        *level = rms;
-                    }
+                    audio_level.store(rms.to_bits(), Ordering::Relaxed);
 
                     if let Ok(mut buffer) = audio_buffer.lock() {
                         buffer.extend_from_slice(&samples);
@@ -198,19 +190,15 @@ pub fn start_input_recording(
             device.build_input_stream(
                 &config.into(),
                 move |data: &[u16], _: &_| {
-                    if let Ok(stop) = stop_signal.lock() {
-                        if *stop {
-                            return;
-                        }
+                    if stop_signal.load(Ordering::Acquire) {
+                        return;
                     }
 
                     let samples: Vec<f32> = data.iter()
                         .map(|&s| (s as f32 - 32768.0) / 32768.0)
                         .collect();
                     let rms = calculate_rms(&samples);
-                    if let Ok(mut level) = audio_level.lock() {
-                        *level = rms;
-                    }
+                    audio_level.store(rms.to_bits(), Ordering::Relaxed);
 
                     if let Ok(mut buffer) = audio_buffer.lock() {
                         buffer.extend_from_slice(&samples);
@@ -535,14 +523,12 @@ pub fn start_output_recording(
 
                 // Audio capture loop
                 loop {
-                    if let Ok(stop) = stop_signal.lock() {
-                        if *stop {
-                            break;
-                        }
+                    if stop_signal.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
                     }
 
-                    // 5ms sleep for low latency
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // 10ms sleep balances latency vs CPU usage with 1-second buffer
+                    std::thread::sleep(std::time::Duration::from_millis(10));
 
                     loop {
                         let packet_size = capture_client.GetNextPacketSize().ok().unwrap_or(0);
@@ -568,9 +554,7 @@ pub fn start_output_recording(
                             );
 
                             let rms = calculate_rms(float_buffer);
-                            if let Ok(mut level) = audio_level.lock() {
-                                *level = rms;
-                            }
+                            audio_level.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
                             if let Ok(mut buffer) = audio_buffer.lock() {
                                 buffer.extend_from_slice(float_buffer);
@@ -582,8 +566,8 @@ pub fn start_output_recording(
                             }
 
                             packet_count += 1;
-                            // Log every 200 packets (roughly every 1 second at 5ms intervals)
-                            if packet_count % 200 == 0 {
+                            // Log every 100 packets (roughly every 1 second at 10ms intervals)
+                            if packet_count % 100 == 0 {
                                 log::debug!("[PID {}] Captured {} packets, RMS: {:.4}", process_id, packet_count, rms);
                             }
 
@@ -726,13 +710,11 @@ fn start_output_recording_device_loopback(
                     .ok().context("Failed to start audio stream")?;
 
                 loop {
-                    if let Ok(stop) = stop_signal.lock() {
-                        if *stop {
-                            break;
-                        }
+                    if stop_signal.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
                     }
 
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
 
                     loop {
                         let packet_size = capture_client.GetNextPacketSize().ok().unwrap_or(0);
@@ -758,9 +740,7 @@ fn start_output_recording_device_loopback(
                             );
 
                             let rms = calculate_rms(float_buffer);
-                            if let Ok(mut level) = audio_level.lock() {
-                                *level = rms;
-                            }
+                            audio_level.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
                             if let Ok(mut buffer) = audio_buffer.lock() {
                                 buffer.extend_from_slice(float_buffer);
@@ -908,9 +888,9 @@ pub fn start_output_recording(
 
     // Create output handler for audio samples — writes to AudioProducer if streaming
     struct AudioOutputHandler {
-        audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
+        audio_level: std::sync::Arc<std::sync::atomic::AtomicU32>,
         audio_buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
-        stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
+        stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
         producer: Option<AudioProducer>,
     }
 
@@ -922,10 +902,8 @@ pub fn start_output_recording(
             }
 
             // Check stop signal
-            if let Ok(stop) = self.stop_signal.lock() {
-                if *stop {
-                    return;
-                }
+            if self.stop_signal.load(std::sync::atomic::Ordering::Acquire) {
+                return;
             }
 
             // Extract audio samples from CMSampleBuffer
@@ -953,9 +931,7 @@ pub fn start_output_recording(
 
                 // Calculate RMS and update audio level
                 let rms = crate::audio::calculate_rms(&samples);
-                if let Ok(mut level) = self.audio_level.lock() {
-                    *level = rms;
-                }
+                self.audio_level.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
                 // Store in local buffer (for potential WAV export)
                 if let Ok(mut buffer) = self.audio_buffer.lock() {
@@ -997,9 +973,7 @@ pub fn start_output_recording(
     // Return cleanup closure that stops the stream
     let stop_signal_cleanup = stop_signal.clone();
     Ok(Box::new(move || {
-        if let Ok(mut stop) = stop_signal_cleanup.lock() {
-            *stop = true;
-        }
+        stop_signal_cleanup.store(true, Ordering::Release);
         // Stream will be dropped here, stopping capture
         drop(stream);
     }))

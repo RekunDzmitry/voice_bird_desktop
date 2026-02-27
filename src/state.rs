@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 use anyhow::Result;
@@ -141,23 +142,20 @@ impl AppState {
 
         std::thread::spawn(move || {
             loop {
-                if let Ok(stop) = stop_signal.lock() {
-                    if *stop {
-                        break;
-                    }
+                if stop_signal.load(Ordering::Acquire) {
+                    break;
                 }
 
-                if let Ok(level) = audio_level.lock() {
-                    let _ = app_handle_clone.emit(
-                        "audio-level",
-                        AudioLevelEvent {
-                            session_id: session_id_str.clone(),
-                            level: *level,
-                        },
-                    );
-                }
+                let level = f32::from_bits(audio_level.load(Ordering::Relaxed));
+                let _ = app_handle_clone.emit(
+                    "audio-level",
+                    AudioLevelEvent {
+                        session_id: session_id_str.clone(),
+                        level,
+                    },
+                );
 
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         });
 

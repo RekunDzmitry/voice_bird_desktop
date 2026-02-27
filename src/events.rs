@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// Event emitted for real-time audio level updates
-/// Emitted at ~20Hz (every 50ms) per session
+/// Emitted at ~10Hz (every 100ms) per session
 #[derive(Clone, Serialize)]
 pub struct AudioLevelEvent {
     pub session_id: String,

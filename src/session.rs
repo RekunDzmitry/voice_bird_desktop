@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
 use uuid::Uuid;
 use chrono::Local;
@@ -30,12 +31,12 @@ pub struct RecordingSession {
     #[allow(dead_code)]
     pub is_input: bool,
     pub status: Arc<Mutex<SessionStatus>>,
-    pub audio_level: Arc<Mutex<f32>>,
+    pub audio_level: Arc<AtomicU32>,
     pub audio_buffer: Arc<Mutex<Vec<f32>>>,
     pub sample_rate: u32,
     pub channels: u16,
     pub start_time: Option<std::time::Instant>,
-    pub stop_signal: Arc<Mutex<bool>>,
+    pub stop_signal: Arc<AtomicBool>,
 }
 
 impl RecordingSession {
@@ -47,12 +48,12 @@ impl RecordingSession {
             process_id: session_info.process_id,
             is_input: session_info.is_input,
             status: Arc::new(Mutex::new(SessionStatus::Idle)),
-            audio_level: Arc::new(Mutex::new(0.0)),
+            audio_level: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             sample_rate,
             channels,
             start_time: None,
-            stop_signal: Arc::new(Mutex::new(false)),
+            stop_signal: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -67,9 +68,7 @@ impl RecordingSession {
         if let Ok(mut status) = self.status.lock() {
             *status = SessionStatus::Stopped;
         }
-        if let Ok(mut signal) = self.stop_signal.lock() {
-            *signal = true;
-        }
+        self.stop_signal.store(true, Ordering::Release);
     }
 
     pub fn get_status(&self) -> SessionStatus {
@@ -77,7 +76,7 @@ impl RecordingSession {
     }
 
     pub fn get_audio_level(&self) -> f32 {
-        self.audio_level.lock().map(|l| *l).unwrap_or(0.0)
+        f32::from_bits(self.audio_level.load(Ordering::Relaxed))
     }
 
     pub fn get_duration(&self) -> f32 {
