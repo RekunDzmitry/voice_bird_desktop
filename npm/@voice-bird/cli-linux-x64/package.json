@@ -1,6 +1,6 @@
 {
   "name": "@voice-bird/cli-linux-x64",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "Linux x64 binary for voice-bird-cli",
   "repository": {
     "type": "git",
