@@ -118,6 +118,7 @@ pub fn start_output_recording(
     session_id: String,
     audio_level: Arc<Mutex<f32>>,
     stop_signal: Arc<Mutex<bool>>,
+    init_result_tx: mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
     let macos_version = check_macos_version()?;
 
@@ -156,6 +157,7 @@ pub fn start_output_recording(
                 rx,
                 DEFAULT_SAMPLE_RATE,
                 DEFAULT_CHANNELS,
+                init_result_tx,
             ).await;
         });
     });

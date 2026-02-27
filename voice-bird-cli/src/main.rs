@@ -19,7 +19,48 @@ use crossterm::{
 use ratatui::prelude::*;
 use uuid::Uuid;
 
-use app::{App, AppMode, RecordingStatus, ActiveSession};
+use app::{App, AppMode, RecordingStatus, RecordingError, ActiveSession};
+
+/// When launched via macOS `open --args --tty <path>`, the process gets
+/// stdin from `open` which doesn't properly forward terminal input.
+/// We detect the `--tty` flag, reopen the real TTY, and dup2 it onto
+/// stdin so crossterm gets proper raw-mode keyboard events.
+#[cfg(target_os = "macos")]
+fn reconnect_tty_from_args() {
+    let args: Vec<String> = std::env::args().collect();
+    let tty_idx = match args.iter().position(|a| a == "--tty") {
+        Some(idx) => idx,
+        None => return,
+    };
+    let tty_path = match args.get(tty_idx + 1) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    let c_path = match std::ffi::CString::new(tty_path) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    unsafe {
+        extern "C" {
+            fn open(path: *const std::ffi::c_char, oflag: i32) -> i32;
+            fn dup2(oldfd: i32, newfd: i32) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+        const O_RDWR: i32 = 2;
+
+        let fd = open(c_path.as_ptr(), O_RDWR);
+        if fd < 0 {
+            return;
+        }
+        // Reconnect stdin to the real TTY for keyboard input
+        dup2(fd, 0);
+        if fd > 2 {
+            close(fd);
+        }
+    }
+}
 
 /// On macOS, when launched via `open` as an .app bundle, macOS expects
 /// the process to initialize NSApplication and process Apple Events.
@@ -70,6 +111,12 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
+    // When launched via macOS `open`, reconnect stdin to the real TTY
+    // so crossterm gets proper keyboard input. Must happen before anything
+    // reads from stdin.
+    #[cfg(target_os = "macos")]
+    reconnect_tty_from_args();
+
     // On macOS, satisfy Apple Event expectations to prevent "not responding" dialogs
     #[cfg(target_os = "macos")]
     init_macos_app_event_handler();
@@ -127,6 +174,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
         // Check for errors from recording threads
         app.check_error();
+
+        // Check for init results from streaming threads
+        app.check_init_result();
 
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
@@ -218,7 +268,11 @@ fn handle_config_mode(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Backspace => {
             app.api_key_input.pop();
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.toggle_api_key_visibility();
+        }
+        KeyCode::Char('\t') => {
+            // Some terminals report Tab as Char('\t') instead of KeyCode::Tab
             app.toggle_api_key_visibility();
         }
         KeyCode::Char(c) => {
@@ -238,8 +292,8 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
 }
 
 fn copy_error_to_clipboard(app: &mut App) {
-    if let RecordingStatus::Error(ref msg) = app.status {
-        let text = msg.clone();
+    if let RecordingStatus::Error(ref err) = app.status {
+        let text = err.display_message();
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
             Ok(()) => {
                 app.status_message = Some("Error copied to clipboard".to_string());
@@ -272,7 +326,7 @@ fn toggle_recording(app: &mut App) {
         RecordingStatus::Idle | RecordingStatus::Error(_) => {
             start_recording(app);
         }
-        RecordingStatus::Streaming | RecordingStatus::Connecting => {
+        RecordingStatus::Streaming { .. } | RecordingStatus::Connecting => {
             stop_all_sessions(app);
         }
     }
@@ -281,13 +335,13 @@ fn toggle_recording(app: &mut App) {
 fn start_recording(app: &mut App) {
     // Check API key
     if !app.config.has_api_key() {
-        app.status = RecordingStatus::Error("API key not configured. Press 'c' to configure.".to_string());
+        app.status = RecordingStatus::Error(RecordingError::NoApiKey);
         return;
     }
 
     // Check selections
     if app.selected_sessions.is_empty() {
-        app.status = RecordingStatus::Error("No sessions selected. Press Space to select.".to_string());
+        app.status = RecordingStatus::Error(RecordingError::NoSelection);
         return;
     }
 
@@ -297,6 +351,10 @@ fn start_recording(app: &mut App) {
     let server_url = app.config.server_url();
     let api_key = app.config.api_key.clone().unwrap_or_default();
 
+    // Create init result channel — streaming threads report init success/failure here
+    let (init_tx, init_rx) = std::sync::mpsc::channel();
+    app.init_result_rx = Some(init_rx);
+
     // Start each selected session
     for &idx in &app.selected_sessions.clone() {
         if let Some(session) = app.sessions.get(idx).cloned() {
@@ -304,6 +362,7 @@ fn start_recording(app: &mut App) {
             let stop_signal = Arc::new(Mutex::new(false));
             let audio_level = app.audio_level.clone();
             let error_channel = app.error_channel.clone();
+            let init_tx_clone = init_tx.clone();
 
             let server_url_clone = server_url.clone();
             let api_key_clone = api_key.clone();
@@ -329,6 +388,7 @@ fn start_recording(app: &mut App) {
                             stop_signal: stop_signal_clone,
                             audio_level: audio_level_clone,
                         },
+                        init_tx_clone,
                     )
                 } else {
                     platform::start_output_recording(
@@ -338,6 +398,7 @@ fn start_recording(app: &mut App) {
                         session_id_str,
                         audio_level_clone,
                         stop_signal_clone,
+                        init_tx_clone,
                     )
                 };
 
@@ -358,11 +419,10 @@ fn start_recording(app: &mut App) {
         }
     }
 
-    if !app.active_sessions.is_empty() {
-        app.status = RecordingStatus::Streaming;
-    } else {
-        app.status = RecordingStatus::Error("Failed to start any sessions".to_string());
+    if app.active_sessions.is_empty() {
+        app.status = RecordingStatus::Error(RecordingError::NoSessionsStarted);
     }
+    // Status stays as Connecting until check_init_result() receives confirmation
 }
 
 fn stop_all_sessions(app: &mut App) {
@@ -378,6 +438,7 @@ fn stop_all_sessions(app: &mut App) {
     app.status = RecordingStatus::Idle;
     app.start_time = None;
     app.duration = 0.0;
+    app.init_result_rx = None;
 
     if let Ok(mut level) = app.audio_level.lock() {
         *level = 0.0;

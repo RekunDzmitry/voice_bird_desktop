@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
+use crate::streaming;
+
 #[cfg(windows)]
 mod windows;
 
@@ -42,8 +44,9 @@ pub fn start_output_recording(
     session_id: String,
     audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
     stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
+    init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
-    windows::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal)
+    windows::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal, init_result_tx)
 }
 
 #[cfg(target_os = "macos")]
@@ -54,8 +57,9 @@ pub fn start_output_recording(
     session_id: String,
     audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
     stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
+    init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
-    macos::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal)
+    macos::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal, init_result_tx)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -66,6 +70,7 @@ pub fn start_output_recording(
     _session_id: String,
     _audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
     _stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
+    _init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
     Err(anyhow::anyhow!("Output recording not supported on this platform"))
 }

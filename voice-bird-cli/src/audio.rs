@@ -93,6 +93,7 @@ pub fn start_input_recording(
     api_key: String,
     session_id: String,
     ctx: RecordingContext,
+    init_result_tx: mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
 ) -> Result<()> {
     let host = cpal::default_host();
 
@@ -136,6 +137,7 @@ pub fn start_input_recording(
                 rx,
                 sample_rate,
                 channels,
+                init_result_tx,
             )
             .await;
         });

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::mpsc;
 use tokio::time::Duration as TokioDuration;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
@@ -11,6 +12,47 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 
 use crate::audio::AudioConverter;
+
+/// Usage information returned by the server
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UsageInfo {
+    #[serde(default)]
+    pub seconds_remaining: f64,
+    #[serde(default)]
+    pub seconds_limit: f64,
+    #[serde(default)]
+    pub seconds_used: f64,
+    #[serde(default)]
+    pub plan: String,
+}
+
+/// Successful init response from server
+#[derive(Debug, Clone)]
+pub struct InitSuccess {
+    pub usage: Option<UsageInfo>,
+}
+
+/// Errors that can occur during stream initialization
+#[derive(Debug, Clone)]
+pub enum StreamError {
+    QuotaExceeded { message: String, usage: Option<UsageInfo> },
+    InvalidApiKey { message: String },
+    ConnectionFailed { message: String },
+    InitTimeout,
+    Other { message: String },
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::QuotaExceeded { message, .. } => write!(f, "{}", message),
+            StreamError::InvalidApiKey { message } => write!(f, "{}", message),
+            StreamError::ConnectionFailed { message } => write!(f, "{}", message),
+            StreamError::InitTimeout => write!(f, "Session initialization timeout"),
+            StreamError::Other { message } => write!(f, "{}", message),
+        }
+    }
+}
 
 /// Message sent to initialize a streaming session
 #[derive(Debug, Serialize)]
@@ -46,6 +88,10 @@ struct ServerResponse {
     message: String,
     #[serde(default)]
     error: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 /// Stream audio to Voice Bird server via WebSocket
@@ -60,6 +106,7 @@ pub async fn stream_to_server(
     audio_rx: mpsc::Receiver<Vec<f32>>,
     sample_rate: u32,
     channels: u16,
+    init_result_tx: mpsc::Sender<Result<InitSuccess, StreamError>>,
 ) -> Result<()> {
     // Convert HTTP(S) URL to WebSocket URL
     let ws_url = server_url
@@ -97,9 +144,13 @@ pub async fn stream_to_server(
     let (ws_stream, _response) = match connection_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
+            let err = StreamError::ConnectionFailed { message: format!("WebSocket connection failed: {}", e) };
+            let _ = init_result_tx.send(Err(err));
             return Err(anyhow::anyhow!("WebSocket connection failed: {}", e));
         }
         Err(_) => {
+            let err = StreamError::ConnectionFailed { message: "Connection timeout".to_string() };
+            let _ = init_result_tx.send(Err(err));
             return Err(anyhow::anyhow!("Connection timeout"));
         }
     };
@@ -131,7 +182,9 @@ pub async fn stream_to_server(
 
     // Create channels for coordination
     let (pong_tx, mut pong_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    let (init_ack_tx, init_ack_rx) = oneshot::channel::<Result<(), String>>();
+
+    // Internal oneshot carries full server response info for init
+    let (init_ack_tx, init_ack_rx) = oneshot::channel::<Result<InitSuccess, StreamError>>();
     let init_ack_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(init_ack_tx)));
     let init_ack_tx_clone = init_ack_tx.clone();
 
@@ -146,19 +199,33 @@ pub async fn stream_to_server(
                             "init_success" => {
                                 if let Ok(mut guard) = init_ack_tx_clone.lock() {
                                     if let Some(tx) = guard.take() {
-                                        let _ = tx.send(Ok(()));
+                                        let _ = tx.send(Ok(InitSuccess {
+                                            usage: response.usage,
+                                        }));
                                     }
                                 }
                             }
                             "error" => {
                                 let error_msg = if !response.message.is_empty() {
-                                    response.message
+                                    response.message.clone()
                                 } else {
-                                    response.error
+                                    response.error.clone()
+                                };
+                                let stream_err = match response.code.as_deref() {
+                                    Some("QUOTA_EXCEEDED") => StreamError::QuotaExceeded {
+                                        message: error_msg,
+                                        usage: response.usage,
+                                    },
+                                    Some("INVALID_API_KEY") => StreamError::InvalidApiKey {
+                                        message: error_msg,
+                                    },
+                                    _ => StreamError::Other {
+                                        message: error_msg,
+                                    },
                                 };
                                 if let Ok(mut guard) = init_ack_tx_clone.lock() {
                                     if let Some(tx) = guard.take() {
-                                        let _ = tx.send(Err(error_msg));
+                                        let _ = tx.send(Err(stream_err));
                                     }
                                 }
                             }
@@ -182,16 +249,20 @@ pub async fn stream_to_server(
     });
 
     // Wait for server to confirm init
-    match tokio::time::timeout(TokioDuration::from_secs(10), init_ack_rx).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => {
-            return Err(anyhow::anyhow!("Session rejected: {}", e));
+    let init_result = match tokio::time::timeout(TokioDuration::from_secs(10), init_ack_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(StreamError::Other { message: "Init acknowledgment channel closed".to_string() }),
+        Err(_) => Err(StreamError::InitTimeout),
+    };
+
+    // Report init result to the UI thread
+    match init_result {
+        Ok(ref success) => {
+            let _ = init_result_tx.send(Ok(success.clone()));
         }
-        Ok(Err(_)) => {
-            return Err(anyhow::anyhow!("Init acknowledgment failed"));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!("Session initialization timeout"));
+        Err(ref err) => {
+            let _ = init_result_tx.send(Err(err.clone()));
+            return Err(anyhow::anyhow!("{}", err));
         }
     }
 

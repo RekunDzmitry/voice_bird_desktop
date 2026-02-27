@@ -129,10 +129,20 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     // Status text
     let (status_text, status_color) = match &app.status {
-        RecordingStatus::Idle => ("Idle", Color::DarkGray),
-        RecordingStatus::Connecting => ("Connecting...", Color::Yellow),
-        RecordingStatus::Streaming => ("Streaming to server", Color::Green),
-        RecordingStatus::Error(msg) => (msg.as_str(), Color::Red),
+        RecordingStatus::Idle => ("Idle".to_string(), Color::DarkGray),
+        RecordingStatus::Connecting => ("Connecting...".to_string(), Color::Yellow),
+        RecordingStatus::Streaming { usage } => {
+            let text = if let Some(u) = usage {
+                let remaining_secs = u.seconds_remaining as u32;
+                let mins = remaining_secs / 60;
+                let secs = remaining_secs % 60;
+                format!("Streaming to server ({:02}:{:02} remaining)", mins, secs)
+            } else {
+                "Streaming to server".to_string()
+            };
+            (text, Color::Green)
+        }
+        RecordingStatus::Error(err) => (err.display_message(), Color::Red),
     };
 
     let status_line = Paragraph::new(format!("Status: {}", status_text))
@@ -171,7 +181,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
-    let recording = matches!(app.status, RecordingStatus::Streaming | RecordingStatus::Connecting);
+    let recording = matches!(app.status, RecordingStatus::Streaming { .. } | RecordingStatus::Connecting);
 
     let controls = if recording {
         vec![
