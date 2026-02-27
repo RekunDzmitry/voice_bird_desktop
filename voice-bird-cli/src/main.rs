@@ -168,7 +168,23 @@ fn main() -> Result<()> {
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    let mut consecutive_poll_errors: u32 = 0;
+
     loop {
+        // Detect revoked stdin (e.g., TTY closed while app bundle still running).
+        // On Unix, isatty(0) returns false when stdin fd is revoked, which would
+        // cause event::poll to return instantly and spin the CPU at 100%.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let stdin_fd = std::io::stdin().as_raw_fd();
+            if unsafe { libc::isatty(stdin_fd) } == 0 {
+                log::warn!("stdin is no longer a TTY, exiting gracefully");
+                stop_all_sessions(app);
+                return Ok(());
+            }
+        }
+
         // Update duration if recording
         app.update_duration();
 
@@ -182,16 +198,31 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         terminal.draw(|f| ui::render(f, app))?;
 
         // Handle events with timeout for smooth updates
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        match event::poll(Duration::from_millis(50)) {
+            Ok(true) => {
+                consecutive_poll_errors = 0;
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
 
-                match app.mode {
-                    AppMode::Normal => handle_normal_mode(app, key.code),
-                    AppMode::ConfigInput => handle_config_mode(app, key.code, key.modifiers),
-                    AppMode::Help => handle_help_mode(app, key.code),
+                    match app.mode {
+                        AppMode::Normal => handle_normal_mode(app, key.code),
+                        AppMode::ConfigInput => handle_config_mode(app, key.code, key.modifiers),
+                        AppMode::Help => handle_help_mode(app, key.code),
+                    }
+                }
+            }
+            Ok(false) => {
+                consecutive_poll_errors = 0;
+            }
+            Err(e) => {
+                consecutive_poll_errors += 1;
+                log::warn!("event::poll error ({}/5): {}", consecutive_poll_errors, e);
+                if consecutive_poll_errors >= 5 {
+                    log::error!("Too many consecutive poll errors, exiting");
+                    stop_all_sessions(app);
+                    return Ok(());
                 }
             }
         }
