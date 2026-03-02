@@ -2,14 +2,27 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Clear},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
 
 use crate::app::{App, AppMode, RecordingStatus};
 
-/// Render the application UI
+/// Render the application UI.
+///
+/// Modal views (config, help) render as full-screen layouts instead of
+/// overlays.  This avoids a Windows-specific issue where ratatui's
+/// buffer-diff algorithm fails to visually update overlay content,
+/// requiring `terminal.clear()` which causes visible screen flicker.
 pub fn render(frame: &mut Frame, app: &App) {
+    match app.mode {
+        AppMode::Normal => render_normal(frame, app),
+        AppMode::ConfigInput => render_config_fullscreen(frame, app),
+        AppMode::Help => render_help_fullscreen(frame),
+    }
+}
+
+fn render_normal(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,13 +37,6 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_session_list(frame, chunks[1], app);
     render_status_panel(frame, chunks[2], app);
     render_controls(frame, chunks[3], app);
-
-    // Render overlays
-    match app.mode {
-        AppMode::ConfigInput => render_config_dialog(frame, app),
-        AppMode::Help => render_help_dialog(frame),
-        AppMode::Normal => {}
-    }
 }
 
 fn render_title(frame: &mut Frame, area: Rect, app: &App) {
@@ -229,10 +235,46 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_config_dialog(frame: &mut Frame, app: &App) {
-    let area = centered_rect(60, 45, frame.area());
+/// Full-screen config view — no overlay, no Clear widget.
+/// Ratatui's normal diff handles updates without flicker.
+fn render_config_fullscreen(frame: &mut Frame, app: &App) {
+    let area = frame.area();
 
-    frame.render_widget(Clear, area);
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title bar
+            Constraint::Min(0),    // Config content
+            Constraint::Length(1), // Bottom hint
+        ])
+        .split(area);
+
+    // Title bar
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" Voice Bird CLI v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" — Configure API Key", Style::default().fg(Color::White)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(title, outer[0]);
+
+    // Config content — vertically centered
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // Top padding
+            Constraint::Length(8), // Config card
+            Constraint::Min(0),    // Bottom padding
+        ])
+        .split(outer[1]);
+
+    let card_area = centered_horiz(60, inner[1]);
 
     let block = Block::default()
         .title(" Configure API Key ")
@@ -242,25 +284,26 @@ fn render_config_dialog(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Current key status
-            Constraint::Length(2),  // Instructions
-            Constraint::Length(3),  // Input
-            Constraint::Length(2),  // Actions line 1
-            Constraint::Length(1),  // Actions line 2
+            Constraint::Length(1), // Current key status
+            Constraint::Length(1), // Instructions
+            Constraint::Length(3), // Input (with borders)
+            Constraint::Length(1), // Actions
         ])
         .margin(1)
-        .split(area);
+        .split(card_area);
 
-    // Show current stored key (masked)
+    // Current stored key (masked)
     let current_key_line = if let Some(masked) = app.masked_stored_key() {
         Line::from(vec![
             Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
             Span::styled(masked, Style::default().fg(Color::Green)),
         ])
     } else {
-        Line::from(Span::styled("No API key configured", Style::default().fg(Color::Yellow)))
+        Line::from(Span::styled(
+            "No API key configured",
+            Style::default().fg(Color::Yellow),
+        ))
     };
-    let current_key = Paragraph::new(current_key_line);
 
     let instructions = Paragraph::new("Enter new API key (paste replaces all):")
         .style(Style::default().fg(Color::White));
@@ -288,25 +331,51 @@ fn render_config_dialog(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
-    let actions1 = Paragraph::new("[Enter] Save  [Esc] Cancel  [Tab] Show/Hide")
-        .style(Style::default().fg(Color::DarkGray));
+    let actions =
+        Paragraph::new("[Enter] Save  [Esc] Cancel  [Tab] Show/Hide  [Ctrl+V] Paste")
+            .style(Style::default().fg(Color::DarkGray));
 
-    let actions2 = Paragraph::new("[Ctrl+V] Paste  [Ctrl+U] Clear all  [Bksp] Delete char")
-        .style(Style::default().fg(Color::DarkGray));
-
-    frame.render_widget(block, area);
-    frame.render_widget(current_key, chunks[0]);
+    frame.render_widget(block, card_area);
+    frame.render_widget(Paragraph::new(current_key_line), chunks[0]);
     frame.render_widget(instructions, chunks[1]);
     frame.render_widget(input, chunks[2]);
-    frame.render_widget(actions1, chunks[3]);
-    frame.render_widget(actions2, chunks[4]);
+    frame.render_widget(actions, chunks[3]);
+
+    // Bottom hint
+    let hint = Paragraph::new(" Press Esc to return")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(hint, outer[2]);
 }
 
-fn render_help_dialog(frame: &mut Frame) {
-    let area = centered_rect(50, 60, frame.area());
+/// Full-screen help view.
+fn render_help_fullscreen(frame: &mut Frame) {
+    let area = frame.area();
 
-    frame.render_widget(Clear, area);
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title bar
+            Constraint::Min(0),    // Help content
+            Constraint::Length(1), // Bottom hint
+        ])
+        .split(area);
 
+    // Title bar
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" Voice Bird CLI v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" — Help", Style::default().fg(Color::White)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(title, outer[0]);
+
+    // Help content
     let help_text = vec![
         "",
         "  Navigation:",
@@ -341,21 +410,16 @@ fn render_help_dialog(frame: &mut Frame) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         );
+    frame.render_widget(paragraph, outer[1]);
 
-    frame.render_widget(paragraph, area);
+    // Bottom hint
+    let hint = Paragraph::new(" Press Esc or ? to return")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(hint, outer[2]);
 }
 
-/// Helper to create a centered rectangle
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
+/// Helper to horizontally center a rect within its row.
+fn centered_horiz(percent_x: u16, r: Rect) -> Rect {
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -363,5 +427,5 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(popup_layout[1])[1]
+        .split(r)[1]
 }
