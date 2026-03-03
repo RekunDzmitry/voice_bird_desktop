@@ -797,6 +797,8 @@ cargo binstall voice-bird-cli
 - Per-application audio capture (Windows/macOS)
 - Server streaming with API key authentication
 - Real-time audio level visualization
+- Full-screen modal views for config/help (avoids ratatui overlay diff issues on Windows)
+- Windows console mode management (`Win32_System_Console`) to ensure correct key event reporting
 
 **Release workflow**:
 1. Build CLI binaries on target platforms (`voice-bird-cli/`)
