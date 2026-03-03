@@ -46,6 +46,7 @@ Desktop.ini
 # Environment and local config
 .env
 .env.local
+.env.release
 *.local
 
 # Test outputs

@@ -3,6 +3,42 @@ set -e
 
 cd "$(dirname "$0")/.."
 
+# ── Load credentials ────────────────────────────────────────────────
+if [ -f .env.release ]; then
+  # shellcheck disable=SC1091
+  set -a; source .env.release; set +a
+fi
+
+# Configure npm auth from token
+if [ -n "${NPM_TOKEN:-}" ] && [ "$NPM_TOKEN" != "your_npm_token_here" ]; then
+  echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+fi
+
+# Configure cargo auth from token
+if [ -n "${CARGO_TOKEN:-}" ] && [ "$CARGO_TOKEN" != "your_cargo_token_here" ]; then
+  # In WSL, cargo.exe reads from Windows home
+  if grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null; then
+    WIN_USER=$(cmd.exe /C "echo %USERNAME%" 2>/dev/null | tr -d '\r')
+    WIN_CARGO="/mnt/c/Users/${WIN_USER}/.cargo"
+    mkdir -p "$WIN_CARGO"
+    cat > "$WIN_CARGO/credentials.toml" <<CREDS
+[registry]
+token = "$CARGO_TOKEN"
+CREDS
+  else
+    mkdir -p "$HOME/.cargo"
+    cat > "$HOME/.cargo/credentials.toml" <<CREDS
+[registry]
+token = "$CARGO_TOKEN"
+CREDS
+  fi
+fi
+
+# Configure PyPI auth from token (maturin uses MATURIN_PYPI_TOKEN)
+if [ -n "${PYPI_TOKEN:-}" ] && [ "$PYPI_TOKEN" != "your_pypi_token_here" ]; then
+  export MATURIN_PYPI_TOKEN="$PYPI_TOKEN"
+fi
+
 # ── Helpers ──────────────────────────────────────────────────────────
 red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
@@ -22,8 +58,9 @@ Commands:
   all         Run: build → github → npm → pypi → cargo
 
 Options:
-  --dry-run   Print commands without executing (npm/pypi/cargo)
+  --dry-run     Print commands without executing (npm/pypi/cargo)
   --skip-build  Skip build step when running 'all'
+  --platform X  Force platform: windows, macos, linux (useful in WSL)
 
 Prerequisites:
   npm:    npm login (or NPM_TOKEN env var)
@@ -35,21 +72,18 @@ EOF
 }
 
 # ── Detect platform ──────────────────────────────────────────────────
-detect_platform() {
-  local os arch
-  os="$(uname -s)"
-  arch="$(uname -m)"
-
-  case "$os" in
-    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+set_platform_vars() {
+  case "$1" in
+    windows)
       PLATFORM="windows"
       RUST_TARGET="x86_64-pc-windows-msvc"
       NPM_PKG="@voice-bird/cli-win32-x64"
       BIN_NAME="voice-bird-cli.exe"
       ZIP_NAME="voice-bird-cli-x86_64-pc-windows-msvc.zip"
       ;;
-    Darwin)
+    macos)
       PLATFORM="macos"
+      local arch="$(uname -m)"
       if [ "$arch" = "arm64" ]; then
         RUST_TARGET="aarch64-apple-darwin"
         NPM_PKG="@voice-bird/cli-darwin-arm64"
@@ -61,7 +95,7 @@ detect_platform() {
       fi
       BIN_NAME="voice-bird-cli"
       ;;
-    Linux)
+    linux)
       PLATFORM="linux"
       RUST_TARGET="x86_64-unknown-linux-gnu"
       NPM_PKG="@voice-bird/cli-linux-x64"
@@ -69,10 +103,38 @@ detect_platform() {
       ZIP_NAME="voice-bird-cli-x86_64-unknown-linux-gnu.zip"
       ;;
     *)
-      red "Unsupported OS: $os"
+      red "Unsupported platform: $1"
       exit 1
       ;;
   esac
+}
+
+detect_platform() {
+  # Honour explicit --platform override
+  if [ -n "$FORCE_PLATFORM" ]; then
+    set_platform_vars "$FORCE_PLATFORM"
+  else
+    local os="$(uname -s)"
+    case "$os" in
+      MINGW*|MSYS*|CYGWIN*|Windows_NT)
+        set_platform_vars windows ;;
+      Darwin)
+        set_platform_vars macos ;;
+      Linux)
+        # Auto-detect WSL → target Windows
+        if grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null; then
+          blue "WSL detected — targeting Windows"
+          set_platform_vars windows
+        else
+          set_platform_vars linux
+        fi
+        ;;
+      *)
+        red "Unsupported OS: $os"
+        exit 1
+        ;;
+    esac
+  fi
 
   VERSION=$(grep '^version' voice-bird-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
   blue "Platform: $PLATFORM ($RUST_TARGET)"
@@ -159,7 +221,7 @@ cmd_github() {
   gh release create "$release_tag" "$ZIP_NAME" \
     --repo "$repo" \
     --title "Voice Bird CLI v$VERSION" \
-    --generate-notes
+    --notes "Release v$VERSION for $PLATFORM"
 
   green "GitHub release created: $release_tag"
 }
@@ -210,11 +272,31 @@ cmd_pypi() {
 
   if [ "$DRY_RUN" = "1" ]; then
     blue "[dry-run] maturin build --release --target $RUST_TARGET"
-    blue "[dry-run] maturin publish --target $RUST_TARGET"
+    blue "[dry-run] twine upload <wheel>"
     return
   fi
 
-  maturin publish --target "$RUST_TARGET"
+  local wheel_dir="voice-bird-cli/target/wheels"
+
+  # In WSL, use Windows maturin for building, then twine for uploading
+  if grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null; then
+    local win_path
+    win_path=$(wslpath -w "$(pwd)")
+    cmd.exe /C "cd /d $win_path && maturin build --release --target $RUST_TARGET 2>&1" 2>/dev/null | tr -d '\r'
+  else
+    maturin build --release --target "$RUST_TARGET"
+  fi
+
+  local wheel
+  wheel=$(ls -t "$wheel_dir"/voice_bird_cli-"$VERSION"*.whl 2>/dev/null | head -1)
+  if [ -z "$wheel" ]; then
+    red "No wheel found in $wheel_dir"
+    exit 1
+  fi
+
+  blue "Uploading $wheel..."
+  TWINE_USERNAME=__token__ TWINE_PASSWORD="${MATURIN_PYPI_TOKEN:-$PYPI_TOKEN}" \
+    twine upload "$wheel"
 
   green "PyPI package published"
 }
@@ -252,11 +334,14 @@ shift 2>/dev/null || true
 
 DRY_RUN=0
 SKIP_BUILD=0
-for arg in "$@"; do
-  case "$arg" in
+FORCE_PLATFORM=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run)    DRY_RUN=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
+    --platform)   FORCE_PLATFORM="$2"; shift ;;
   esac
+  shift
 done
 
 [ -z "$COMMAND" ] && usage
