@@ -797,12 +797,23 @@ cargo binstall voice-bird-cli
 - Per-application audio capture (Windows/macOS)
 - Server streaming with API key authentication
 - Real-time audio level visualization
+- Full-screen modal views for config/help (avoids ratatui overlay diff issues on Windows)
+- Windows console mode management (`Win32_System_Console`) to ensure correct key event reporting
 
-**Release workflow**:
-1. Build CLI binaries on target platforms (`voice-bird-cli/`)
-2. Package into ZIPs with correct naming
-3. Create GitHub release with binaries at voice-bird-releases repo
-4. Publish stub crate to crates.io (`voice-bird-cli-crate/`)
+**Release workflow** (local, no CI/CD):
+```bash
+./scripts/bump-version.sh 0.3.0   # Update all package versions
+./scripts/release.sh all           # Build + publish for current platform
+# Or individual steps:
+./scripts/release.sh build         # Build binary for current platform
+./scripts/release.sh github        # Upload zip to GitHub Releases
+./scripts/release.sh npm           # Publish npm platform + main packages
+./scripts/release.sh pypi          # Build and publish Python wheel
+./scripts/release.sh cargo         # Publish stub crate to crates.io
+```
+- Run on each platform (Windows, macOS, Linux) to publish platform-specific packages
+- Supports `--dry-run` to preview commands without executing
+- Auto-detects platform and selects correct Rust target, npm package, and binary name
 
 ### Distribution (npm) - CLI Tool
 
@@ -822,8 +833,8 @@ On macOS 15+ (Sequoia/Tahoe), plain CLI binaries cannot receive Screen Recording
 - **Bundle**: `VoiceBirdCLI.app/Contents/MacOS/voice-bird-cli` with `Info.plist` (`CFBundleIdentifier: com.voicebird.cli`)
 - **Launch method**: `open -W -n -g --stdin/--stdout/--stderr <tty>` via the Node.js wrapper, so the app is parented under `launchd` (not the terminal) for proper TCC attribution
 - **Fallback**: `VOICE_BIRD_NO_OPEN=1` bypasses the `.app` launcher and runs the binary directly (user must grant Screen Recording to their terminal instead)
-- **Build config**: `voice-bird-cli/.cargo/config.toml` sets `-rpath /usr/lib/swift` for Swift runtime (`libswift_Concurrency.dylib`); CI also runs `install_name_tool -add_rpath` as a safety net
-- **Codesigning**: Ad-hoc codesign (`codesign --force --deep --sign -`) in CI
+- **Build config**: `voice-bird-cli/.cargo/config.toml` sets `-rpath /usr/lib/swift` for Swift runtime (`libswift_Concurrency.dylib`); `scripts/release.sh` also runs `install_name_tool -add_rpath` as a safety net
+- **Codesigning**: Ad-hoc codesign (`codesign --force --deep --sign -`) in `scripts/release.sh`
 
 **Key Files**:
 - `npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app/Contents/Info.plist` — Bundle identity for TCC

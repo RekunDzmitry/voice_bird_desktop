@@ -68,8 +68,10 @@ async function showApiKeySection(canGoBack = false) {
     apiKeyInput.value = '';
     apiKeyInput.type = 'password';
     toggleVisibilityBtn.textContent = 'Show';
-    apiKeyInput.focus();
     updateSaveButton();
+    // Defer focus to next frame — WebView2 on Windows may not focus
+    // the input if the DOM layout hasn't settled yet
+    requestAnimationFrame(() => apiKeyInput.focus());
 
     // Show back button only if user can return (already configured)
     if (canGoBack) {
@@ -530,11 +532,22 @@ function escapeHtml(text) {
 // === Event Listeners ===
 
 function setupEventListeners() {
-    // API Key section
+    // API Key section — use keydown instead of keypress for reliable
+    // handling on Windows WebView2 (keypress is deprecated and unreliable)
     apiKeyInput.addEventListener('input', updateSaveButton);
-    apiKeyInput.addEventListener('keypress', (e) => {
+    apiKeyInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !saveKeyBtn.disabled) {
+            e.preventDefault();
             saveApiKey();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            if (backBtn && !backBtn.classList.contains('hidden')) {
+                goBackFromSettings();
+            }
+        } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey) {
+            // Tab toggles API key visibility (matches CLI behavior)
+            e.preventDefault();
+            toggleApiKeyVisibility();
         }
     });
     // On paste, replace entire field content to prevent concatenation
@@ -547,6 +560,18 @@ function setupEventListeners() {
     toggleVisibilityBtn.addEventListener('click', toggleApiKeyVisibility);
     clearKeyBtn.addEventListener('click', clearApiKeyInput);
     saveKeyBtn.addEventListener('click', saveApiKey);
+
+    // Global keyboard shortcuts for API key view
+    document.addEventListener('keydown', (e) => {
+        if (currentView !== 'api-key') return;
+
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            if (backBtn && !backBtn.classList.contains('hidden')) {
+                goBackFromSettings();
+            }
+        }
+    });
 
     // Session browser
     refreshBtn.addEventListener('click', refreshSessions);

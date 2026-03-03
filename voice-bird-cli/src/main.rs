@@ -110,6 +110,48 @@ fn init_macos_app_event_handler() {
     std::thread::sleep(Duration::from_millis(50));
 }
 
+/// On Windows, ensure VIRTUAL_TERMINAL_INPUT is disabled on the console input
+/// handle. When VT Input is ON, special keys (Tab, Esc, Backspace, Ctrl+key)
+/// are sent as VT escape sequences, causing crossterm to report them as
+/// Release-only events. Since the event loop filters on `KeyEventKind::Press`,
+/// those keys are silently dropped — making the config dialog appear frozen.
+///
+/// This must be called AFTER all terminal setup (`enable_raw_mode()`,
+/// `EnterAlternateScreen`, `EnableMouseCapture`) and after any COM operations
+/// (like `refresh_sessions()`), because any of those may alter console mode.
+#[cfg(windows)]
+fn ensure_console_mode() {
+    use windows::Win32::System::Console::*;
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if let Ok(handle) = handle {
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(handle, &mut mode).is_ok() {
+                let before = mode.0;
+                let mut new_mode = mode;
+                // Disable VT Input — we want ReadConsoleInputW to return
+                // proper key records, not VT escape sequences
+                new_mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
+                // Disable Quick Edit to prevent mouse selection from blocking
+                new_mode &= !ENABLE_QUICK_EDIT_MODE;
+                new_mode |= ENABLE_EXTENDED_FLAGS;
+
+                if new_mode != mode {
+                    let _ = SetConsoleMode(handle, new_mode);
+                    log::info!(
+                        "Console mode adjusted: 0x{:04X} -> 0x{:04X} (VT_INPUT was {})",
+                        before, new_mode.0,
+                        if before & 0x0200 != 0 { "ON" } else { "OFF" }
+                    );
+                } else {
+                    log::debug!("Console mode OK: 0x{:04X}", before);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // When launched via macOS `open`, reconnect stdin to the real TTY
     // so crossterm gets proper keyboard input. Must happen before anything
@@ -139,10 +181,21 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // On Windows, fix console input mode AFTER all terminal setup.
+    // enable_raw_mode(), EnterAlternateScreen, or EnableMouseCapture may
+    // enable VIRTUAL_TERMINAL_INPUT which breaks key event reporting.
+    #[cfg(windows)]
+    ensure_console_mode();
+
     // Create app and run
     let mut app = App::new();
     app.log_path = log_path;
     app.refresh_sessions();
+
+    // On Windows, refresh_sessions() uses COM (CoInitializeEx) for WASAPI
+    // audio enumeration, which may alter console input mode. Re-apply fix.
+    #[cfg(windows)]
+    ensure_console_mode();
 
     log::info!("Found {} audio sessions", app.sessions.len());
 
@@ -185,6 +238,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             }
         }
 
+        // On Windows, verify the console handle is still valid.
+        // If the console was detached (e.g., parent closed), GetConsoleMode
+        // fails and event::poll would spin.
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Console::*;
+            unsafe {
+                if let Ok(handle) = GetStdHandle(STD_INPUT_HANDLE) {
+                    let mut mode = CONSOLE_MODE::default();
+                    if GetConsoleMode(handle, &mut mode).is_err() {
+                        log::warn!("Console handle invalid, exiting gracefully");
+                        stop_all_sessions(app);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // Update duration if recording
         app.update_duration();
 
@@ -194,7 +265,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Check for init results from streaming threads
         app.check_init_result();
 
-        // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
         // Handle events with timeout for smooth updates
@@ -202,13 +272,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             Ok(true) => {
                 consecutive_poll_errors = 0;
                 if let Event::Key(key) = event::read()? {
+                    // Log all key events in config mode for diagnostics
+                    if app.mode == AppMode::ConfigInput {
+                        log::debug!(
+                            "config key: kind={:?} code={:?} mod={:?} state={:?}",
+                            key.kind, key.code, key.modifiers, key.state
+                        );
+                    }
+
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
 
                     match app.mode {
                         AppMode::Normal => handle_normal_mode(app, key.code),
-                        AppMode::ConfigInput => handle_config_mode(app, key.code, key.modifiers),
+                        AppMode::ConfigInput => {
+                            handle_config_mode(app, key.code, key.modifiers);
+                        }
                         AppMode::Help => handle_help_mode(app, key.code),
                     }
                 }
