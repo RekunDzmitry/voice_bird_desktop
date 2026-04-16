@@ -1,3 +1,6 @@
+# Git worktrees
+.worktrees/
+
 # Rust build artifacts
 /target/
 **/*.rs.bk
