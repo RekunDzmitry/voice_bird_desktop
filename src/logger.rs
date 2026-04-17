@@ -5,19 +5,19 @@ use std::path::PathBuf;
 
 /// Initialize file-based logging for the CLI.
 ///
-/// Logs to `~/.voice-bird-cli/logs/voice_bird_cli_YYYY-MM-DD_HH-MM-SS.log`.
+/// Logs to `~/.voice-bird/logs/voice_bird_YYYY-MM-DD_HH-MM-SS.log`.
 /// All levels (DEBUG+) go to file only — nothing to terminal (TUI owns the screen).
 /// Returns the log file path so the app can display it.
 pub fn init() -> Result<PathBuf> {
     let logs_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join(".voice-bird-cli")
+        .join(".voice-bird")
         .join("logs");
 
     fs::create_dir_all(&logs_dir)?;
 
     let log_filename = format!(
-        "voice_bird_cli_{}.log",
+        "voice_bird_{}.log",
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let log_path = logs_dir.join(log_filename);

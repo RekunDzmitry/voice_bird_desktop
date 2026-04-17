@@ -86,11 +86,9 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
             let selected_marker = if app.is_selected(i) { "[*]" } else { "[ ]" };
             let cursor = if i == app.selected_index { "> " } else { "  " };
 
-            let device_type = if session.is_input { "mic" } else { "out" };
-
             let content = format!(
-                "{}{} {} ({}) [{}]",
-                cursor, selected_marker, session.app_name, session.device_name, device_type
+                "{}{} {} ({}) [mic]",
+                cursor, selected_marker, session.app_name, session.device_name
             );
 
             let style = if i == app.selected_index {

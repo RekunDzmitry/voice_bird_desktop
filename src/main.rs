@@ -403,35 +403,24 @@ fn start_recording(app: &mut App) {
             let audio_level_clone = audio_level.clone();
 
             log::info!(
-                "Starting recording: session={}, device={}, input={}",
-                session_id_str, session_clone.device_name, session_clone.is_input
+                "Starting recording: session={}, device={}",
+                session_id_str, session_clone.device_name
             );
 
-            // Spawn recording thread
+            // Spawn recording thread — Project A is microphone-only, so all
+            // sessions are input devices. Loopback capture is deferred.
             std::thread::spawn(move || {
-                let result = if session_clone.is_input {
-                    audio::start_input_recording(
-                        &session_clone,
-                        server_url_clone,
-                        api_key_clone,
-                        session_id_str,
-                        audio::RecordingContext {
-                            stop_signal: stop_signal_clone,
-                            audio_level: audio_level_clone,
-                        },
-                        init_tx_clone,
-                    )
-                } else {
-                    platform::start_output_recording(
-                        &session_clone,
-                        server_url_clone,
-                        api_key_clone,
-                        session_id_str,
-                        audio_level_clone,
-                        stop_signal_clone,
-                        init_tx_clone,
-                    )
-                };
+                let result = audio::start_input_recording(
+                    &session_clone,
+                    server_url_clone,
+                    api_key_clone,
+                    session_id_str,
+                    audio::RecordingContext {
+                        stop_signal: stop_signal_clone,
+                        audio_level: audio_level_clone,
+                    },
+                    init_tx_clone,
+                );
 
                 if let Err(e) = result {
                     let msg = format!("Recording error: {}", e);

@@ -1,76 +1,37 @@
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use cpal::traits::{DeviceTrait, HostTrait};
+use serde::{Deserialize, Serialize};
 
-use crate::streaming;
-
-#[cfg(windows)]
-mod windows;
-
-#[cfg(target_os = "macos")]
-mod macos;
-
-/// Information about an audio session (application producing audio)
+/// Information about an audio session (microphone input device).
+///
+/// Project A is microphone-only. Loopback / system-audio capture is deferred
+/// to a follow-up sub-project — see
+/// `docs/superpowers/specs/2026-04-16-desktop-local-whisper-design.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSession {
     pub device_name: String,
     pub app_name: String,
     pub process_id: u32,
-    pub is_input: bool,
 }
 
-/// Enumerate all active audio sessions
-#[cfg(windows)]
+/// Enumerate microphone input devices via cpal.
 pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
-    windows::enumerate_audio_sessions()
-}
+    let host = cpal::default_host();
+    let mut sessions = Vec::new();
 
-#[cfg(target_os = "macos")]
-pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
-    macos::enumerate_audio_sessions()
-}
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            let name = match device.name() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            sessions.push(AudioSession {
+                device_name: name.clone(),
+                app_name: name,
+                process_id: 0,
+            });
+        }
+    }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn enumerate_audio_sessions() -> Result<Vec<AudioSession>> {
-    // Fallback: return empty list on unsupported platforms
-    Ok(Vec::new())
-}
-
-/// Start output recording (loopback capture)
-#[cfg(windows)]
-pub fn start_output_recording(
-    session: &AudioSession,
-    server_url: String,
-    api_key: String,
-    session_id: String,
-    audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
-    stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
-    init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
-) -> Result<()> {
-    windows::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal, init_result_tx)
-}
-
-#[cfg(target_os = "macos")]
-pub fn start_output_recording(
-    session: &AudioSession,
-    server_url: String,
-    api_key: String,
-    session_id: String,
-    audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
-    stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
-    init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
-) -> Result<()> {
-    macos::start_output_recording(session, server_url, api_key, session_id, audio_level, stop_signal, init_result_tx)
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn start_output_recording(
-    _session: &AudioSession,
-    _server_url: String,
-    _api_key: String,
-    _session_id: String,
-    _audio_level: std::sync::Arc<std::sync::Mutex<f32>>,
-    _stop_signal: std::sync::Arc<std::sync::Mutex<bool>>,
-    _init_result_tx: std::sync::mpsc::Sender<Result<streaming::InitSuccess, streaming::StreamError>>,
-) -> Result<()> {
-    Err(anyhow::anyhow!("Output recording not supported on this platform"))
+    Ok(sessions)
 }
