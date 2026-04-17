@@ -12,6 +12,20 @@
 
 **Working branch:** All tasks run on a feature branch (e.g. `feat/local-whisper`) off `main`. Do NOT commit to `main` directly. Create the branch before Task 1.
 
+**Scope amendment (added during execution):** System-audio / loopback capture is deferred for Project A on both Windows and macOS. Project A guarantees **microphone capture only via cpal** on every platform. Rationale:
+
+- `screencapturekit 1.5.x` (used by the existing `voice-bird-cli/src/platform/macos.rs`) fails to build against current CLT `PackageDescription` ABI on our dev machine.
+- Loopback is not on the critical path for shipping local transcription — microphone capture covers the common user story and unblocks all other Stage 2 / 3 / 4 work.
+- Loopback returns in a follow-up project using a CLT-neutral approach (e.g. `objc2-screen-capture-kit` on macOS, keeping WASAPI on Windows).
+
+Concrete effects on the task list below:
+
+- In **Task 2** (file moves), additionally delete: `voice-bird-cli/src/platform/macos.rs`, `voice-bird-cli/src/platform/windows.rs` (contains WASAPI loopback), and the `pub mod macos; pub mod windows;` lines inside `voice-bird-cli/src/platform/mod.rs`. Keep only the trait/enumeration scaffolding that's purely about input devices, collapsing the module to expose only microphone enumeration via cpal.
+- In **Task 2** (file moves), also strip any `platform::start_output_recording` and `AudioSession::is_input`-related branching from `src/main.rs` and `src/app.rs` — after Project A there is only one kind of session (microphone). `RecordingSource::Microphone` is the only variant used until loopback returns.
+- In **Task 3** (Cargo.toml rewrite), the `[target.'cfg(target_os = "macos")'.dependencies]` block is empty (see code block in Task 3 — already amended).
+
+Subagents: treat the amendment above as authoritative wherever it conflicts with earlier task-body text.
+
 ---
 
 ## Stage 1 — Promote the CLI to repo root, delete Tauri
@@ -163,11 +177,15 @@ windows = { version = "0.58", features = [
 ] }
 windows-core = "0.58"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "1.5"
+# (No macOS-specific dependencies in Project A. macOS system-audio
+# loopback is deferred to a follow-up: the `screencapturekit 1.5.x`
+# crate fails to build against the current CLT PackageDescription
+# ABI, and loopback is not on Project A's critical path. Microphone
+# capture works cross-platform via cpal. When loopback returns,
+# options include objc2-screen-capture-kit or a direct FFI shim.)
 ```
 
-Note: the name is `voice-bird` (not `voice-bird-cli`) because the product is the only binary now. The binary name matches. The `tokio-tungstenite`, `futures-util`, `http`, `uuid v4` dependencies from the old CLI Cargo.toml are intentionally dropped — they were for server streaming which is being removed. (If Task 13 needs `uuid`, re-check the list; Task 5 clarifies session slugs don't need it.) `arboard` stays — still used by config paste. `thiserror`, `toml`, `proptest`, `tempfile`, `pretty_assertions` are added for new code in later tasks.
+Note: the name is `voice-bird` (not `voice-bird-cli`) because the product is the only binary now. The binary name matches. The `tokio-tungstenite`, `futures-util`, `http`, `uuid v4`, and `screencapturekit` dependencies from the old CLI Cargo.toml are intentionally dropped — the first three were for server streaming (being removed), and `screencapturekit` is deferred until macOS loopback returns in a follow-up. `arboard` stays — still used by config paste. `thiserror`, `toml`, `proptest`, `tempfile`, `pretty_assertions` are added for new code in later tasks.
 
 - [ ] **Step 2: Delete the now-empty `voice-bird-cli/` directory**
 
