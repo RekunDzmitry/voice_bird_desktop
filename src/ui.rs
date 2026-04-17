@@ -32,17 +32,12 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         RecordingStatus::Recording => "● REC",
         RecordingStatus::Error(_) => "ERROR",
     };
-    // Task 15 introduces `default_model` and `engine_prefer` on AppConfig.
-    // Until then, display hard-coded placeholders so the header stays
-    // structurally in the right shape.
-    let model = "distil-small.en";
-    let engine_prefer = "auto";
     let line = Line::from(vec![
         Span::styled("Voice Bird", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  │  "),
-        Span::raw(model),
+        Span::raw(app.config.default_model.as_str()),
         Span::raw("  │  "),
-        Span::raw(format!("engine: {}", engine_prefer)),
+        Span::raw(format!("engine: {}", app.config.engine_prefer.as_str())),
         Span::raw("  │  "),
         Span::styled(status, status_style(&app.status)),
         Span::raw("  │  "),

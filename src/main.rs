@@ -1,5 +1,4 @@
 mod app;
-mod config;
 mod logger;
 mod platform;
 mod ui;

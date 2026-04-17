@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use parking_lot::Mutex as PlMutex;
 
-use crate::config::AppConfig;
 use crate::platform::AudioSession;
+use voice_bird::config::AppConfig;
 use voice_bird::session::layout::SessionSource;
 
 /// Application running mode
@@ -350,8 +350,7 @@ impl App {
             let ended = chrono::Utc::now();
             let meta = voice_bird::session::finalize::SessionMeta {
                 version: env!("CARGO_PKG_VERSION").into(),
-                // Task 15 replaces this with `self.config.default_model`.
-                model: "mock".into(),
+                model: self.config.default_model.clone(),
                 engine: "mock".into(),
                 source: "mic".into(),
                 device: "mock".into(),

@@ -1,72 +1,104 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Application configuration stored in user's config directory
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub api_key: Option<String>,
-    pub server_url: Option<String>,
+    pub default_model: String,
+    pub language: String,
+    pub session_dir: String,
+    pub hop_ms: u32,
+    pub min_window_ms: u32,
+    #[serde(rename = "engine_prefer")]
+    pub engine_prefer: String,
+    pub audio_default_source: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_model: "distil-small.en".into(),
+            language: "en".into(),
+            session_dir: "~/voice-bird/sessions".into(),
+            hop_ms: 750,
+            min_window_ms: 1000,
+            engine_prefer: "auto".into(),
+            audio_default_source: "microphone".into(),
+        }
+    }
 }
 
 impl AppConfig {
-    /// Default Voice Bird server URL
-    pub const DEFAULT_SERVER_URL: &'static str = "https://voicebird.app";
+    pub fn config_path() -> anyhow::Result<PathBuf> {
+        let base = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+        Ok(base.join("voice-bird").join("config.toml"))
+    }
 
-    /// Load config from file, or return default if not found
-    pub fn load() -> Result<Self> {
+    pub fn load() -> anyhow::Result<Self> {
         let path = Self::config_path()?;
         if path.exists() {
-            let contents = fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&contents)?)
+            Self::load_from(&path)
         } else {
             Ok(Self::default())
         }
     }
 
-    /// Save config to file
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        self.save_to(&path)
+    }
+
+    pub fn load_from(path: &Path) -> anyhow::Result<Self> {
+        let s = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&s)?)
+    }
+
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p)?;
         }
-        fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
     }
 
-    /// Get the config file path (shared with desktop app)
-    fn config_path() -> Result<PathBuf> {
-        let app_data = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
-        Ok(app_data.join("VoiceBirdDesktop").join("config.json"))
-    }
-
-    /// Get the server URL (with fallback to default)
-    pub fn server_url(&self) -> String {
-        self.server_url
-            .clone()
-            .unwrap_or_else(|| Self::DEFAULT_SERVER_URL.to_string())
-    }
-
-    /// Check if API key is configured
-    pub fn has_api_key(&self) -> bool {
-        self.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
-    }
-
-    /// TEMPORARY stub until Task 15 rewrites config.
-    ///
-    /// Returns the expanded session directory path, replacing `~/` with
-    /// the user's home directory. Task 14 uses a hard-coded default of
-    /// `~/voice-bird/sessions`; Task 15 introduces a real `session_dir`
-    /// field on `AppConfig`.
     pub fn session_dir_expanded(&self) -> String {
-        let raw = "~/voice-bird/sessions";
-        if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(rest) = self.session_dir.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 return home.join(rest).to_string_lossy().into_owned();
             }
         }
-        raw.to_string()
+        self.session_dir.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn defaults_when_file_missing() {
+        let c = AppConfig::default();
+        assert_eq!(c.default_model, "distil-small.en");
+        assert_eq!(c.hop_ms, 750);
+        assert_eq!(c.engine_prefer, "auto");
+    }
+
+    #[test]
+    fn roundtrip_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = AppConfig {
+            default_model: "large-v3-turbo".into(),
+            language: "auto".into(),
+            session_dir: "~/foo".into(),
+            hop_ms: 600,
+            min_window_ms: 800,
+            engine_prefer: "whisperkit".into(),
+            audio_default_source: "system".into(),
+        };
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, c);
     }
 }
