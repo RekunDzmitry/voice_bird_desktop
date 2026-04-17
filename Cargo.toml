@@ -8,6 +8,10 @@ description = "Voice Bird — local voice transcription TUI"
 name = "voice-bird"
 path = "src/main.rs"
 
+[lib]
+name = "voice_bird"
+path = "src/lib.rs"
+
 [workspace]
 members = ["."]
 

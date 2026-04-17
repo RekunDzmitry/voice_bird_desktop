@@ -1,12 +1,9 @@
 mod app;
-mod audio;
 mod audio_legacy;
 mod config;
 mod logger;
 mod platform;
-mod session;
 mod streaming;
-mod transcription;
 mod ui;
 
 use std::io;
@@ -114,6 +111,18 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
+    // Handle `--recover <dir>` before any TTY/terminal setup so it works
+    // from non-TTY shells (e.g., piped or macOS `open` invocations).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--recover") {
+        let dir = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow::anyhow!("--recover requires a path"))?;
+        voice_bird::session::recover::recover(std::path::Path::new(dir))?;
+        println!("Recovered transcripts in {}", dir);
+        return Ok(());
+    }
+
     // When launched via macOS `open`, reconnect stdin to the real TTY
     // so crossterm gets proper keyboard input. Must happen before anything
     // reads from stdin.
