@@ -51,6 +51,10 @@ pub struct CommittedLine {
 pub struct RecordingRuntime {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub join: tokio::task::JoinHandle<()>,
+    /// Producer task: pulls cpal frames, resamples, tees to WAV + engine.
+    /// Aborted by `stop_recording` so the await on `join` does not hang
+    /// when the cpal channel `recv()` is blocked.
+    pub producer: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Main application state
@@ -118,6 +122,12 @@ pub struct App {
     /// True iff `config.toml` already existed on disk at startup. When
     /// false, the model picker refuses to Esc-cancel — first run must pick.
     pub config_was_loaded_from_disk: bool,
+
+    /// Live cpal input stream for the active recording. `cpal::Stream` is
+    /// `!Send`, so it cannot ride along into the tokio producer task —
+    /// instead, we keep it pinned to the main (App-owning) thread and drop
+    /// it in `stop_recording`, which cleanly stops capture.
+    pub _capture_stream: Option<cpal::Stream>,
 }
 
 impl App {
@@ -171,6 +181,7 @@ impl App {
             session_started_at: None,
             picker,
             config_was_loaded_from_disk,
+            _capture_stream: None,
         }
     }
 
@@ -260,10 +271,10 @@ impl App {
         };
     }
 
-    /// Start recording a new session driven by `MockEngine`.
-    ///
-    /// Stage 3 replaces the mock + tick-driver with real cpal input +
-    /// `WhisperRsEngine`. The shape of this function stays the same.
+    /// Start recording a new session: open the default cpal input device,
+    /// resample to 16 kHz mono, tee the PCM to a WAV file and to a live
+    /// `WhisperRsEngine`, and drive the event consumer that fills
+    /// `committed` / `tentative` and appends to `transcript.jsonl`.
     pub fn start_recording(&mut self, source: SessionSource) {
         let now = chrono::Utc::now();
         let session_dir = voice_bird::session::layout::session_dir(
@@ -283,44 +294,104 @@ impl App {
         self.committed.lock().clear();
         *self.tentative.lock() = String::new();
 
-        // Stub: script a mock event stream so we can see it rendered.
-        use voice_bird::transcription::mock::{MockEngine, MockEvent};
-        use voice_bird::transcription::TranscriptionEngine;
-        let mut engine = MockEngine::new(vec![
-            MockEvent::ModelLoaded("mock".into()),
-            MockEvent::Tentative("warming up".into()),
-            MockEvent::Committed {
-                t_start_ms: 0,
-                t_end_ms: 1000,
-                text: "Welcome to Voice Bird".into(),
-            },
-        ]);
-
-        let cfg = voice_bird::transcription::EngineConfig {
-            model_path: std::path::PathBuf::from("mock"),
-            language: None,
-            sample_rate: 16_000,
-            hop_ms: 750,
-            min_window_ms: 1000,
+        // --- 1. cpal capture -----------------------------------------------
+        let capture = match voice_bird::audio::capture::capture_default_input() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = RecordingStatus::Error(format!("capture: {e}"));
+                return;
+            }
         };
+        let (mut frames_rx, info, stream) = capture.split();
 
-        let handle = match engine.start(cfg) {
+        // --- 2. Resampler (device-native → 16 kHz mono) --------------------
+        let mut resampler =
+            match voice_bird::audio::resample::Resampler::new(info.sample_rate, info.channels) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.status = RecordingStatus::Error(format!("resample: {e}"));
+                    return;
+                }
+            };
+
+        // --- 3. WhisperRsEngine -------------------------------------------
+        use voice_bird::transcription::{
+            whisper_rs_engine::WhisperRsEngine, EngineConfig, TranscriptionEngine,
+        };
+        let model_path =
+            match voice_bird::transcription::models::gguf_path(&self.config.default_model) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.status = RecordingStatus::Error(format!("model path: {e}"));
+                    return;
+                }
+            };
+        let mut engine = WhisperRsEngine::default();
+        let handle = match engine.start(EngineConfig {
+            model_path,
+            language: Some(self.config.language.clone()).filter(|s| s != "auto"),
+            sample_rate: 16_000,
+            hop_ms: self.config.hop_ms,
+            min_window_ms: self.config.min_window_ms,
+        }) {
             Ok(h) => h,
             Err(e) => {
-                self.status = RecordingStatus::Error(format!("engine start: {e}"));
+                self.status = RecordingStatus::Error(format!("engine: {e}"));
                 return;
             }
         };
 
+        // --- 4. WAV writer on the resampled 16 kHz mono stream ------------
+        let wav_path = session_dir.join("audio.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut wav = match hound::WavWriter::create(&wav_path, spec) {
+            Ok(w) => w,
+            Err(e) => {
+                self.status = RecordingStatus::Error(format!("wav: {e}"));
+                return;
+            }
+        };
+
+        let pcm_tx = handle.pcm_tx.clone();
+        let mut events_rx = handle.events_rx;
         let committed = self.committed.clone();
         let tentative = self.tentative.clone();
         let writer_path = session_dir.join("transcript.jsonl");
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let mut events_rx = handle.events_rx;
-        let pcm_tx = handle.pcm_tx.clone();
+        // --- 5. Producer task: cpal frames → resample → tee(WAV + engine) -
+        let producer = self.rt.spawn(async move {
+            while let Some(frames) = frames_rx.recv().await {
+                match resampler.process(&frames) {
+                    Ok(out) => {
+                        for s in &out {
+                            if let Err(e) = wav.write_sample(*s) {
+                                log::error!("wav write: {e}");
+                                break;
+                            }
+                        }
+                        if pcm_tx.send(out).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("resample: {e}");
+                        break;
+                    }
+                }
+            }
+            if let Err(e) = wav.finalize() {
+                log::error!("wav finalize: {e}");
+            }
+        });
 
+        // --- 6. Consumer task: engine events → live state + JSONL ---------
         let join = self.rt.spawn(async move {
             let mut writer = match voice_bird::session::writer::SegmentWriter::open(&writer_path) {
                 Ok(w) => w,
@@ -329,19 +400,6 @@ impl App {
                     return;
                 }
             };
-
-            // Drive mock with dummy PCM ticks so the scripted events fire.
-            let pcm_tx2 = pcm_tx.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
-                loop {
-                    ticker.tick().await;
-                    if pcm_tx2.send(vec![0.0; 16]).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
@@ -374,14 +432,31 @@ impl App {
             }
         });
 
-        self.runtime = Some(RecordingRuntime { shutdown_tx, join });
+        self._capture_stream = Some(stream);
+        self.runtime = Some(RecordingRuntime {
+            shutdown_tx,
+            join,
+            producer: Some(producer),
+        });
         self.status = RecordingStatus::Recording;
         self.start_time = Some(std::time::Instant::now());
     }
 
     /// Stop the active recording and finalize the session files.
     pub fn stop_recording(&mut self) {
-        if let Some(rt) = self.runtime.take() {
+        // Drop the cpal stream first — this halts capture, the cpal callback
+        // thread exits, and the `frames_rx` receiver inside the producer
+        // task observes `None` on its next `recv()` (clean shutdown).
+        self._capture_stream = None;
+
+        if let Some(mut rt) = self.runtime.take() {
+            // Abort the producer in case it is still blocked on recv() —
+            // otherwise the task would linger until the last cpal buffer is
+            // drained. The producer's WAV finalize ran inline; if we aborted
+            // mid-process, we accept the tail loss as part of shutdown.
+            if let Some(producer) = rt.producer.take() {
+                producer.abort();
+            }
             let _ = rt.shutdown_tx.send(());
             // best-effort await
             let _ = self.rt.block_on(async move {
