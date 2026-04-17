@@ -1,9 +1,12 @@
 mod app;
 mod audio;
+mod audio_legacy;
 mod config;
 mod logger;
 mod platform;
+mod session;
 mod streaming;
+mod transcription;
 mod ui;
 
 use std::io;
@@ -410,12 +413,12 @@ fn start_recording(app: &mut App) {
             // Spawn recording thread — Project A is microphone-only, so all
             // sessions are input devices. Loopback capture is deferred.
             std::thread::spawn(move || {
-                let result = audio::start_input_recording(
+                let result = audio_legacy::start_input_recording(
                     &session_clone,
                     server_url_clone,
                     api_key_clone,
                     session_id_str,
-                    audio::RecordingContext {
+                    audio_legacy::RecordingContext {
                         stop_signal: stop_signal_clone,
                         audio_level: audio_level_clone,
                     },
