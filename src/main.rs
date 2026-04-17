@@ -1,25 +1,21 @@
 mod app;
-mod audio_legacy;
 mod config;
 mod logger;
 mod platform;
-mod streaming;
 mod ui;
 
 use std::io;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use uuid::Uuid;
 
-use app::{App, AppMode, RecordingStatus, RecordingError, ActiveSession};
+use app::{App, AppMode, RecordingStatus};
 
 /// When launched via macOS `open --args --tty <path>`, the process gets
 /// stdin from `open` which doesn't properly forward terminal input.
@@ -203,9 +199,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Check for errors from recording threads
         app.check_error();
 
-        // Check for init results from streaming threads
-        app.check_init_result();
-
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -220,7 +213,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
                     match app.mode {
                         AppMode::Normal => handle_normal_mode(app, key.code),
-                        AppMode::ConfigInput => handle_config_mode(app, key.code, key.modifiers),
+                        AppMode::ModelPicker => {
+                            // Wired in Stage 3 (Task 18). For now, Esc returns to Normal.
+                            if matches!(key.code, KeyCode::Esc) {
+                                app.mode = AppMode::Normal;
+                            }
+                        }
                         AppMode::Help => handle_help_mode(app, key.code),
                     }
                 }
@@ -257,11 +255,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('?') => {
             app.toggle_help();
         }
-        KeyCode::Char('c') => {
-            app.enter_config_mode();
-        }
         KeyCode::Char('r') => {
-            app.refresh_sessions();
+            toggle_recording(app);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.select_previous();
@@ -272,54 +267,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char(' ') => {
             app.toggle_selection();
         }
-        KeyCode::Enter => {
-            toggle_recording(app);
-        }
-        KeyCode::Char('l') => {
-            copy_error_to_clipboard(app);
-        }
         KeyCode::Char('L') => {
             copy_log_path_to_clipboard(app);
-        }
-        _ => {}
-    }
-}
-
-fn handle_config_mode(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
-    // Ctrl+U clears entire input
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        match key {
-            KeyCode::Char('u') => {
-                app.api_key_input.clear();
-                return;
-            }
-            KeyCode::Char('v') => {
-                app.paste_from_clipboard();
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    match key {
-        KeyCode::Enter => {
-            app.save_api_key();
-        }
-        KeyCode::Esc => {
-            app.cancel_config();
-        }
-        KeyCode::Backspace => {
-            app.api_key_input.pop();
-        }
-        KeyCode::Tab | KeyCode::BackTab => {
-            app.toggle_api_key_visibility();
-        }
-        KeyCode::Char('\t') => {
-            // Some terminals report Tab as Char('\t') instead of KeyCode::Tab
-            app.toggle_api_key_visibility();
-        }
-        KeyCode::Char(c) => {
-            app.api_key_input.push(c);
         }
         _ => {}
     }
@@ -331,21 +280,6 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
             app.toggle_help();
         }
         _ => {}
-    }
-}
-
-fn copy_error_to_clipboard(app: &mut App) {
-    if let RecordingStatus::Error(ref err) = app.status {
-        let text = err.display_message();
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
-            Ok(()) => {
-                app.status_message = Some("Error copied to clipboard".to_string());
-            }
-            Err(e) => {
-                log::warn!("Failed to copy to clipboard: {}", e);
-                app.status_message = Some(format!("Clipboard error: {}", e));
-            }
-        }
     }
 }
 
@@ -367,112 +301,15 @@ fn copy_log_path_to_clipboard(app: &mut App) {
 fn toggle_recording(app: &mut App) {
     match &app.status {
         RecordingStatus::Idle | RecordingStatus::Error(_) => {
-            start_recording(app);
+            app.start_recording();
         }
-        RecordingStatus::Streaming { .. } | RecordingStatus::Connecting => {
+        RecordingStatus::Recording => {
             stop_all_sessions(app);
         }
     }
 }
 
-fn start_recording(app: &mut App) {
-    // Check API key
-    if !app.config.has_api_key() {
-        app.status = RecordingStatus::Error(RecordingError::NoApiKey);
-        return;
-    }
-
-    // Check selections
-    if app.selected_sessions.is_empty() {
-        app.status = RecordingStatus::Error(RecordingError::NoSelection);
-        return;
-    }
-
-    app.status = RecordingStatus::Connecting;
-    app.start_time = Some(std::time::Instant::now());
-
-    let server_url = app.config.server_url();
-    let api_key = app.config.api_key.clone().unwrap_or_default();
-
-    // Create init result channel — streaming threads report init success/failure here
-    let (init_tx, init_rx) = std::sync::mpsc::channel();
-    app.init_result_rx = Some(init_rx);
-
-    // Start each selected session
-    for &idx in &app.selected_sessions.clone() {
-        if let Some(session) = app.sessions.get(idx).cloned() {
-            let session_id = Uuid::new_v4();
-            let stop_signal = Arc::new(Mutex::new(false));
-            let audio_level = app.audio_level.clone();
-            let error_channel = app.error_channel.clone();
-            let init_tx_clone = init_tx.clone();
-
-            let server_url_clone = server_url.clone();
-            let api_key_clone = api_key.clone();
-            let session_id_str = session_id.to_string();
-            let session_clone = session.clone();
-            let stop_signal_clone = stop_signal.clone();
-            let audio_level_clone = audio_level.clone();
-
-            log::info!(
-                "Starting recording: session={}, device={}",
-                session_id_str, session_clone.device_name
-            );
-
-            // Spawn recording thread — Project A is microphone-only, so all
-            // sessions are input devices. Loopback capture is deferred.
-            std::thread::spawn(move || {
-                let result = audio_legacy::start_input_recording(
-                    &session_clone,
-                    server_url_clone,
-                    api_key_clone,
-                    session_id_str,
-                    audio_legacy::RecordingContext {
-                        stop_signal: stop_signal_clone,
-                        audio_level: audio_level_clone,
-                    },
-                    init_tx_clone,
-                );
-
-                if let Err(e) = result {
-                    let msg = format!("Recording error: {}", e);
-                    log::error!("{}", msg);
-                    if let Ok(mut err) = error_channel.lock() {
-                        *err = Some(msg);
-                    }
-                }
-            });
-
-            app.active_sessions.push(ActiveSession {
-                id: session_id,
-                session,
-                stop_signal,
-            });
-        }
-    }
-
-    if app.active_sessions.is_empty() {
-        app.status = RecordingStatus::Error(RecordingError::NoSessionsStarted);
-    }
-    // Status stays as Connecting until check_init_result() receives confirmation
-}
-
 fn stop_all_sessions(app: &mut App) {
     log::info!("Stopping all sessions");
-
-    for session in &app.active_sessions {
-        if let Ok(mut stop) = session.stop_signal.lock() {
-            *stop = true;
-        }
-    }
-
-    app.active_sessions.clear();
-    app.status = RecordingStatus::Idle;
-    app.start_time = None;
-    app.duration = 0.0;
-    app.init_result_rx = None;
-
-    if let Ok(mut level) = app.audio_level.lock() {
-        *level = 0.0;
-    }
+    app.stop_recording();
 }
