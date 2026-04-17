@@ -1999,6 +1999,7 @@ dependencies = [
  "hound",
  "libc",
  "log",
+ "parking_lot",
  "pretty_assertions",
  "proptest",
  "ratatui",

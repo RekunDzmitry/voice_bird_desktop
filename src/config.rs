@@ -53,4 +53,20 @@ impl AppConfig {
     pub fn has_api_key(&self) -> bool {
         self.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
     }
+
+    /// TEMPORARY stub until Task 15 rewrites config.
+    ///
+    /// Returns the expanded session directory path, replacing `~/` with
+    /// the user's home directory. Task 14 uses a hard-coded default of
+    /// `~/voice-bird/sessions`; Task 15 introduces a real `session_dir`
+    /// field on `AppConfig`.
+    pub fn session_dir_expanded(&self) -> String {
+        let raw = "~/voice-bird/sessions";
+        if let Some(rest) = raw.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest).to_string_lossy().into_owned();
+            }
+        }
+        raw.to_string()
+    }
 }

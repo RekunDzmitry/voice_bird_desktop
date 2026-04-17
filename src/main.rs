@@ -301,7 +301,7 @@ fn copy_log_path_to_clipboard(app: &mut App) {
 fn toggle_recording(app: &mut App) {
     match &app.status {
         RecordingStatus::Idle | RecordingStatus::Error(_) => {
-            app.start_recording();
+            app.start_recording(voice_bird::session::layout::SessionSource::Microphone);
         }
         RecordingStatus::Recording => {
             stop_all_sessions(app);
