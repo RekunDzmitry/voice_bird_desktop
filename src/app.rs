@@ -23,6 +23,24 @@ pub enum RecordingStatus {
     Error(String),
 }
 
+/// Progress reported by a running model download.
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub model_id: String,
+    pub bytes: u64,
+    pub total: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// State for the first-run model picker overlay.
+pub struct PickerState {
+    pub index: usize,
+    /// When present, a download is in progress (or just finished with an
+    /// error). Wrapped in `Arc<PlMutex<...>>` so the background download
+    /// thread can mutate the same progress that the render path reads.
+    pub downloading: Option<Arc<PlMutex<DownloadProgress>>>,
+}
+
 /// A single committed (finalized) transcript line.
 pub struct CommittedLine {
     pub t_start_ms: u64,
@@ -93,12 +111,37 @@ pub struct App {
 
     /// Start-of-session UTC timestamp, if any.
     pub session_started_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// First-run model picker state; `Some` while in `AppMode::ModelPicker`.
+    pub picker: Option<PickerState>,
+
+    /// True iff `config.toml` already existed on disk at startup. When
+    /// false, the model picker refuses to Esc-cancel — first run must pick.
+    pub config_was_loaded_from_disk: bool,
 }
 
 impl App {
     /// Create a new application instance
     pub fn new() -> Self {
         let config = AppConfig::load().unwrap_or_default();
+
+        let config_path = AppConfig::config_path().ok();
+        let config_was_loaded_from_disk = config_path
+            .as_ref()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+
+        let (mode, picker) = if config_was_loaded_from_disk {
+            (AppMode::Normal, None)
+        } else {
+            (
+                AppMode::ModelPicker,
+                Some(PickerState {
+                    index: 0,
+                    downloading: None,
+                }),
+            )
+        };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -107,7 +150,7 @@ impl App {
             .expect("tokio runtime");
 
         Self {
-            mode: AppMode::Normal,
+            mode,
             sessions: Vec::new(),
             selected_index: 0,
             selected_sessions: Vec::new(),
@@ -126,6 +169,8 @@ impl App {
             runtime: None,
             session_dir: None,
             session_started_at: None,
+            picker,
+            config_was_loaded_from_disk,
         }
     }
 
@@ -375,6 +420,99 @@ impl App {
 
         if let Ok(mut level) = self.audio_level.lock() {
             *level = 0.0;
+        }
+    }
+
+    /// Kick off an async download of `entry`'s gguf model file. Progress
+    /// is written into the picker's `downloading` slot; on success, the
+    /// config is written with the chosen model id and the app transitions
+    /// back to `AppMode::Normal`.
+    pub fn begin_model_download(
+        &mut self,
+        entry: &voice_bird::transcription::models::ModelEntry,
+    ) {
+        let dest = match voice_bird::transcription::models::gguf_path(entry.id) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("gguf_path: {e}");
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.downloading = Some(Arc::new(PlMutex::new(DownloadProgress {
+                        model_id: entry.id.into(),
+                        bytes: 0,
+                        total: None,
+                        error: Some(format!("{e}")),
+                    })));
+                }
+                return;
+            }
+        };
+
+        let progress = Arc::new(PlMutex::new(DownloadProgress {
+            model_id: entry.id.into(),
+            bytes: 0,
+            total: None,
+            error: None,
+        }));
+
+        if let Some(picker) = self.picker.as_mut() {
+            picker.downloading = Some(progress.clone());
+        }
+
+        let url = entry.gguf_url.to_string();
+        let sha = entry.gguf_sha256.to_string();
+        let progress_for_thread = progress.clone();
+
+        // Plain OS thread: the download is blocking I/O, we don't need
+        // tokio for it, and this keeps the progress callback trivially
+        // synchronous.
+        std::thread::spawn(move || {
+            let mut cb = |bytes: u64, total: Option<u64>| {
+                let mut g = progress_for_thread.lock();
+                g.bytes = bytes;
+                g.total = total;
+            };
+            let res = voice_bird::transcription::models::download_with_verify(
+                &url, &dest, &sha, &mut cb,
+            );
+            if let Err(e) = res {
+                let mut g = progress_for_thread.lock();
+                g.error = Some(format!("{e}"));
+            }
+        });
+    }
+
+    /// If a picker download has finished (successfully), commit the chosen
+    /// model id to config and return to Normal mode. Intended to be called
+    /// from the render loop once per tick.
+    pub fn poll_picker_download(&mut self) {
+        let Some(picker) = self.picker.as_ref() else { return; };
+        let Some(progress_arc) = picker.downloading.as_ref() else { return; };
+
+        // Snapshot under the lock, release before mutating self.
+        let (done, err, model_id) = {
+            let g = progress_arc.lock();
+            let done = g.error.is_none()
+                && g.total.is_some()
+                && Some(g.bytes) == g.total;
+            (done, g.error.clone(), g.model_id.clone())
+        };
+
+        if err.is_some() {
+            // Leave the error visible in the picker overlay; user can retry.
+            return;
+        }
+
+        if done {
+            self.config.default_model = model_id;
+            if let Err(e) = self.config.save() {
+                log::error!("config save: {e}");
+                let mut g = progress_arc.lock();
+                g.error = Some(format!("config save: {e}"));
+                return;
+            }
+            self.mode = AppMode::Normal;
+            self.picker = None;
+            self.config_was_loaded_from_disk = true;
         }
     }
 }

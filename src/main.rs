@@ -198,6 +198,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Check for errors from recording threads
         app.check_error();
 
+        // If the model picker has a completed download, commit config &
+        // return to Normal mode.
+        app.poll_picker_download();
+
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -212,12 +216,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
                     match app.mode {
                         AppMode::Normal => handle_normal_mode(app, key.code),
-                        AppMode::ModelPicker => {
-                            // Wired in Stage 3 (Task 18). For now, Esc returns to Normal.
-                            if matches!(key.code, KeyCode::Esc) {
-                                app.mode = AppMode::Normal;
-                            }
-                        }
+                        AppMode::ModelPicker => handle_picker_mode(app, key.code),
                         AppMode::Help => handle_help_mode(app, key.code),
                     }
                 }
@@ -261,6 +260,51 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Char('m') => app.mode = AppMode::ModelPicker, // wired in Stage 3
+        _ => {}
+    }
+}
+
+fn handle_picker_mode(app: &mut App, key: KeyCode) {
+    // Ignore input while a download is in progress (no error yet).
+    let download_in_flight = app
+        .picker
+        .as_ref()
+        .and_then(|p| p.downloading.as_ref())
+        .map(|arc| arc.lock().error.is_none())
+        .unwrap_or(false);
+    if download_in_flight {
+        return;
+    }
+
+    let catalog = voice_bird::transcription::models::Catalog::builtin();
+    let total = catalog.all().len();
+
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(picker) = app.picker.as_mut() {
+                picker.index = picker.index.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(picker) = app.picker.as_mut() {
+                if picker.index + 1 < total {
+                    picker.index += 1;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let idx = app.picker.as_ref().map(|p| p.index).unwrap_or(0);
+            if let Some(entry) = catalog.all().get(idx).cloned() {
+                app.begin_model_download(&entry);
+            }
+        }
+        KeyCode::Esc => {
+            if app.config_was_loaded_from_disk {
+                app.mode = AppMode::Normal;
+                app.picker = None;
+            }
+            // First run: Esc is ignored — user must pick a model.
+        }
         _ => {}
     }
 }
