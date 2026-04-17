@@ -1,53 +1,62 @@
-# Voice Bird CLI
+# Voice Bird
 
-Terminal-based audio streaming for voice transcription.
+Terminal-based voice transcription. Runs fully locally — your audio never leaves your machine.
 
-## Installation
-
-### Using cargo-binstall (Recommended)
+## Install
 
 ```bash
-# Install cargo-binstall if you don't have it
-cargo install cargo-binstall
-
-# Install Voice Bird CLI
-cargo binstall voice-bird-cli
+cargo install voice-bird
 ```
 
-### Manual Download
+Voice Bird downloads Whisper models on first run (defaults to `distil-small.en`, ~250 MB) and caches them under your OS cache directory.
 
-Download pre-built binaries from [GitHub Releases](https://github.com/RekunDzmitry/voice-bird-releases/releases).
+### macOS bonus: ANE-accelerated inference
 
-## Features
+On Apple Silicon, a bundled WhisperKit sidecar can run Whisper on the Neural Engine. Building it requires a working Swift toolchain (full Xcode or a repaired Command Line Tools install):
 
-- Enumerate audio devices and running applications
-- Capture per-application audio (Windows/macOS)
-- Stream audio to Voice Bird server for transcription
-- Real-time audio level visualization
-- Interactive TUI interface
+```bash
+cd whisperkit-helper
+swift build -c release
+# then copy the binary next to the voice-bird binary:
+cp .build/release/voice-bird-whisperkit "$(dirname "$(which voice-bird)")/"
+```
+
+Without the sidecar, Voice Bird falls back to `whisper-rs` (whisper.cpp bindings with Metal acceleration) — still fully local, just without ANE.
 
 ## Usage
 
 ```bash
-# Run the CLI
-voice-bird-cli
+voice-bird                          # start the TUI
+voice-bird --recover <session-dir>  # rebuild transcript.{json,txt} after a crash
 ```
 
-### Controls
+On first launch you pick a model. Subsequent launches remember your choice (stored in `~/.config/voice-bird/config.toml` on Linux/macOS, `%APPDATA%\voice-bird\config.toml` on Windows).
 
-- `↑/↓` - Navigate device list
-- `Space` - Select/deselect audio source
-- `Enter` - Start/stop streaming
-- `c` - Configure API key
-- `r` - Refresh device list
-- `q` - Quit
-- `?` - Help
+Recordings live under `~/voice-bird/sessions/<timestamp>-<source>/`:
 
-## Requirements
+| File | Content |
+|------|---------|
+| `audio.wav` | 16 kHz mono |
+| `transcript.jsonl` | Append-only log, crash-safe |
+| `transcript.json` | Finalized segments + metadata |
+| `transcript.txt` | Plain text, one line per segment |
+| `meta.json` | Device, model, engine, duration |
 
-- Windows 10 Build 20348+ or macOS 12+
-- Voice Bird API key (get one at https://voicebird.app)
+## Keys
+
+| Key | Action |
+|-----|--------|
+| `r` | start recording |
+| `s` | stop |
+| `m` | change model (first-run picker) |
+| `q` | quit |
+| `?` | help |
+
+## Scope caveats (current release)
+
+- Capture is microphone-only. System-audio loopback (via ScreenCaptureKit on macOS / WASAPI on Windows) is deferred to a follow-up release.
+- WhisperKit sidecar must be built by the user (see install notes).
 
 ## License
 
-Proprietary - See LICENSE file for details.
+Proprietary.
