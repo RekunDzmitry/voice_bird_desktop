@@ -249,27 +249,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 
 fn handle_normal_mode(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-        }
-        KeyCode::Char('?') => {
-            app.toggle_help();
-        }
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('r') => {
-            toggle_recording(app);
+            if matches!(app.status, RecordingStatus::Idle | RecordingStatus::Error(_)) {
+                app.start_recording(voice_bird::session::layout::SessionSource::Microphone);
+            }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.select_previous();
+        KeyCode::Char('s') => {
+            if matches!(app.status, RecordingStatus::Recording) {
+                app.stop_recording();
+            }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.select_next();
-        }
-        KeyCode::Char(' ') => {
-            app.toggle_selection();
-        }
-        KeyCode::Char('L') => {
-            copy_log_path_to_clipboard(app);
-        }
+        KeyCode::Char('m') => app.mode = AppMode::ModelPicker, // wired in Stage 3
         _ => {}
     }
 }
@@ -280,32 +272,6 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
             app.toggle_help();
         }
         _ => {}
-    }
-}
-
-fn copy_log_path_to_clipboard(app: &mut App) {
-    if let Some(ref path) = app.log_path {
-        let text = path.display().to_string();
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
-            Ok(()) => {
-                app.status_message = Some("Log path copied to clipboard".to_string());
-            }
-            Err(e) => {
-                log::warn!("Failed to copy to clipboard: {}", e);
-                app.status_message = Some(format!("Clipboard error: {}", e));
-            }
-        }
-    }
-}
-
-fn toggle_recording(app: &mut App) {
-    match &app.status {
-        RecordingStatus::Idle | RecordingStatus::Error(_) => {
-            app.start_recording(voice_bird::session::layout::SessionSource::Microphone);
-        }
-        RecordingStatus::Recording => {
-            stop_all_sessions(app);
-        }
     }
 }
 
