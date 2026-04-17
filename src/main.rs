@@ -198,6 +198,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Check for errors from recording threads
         app.check_error();
 
+        // Drain any error the engine's consumer task posted — sets the
+        // banner + flips status to Error, so the user sees the message
+        // and can press `r` to retry.
+        app.check_engine_error();
+
         // If the model picker has a completed download, commit config &
         // return to Normal mode.
         app.poll_picker_download();

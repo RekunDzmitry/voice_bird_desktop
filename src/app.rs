@@ -128,6 +128,24 @@ pub struct App {
     /// instead, we keep it pinned to the main (App-owning) thread and drop
     /// it in `stop_recording`, which cleanly stops capture.
     pub _capture_stream: Option<cpal::Stream>,
+
+    /// Which engine is actually running: `"whisperkit"` or `"whisper_rs"`.
+    /// Set by `start_recording` based on `config.engine_prefer` and whether
+    /// the sidecar binary was located on disk. Surfaced in the header and
+    /// persisted into `meta.json` by `stop_recording`.
+    pub engine_kind: String,
+
+    /// Error banner displayed above the footer. Set when an engine emits
+    /// `EngineEvent::Error` (or when the pipeline fails to start); cleared
+    /// on the next successful `start_recording`. Plan deviation: we chose
+    /// this simpler banner-based surface over the plan's silent
+    /// WhisperKit→whisper-rs restart, which would require significant
+    /// state-machine work and risks regressing Stage 2's pipeline.
+    pub banner: Option<String>,
+
+    /// Shared slot written by the consumer task when an `EngineEvent::Error`
+    /// lands. `tick()` drains it into `banner` + sets `status` to Error.
+    pub engine_error_channel: Arc<Mutex<Option<String>>>,
 }
 
 impl App {
@@ -182,6 +200,9 @@ impl App {
             picker,
             config_was_loaded_from_disk,
             _capture_stream: None,
+            engine_kind: String::new(),
+            banner: None,
+            engine_error_channel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -262,6 +283,21 @@ impl App {
         }
     }
 
+    /// Drain any engine error published by the consumer task into `banner`
+    /// and flip the status to `Error`. Called on each UI tick. Plan
+    /// deviation: the plan originally described a silent WhisperKit →
+    /// whisper-rs restart on engine error; we instead surface the error
+    /// as a red banner and let the user press `r` to retry, which is a
+    /// much smaller change and does not touch the Stage 2 pipeline shape.
+    pub fn check_engine_error(&mut self) {
+        if let Ok(mut slot) = self.engine_error_channel.lock() {
+            if let Some(msg) = slot.take() {
+                self.banner = Some(msg.clone());
+                self.status = RecordingStatus::Error(msg);
+            }
+        }
+    }
+
     /// Toggle help display
     pub fn toggle_help(&mut self) {
         self.mode = if self.mode == AppMode::Help {
@@ -314,10 +350,8 @@ impl App {
                 }
             };
 
-        // --- 3. WhisperRsEngine -------------------------------------------
-        use voice_bird::transcription::{
-            whisper_rs_engine::WhisperRsEngine, EngineConfig, TranscriptionEngine,
-        };
+        // --- 3. Engine (WhisperKit sidecar or whisper-rs fallback) --------
+        use voice_bird::transcription::{EngineConfig, TranscriptionEngine};
         let model_path =
             match voice_bird::transcription::models::gguf_path(&self.config.default_model) {
                 Ok(p) => p,
@@ -326,7 +360,23 @@ impl App {
                     return;
                 }
             };
-        let mut engine = WhisperRsEngine::default();
+        // Pick the engine based on user preference + sidecar availability.
+        // `sidecar_path()` probes the .app bundle and dev layouts; on this
+        // machine (no Swift binary built) it returns None, and
+        // `select_engine` transparently falls back to WhisperRsEngine.
+        let sidecar = voice_bird::transcription::sidecar_path();
+        let engine_kind_used = match (sidecar.as_deref(), self.config.engine_prefer.as_str()) {
+            (Some(_), "auto") | (Some(_), "whisperkit") if cfg!(target_os = "macos") => {
+                "whisperkit"
+            }
+            _ => "whisper_rs",
+        };
+        self.engine_kind = engine_kind_used.to_string();
+        self.banner = None; // clear stale banner from previous run
+        let mut engine = voice_bird::transcription::select_engine(
+            &self.config.engine_prefer,
+            sidecar.as_deref(),
+        );
         let handle = match engine.start(EngineConfig {
             model_path,
             language: Some(self.config.language.clone()).filter(|s| s != "auto"),
@@ -361,6 +411,7 @@ impl App {
         let mut events_rx = handle.events_rx;
         let committed = self.committed.clone();
         let tentative = self.tentative.clone();
+        let engine_error_channel = self.engine_error_channel.clone();
         let writer_path = session_dir.join("transcript.jsonl");
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -424,6 +475,12 @@ impl App {
                         }
                         Ok(voice_bird::transcription::EngineEvent::Error(e)) => {
                             log::error!("engine error: {e}");
+                            // Publish to the shared error channel so the
+                            // main App loop picks it up on the next tick
+                            // and sets `self.banner` + status=Error.
+                            if let Ok(mut slot) = engine_error_channel.lock() {
+                                *slot = Some(e);
+                            }
                             break;
                         }
                         Err(_) => break,
@@ -468,10 +525,15 @@ impl App {
             (self.session_dir.take(), self.session_started_at.take())
         {
             let ended = chrono::Utc::now();
+            let engine_for_meta = if self.engine_kind.is_empty() {
+                "whisper_rs".to_string()
+            } else {
+                self.engine_kind.clone()
+            };
             let meta = voice_bird::session::finalize::SessionMeta {
                 version: env!("CARGO_PKG_VERSION").into(),
                 model: self.config.default_model.clone(),
-                engine: "mock".into(),
+                engine: engine_for_meta,
                 source: "mic".into(),
                 device: "mock".into(),
                 started_at: started.to_rfc3339(),

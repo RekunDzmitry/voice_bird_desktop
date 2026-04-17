@@ -62,3 +62,56 @@ pub struct EngineHandle {
 pub trait TranscriptionEngine: Send {
     fn start(&mut self, cfg: EngineConfig) -> anyhow::Result<EngineHandle>;
 }
+
+/// Build a transcription engine based on user preference and whether the
+/// WhisperKit sidecar binary is available on disk. `prefer` comes from
+/// `config.toml`'s `engine_prefer` field (`"auto"`, `"whisperkit"`, or
+/// `"whisper_rs"`). On macOS, `"auto"` and `"whisperkit"` pick the
+/// sidecar iff `sidecar_path` is `Some` and points to an existing file;
+/// otherwise we fall back to `whisper-rs` transparently.
+pub fn select_engine(
+    prefer: &str,
+    sidecar_path: Option<&std::path::Path>,
+) -> Box<dyn TranscriptionEngine> {
+    #[cfg(target_os = "macos")]
+    {
+        if prefer == "whisperkit" || prefer == "auto" {
+            if let Some(path) = sidecar_path {
+                if path.exists() {
+                    return Box::new(whisper_kit_engine::WhisperKitEngine::new(
+                        path.to_path_buf(),
+                    ));
+                }
+            }
+        }
+    }
+    // Silence the unused-parameter warning on non-macOS builds.
+    let _ = (prefer, sidecar_path);
+    Box::new(whisper_rs_engine::WhisperRsEngine::default())
+}
+
+/// Locate the `voice-bird-whisperkit` Swift sidecar binary. We probe, in
+/// order: the macOS `.app` bundle layout (Resources/), a sibling next to
+/// the current executable (release layout), and the dev `.build/release`
+/// produced by `cargo run -p xtask -- build-sidecar`. Returns `None` on
+/// non-macOS or if no candidate exists.
+pub fn sidecar_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    // .app bundle layout
+    let bundle = dir.join("../Resources/voice-bird-whisperkit");
+    if bundle.exists() {
+        return Some(bundle);
+    }
+    // sibling binary (dev / release layout)
+    let sibling = dir.join("voice-bird-whisperkit");
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    // project dev fallback (running via `cargo run`, target/debug/voice-bird)
+    let dev = dir.join("../../whisperkit-helper/.build/release/voice-bird-whisperkit");
+    if dev.exists() {
+        return Some(dev);
+    }
+    None
+}

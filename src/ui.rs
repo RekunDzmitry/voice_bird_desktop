@@ -14,20 +14,42 @@ pub fn render(f: &mut Frame, app: &App) {
         return;
     }
 
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // When a banner is set (engine error surfaced to the user), insert a
+    // single-line red strip between the tentative zone and the footer.
+    // Plan deviation: the plan originally called for a silent
+    // WhisperKit→whisper-rs restart on error; we surface errors via this
+    // banner instead and let the user press `r` to retry.
+    let has_banner = app.banner.is_some();
+    let constraints: Vec<Constraint> = if has_banner {
+        vec![
+            Constraint::Length(3), // header
+            Constraint::Min(4),    // committed zone
+            Constraint::Length(3), // tentative line
+            Constraint::Length(1), // banner
+            Constraint::Length(1), // footer/keys
+        ]
+    } else {
+        vec![
             Constraint::Length(3), // header
             Constraint::Min(4),    // committed zone
             Constraint::Length(3), // tentative line
             Constraint::Length(1), // footer/keys
-        ])
+        ]
+    };
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(f.area());
 
     render_header(f, root[0], app);
     render_committed(f, root[1], app);
     render_tentative(f, root[2], app);
-    render_footer(f, root[3], app);
+    if has_banner {
+        render_banner(f, root[3], app);
+        render_footer(f, root[4], app);
+    } else {
+        render_footer(f, root[3], app);
+    }
 }
 
 pub fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
@@ -104,7 +126,18 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  │  "),
         Span::raw(app.config.default_model.as_str()),
         Span::raw("  │  "),
-        Span::raw(format!("engine: {}", app.config.engine_prefer.as_str())),
+        Span::raw(format!(
+            "engine: {}",
+            // While recording / after a run, show the engine that was
+            // actually selected (e.g. `whisper_rs` when the WhisperKit
+            // sidecar was absent). Idle → fall back to the config
+            // preference so the user can see what will be used next.
+            if app.engine_kind.is_empty() {
+                app.config.engine_prefer.as_str()
+            } else {
+                app.engine_kind.as_str()
+            }
+        )),
         Span::raw("  │  "),
         Span::styled(status, status_style(&app.status)),
         Span::raw("  │  "),
@@ -155,6 +188,18 @@ fn render_tentative(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::ITALIC),
     )))
     .block(Block::default().borders(Borders::ALL));
+    f.render_widget(p, area);
+}
+
+fn render_banner(f: &mut Frame, area: Rect, app: &App) {
+    let msg = app.banner.clone().unwrap_or_default();
+    let p = Paragraph::new(Line::from(Span::styled(
+        format!(" ! {msg}"),
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )));
     f.render_widget(p, area);
 }
 
