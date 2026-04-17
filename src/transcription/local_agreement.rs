@@ -203,4 +203,35 @@ mod tests {
         assert_eq!(out.committed_segments[0].text, "before pause");
         assert_eq!(out.committed_segments[1].text, "after");
     }
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn arb_tokens(max_len: usize)(
+            texts in prop::collection::vec("[a-z]{1,8}", 0..max_len)
+        ) -> Vec<Token> {
+            texts.into_iter().enumerate().map(|(i, text)| Token {
+                text,
+                t_start_ms: (i as u64) * 400,
+                t_end_ms:   (i as u64) * 400 + 350,
+            }).collect()
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn step_never_panics_and_monotonic_upto(
+            prev in arb_tokens(20),
+            curr in arb_tokens(20),
+            upto_ms in 0u64..5_000u64,
+        ) {
+            let upto = Duration::from_millis(upto_ms);
+            let out = step(&prev, &curr, upto);
+            prop_assert!(out.new_committed_upto >= upto,
+                "committed_upto must never regress");
+            for seg in &out.committed_segments {
+                prop_assert!(seg.t_end >= seg.t_start);
+            }
+        }
+    }
 }
