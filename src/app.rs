@@ -44,17 +44,20 @@ pub struct PickerState {
 /// A single committed (finalized) transcript line.
 pub struct CommittedLine {
     pub t_start_ms: u64,
+    pub t_end_ms: u64,
     pub text: String,
 }
 
 /// Handles to the currently running recording pipeline.
 pub struct RecordingRuntime {
-    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub join: tokio::task::JoinHandle<()>,
     /// Producer task: pulls cpal frames, resamples, tees to WAV + engine.
     /// Aborted by `stop_recording` so the await on `join` does not hang
     /// when the cpal channel `recv()` is blocked.
     pub producer: Option<tokio::task::JoinHandle<()>>,
+    /// Background refinement consumer join. `None` when no refinement
+    /// model is configured or when it failed to load.
+    pub refinement_join: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Main application state
@@ -104,6 +107,11 @@ pub struct App {
     /// Committed (finalized) transcript lines for the current session.
     pub committed: Arc<PlMutex<Vec<CommittedLine>>>,
 
+    /// Refined transcript lines from the background engine (beam search,
+    /// larger windows). When present, these override streaming `committed`
+    /// lines in the same time range at render time.
+    pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
+
     /// Latest tentative (in-progress) transcript text.
     pub tentative: Arc<PlMutex<String>>,
 
@@ -123,11 +131,13 @@ pub struct App {
     /// false, the model picker refuses to Esc-cancel — first run must pick.
     pub config_was_loaded_from_disk: bool,
 
-    /// Live cpal input stream for the active recording. `cpal::Stream` is
-    /// `!Send`, so it cannot ride along into the tokio producer task —
-    /// instead, we keep it pinned to the main (App-owning) thread and drop
-    /// it in `stop_recording`, which cleanly stops capture.
-    pub _capture_stream: Option<cpal::Stream>,
+    /// Live capture keep-alive for the active recording. Wraps either a
+    /// `cpal::Stream` (mic path) or an `SCStream` (macOS loopback). The
+    /// whole enum is `!Send` because `cpal::Stream` is `!Send`, so it
+    /// cannot ride along into the tokio producer task — instead, we keep
+    /// it pinned to the main (App-owning) thread and drop it in
+    /// `stop_recording`, which cleanly stops capture.
+    pub _capture_stream: Option<voice_bird::audio::capture::CaptureKeepAlive>,
 
     /// Which engine is actually running: `"whisperkit"` or `"whisper_rs"`.
     /// Set by `start_recording` based on `config.engine_prefer` and whether
@@ -146,6 +156,16 @@ pub struct App {
     /// Shared slot written by the consumer task when an `EngineEvent::Error`
     /// lands. `tick()` drains it into `banner` + sets `status` to Error.
     pub engine_error_channel: Arc<Mutex<Option<String>>>,
+
+    /// Transcript scroll offset (lines from the top). Only consulted when
+    /// `transcript_follow` is false — otherwise the render path pins
+    /// the view to the bottom automatically.
+    pub transcript_scroll: u16,
+
+    /// When true (default), the transcript auto-scrolls to show the latest
+    /// content. Set false when the user manually scrolls up. Pressing
+    /// End re-enables it.
+    pub transcript_follow: bool,
 }
 
 impl App {
@@ -193,6 +213,7 @@ impl App {
             log_path: None,
             rt,
             committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
             tentative: Arc::new(PlMutex::new(String::new())),
             runtime: None,
             session_dir: None,
@@ -203,7 +224,33 @@ impl App {
             engine_kind: String::new(),
             banner: None,
             engine_error_channel: Arc::new(Mutex::new(None)),
+            transcript_scroll: 0,
+            transcript_follow: true,
         }
+    }
+
+    /// Scroll the transcript up by `n` lines. Disables auto-follow.
+    pub fn scroll_transcript_up(&mut self, n: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(n);
+        self.transcript_follow = false;
+    }
+
+    /// Scroll the transcript down by `n` lines. Disables auto-follow —
+    /// the render path clamps the offset against the total line count.
+    pub fn scroll_transcript_down(&mut self, n: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_add(n);
+        self.transcript_follow = false;
+    }
+
+    /// Jump to the top and pin there.
+    pub fn scroll_transcript_home(&mut self) {
+        self.transcript_scroll = 0;
+        self.transcript_follow = false;
+    }
+
+    /// Re-enable auto-follow so the view tracks the latest content.
+    pub fn scroll_transcript_end(&mut self) {
+        self.transcript_follow = true;
     }
 
     /// Refresh the list of audio sessions
@@ -328,11 +375,47 @@ impl App {
 
         // Clear live state
         self.committed.lock().clear();
+        self.refined.lock().clear();
         *self.tentative.lock() = String::new();
+        self.transcript_scroll = 0;
+        self.transcript_follow = true;
 
-        // --- 1. cpal capture -----------------------------------------------
-        let capture = match voice_bird::audio::capture::capture_default_input() {
+        // --- 1. Capture ----------------------------------------------------
+        // Branch on saved device kind: Input → cpal mic capture,
+        // Output → platform-specific loopback (ScreenCaptureKit on macOS).
+        use voice_bird::config::AudioSessionKind;
+        let want = self.config.input_device.as_deref();
+        let want_kind = self.config.input_device_kind.unwrap_or(AudioSessionKind::Input);
+        log::info!(
+            "start_recording: requested device = {:?}, kind = {:?}",
+            want,
+            want_kind
+        );
+
+        let capture_result = match want_kind {
+            AudioSessionKind::Input => voice_bird::audio::capture::capture_input(want),
+            AudioSessionKind::Output => {
+                voice_bird::audio::loopback::capture_loopback(want)
+            }
+        };
+        let capture = match capture_result {
             Ok(c) => c,
+            Err(e) if want.is_some() && want_kind == AudioSessionKind::Input => {
+                log::warn!(
+                    "selected input device unavailable ({e}); falling back to default"
+                );
+                self.banner = Some(format!(
+                    "input '{}' not found — using default",
+                    want.unwrap_or("")
+                ));
+                match voice_bird::audio::capture::capture_input(None) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        self.status = RecordingStatus::Error(format!("capture: {e2}"));
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 self.status = RecordingStatus::Error(format!("capture: {e}"));
                 return;
@@ -351,7 +434,7 @@ impl App {
             };
 
         // --- 3. Engine (WhisperKit sidecar or whisper-rs fallback) --------
-        use voice_bird::transcription::{EngineConfig, TranscriptionEngine};
+        use voice_bird::transcription::EngineConfig;
         let model_path =
             match voice_bird::transcription::models::gguf_path(&self.config.default_model) {
                 Ok(p) => p,
@@ -414,9 +497,49 @@ impl App {
         let engine_error_channel = self.engine_error_channel.clone();
         let writer_path = session_dir.join("transcript.jsonl");
 
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Wall-clock anchor. The streaming engine emits buffer-relative
+        // timestamps (they reset after each sliding-window trim), so the
+        // consumer stamps commits with elapsed-since-start instead. The
+        // refinement engine already emits absolute-time segments.
+        let session_start = std::time::Instant::now();
 
-        // --- 5. Producer task: cpal frames → resample → tee(WAV + engine) -
+        // --- 4b. Optional refinement engine (beam-search on wider windows) -
+        // Spawned only when `refinement_model` is set in config AND the
+        // model file is present on disk. If either check fails, refinement
+        // is silently skipped and only the streaming engine runs.
+        let (refinement_pcm_tx, refinement_handle) = self
+            .config
+            .refinement_model
+            .as_ref()
+            .and_then(|id| {
+                let path = voice_bird::transcription::models::gguf_path(id).ok()?;
+                if !path.exists() {
+                    log::warn!(
+                        "refinement_model '{}' set but file missing at {} — disabled",
+                        id,
+                        path.display()
+                    );
+                    return None;
+                }
+                let eng = voice_bird::transcription::refinement_engine::RefinementEngine {
+                    model_path: path,
+                    language: Some(self.config.language.clone()).filter(|s| s != "auto"),
+                    window_ms: self.config.refinement_window_ms,
+                    beam_size: self.config.refinement_beam_size,
+                };
+                match eng.start() {
+                    Ok(h) => Some((h.pcm_tx.clone(), h)),
+                    Err(e) => {
+                        log::error!("refinement engine start: {e}");
+                        None
+                    }
+                }
+            })
+            .map(|(tx, h)| (Some(tx), Some(h)))
+            .unwrap_or((None, None));
+
+        // --- 5. Producer task: cpal frames → resample → tee(WAV + engines) -
+        let refinement_pcm_tx_for_producer = refinement_pcm_tx.clone();
         let producer = self.rt.spawn(async move {
             while let Some(frames) = frames_rx.recv().await {
                 match resampler.process(&frames) {
@@ -425,6 +548,16 @@ impl App {
                             if let Err(e) = wav.write_sample(*s) {
                                 log::error!("wav write: {e}");
                                 break;
+                            }
+                        }
+                        if let Some(ref rtx) = refinement_pcm_tx_for_producer {
+                            // Clone PCM for the refinement engine. If the
+                            // refinement side falls behind, this `send()`
+                            // awaits — which also throttles streaming. In
+                            // practice the refinement engine should keep
+                            // up because it only runs every window_ms.
+                            if rtx.send(out.clone()).await.is_err() {
+                                log::warn!("refinement channel closed");
                             }
                         }
                         if pcm_tx.send(out).await.is_err() {
@@ -443,6 +576,9 @@ impl App {
         });
 
         // --- 6. Consumer task: engine events → live state + JSONL ---------
+        // Loops until the engine's broadcast channel closes, which only
+        // happens after the engine thread exits — so we never miss the
+        // final tail-flush Committed event emitted at end-of-stream.
         let join = self.rt.spawn(async move {
             let mut writer = match voice_bird::session::writer::SegmentWriter::open(&writer_path) {
                 Ok(w) => w,
@@ -451,50 +587,117 @@ impl App {
                     return;
                 }
             };
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => break,
-                    evt = events_rx.recv() => match evt {
-                        Ok(voice_bird::transcription::EngineEvent::ModelLoaded { name }) => {
-                            log::info!("engine loaded: {}", name);
-                        }
-                        Ok(voice_bird::transcription::EngineEvent::Tentative(s)) => {
-                            *tentative.lock() = s;
-                        }
-                        Ok(voice_bird::transcription::EngineEvent::Committed(seg)) => {
-                            let written = (&seg).into();
-                            if let Err(e) = writer.append(&written) {
-                                log::error!("writer append: {e}");
-                                break;
-                            }
-                            committed.lock().push(CommittedLine {
-                                t_start_ms: seg.t_start.as_millis() as u64,
-                                text: seg.text,
-                            });
-                            tentative.lock().clear();
-                        }
-                        Ok(voice_bird::transcription::EngineEvent::Error(e)) => {
-                            log::error!("engine error: {e}");
-                            // Publish to the shared error channel so the
-                            // main App loop picks it up on the next tick
-                            // and sets `self.banner` + status=Error.
-                            if let Ok(mut slot) = engine_error_channel.lock() {
-                                *slot = Some(e);
-                            }
+            while let Ok(evt) = events_rx.recv().await {
+                match evt {
+                    voice_bird::transcription::EngineEvent::ModelLoaded { name } => {
+                        log::info!("engine loaded: {}", name);
+                    }
+                    voice_bird::transcription::EngineEvent::Tentative(s) => {
+                        *tentative.lock() = s;
+                    }
+                    voice_bird::transcription::EngineEvent::Committed(seg) => {
+                        let written = (&seg).into();
+                        if let Err(e) = writer.append(&written) {
+                            log::error!("writer append: {e}");
                             break;
                         }
-                        Err(_) => break,
+                        // Override the engine's buffer-relative timestamp
+                        // with wall-clock elapsed so the UI shows sane
+                        // times (roughly "when the user said it" with a
+                        // small inference delay).
+                        let elapsed_ms = session_start.elapsed().as_millis() as u64;
+                        committed.lock().push(CommittedLine {
+                            t_start_ms: elapsed_ms,
+                            t_end_ms: elapsed_ms,
+                            text: seg.text,
+                        });
+                        tentative.lock().clear();
+                    }
+                    voice_bird::transcription::EngineEvent::Error(e) => {
+                        log::error!("engine error: {e}");
+                        // Publish to the shared error channel so the
+                        // main App loop picks it up on the next tick
+                        // and sets `self.banner` + status=Error.
+                        if let Ok(mut slot) = engine_error_channel.lock() {
+                            *slot = Some(e);
+                        }
+                        break;
                     }
                 }
             }
         });
 
+        // --- 6b. Refinement consumer task (separate writer, separate JSONL) -
+        // Same drain-until-close pattern as the streaming consumer above —
+        // we need the engine thread's final tail-flush Committed event
+        // (which lands AFTER the PCM channel closes).
+        let refinement_join = if let Some(h) = refinement_handle {
+            let mut r_events_rx = h.events_rx;
+            let refined = self.refined.clone();
+            // Shared with the streaming consumer — every time a new
+            // refined segment lands, we clear the streaming `committed`
+            // vec so the UI only shows streaming text as the live "tail"
+            // since the most recent refinement cutoff.
+            let committed_for_refinement = self.committed.clone();
+            let r_writer_path = session_dir.join("transcript.refined.jsonl");
+            let r_join = self.rt.spawn(async move {
+                let mut writer = match voice_bird::session::writer::SegmentWriter::open(
+                    &r_writer_path,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::error!("refinement writer: {e}");
+                        return;
+                    }
+                };
+                while let Ok(evt) = r_events_rx.recv().await {
+                    match evt {
+                        voice_bird::transcription::EngineEvent::ModelLoaded { name } => {
+                            log::info!("refinement loaded: {}", name);
+                        }
+                        voice_bird::transcription::EngineEvent::Committed(seg) => {
+                            let written = (&seg).into();
+                            if let Err(e) = writer.append(&written) {
+                                log::error!("refined append: {e}");
+                                break;
+                            }
+                            refined.lock().push(CommittedLine {
+                                t_start_ms: seg.t_start.as_millis() as u64,
+                                t_end_ms: seg.t_end.as_millis() as u64,
+                                text: seg.text,
+                            });
+                            // Refined now covers the audio up through
+                            // this segment; drop the streaming lines
+                            // that duplicate it. Any streaming commits
+                            // arriving next will be the live tail below.
+                            committed_for_refinement.lock().clear();
+                        }
+                        voice_bird::transcription::EngineEvent::Tentative(_) => {}
+                        voice_bird::transcription::EngineEvent::Error(e) => {
+                            log::error!("refinement error: {e}");
+                        }
+                    }
+                }
+            });
+            // Drop the refinement engine's internal shutdown sender — the
+            // engine thread exits naturally when its pcm channel closes,
+            // not via this oneshot.
+            drop(h.shutdown);
+            Some(r_join)
+        } else {
+            None
+        };
+
         self._capture_stream = Some(stream);
         self.runtime = Some(RecordingRuntime {
-            shutdown_tx,
             join,
             producer: Some(producer),
+            refinement_join,
         });
+        // Drop the producer-side clone: the producer task owns its own
+        // copy. Keeping a second sender alive would prevent the refinement
+        // engine from observing channel-close on stop.
+        drop(refinement_pcm_tx);
         self.status = RecordingStatus::Recording;
         self.start_time = Some(std::time::Instant::now());
     }
@@ -507,17 +710,25 @@ impl App {
         self._capture_stream = None;
 
         if let Some(mut rt) = self.runtime.take() {
-            // Abort the producer in case it is still blocked on recv() —
-            // otherwise the task would linger until the last cpal buffer is
-            // drained. The producer's WAV finalize ran inline; if we aborted
-            // mid-process, we accept the tail loss as part of shutdown.
+            // Abort the producer so it drops its PCM senders. That closes
+            // both engines' pcm channels, triggering each engine's tail
+            // flush (one final `full()` pass on remaining audio + a
+            // Committed event to the broadcast). The consumers drain
+            // until the broadcast closes — which is how we guarantee the
+            // tail lands in `app.{committed,refined}` and the JSONL.
+            //
+            // This means stop can block for several seconds while large
+            // models run their final pass; acceptable trade for not
+            // losing the final chunk of transcript.
             if let Some(producer) = rt.producer.take() {
                 producer.abort();
             }
-            let _ = rt.shutdown_tx.send(());
-            // best-effort await
+            let refinement_join = rt.refinement_join.take();
             let _ = self.rt.block_on(async move {
                 let _ = rt.join.await;
+                if let Some(rj) = refinement_join {
+                    let _ = rj.await;
+                }
             });
         }
 
