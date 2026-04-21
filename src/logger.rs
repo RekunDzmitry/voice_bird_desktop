@@ -1,35 +1,34 @@
 use anyhow::Result;
 use chrono::Local;
-use std::fs::{self, OpenOptions};
-use std::io;
+use std::fs;
 use std::path::PathBuf;
 
-/// Initialize file-based logging with clean terminal output
+/// Initialize file-based logging for the CLI.
 ///
-/// All log levels (debug, info, warn, error) are written to a log file
-/// in the `logs/` directory with timestamp. Terminal remains clean for UI.
-pub fn init() -> Result<()> {
-    // Create logs directory if it doesn't exist
-    let logs_dir = PathBuf::from("logs");
+/// Logs to `~/.voice-bird/logs/voice_bird_YYYY-MM-DD_HH-MM-SS.log`.
+/// All levels (DEBUG+) go to file only — nothing to terminal (TUI owns the screen).
+/// Returns the log file path so the app can display it.
+pub fn init() -> Result<PathBuf> {
+    let logs_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .join(".voice-bird")
+        .join("logs");
+
     fs::create_dir_all(&logs_dir)?;
 
-    // Create log file with timestamp
     let log_filename = format!(
         "voice_bird_{}.log",
         Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let log_path = logs_dir.join(log_filename);
 
-    // Open log file for writing
-    let log_file = OpenOptions::new()
+    let log_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&log_path)?;
 
-    // Configure logging
     fern::Dispatch::new()
-        // Format log messages
         .format(|out, message, record| {
             out.finish(format_args!(
                 "[{} {} {}] {}",
@@ -39,45 +38,10 @@ pub fn init() -> Result<()> {
                 message
             ))
         })
-        // Log all levels to file
         .level(log::LevelFilter::Debug)
-        // Write to file
         .chain(log_file)
-        // Apply the configuration
-        .apply()?;
+        .apply()
+        .map_err(|e| anyhow::anyhow!("Failed to initialize logger: {}", e))?;
 
-    // Print startup message to terminal (this goes to stdout, not through logger)
-    println!("Voice Bird Desktop - Audio Streaming Client");
-    println!("Logging to: {}", log_path.display());
-    println!();
-
-    Ok(())
-}
-
-/// Print a user-friendly message to terminal (bypasses logging)
-pub fn print_info(message: &str) {
-    println!("{}", message);
-}
-
-/// Print a user-friendly error to terminal (bypasses logging)
-pub fn print_error(message: &str) {
-    eprintln!("ERROR: {}", message);
-}
-
-/// Print a user-friendly warning to terminal (bypasses logging)
-pub fn print_warning(message: &str) {
-    println!("WARNING: {}", message);
-}
-
-/// Print connection status to terminal
-pub fn print_connection_status(status: &str, details: &str) {
-    println!("🔌 {}: {}", status, details);
-}
-
-/// Print streaming statistics to terminal
-pub fn print_stats(device: &str, packets: u64, duration: f32, bytes: f64) {
-    println!(
-        "📊 {} | Packets: {} | Duration: {:.1}s | Data: {:.2} KB",
-        device, packets, duration, bytes
-    );
+    Ok(log_path)
 }

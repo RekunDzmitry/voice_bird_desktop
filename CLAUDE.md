@@ -4,148 +4,63 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Voice Bird Desktop is a Rust audio recording application supporting:
-- Audio device enumeration (input/output)
-- Input device recording (microphones)
-- Output device loopback recording (Windows WASAPI - system audio capture)
-- Real-time audio visualization
-- WAV file export
+Voice Bird is a Rust TUI for fully-local voice transcription. It records microphone audio via `cpal`, resamples to 16 kHz mono with `rubato`, and runs Whisper locally — either through `whisper-rs` (whisper.cpp bindings, cross-platform, Metal on macOS) or through a WhisperKit Swift sidecar (macOS only, ANE-accelerated). Every session lives under `~/voice-bird/sessions/<timestamp>-<source>/` as an append-only `transcript.jsonl` plus finalized `transcript.{json,txt}`, `audio.wav`, and `meta.json`.
 
-## Build and Development Commands
-
-### Build
-```bash
-cargo build              # Debug build (target/debug/)
-cargo build --release    # Optimized release build (target/release/)
-```
-
-### Run
-```bash
-cargo run                # Run with debug build
-cargo run --release      # Run with optimized build
-```
-
-### Testing and Validation
-```bash
-cargo test               # Run unit tests
-cargo check              # Fast compilation check without building
-cargo clippy             # Linting and suggestions
-```
-
-### Cleanup
-```bash
-cargo clean              # Remove build artifacts
-```
+No audio, text, or telemetry leaves the machine.
 
 ## Architecture
 
-### Single-File Structure
-The entire application is in `src/main.rs` (~720 lines). This monolithic structure is intentional for a focused utility.
+- `src/main.rs` — entry point, crossterm event loop / key handlers, `--recover` CLI flag.
+- `src/app.rs` — `App` state, start/stop recording, owns the tokio runtime handle and the cpal `Stream`, drives engine selection (WhisperKit → whisper-rs fallback).
+- `src/ui.rs` — ratatui render pipeline: header / committed zone / tentative line / status banner / footer, plus the first-run model-picker overlay.
+- `src/config.rs` — TOML-backed `AppConfig` (selected model, engine preference).
+- `src/audio/capture.rs` — cpal input stream, sample-format fan-in to `f32`.
+- `src/audio/resample.rs` — `rubato` 16 kHz mono resampler.
+- `src/session/layout.rs` — session-directory path conventions and slug rules.
+- `src/session/writer.rs` — append-only JSONL writer, fsync per segment.
+- `src/session/finalize.rs` — `transcript.jsonl` → `transcript.{json,txt}` + `meta.json`.
+- `src/session/recover.rs` — reruns finalize over a partially-written session.
+- `src/transcription/mod.rs` — `TranscriptionEngine` trait.
+- `src/transcription/whisper_rs_engine.rs` — `WhisperRsEngine`, whisper.cpp via `whisper-rs` 0.13.
+- `src/transcription/whisper_kit_engine.rs` — `WhisperKitEngine`, spawns the Swift sidecar and streams length-prefixed PCM over stdio, reads JSONL results.
+- `src/transcription/mock.rs` — `MockEngine` for deterministic tests.
+- `src/transcription/local_agreement.rs` — `step()` implements LocalAgreement-2 for committed/tentative merge.
+- `src/transcription/models.rs` — model catalog (URLs, sizes, SHA-256) + downloader with resume + digest verify.
+- `whisperkit-helper/` — Swift package (macOS only). Source is in-tree; the plan defers the actual `swift build` to the user.
+- `xtask/` — workspace helper binary: `build-sidecar` shells out to `swift build` on macOS; `check-catalog` fails when `src/transcription/models.rs` still contains `<FILL>` placeholders.
 
-### Audio Pipeline Flow
-1. **Device Enumeration** → `collect_input_devices()` / `collect_output_devices()`
-2. **User Selection** → Interactive prompt via `dialoguer` crate
-3. **Stream Setup** → Input via cpal API, Output via Windows WASAPI COM
-4. **Audio Capture** → Callback-based sample collection into `Arc<Mutex<Vec<f32>>>`
-5. **Visualization** → RMS calculation + colored terminal bars (crossterm)
-6. **Persistence** → WAV export via `hound` crate with timestamped filenames
+## Essential Commands
 
-### Key Functions
+```bash
+cargo build                                    # debug build
+cargo test                                     # unit + integration tests (no engine downloads)
+cargo run                                      # launch the TUI
+cargo test --all-targets --features engine-smoke
+    # adds the whisper-rs smoke (downloads tiny.en, ~75 MB) and the
+    # WhisperKit sidecar smoke (gracefully skipped if the sidecar binary
+    # is not present next to the test harness)
 
-#### Device Enumeration (lines 34-92)
-- `collect_input_devices()` - Lists microphones, marks default
-- `collect_output_devices()` - Lists speakers/headphones, marks default
-- Returns `Vec<DeviceInfo>` with name and default flag
-
-#### Audio Processing
-- `calculate_rms()` (lines 95-102) - Root Mean Square level from samples
-- `create_audio_bar()` (lines 105-119) - Terminal visualization with color thresholds (green/yellow/red)
-
-#### Recording Functions
-- `stream_audio()` (lines 182-379) - **Input device recording** using cpal
-  - Handles 3 sample formats: F32, I16, U16
-  - Real-time callback architecture
-  - ESC key stops streaming
-  - Automatic WAV save with diagnostics
-
-- `stream_output_audio()` (lines 382-613) - **Windows WASAPI loopback** (Windows only)
-  - Direct COM API usage (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioCaptureClient`)
-  - Loopback mode captures system audio (games, music, browser)
-  - Packet-based buffer processing
-  - Platform-gated with `#[cfg(windows)]`
-
-#### WAV Export
-- `save_audio_file()` (lines 122-179)
-  - Timestamped filenames: `recording_YYYY-MM-DD_HH-MM-SS.wav`
-  - 32-bit float format
-  - Diagnostic output: capture rate, frame counts, duration validation
-
-### Platform-Specific Code
-
-#### Windows WASAPI (lines 382-613)
-- Uses `windows` crate with Win32 Audio APIs
-- COM initialization/cleanup with `CoInitializeEx`/`CoUninitialize`
-- Loopback flag: `AUDCLNT_STREAMFLAGS_LOOPBACK`
-- Format handling: IEEE_FLOAT (0x0003) and EXTENSIBLE (0xFFFE)
-
-#### Non-Windows Fallback (lines 616-621)
-- Gracefully informs user that output loopback is Windows-only
-- Input device recording works cross-platform
-
-### Dependencies (Cargo.toml)
-
-**Core Audio**
-- `cpal = "0.15"` - Cross-platform audio I/O
-- `hound = "3.5"` - WAV file encoding/decoding
-
-**UI/Terminal**
-- `dialoguer = "0.11"` - Interactive prompts
-- `console = "0.15"` - Styled terminal output
-- `crossterm = "0.27"` - Terminal manipulation, keyboard input
-
-**Utilities**
-- `anyhow = "1.0"` - Error handling with context
-- `chrono = "0.4"` - Timestamp generation
-
-**Windows-Only**
-- `windows = "0.58"` - Win32 API bindings (COM, WASAPI)
-  - Features: `Win32_Media_Audio`, `Win32_System_Com`
-
-### Error Handling Pattern
-Uses `anyhow::Result` with `.context()` for error propagation:
-```rust
-device.build_input_stream(...)
-    .context("Failed to build input stream")?
+cargo run -p xtask -- check-catalog            # CI gate: fails on <FILL> in models.rs
+cargo run -p xtask -- build-sidecar            # macOS only: runs `swift build -c release`
+voice-bird --recover <session-dir>             # rebuild transcript.{json,txt} from JSONL
 ```
 
-### Concurrency Model
-- `Arc<Mutex<>>` for shared state between audio callback thread and main thread
-- Mutex-protected: audio levels, sample buffers, statistics counters
-- No explicit thread spawning (handled by cpal/WASAPI)
+## Key Conventions
 
-## Development Notes
+- Binary is `voice-bird`, library is `voice_bird` (underscore). The workspace has two members: the root crate and `xtask/`.
+- Rust 2021, strict build (no `-D warnings` in CI yet, but we don't land warnings). No clippy-fix — review diffs by hand.
+- Session timestamps are UTC ISO-8601 without colons (filesystem-friendly). Source slugs are normalized to `[a-z0-9-]`.
+- `transcript.jsonl` writes are flushed and fsync'd per segment — crash-mid-recording must still produce a recoverable file.
+- Every entry in `src/transcription/models.rs` must have a real SHA-256 digest before shipping a release; `<FILL>` placeholders are intentional mid-development and `xtask check-catalog` is the CI gate that prevents accidentally shipping unverified downloads.
+- Engine selection prefers WhisperKit on macOS when the sidecar binary is on `PATH` (or co-located with `voice-bird`), else falls back to `whisper-rs`.
 
-### Adding Sample Format Support
-New formats require:
-1. New match arm in `stream_audio()` (line 222)
-2. Sample conversion to f32 for RMS calculation
-3. Clone of shared Arc state for callback
+## Known Gotchas
 
-### Extending Audio Visualization
-Modify `create_audio_bar()` for different thresholds/colors or add frequency analysis (requires FFT).
+- **WhisperKit sidecar build**: requires a working Swift PackageManager. Full Xcode works. A broken Command Line Tools install has been seen to ship `libPackageDescription.dylib` with ABI drift — if `swift build` fails with `Undefined symbols: PackageDescription.Package.__allocating_init`, reinstall CLT or switch to Xcode.
+- **`whisper-rs` 0.13 state**: a single `WhisperState` retained across inference calls leaks KV-cache and drifts the output. `WhisperRsEngine` builds a fresh state per call.
+- **Short-buffer rejection**: whisper.cpp errors on inputs shorter than 1 s. The engine pads buffers below that to 1.1 s of silence before calling `full`.
+- **cpal `Stream` is `!Send`**: the stream is owned by `App` so it lives on the thread that created it. Samples flow into the async world via `tokio::sync::mpsc::Receiver<Vec<f32>>`.
 
-### WAV Format Customization
-Change `WavSpec` in `save_audio_file()` (line 159). Current: 32-bit float, matches cpal's internal format.
+## Design Sources
 
-### Platform Extensions
-Linux/macOS loopback would require:
-- **Linux**: PulseAudio/PipeWire monitor sources
-- **macOS**: Core Audio loopback or virtual audio devices
-- Pattern: Add `#[cfg(target_os = "...")]` functions similar to Windows implementation
-
-### Safety Considerations
-Windows COM code uses `unsafe` block (lines 391-612). When modifying:
-- Ensure COM initialization before API calls
-- Match `CoInitializeEx` with `CoUninitialize`
-- Free COM memory with `CoTaskMemFree`
-- Validate pointer lifetime (format_ptr)
+Architecture and rationale live in `docs/superpowers/specs/2026-04-16-desktop-local-whisper-design.md`; the executable plan (with scope amendments noting microphone-only capture and user-built sidecar) is in `docs/superpowers/plans/2026-04-16-desktop-local-whisper.md`. Consult those before large changes.

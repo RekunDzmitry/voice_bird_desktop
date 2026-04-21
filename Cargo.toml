@@ -1,48 +1,77 @@
 [package]
-name = "voice_bird_desktop"
-version = "0.2.12"
+name = "voice-bird"
+version = "0.3.0"
 edition = "2021"
+description = "Voice Bird — local voice transcription TUI"
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+[[bin]]
+name = "voice-bird"
+path = "src/main.rs"
+
+[lib]
+name = "voice_bird"
+path = "src/lib.rs"
+
+[workspace]
+members = [".", "xtask"]
 
 [dependencies]
-# Tauri framework
-tauri = { version = "2", features = [] }
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
 
-# Audio processing
+# Audio
 cpal = "0.15"
 hound = "3.5"
-audiopus = "0.3.0-rc.0"
 rubato = "0.14"
 
-# Async/networking
+# Async
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.23", features = ["connect", "native-tls"], default-features = false }
-futures-util = "0.3"
-http = "1.0"
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-base64 = "0.22"
+# Logging
+log = "0.4"
+fern = "0.7"
+
+# Clipboard
+arboard = "3"
 
 # Utilities
 anyhow = "1.0"
-chrono = "0.4"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
 dirs = "5.0"
-dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
-log = "0.4"
-env_logger = "0.11"
-fern = { version = "0.7", features = ["colored"] }
+parking_lot = "0.12"
+
+# Transcription (populated in Stage 3)
+whisper-rs = "0.13"
+
+# Model download + verification
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# WhisperKit sidecar IPC (length-prefixed binary samples over stdio)
+bytemuck = "1"
+
+[features]
+engine-smoke = []
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+pretty_assertions = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Media_Audio",
-    "Win32_Media_Multimedia",
     "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_System_ProcessStatus",
@@ -53,5 +82,4 @@ windows = { version = "0.58", features = [
 ] }
 windows-core = "0.58"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "0.3"
+# (No macOS-specific dependencies in Project A — see plan scope amendment.)
