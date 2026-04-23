@@ -1,6 +1,7 @@
 mod app;
 mod logger;
 mod platform;
+mod settings_view;
 mod ui;
 
 use std::io;

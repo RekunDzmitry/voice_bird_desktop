@@ -13,6 +13,10 @@ pub fn render(f: &mut Frame, app: &App) {
         render_model_picker(f, f.area(), app);
         return;
     }
+    if app.mode == AppMode::Settings {
+        crate::settings_view::render(f, f.area(), app);
+        return;
+    }
 
     // When a banner is set (engine error surfaced to the user), insert a
     // single-line red strip between the tentative zone and the footer.
