@@ -216,6 +216,14 @@ impl App {
             )
         };
 
+        let banner_on_launch = if config.engine_prefer == "assemblyai"
+            && config.assemblyai_api_key.is_empty()
+        {
+            Some("Cloud engine selected but no API key — open settings (press ',')".into())
+        } else {
+            None
+        };
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -253,7 +261,7 @@ impl App {
             settings_edit_buf: None,
             settings_error: None,
             cloud_reminder_until: None,
-            banner: None,
+            banner: banner_on_launch,
             engine_error_channel: Arc::new(Mutex::new(None)),
             transcript_scroll: 0,
             transcript_follow: true,
@@ -390,6 +398,16 @@ impl App {
     /// `WhisperRsEngine`, and drive the event consumer that fills
     /// `committed` / `tentative` and appends to `transcript.jsonl`.
     pub fn start_recording(&mut self, source: SessionSource) {
+        if self.config.engine_prefer == "assemblyai"
+            && self.config.assemblyai_api_key.is_empty()
+        {
+            self.banner = Some(
+                "Cloud engine selected but no API key — open settings (press ',')".into(),
+            );
+            self.status = RecordingStatus::Error("no api key".into());
+            return;
+        }
+
         let now = chrono::Utc::now();
         let session_dir = voice_bird::session::layout::session_dir(
             std::path::Path::new(&self.config.session_dir_expanded()),
