@@ -230,6 +230,57 @@ async fn turn_partial_maps_to_tentative_and_final_maps_to_committed() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn shutdown_sends_terminate_text_message() {
+    // Mock server: send Begin, then record every text message from client.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let texts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let texts_clone = texts.clone();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            r#"{"type":"Begin","session_id":"s","expires_at":0}"#.into(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(m)) = ws.next().await {
+            if let Message::Text(t) = m {
+                texts_clone.lock().await.push(t);
+            }
+        }
+    });
+    unsafe {
+        std::env::set_var(
+            "ASSEMBLYAI_WS_URL_OVERRIDE",
+            format!("ws://{}/v3/ws", addr),
+        );
+    }
+
+    let mut e = AssemblyAiEngine::new("sk-x".into());
+    let handle = e
+        .start(EngineConfig::Cloud {
+            api_key: "sk-x".into(),
+            language: None,
+            sample_rate: 16_000,
+        })
+        .unwrap();
+    let mut rx = handle.events_rx;
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+    let _ = handle.shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let texts = texts.lock().await;
+    assert!(
+        texts.iter().any(|t| t.contains("Terminate")),
+        "Terminate not sent; got: {:?}",
+        *texts
+    );
+}
+
+#[tokio::test]
 #[serial]
 async fn error_message_maps_to_engine_error() {
     let addr = spawn_mock_server(vec![
