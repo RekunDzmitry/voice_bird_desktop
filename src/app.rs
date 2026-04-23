@@ -13,6 +13,7 @@ pub enum AppMode {
     Normal,
     ModelPicker, // wired in Stage 3's Task 18
     Help,
+    Settings,
 }
 
 /// Recording status
@@ -145,6 +146,30 @@ pub struct App {
     /// persisted into `meta.json` by `stop_recording`.
     pub engine_kind: String,
 
+    /// True while a cloud engine is actively transmitting audio. Drives
+    /// the CLOUD badge in the header. Set in `start_recording`, cleared
+    /// in `stop_recording`.
+    pub is_cloud_engine: bool,
+
+    /// Snapshot of config taken on entering Settings mode. Used to
+    /// discard edits on Cancel.
+    pub settings_snapshot: Option<AppConfig>,
+
+    /// Cursor index over the ordered list of editable settings fields.
+    pub settings_cursor: usize,
+
+    /// In-flight text buffer while editing a single settings field.
+    /// `None` = not currently editing a field.
+    pub settings_edit_buf: Option<String>,
+
+    /// Error line displayed at the bottom of the settings view.
+    pub settings_error: Option<String>,
+
+    /// When recording started with a cloud engine, the wall-clock time
+    /// at which the "Audio is being sent to AssemblyAI." reminder
+    /// should be hidden (3 s after recording start).
+    pub cloud_reminder_until: Option<std::time::Instant>,
+
     /// Error banner displayed above the footer. Set when an engine emits
     /// `EngineEvent::Error` (or when the pipeline fails to start); cleared
     /// on the next successful `start_recording`. Plan deviation: we chose
@@ -222,6 +247,12 @@ impl App {
             config_was_loaded_from_disk,
             _capture_stream: None,
             engine_kind: String::new(),
+            is_cloud_engine: false,
+            settings_snapshot: None,
+            settings_cursor: 0,
+            settings_edit_buf: None,
+            settings_error: None,
+            cloud_reminder_until: None,
             banner: None,
             engine_error_channel: Arc::new(Mutex::new(None)),
             transcript_scroll: 0,
@@ -433,40 +464,66 @@ impl App {
                 }
             };
 
-        // --- 3. Engine (WhisperKit sidecar or whisper-rs fallback) --------
+        // --- 3. Engine (AssemblyAI cloud, WhisperKit sidecar, or whisper-rs fallback) --------
         use voice_bird::transcription::EngineConfig;
-        let model_path =
+        // Pick the engine based on user preference + sidecar availability.
+        let sidecar = voice_bird::transcription::sidecar_path();
+        let (engine_kind_used, mut engine) = match voice_bird::transcription::try_select_engine(
+            &self.config.engine_prefer,
+            &self.config.assemblyai_api_key,
+            sidecar.as_deref(),
+        ) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                self.banner = Some(msg);
+                self.status = RecordingStatus::Error("engine selection failed".into());
+                return;
+            }
+        };
+        self.engine_kind = match engine_kind_used {
+            voice_bird::transcription::EngineKind::WhisperRs => "whisper_rs".into(),
+            voice_bird::transcription::EngineKind::WhisperKit => "whisperkit".into(),
+            voice_bird::transcription::EngineKind::AssemblyAi => "assemblyai".into(),
+        };
+        self.is_cloud_engine = matches!(
+            engine_kind_used,
+            voice_bird::transcription::EngineKind::AssemblyAi,
+        );
+        if self.is_cloud_engine {
+            self.cloud_reminder_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            );
+        } else {
+            self.cloud_reminder_until = None;
+        }
+        self.banner = None; // clear stale banner from previous run
+        let model_path = if matches!(engine_kind_used, voice_bird::transcription::EngineKind::AssemblyAi) {
+            std::path::PathBuf::new() // unused for cloud
+        } else {
             match voice_bird::transcription::models::gguf_path(&self.config.default_model) {
                 Ok(p) => p,
                 Err(e) => {
                     self.status = RecordingStatus::Error(format!("model path: {e}"));
                     return;
                 }
-            };
-        // Pick the engine based on user preference + sidecar availability.
-        // `sidecar_path()` probes the .app bundle and dev layouts; on this
-        // machine (no Swift binary built) it returns None, and
-        // `select_engine` transparently falls back to WhisperRsEngine.
-        let sidecar = voice_bird::transcription::sidecar_path();
-        let engine_kind_used = match (sidecar.as_deref(), self.config.engine_prefer.as_str()) {
-            (Some(_), "auto") | (Some(_), "whisperkit") if cfg!(target_os = "macos") => {
-                "whisperkit"
             }
-            _ => "whisper_rs",
         };
-        self.engine_kind = engine_kind_used.to_string();
-        self.banner = None; // clear stale banner from previous run
-        let mut engine = voice_bird::transcription::select_engine(
-            &self.config.engine_prefer,
-            sidecar.as_deref(),
-        );
-        let handle = match engine.start(EngineConfig::Local {
-            model_path,
-            language: Some(self.config.language.clone()).filter(|s| s != "auto"),
-            sample_rate: 16_000,
-            hop_ms: self.config.hop_ms,
-            min_window_ms: self.config.min_window_ms,
-        }) {
+        let engine_cfg = if self.is_cloud_engine {
+            EngineConfig::Cloud {
+                api_key: self.config.assemblyai_api_key.clone(),
+                language: Some(self.config.language.clone()).filter(|s| s != "auto"),
+                sample_rate: 16_000,
+            }
+        } else {
+            EngineConfig::Local {
+                model_path,
+                language: Some(self.config.language.clone()).filter(|s| s != "auto"),
+                sample_rate: 16_000,
+                hop_ms: self.config.hop_ms,
+                min_window_ms: self.config.min_window_ms,
+            }
+        };
+        let handle = match engine.start(engine_cfg) {
             Ok(h) => h,
             Err(e) => {
                 self.status = RecordingStatus::Error(format!("engine: {e}"));
@@ -704,6 +761,9 @@ impl App {
 
     /// Stop the active recording and finalize the session files.
     pub fn stop_recording(&mut self) {
+        self.is_cloud_engine = false;
+        self.cloud_reminder_until = None;
+
         // Drop the cpal stream first — this halts capture, the cpal callback
         // thread exits, and the `frames_rx` receiver inside the producer
         // task observes `None` on its next `recv()` (clean shutdown).

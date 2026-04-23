@@ -254,6 +254,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
+                            // Settings view key handling added in Task 13/14.
+                            AppMode::Settings => {}
                         }
                     }
                     Event::Mouse(mouse) if app.mode == AppMode::Normal => {

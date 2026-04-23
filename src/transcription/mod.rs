@@ -99,6 +99,56 @@ pub fn select_engine(
     Box::new(whisper_rs_engine::WhisperRsEngine::default())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    WhisperRs,
+    WhisperKit,
+    AssemblyAi,
+}
+
+/// Typed variant of `select_engine`. Returns an error for cases that
+/// should surface to the user (e.g. cloud engine selected but no key).
+pub fn try_select_engine(
+    prefer: &str,
+    assemblyai_api_key: &str,
+    sidecar_path: Option<&std::path::Path>,
+) -> Result<(EngineKind, Box<dyn TranscriptionEngine>), String> {
+    if prefer == "assemblyai" {
+        if assemblyai_api_key.is_empty() {
+            return Err(
+                "AssemblyAI selected but no API key — open settings (press ',')".into(),
+            );
+        }
+        return Ok((
+            EngineKind::AssemblyAi,
+            Box::new(assemblyai_engine::AssemblyAiEngine::new(
+                assemblyai_api_key.to_string(),
+            )),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if prefer == "whisperkit" || prefer == "auto" {
+            if let Some(path) = sidecar_path {
+                if path.exists() {
+                    return Ok((
+                        EngineKind::WhisperKit,
+                        Box::new(whisper_kit_engine::WhisperKitEngine::new(
+                            path.to_path_buf(),
+                        )),
+                    ));
+                }
+            }
+        }
+    }
+    let _ = sidecar_path;
+    Ok((
+        EngineKind::WhisperRs,
+        Box::<whisper_rs_engine::WhisperRsEngine>::default(),
+    ))
+}
+
 /// Locate the `voice-bird-whisperkit` Swift sidecar binary. We probe, in
 /// order: the macOS `.app` bundle layout (Resources/), a sibling next to
 /// the current executable (release layout), and the dev `.build/release`
@@ -123,4 +173,28 @@ pub fn sidecar_path() -> Option<std::path::PathBuf> {
         return Some(dev);
     }
     None
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    #[test]
+    fn assemblyai_with_key_returns_cloud_engine() {
+        let res = try_select_engine("assemblyai", "sk-fake", None);
+        let (kind, _engine) = res.expect("expected Ok");
+        assert_eq!(kind, EngineKind::AssemblyAi);
+    }
+
+    #[test]
+    fn assemblyai_without_key_returns_err() {
+        let err = try_select_engine("assemblyai", "", None).err().unwrap();
+        assert!(err.to_lowercase().contains("api key"));
+    }
+
+    #[test]
+    fn non_cloud_preference_ignores_key() {
+        let (kind, _) = try_select_engine("whisper_rs", "", None).unwrap();
+        assert_eq!(kind, EngineKind::WhisperRs);
+    }
 }
