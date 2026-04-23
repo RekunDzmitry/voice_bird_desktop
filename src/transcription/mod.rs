@@ -1,3 +1,4 @@
+pub mod assemblyai_engine;
 pub mod local_agreement;
 pub mod mock;
 pub mod models;
