@@ -54,6 +54,11 @@ pub enum EngineConfig {
         hop_ms: u32,        // whisper-rs only
         min_window_ms: u32, // whisper-rs only
     },
+    Cloud {
+        api_key: String,
+        language: Option<String>,
+        sample_rate: u32,
+    },
 }
 
 pub struct EngineHandle {

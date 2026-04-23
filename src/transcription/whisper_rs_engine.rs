@@ -25,6 +25,9 @@ impl TranscriptionEngine for WhisperRsEngine {
                 min_window_ms,
                 ..
             } => (model_path, language, hop_ms as u64, min_window_ms as u64),
+            EngineConfig::Cloud { .. } => {
+                anyhow::bail!("WhisperRsEngine requires EngineConfig::Local");
+            }
         };
 
         std::thread::spawn(move || {

@@ -22,7 +22,13 @@ impl MockEngine {
 }
 
 impl TranscriptionEngine for MockEngine {
-    fn start(&mut self, _cfg: EngineConfig) -> anyhow::Result<EngineHandle> {
+    fn start(&mut self, cfg: EngineConfig) -> anyhow::Result<EngineHandle> {
+        match cfg {
+            EngineConfig::Local { .. } => {}
+            EngineConfig::Cloud { .. } => {
+                anyhow::bail!("MockEngine does not support EngineConfig::Cloud");
+            }
+        }
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<f32>>(16);
         let (events_tx, events_rx) = broadcast::channel::<EngineEvent>(64);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -100,5 +106,20 @@ mod tests {
             hop_ms: 750,
             min_window_ms: 1000,
         }
+    }
+
+    #[tokio::test]
+    async fn mock_engine_rejects_cloud_variant() {
+        let mut engine = MockEngine::new(vec![]);
+        let cfg = EngineConfig::Cloud {
+            api_key: "sk-x".into(),
+            language: None,
+            sample_rate: 16_000,
+        };
+        let err = engine.start(cfg).err().expect("expected Err on Cloud");
+        assert!(
+            err.to_string().to_lowercase().contains("cloud"),
+            "error should mention cloud variant; got: {err}",
+        );
     }
 }

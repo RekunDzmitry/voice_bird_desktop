@@ -81,6 +81,9 @@ impl TranscriptionEngine for WhisperKitEngine {
                 sample_rate,
                 ..
             } => (model_path, language, sample_rate),
+            EngineConfig::Cloud { .. } => {
+                anyhow::bail!("WhisperKitEngine requires EngineConfig::Local");
+            }
         };
 
         // --- Handshake line: JSON with model + language --------------------
