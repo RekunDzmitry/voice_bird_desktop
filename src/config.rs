@@ -150,8 +150,7 @@ mod tests {
     fn assemblyai_api_key_roundtrips_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.assemblyai_api_key = "sk-fake-12345".into();
+        let c = AppConfig { assemblyai_api_key: "sk-fake-12345".into(), ..AppConfig::default() };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.assemblyai_api_key, "sk-fake-12345");
@@ -197,8 +196,7 @@ refinement_beam_size = 5
     fn save_with_secret_prepends_warning_comment() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.assemblyai_api_key = "sk-secret".into();
+        let c = AppConfig { assemblyai_api_key: "sk-secret".into(), ..AppConfig::default() };
         c.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(

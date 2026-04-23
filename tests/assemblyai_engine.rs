@@ -45,7 +45,7 @@ async fn spawn_mock_server(messages: Vec<String>) -> SocketAddr {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         for m in messages {
-            ws.send(Message::Text(m.into())).await.unwrap();
+            ws.send(Message::Text(m)).await.unwrap();
         }
         let _ = ws.close(None).await;
     });

@@ -19,6 +19,7 @@ use super::{EngineConfig, EngineEvent, EngineHandle, Segment, TranscriptionEngin
 /// `wss://streaming.assemblyai.com/v3/ws`, forwards 16-kHz mono PCM as
 /// binary frames, and maps incoming JSON turns onto `EngineEvent`s.
 pub struct AssemblyAiEngine {
+    #[allow(dead_code)]
     api_key: String,
 }
 

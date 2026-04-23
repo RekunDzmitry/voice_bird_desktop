@@ -94,9 +94,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut prev_section: Option<&'static str> = None;
-    let mut field_idx = 0usize;
 
-    for fld in FIELDS {
+    for (field_idx, fld) in FIELDS.iter().enumerate() {
         if prev_section != Some(fld.section) {
             if prev_section.is_some() {
                 lines.push(Line::from(""));
@@ -127,7 +126,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(value_text, value_style),
         ]));
 
-        field_idx += 1;
     }
 
     lines.push(Line::from(""));
