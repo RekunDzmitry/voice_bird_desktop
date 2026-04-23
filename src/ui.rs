@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use std::time::Instant;
 
 use crate::app::{App, AppMode, RecordingStatus};
 
@@ -24,15 +25,22 @@ pub fn render(f: &mut Frame, app: &App) {
     // WhisperKit→whisper-rs restart on error; we surface errors via this
     // banner instead and let the user press `r` to retry.
     let has_banner = app.banner.is_some();
+    let has_reminder = app
+        .cloud_reminder_until
+        .map(|t| Instant::now() < t)
+        .unwrap_or(false);
     // Devices panel grows with session count, capped to keep transcript
     // space. Always show at least the header frame even when empty.
     let devices_h = (app.sessions.len() as u16 + 2).clamp(3, 8);
     let mut constraints: Vec<Constraint> = vec![
-        Constraint::Length(3),         // header
-        Constraint::Length(devices_h), // devices panel
-        Constraint::Min(4),            // committed zone
-        Constraint::Length(3),         // tentative line
+        Constraint::Length(3),         // [0] header
+        Constraint::Length(devices_h), // [1] devices panel
+        Constraint::Min(4),            // [2] committed zone
+        Constraint::Length(3),         // [3] tentative line
     ];
+    if has_reminder {
+        constraints.push(Constraint::Length(1)); // reminder
+    }
     if has_banner {
         constraints.push(Constraint::Length(1)); // banner
     }
@@ -47,12 +55,23 @@ pub fn render(f: &mut Frame, app: &App) {
     render_devices(f, root[1], app);
     render_committed(f, root[2], app);
     render_tentative(f, root[3], app);
-    if has_banner {
-        render_banner(f, root[4], app);
-        render_footer(f, root[5], app);
-    } else {
-        render_footer(f, root[4], app);
+
+    // Running index for the optional rows after the tentative line.
+    let mut next_slot: usize = 4;
+
+    if has_reminder {
+        let r = Paragraph::new(Span::styled(
+            "Audio is being sent to AssemblyAI.",
+            Style::default().fg(Color::Yellow),
+        ));
+        f.render_widget(r, root[next_slot]);
+        next_slot += 1;
     }
+    if has_banner {
+        render_banner(f, root[next_slot], app);
+        next_slot += 1;
+    }
+    render_footer(f, root[next_slot], app);
 }
 
 pub fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
@@ -207,8 +226,45 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  │  "),
         Span::raw(timer),
     ]);
-    let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
-    f.render_widget(p, area);
+
+    if app.is_cloud_engine {
+        // Reserve 9 columns on the right for " CLOUD " (with border padding).
+        const BADGE_WIDTH: u16 = 9;
+        let inner_w = area.width.saturating_sub(2); // subtract left+right borders
+        let (title_w, badge_w) = if inner_w > BADGE_WIDTH {
+            (inner_w - BADGE_WIDTH, BADGE_WIDTH)
+        } else {
+            (inner_w, 0)
+        };
+
+        // The outer block draws the border for the full area.
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        // Split inner area: left for title content, right for CLOUD badge.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(title_w), Constraint::Length(badge_w)])
+            .split(inner);
+
+        let title_p = Paragraph::new(line);
+        f.render_widget(title_p, cols[0]);
+
+        if badge_w > 0 {
+            let badge = Paragraph::new(Span::styled(
+                " CLOUD ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            f.render_widget(badge, cols[1]);
+        }
+    } else {
+        let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
+        f.render_widget(p, area);
+    }
 }
 
 fn status_style(status: &RecordingStatus) -> Style {
