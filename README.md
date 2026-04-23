@@ -1,6 +1,6 @@
 # Voice Bird
 
-Terminal-based voice transcription. Runs fully locally — your audio never leaves your machine.
+Terminal-based voice transcription. Runs **locally by default** — your audio never leaves your machine. An optional cloud engine (AssemblyAI) is available for users without a GPU or ANE; it is off by default and requires both an API key and an explicit change to `engine_prefer`. When active, a `CLOUD` badge is shown in the header.
 
 ## Install
 
@@ -22,6 +22,16 @@ cp .build/release/voice-bird-whisperkit "$(dirname "$(which voice-bird)")/"
 ```
 
 Without the sidecar, Voice Bird falls back to `whisper-rs` (whisper.cpp bindings with Metal acceleration) — still fully local, just without ANE.
+
+### Cloud engines (optional)
+
+If your machine can't keep up with local Whisper, Voice Bird can stream audio to AssemblyAI's Universal-Streaming service instead. This is off by default; when on, a `CLOUD` badge is shown in the header and a reminder appears at the start of each recording.
+
+1. Get an API key from https://www.assemblyai.com/.
+2. Open Voice Bird and press `,` to open Settings.
+3. Set `Engine preference` to `assemblyai`, paste your key into `AssemblyAI API key`, press `s` to save.
+
+Your key lives in `~/.config/voice-bird/config.toml` in plaintext (chmod `0600` on Unix). Anyone with read access to that file can read your key.
 
 ## Usage
 
@@ -49,6 +59,7 @@ Recordings live under `~/voice-bird/sessions/<timestamp>-<source>/`:
 | `r` | start recording |
 | `s` | stop |
 | `m` | change model (first-run picker) |
+| `,` | open settings |
 | `q` | quit |
 | `?` | help |
 
