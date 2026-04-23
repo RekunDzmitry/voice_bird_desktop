@@ -50,3 +50,55 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
         assert!(transcript.to_lowercase().contains("hello"), "transcript = {:?}", transcript);
     });
 }
+
+#[cfg(feature = "engine-smoke-assemblyai")]
+#[test]
+fn assemblyai_produces_committed_event_for_fixture() {
+    use std::time::Duration;
+    use voice_bird::transcription::{
+        assemblyai_engine::AssemblyAiEngine, EngineConfig, EngineEvent, TranscriptionEngine,
+    };
+
+    let key = std::env::var("ASSEMBLYAI_API_KEY")
+        .expect("ASSEMBLYAI_API_KEY must be set for this smoke test");
+
+    let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();
+    let samples: Vec<f32> = spec
+        .into_samples::<i16>()
+        .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut engine = AssemblyAiEngine::new(key.clone());
+        let handle = engine
+            .start(EngineConfig::Cloud {
+                api_key: key,
+                language: Some("en".into()),
+                sample_rate: 16_000,
+            })
+            .unwrap();
+
+        for chunk in samples.chunks(8_000) {
+            handle.pcm_tx.send(chunk.to_vec()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = handle.shutdown.send(());
+
+        let mut rx = handle.events_rx;
+        let mut saw_committed = false;
+        while let Ok(Ok(ev)) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+        {
+            if matches!(ev, EngineEvent::Committed(_)) {
+                saw_committed = true;
+                break;
+            }
+        }
+        assert!(saw_committed, "did not receive a Committed event");
+    });
+}
