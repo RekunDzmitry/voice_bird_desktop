@@ -460,7 +460,7 @@ impl App {
             &self.config.engine_prefer,
             sidecar.as_deref(),
         );
-        let handle = match engine.start(EngineConfig {
+        let handle = match engine.start(EngineConfig::Local {
             model_path,
             language: Some(self.config.language.clone()).filter(|s| s != "auto"),
             sample_rate: 16_000,

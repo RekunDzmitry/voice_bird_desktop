@@ -93,7 +93,7 @@ mod tests {
     }
 
     fn test_cfg() -> EngineConfig {
-        EngineConfig {
+        EngineConfig::Local {
             model_path: std::path::PathBuf::from("/dev/null"),
             language: None,
             sample_rate: 16_000,

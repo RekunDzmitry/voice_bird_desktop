@@ -17,10 +17,15 @@ impl TranscriptionEngine for WhisperRsEngine {
         let (events_tx, events_rx) = broadcast::channel::<EngineEvent>(256);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
-        let model_path = cfg.model_path.clone();
-        let language = cfg.language.clone();
-        let hop_ms = cfg.hop_ms as u64;
-        let min_window_ms = cfg.min_window_ms as u64;
+        let (model_path, language, hop_ms, min_window_ms) = match cfg {
+            EngineConfig::Local {
+                model_path,
+                language,
+                hop_ms,
+                min_window_ms,
+                ..
+            } => (model_path, language, hop_ms as u64, min_window_ms as u64),
+        };
 
         std::thread::spawn(move || {
             let ctx = match WhisperContext::new_with_params(

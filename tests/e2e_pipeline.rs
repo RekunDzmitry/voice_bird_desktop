@@ -87,7 +87,7 @@ fn streaming_engine_writes_jsonl_and_finalizes_to_text() {
     rt.block_on(async {
         let mut engine = WhisperRsEngine::default();
         let handle = engine
-            .start(EngineConfig {
+            .start(EngineConfig::Local {
                 model_path: model,
                 language: Some("en".into()),
                 sample_rate: 16_000,
@@ -254,7 +254,7 @@ fn dual_pipeline_writes_both_jsonls_in_parallel() {
     rt.block_on(async {
         let mut streaming = WhisperRsEngine::default();
         let streaming_handle = streaming
-            .start(EngineConfig {
+            .start(EngineConfig::Local {
                 model_path: model.clone(),
                 language: Some("en".into()),
                 sample_rate: 16_000,

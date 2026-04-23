@@ -46,12 +46,14 @@ pub enum EngineEvent {
 }
 
 #[derive(Debug, Clone)]
-pub struct EngineConfig {
-    pub model_path: std::path::PathBuf,
-    pub language: Option<String>,
-    pub sample_rate: u32,   // always 16_000
-    pub hop_ms: u32,        // WhisperRsEngine only
-    pub min_window_ms: u32, // WhisperRsEngine only
+pub enum EngineConfig {
+    Local {
+        model_path: std::path::PathBuf,
+        language: Option<String>,
+        sample_rate: u32,   // always 16_000
+        hop_ms: u32,        // whisper-rs only
+        min_window_ms: u32, // whisper-rs only
+    },
 }
 
 pub struct EngineHandle {

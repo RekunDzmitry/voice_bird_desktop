@@ -25,7 +25,7 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let mut engine = WhisperRsEngine::default();
-        let handle = engine.start(EngineConfig {
+        let handle = engine.start(EngineConfig::Local {
             model_path: cache,
             language: Some("en".into()),
             sample_rate: 16_000,
