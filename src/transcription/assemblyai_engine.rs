@@ -114,8 +114,24 @@ impl TranscriptionEngine for AssemblyAiEngine {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
-                    _pcm = pcm_rx.recv() => {
-                        // PCM forwarding is wired in Task 8.
+                    maybe_pcm = pcm_rx.recv() => {
+                        let Some(chunk) = maybe_pcm else { break; };
+                        // ~50 ms frames at 16 kHz mono = 800 samples = 1600 bytes.
+                        const FRAME_SAMPLES: usize = 800;
+                        for win in chunk.chunks(FRAME_SAMPLES) {
+                            let mut bytes = Vec::with_capacity(win.len() * 2);
+                            for &s in win {
+                                let clamped = s.clamp(-1.0, 1.0);
+                                let i = (clamped * i16::MAX as f32) as i16;
+                                bytes.extend_from_slice(&i.to_le_bytes());
+                            }
+                            if let Err(e) = ws.send(Message::Binary(bytes)).await {
+                                let _ = events_tx.send(EngineEvent::Error(
+                                    format!("ws send: {e}"),
+                                ));
+                                break;
+                            }
+                        }
                     }
                     maybe_msg = ws.next() => {
                         let Some(msg) = maybe_msg else { break; };
@@ -147,6 +163,9 @@ impl TranscriptionEngine for AssemblyAiEngine {
                 }
             }
 
+            let _ = ws
+                .send(Message::Text(r#"{"type":"Terminate"}"#.into()))
+                .await;
             let _ = ws.close(None).await;
         });
 

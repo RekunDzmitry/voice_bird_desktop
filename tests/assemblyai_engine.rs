@@ -1,13 +1,40 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serial_test::serial;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use voice_bird::transcription::{
     assemblyai_engine::AssemblyAiEngine, EngineConfig, EngineEvent, TranscriptionEngine,
 };
+
+/// Run a mock server that echoes a Begin then records all binary frames
+/// it receives. Returns the frames after client disconnects.
+async fn record_binary_frames() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let frames_clone = frames.clone();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            r#"{"type":"Begin","session_id":"s1","expires_at":0}"#.into(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(m)) = ws.next().await {
+            if let Message::Binary(b) = m {
+                frames_clone.lock().await.push(b);
+            }
+        }
+    });
+    (addr, frames)
+}
 
 /// Spawn a local ws:// server that accepts one client, immediately sends
 /// the provided JSON messages, then closes. Returns the bound address.
@@ -73,6 +100,7 @@ fn rejects_non_16khz_sample_rate() {
 }
 
 #[tokio::test]
+#[serial]
 async fn emits_model_loaded_on_begin() {
     let addr = spawn_mock_server(vec![
         r#"{"type":"Begin","session_id":"s1","expires_at":0}"#.into(),
@@ -102,5 +130,52 @@ async fn emits_model_loaded_on_begin() {
             assert!(name.contains("assemblyai"), "got: {name}");
         }
         other => panic!("expected ModelLoaded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn forwards_pcm_as_i16_binary_frames() {
+    let (addr, frames) = record_binary_frames().await;
+    unsafe {
+        std::env::set_var(
+            "ASSEMBLYAI_WS_URL_OVERRIDE",
+            format!("ws://{}/v3/ws", addr),
+        );
+    }
+
+    let mut e = AssemblyAiEngine::new("sk-x".into());
+    let handle = e
+        .start(EngineConfig::Cloud {
+            api_key: "sk-x".into(),
+            language: None,
+            sample_rate: 16_000,
+        })
+        .unwrap();
+
+    // Wait for ModelLoaded so we know the WS is up.
+    let mut rx = handle.events_rx;
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+    // Send 1 second of silence as f32, expect ~20 frames of 800 samples.
+    let chunk = vec![0.0_f32; 16_000];
+    handle.pcm_tx.send(chunk).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Drop pcm_tx to let the engine's select exit on next iteration.
+    drop(handle.pcm_tx);
+    let _ = handle.shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let frames = frames.lock().await;
+    assert!(!frames.is_empty(), "no frames received");
+    let total_bytes: usize = frames.iter().map(|f| f.len()).sum();
+    // 16000 samples * 2 bytes = 32000 bytes of i16 PCM.
+    assert_eq!(total_bytes, 32_000, "unexpected total bytes: {total_bytes}");
+    for f in frames.iter() {
+        // Each frame is ~50 ms = 800 samples = 1600 bytes. Final partial
+        // frame may be smaller. All frames must have an even byte count.
+        assert_eq!(f.len() % 2, 0, "frame length not a multiple of 2");
+        assert!(f.len() <= 1600, "frame too large: {}", f.len());
     }
 }

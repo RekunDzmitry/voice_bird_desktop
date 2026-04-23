@@ -76,6 +76,7 @@ proptest = "1"
 tempfile = "3"
 pretty_assertions = "1"
 futures-util = "0.3"
+serial_test = "3.4.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
