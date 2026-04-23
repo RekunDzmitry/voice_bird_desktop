@@ -582,36 +582,39 @@ impl App {
         // Spawned only when `refinement_model` is set in config AND the
         // model file is present on disk. If either check fails, refinement
         // is silently skipped and only the streaming engine runs.
-        let (refinement_pcm_tx, refinement_handle) = self
-            .config
-            .refinement_model
-            .as_ref()
-            .and_then(|id| {
-                let path = voice_bird::transcription::models::gguf_path(id).ok()?;
-                if !path.exists() {
-                    log::warn!(
-                        "refinement_model '{}' set but file missing at {} — disabled",
-                        id,
-                        path.display()
-                    );
-                    return None;
-                }
-                let eng = voice_bird::transcription::refinement_engine::RefinementEngine {
-                    model_path: path,
-                    language: Some(self.config.language.clone()).filter(|s| s != "auto"),
-                    window_ms: self.config.refinement_window_ms,
-                    beam_size: self.config.refinement_beam_size,
-                };
-                match eng.start() {
-                    Ok(h) => Some((h.pcm_tx.clone(), h)),
-                    Err(e) => {
-                        log::error!("refinement engine start: {e}");
-                        None
+        let (refinement_pcm_tx, refinement_handle) = if self.is_cloud_engine {
+            (None, None)
+        } else {
+            self.config
+                .refinement_model
+                .as_ref()
+                .and_then(|id| {
+                    let path = voice_bird::transcription::models::gguf_path(id).ok()?;
+                    if !path.exists() {
+                        log::warn!(
+                            "refinement_model '{}' set but file missing at {} — disabled",
+                            id,
+                            path.display()
+                        );
+                        return None;
                     }
-                }
-            })
-            .map(|(tx, h)| (Some(tx), Some(h)))
-            .unwrap_or((None, None));
+                    let eng = voice_bird::transcription::refinement_engine::RefinementEngine {
+                        model_path: path,
+                        language: Some(self.config.language.clone()).filter(|s| s != "auto"),
+                        window_ms: self.config.refinement_window_ms,
+                        beam_size: self.config.refinement_beam_size,
+                    };
+                    match eng.start() {
+                        Ok(h) => Some((h.pcm_tx.clone(), h)),
+                        Err(e) => {
+                            log::error!("refinement engine start: {e}");
+                            None
+                        }
+                    }
+                })
+                .map(|(tx, h)| (Some(tx), Some(h)))
+                .unwrap_or((None, None))
+        };
 
         // --- 5. Producer task: cpal frames → resample → tee(WAV + engines) -
         let refinement_pcm_tx_for_producer = refinement_pcm_tx.clone();
