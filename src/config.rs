@@ -42,6 +42,10 @@ pub struct AppConfig {
     /// Beam size for refinement. 1 = greedy (fastest, lowest quality).
     #[serde(default = "default_refinement_beam_size")]
     pub refinement_beam_size: u8,
+    /// AssemblyAI API key. Stored in plaintext in config.toml — file
+    /// permissions are the only protection. Empty string = unset.
+    #[serde(default)]
+    pub assemblyai_api_key: String,
 }
 
 fn default_refinement_window_ms() -> u32 {
@@ -67,6 +71,7 @@ impl Default for AppConfig {
             refinement_model: None,
             refinement_window_ms: default_refinement_window_ms(),
             refinement_beam_size: default_refinement_beam_size(),
+            assemblyai_api_key: String::new(),
         }
     }
 }
@@ -128,6 +133,41 @@ mod tests {
     }
 
     #[test]
+    fn assemblyai_api_key_roundtrips_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.assemblyai_api_key = "sk-fake-12345".into();
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.assemblyai_api_key, "sk-fake-12345");
+    }
+
+    #[test]
+    fn missing_assemblyai_api_key_deserializes_to_empty_string() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        // Write an old-style config without the field.
+        std::fs::write(
+            &path,
+            r#"
+default_model = "distil-small.en"
+language = "en"
+session_dir = "~/voice-bird/sessions"
+hop_ms = 750
+min_window_ms = 1000
+engine_prefer = "auto"
+audio_default_source = "microphone"
+refinement_window_ms = 20000
+refinement_beam_size = 5
+"#,
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.assemblyai_api_key, "");
+    }
+
+    #[test]
     fn roundtrip_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
@@ -144,6 +184,7 @@ mod tests {
             refinement_model: Some("large-v3-turbo".into()),
             refinement_window_ms: 20_000,
             refinement_beam_size: 5,
+            assemblyai_api_key: "sk-test".into(),
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
