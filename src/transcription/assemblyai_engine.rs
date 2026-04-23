@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -11,7 +13,7 @@ use tokio_tungstenite::{
     },
 };
 
-use super::{EngineConfig, EngineEvent, EngineHandle, TranscriptionEngine};
+use super::{EngineConfig, EngineEvent, EngineHandle, Segment, TranscriptionEngine};
 
 /// AssemblyAI Universal-Streaming v3 engine. Opens a WebSocket to
 /// `wss://streaming.assemblyai.com/v3/ws`, forwards 16-kHz mono PCM as
@@ -32,6 +34,18 @@ enum AaiMessage {
     Begin {
         #[allow(dead_code)]
         session_id: String,
+    },
+    Turn {
+        transcript: String,
+        end_of_turn: bool,
+        #[serde(default)]
+        audio_start_ms: u64,
+        #[serde(default)]
+        audio_end_ms: u64,
+    },
+    Termination {},
+    Error {
+        error: String,
     },
     #[serde(other)]
     Unknown,
@@ -151,6 +165,31 @@ impl TranscriptionEngine for AssemblyAiEngine {
                                         let _ = events_tx.send(EngineEvent::ModelLoaded {
                                             name: "assemblyai-universal-v3".into(),
                                         });
+                                    }
+                                    Ok(AaiMessage::Turn {
+                                        transcript,
+                                        end_of_turn,
+                                        audio_start_ms,
+                                        audio_end_ms,
+                                    }) => {
+                                        if end_of_turn {
+                                            let seg = Segment {
+                                                t_start: Duration::from_millis(audio_start_ms),
+                                                t_end: Duration::from_millis(audio_end_ms),
+                                                text: transcript,
+                                                tokens: Vec::new(),
+                                            };
+                                            let _ = events_tx.send(EngineEvent::Committed(seg));
+                                        } else {
+                                            let _ = events_tx.send(
+                                                EngineEvent::Tentative(transcript),
+                                            );
+                                        }
+                                    }
+                                    Ok(AaiMessage::Termination {}) => break,
+                                    Ok(AaiMessage::Error { error }) => {
+                                        let _ = events_tx.send(EngineEvent::Error(error));
+                                        break;
                                     }
                                     Ok(AaiMessage::Unknown) => {}
                                     Err(_) => {}

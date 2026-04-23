@@ -179,3 +179,85 @@ async fn forwards_pcm_as_i16_binary_frames() {
         assert!(f.len() <= 1600, "frame too large: {}", f.len());
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn turn_partial_maps_to_tentative_and_final_maps_to_committed() {
+    let addr = spawn_mock_server(vec![
+        r#"{"type":"Begin","session_id":"s1","expires_at":0}"#.into(),
+        r#"{"type":"Turn","transcript":"hel","end_of_turn":false,"turn_is_formatted":false,"audio_start_ms":0,"audio_end_ms":500}"#.into(),
+        r#"{"type":"Turn","transcript":"hello world","end_of_turn":true,"turn_is_formatted":true,"audio_start_ms":0,"audio_end_ms":1200}"#.into(),
+    ])
+    .await;
+    unsafe {
+        std::env::set_var(
+            "ASSEMBLYAI_WS_URL_OVERRIDE",
+            format!("ws://{}/v3/ws", addr),
+        );
+    }
+
+    let mut e = AssemblyAiEngine::new("sk-x".into());
+    let handle = e
+        .start(EngineConfig::Cloud {
+            api_key: "sk-x".into(),
+            language: None,
+            sample_rate: 16_000,
+        })
+        .unwrap();
+    let mut rx = handle.events_rx;
+
+    // Drain in order with a timeout per event.
+    let mut saw_model = false;
+    let mut saw_tentative = false;
+    let mut saw_committed = false;
+    for _ in 0..6 {
+        let Ok(Ok(ev)) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        else { break };
+        match ev {
+            EngineEvent::ModelLoaded { .. } => saw_model = true,
+            EngineEvent::Tentative(t) if t == "hel" => saw_tentative = true,
+            EngineEvent::Committed(seg) if seg.text == "hello world" => {
+                saw_committed = true;
+                assert_eq!(seg.t_start.as_millis(), 0);
+                assert_eq!(seg.t_end.as_millis(), 1200);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_model && saw_tentative && saw_committed,
+        "events: model={saw_model} tentative={saw_tentative} committed={saw_committed}");
+}
+
+#[tokio::test]
+#[serial]
+async fn error_message_maps_to_engine_error() {
+    let addr = spawn_mock_server(vec![
+        r#"{"type":"Error","error":"auth failed"}"#.into(),
+    ])
+    .await;
+    unsafe {
+        std::env::set_var(
+            "ASSEMBLYAI_WS_URL_OVERRIDE",
+            format!("ws://{}/v3/ws", addr),
+        );
+    }
+
+    let mut e = AssemblyAiEngine::new("sk-x".into());
+    let handle = e
+        .start(EngineConfig::Cloud {
+            api_key: "sk-x".into(),
+            language: None,
+            sample_rate: 16_000,
+        })
+        .unwrap();
+    let mut rx = handle.events_rx;
+    let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EngineEvent::Error(msg) => assert!(msg.contains("auth failed"), "got: {msg}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
