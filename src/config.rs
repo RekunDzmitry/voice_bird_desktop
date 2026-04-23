@@ -105,7 +105,21 @@ impl AppConfig {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let body = toml::to_string_pretty(self)?;
+        let out = if self.assemblyai_api_key.is_empty() {
+            body
+        } else {
+            format!("# Contains secrets. Do not share.\n{body}")
+        };
+        std::fs::write(path, out)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            // Best-effort: non-fatal if setting perms fails (e.g., on a
+            // filesystem that doesn't support Unix modes).
+            let _ = std::fs::set_permissions(path, perms);
+        }
         Ok(())
     }
 
@@ -165,6 +179,42 @@ refinement_beam_size = 5
         .unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.assemblyai_api_key, "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = AppConfig::default();
+        c.save_to(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {:o}", mode);
+    }
+
+    #[test]
+    fn save_with_secret_prepends_warning_comment() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.assemblyai_api_key = "sk-secret".into();
+        c.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# Contains secrets. Do not share.\n"),
+            "missing warning header; file was:\n{text}",
+        );
+    }
+
+    #[test]
+    fn save_without_secret_has_no_warning_comment() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = AppConfig::default(); // empty api key
+        c.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("Contains secrets"));
     }
 
     #[test]
