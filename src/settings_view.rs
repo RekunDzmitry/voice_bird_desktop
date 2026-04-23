@@ -151,4 +151,152 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, inner);
 }
 
-// Key handling lives in Task 14.
+use crossterm::event::KeyCode;
+
+pub fn open(app: &mut App) {
+    app.mode = crate::app::AppMode::Settings;
+    app.settings_snapshot = Some(app.config.clone());
+    app.settings_cursor = 0;
+    app.settings_edit_buf = None;
+    app.settings_error = None;
+}
+
+fn close(app: &mut App) {
+    app.mode = crate::app::AppMode::Normal;
+    app.settings_snapshot = None;
+    app.settings_edit_buf = None;
+    app.settings_error = None;
+}
+
+/// Revert config to the snapshot taken at open() time, then close.
+fn cancel(app: &mut App) {
+    if let Some(snap) = app.settings_snapshot.take() {
+        app.config = snap;
+    }
+    close(app);
+}
+
+fn current_field(app: &App) -> Option<&'static Field> {
+    FIELDS.get(app.settings_cursor)
+}
+
+fn apply_edit(app: &mut App) {
+    let Some(buf) = app.settings_edit_buf.take() else { return };
+    let Some(fld) = current_field(app).copied() else { return };
+    let c = &mut app.config;
+    match fld.key {
+        FieldKey::DefaultModel => c.default_model = buf,
+        FieldKey::Language => c.language = buf,
+        FieldKey::SessionDir => c.session_dir = buf,
+        FieldKey::AudioDefaultSource => c.audio_default_source = buf,
+        FieldKey::InputDevice => {
+            c.input_device = if buf.is_empty() { None } else { Some(buf) };
+        }
+        FieldKey::EnginePrefer => c.engine_prefer = buf,
+        FieldKey::HopMs => match buf.parse::<u32>() {
+            Ok(n) => c.hop_ms = n,
+            Err(_) => {
+                app.settings_error = Some(format!("hop_ms: not a number ({buf})"));
+                return;
+            }
+        },
+        FieldKey::MinWindowMs => match buf.parse::<u32>() {
+            Ok(n) => c.min_window_ms = n,
+            Err(_) => {
+                app.settings_error = Some(format!("min_window_ms: not a number ({buf})"));
+                return;
+            }
+        },
+        FieldKey::RefinementModel => {
+            c.refinement_model = if buf.is_empty() { None } else { Some(buf) };
+        }
+        FieldKey::RefinementWindowMs => match buf.parse::<u32>() {
+            Ok(n) => c.refinement_window_ms = n,
+            Err(_) => {
+                app.settings_error = Some(format!("refinement_window_ms: not a number ({buf})"));
+                return;
+            }
+        },
+        FieldKey::RefinementBeamSize => match buf.parse::<u8>() {
+            Ok(n) => c.refinement_beam_size = n,
+            Err(_) => {
+                app.settings_error = Some(format!("refinement_beam_size: not a number ({buf})"));
+                return;
+            }
+        },
+        FieldKey::AssemblyAiApiKey => c.assemblyai_api_key = buf,
+    }
+    app.settings_error = None;
+}
+
+fn try_save(app: &mut App) -> bool {
+    if app.config.engine_prefer == "assemblyai"
+        && app.config.assemblyai_api_key.is_empty()
+    {
+        app.settings_error =
+            Some("engine_prefer=assemblyai requires a non-empty AssemblyAI API key".into());
+        return false;
+    }
+    if let Err(e) = app.config.save() {
+        app.settings_error = Some(format!("save: {e}"));
+        return false;
+    }
+    true
+}
+
+pub fn handle_key(app: &mut App, key: KeyCode) {
+    // Edit mode handling first.
+    if let Some(buf) = app.settings_edit_buf.as_mut() {
+        match key {
+            KeyCode::Esc => {
+                app.settings_edit_buf = None;
+            }
+            KeyCode::Enter => apply_edit(app),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(ch) => buf.push(ch),
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') => cancel(app),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.settings_cursor > 0 {
+                app.settings_cursor -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.settings_cursor + 1 < FIELDS.len() {
+                app.settings_cursor += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(fld) = current_field(app).copied() {
+                let c = &app.config;
+                app.settings_edit_buf = Some(match fld.key {
+                    FieldKey::AssemblyAiApiKey => c.assemblyai_api_key.clone(),
+                    FieldKey::InputDevice => c.input_device.clone().unwrap_or_default(),
+                    FieldKey::RefinementModel => c.refinement_model.clone().unwrap_or_default(),
+                    FieldKey::DefaultModel => c.default_model.clone(),
+                    FieldKey::Language => c.language.clone(),
+                    FieldKey::SessionDir => c.session_dir.clone(),
+                    FieldKey::AudioDefaultSource => c.audio_default_source.clone(),
+                    FieldKey::EnginePrefer => c.engine_prefer.clone(),
+                    FieldKey::HopMs => c.hop_ms.to_string(),
+                    FieldKey::MinWindowMs => c.min_window_ms.to_string(),
+                    FieldKey::RefinementWindowMs => c.refinement_window_ms.to_string(),
+                    FieldKey::RefinementBeamSize => c.refinement_beam_size.to_string(),
+                });
+            }
+        }
+        KeyCode::Char('s') => {
+            if try_save(app) {
+                close(app);
+            }
+        }
+        _ => {}
+    }
+}

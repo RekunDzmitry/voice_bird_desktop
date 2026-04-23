@@ -255,8 +255,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
-                            // Settings view key handling added in Task 13/14.
-                            AppMode::Settings => {}
+                            AppMode::Settings => settings_view::handle_key(app, key.code),
                         }
                     }
                     Event::Mouse(mouse) if app.mode == AppMode::Normal => {
@@ -371,6 +370,13 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.stop_recording();
         }
         KeyCode::Char('m') if !recording => app.mode = AppMode::ModelPicker,
+        KeyCode::Char(',') => {
+            if !matches!(app.status, RecordingStatus::Recording) {
+                settings_view::open(app);
+            } else {
+                app.banner = Some("stop recording before opening settings".into());
+            }
+        }
         _ => {}
     }
 }
