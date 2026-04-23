@@ -28,6 +28,12 @@ rubato = "0.14"
 # Async
 tokio = { version = "1.0", features = ["full"] }
 
+# WebSocket client for AssemblyAI cloud engine. Uses rustls (consistent
+# with reqwest already in-tree) rather than native-tls to keep a single
+# TLS backend across the crate.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+
 # Logging
 log = "0.4"
 fern = "0.7"
@@ -61,6 +67,8 @@ bytemuck = "1"
 
 [features]
 engine-smoke = []
+# Requires ASSEMBLYAI_API_KEY env var at test time; hits the real service.
+engine-smoke-assemblyai = []
 
 [dev-dependencies]
 proptest = "1"
