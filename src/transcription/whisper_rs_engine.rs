@@ -17,10 +17,18 @@ impl TranscriptionEngine for WhisperRsEngine {
         let (events_tx, events_rx) = broadcast::channel::<EngineEvent>(256);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
-        let model_path = cfg.model_path.clone();
-        let language = cfg.language.clone();
-        let hop_ms = cfg.hop_ms as u64;
-        let min_window_ms = cfg.min_window_ms as u64;
+        let (model_path, language, hop_ms, min_window_ms) = match cfg {
+            EngineConfig::Local {
+                model_path,
+                language,
+                hop_ms,
+                min_window_ms,
+                ..
+            } => (model_path, language, hop_ms as u64, min_window_ms as u64),
+            EngineConfig::Cloud { .. } => {
+                anyhow::bail!("WhisperRsEngine requires EngineConfig::Local");
+            }
+        };
 
         std::thread::spawn(move || {
             let ctx = match WhisperContext::new_with_params(
@@ -47,6 +55,19 @@ impl TranscriptionEngine for WhisperRsEngine {
             let mut last_run = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(hop_ms))
                 .unwrap_or_else(std::time::Instant::now);
+
+            // Reuse one state across inferences — `create_state()` runs the
+            // full Metal/ggml init, which is expensive and noisy. Combined
+            // with `set_no_context(true)` below, reuse is safe: each call
+            // decodes from scratch without the prior state's tokens.
+            let mut state = match ctx.create_state() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = events_tx
+                        .send(EngineEvent::Error(format!("create state: {e}")));
+                    return;
+                }
+            };
 
             loop {
                 if shutdown_rx.try_recv().is_ok() {
@@ -85,7 +106,10 @@ impl TranscriptionEngine for WhisperRsEngine {
                 last_run = std::time::Instant::now();
 
                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-                params.set_no_context(false);
+                // true: each `full()` starts with a clean decode context,
+                // which is what we want for a sliding-window re-transcribe.
+                // Also makes state reuse safe (no KV carry-over).
+                params.set_no_context(true);
                 params.set_print_progress(false);
                 params.set_print_realtime(false);
                 params.set_print_special(false);
@@ -111,23 +135,21 @@ impl TranscriptionEngine for WhisperRsEngine {
                     &buffer
                 };
 
-                // Create a fresh state per inference — `WhisperState` holds
-                // the KV cache and decoded segments from the previous
-                // `full()` call, which would leak partial context across
-                // the rolling buffer.
-                let mut state = match ctx.create_state() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = events_tx
-                            .send(EngineEvent::Error(format!("create state: {e}")));
-                        continue;
-                    }
-                };
-
+                let inf_start = std::time::Instant::now();
                 if let Err(e) = state.full(params, inference_input) {
                     let _ = events_tx.send(EngineEvent::Error(format!("whisper full: {e}")));
                     continue;
                 }
+                let inf_ms = inf_start.elapsed().as_millis() as u64;
+                let buf_ms_now = (inference_input.len() as u64 * 1000) / 16_000;
+                // Ratio > 1.0 means inference is slower than real-time for
+                // this buffer length — backlog will grow.
+                log::info!(
+                    "whisper-rs inference: buf={}ms took={}ms (rt_ratio={:.2})",
+                    buf_ms_now,
+                    inf_ms,
+                    inf_ms as f64 / buf_ms_now.max(1) as f64
+                );
 
                 let n_segments = state.full_n_segments().unwrap_or(0);
                 let mut hypothesis: Vec<Token> = Vec::new();

@@ -17,21 +17,36 @@ pub struct CaptureInfo {
     pub channels: u16,
 }
 
-/// Returned by [`capture_default_input`]. Holds the receiver end of the
-/// frames channel plus the live `cpal::Stream`. Call [`CaptureHandle::split`]
-/// to hand the receiver to an async task while keeping the stream on the
-/// calling (Send-free) thread.
+/// Keep-alive handle for whatever backend is producing frames. The `App`
+/// pins this to its owning thread (same as a bare `cpal::Stream` used to be)
+/// and dropping it cleanly stops capture.
+///
+/// NOTE: intentionally NOT required to be `Send`. `cpal::Stream` is `!Send`,
+/// so the whole enum is `!Send` by auto-trait inference, which matches what
+/// the `App` expects. The macOS SCK variant's underlying `SCStream` happens
+/// to be `Send` by itself but we don't rely on that.
+pub enum CaptureKeepAlive {
+    Cpal(cpal::Stream),
+    #[cfg(target_os = "macos")]
+    Sck(crate::audio::loopback::loopback_macos::LoopbackKeepAlive),
+}
+
+/// Returned by [`capture_default_input`] / [`capture_input`] /
+/// [`crate::audio::loopback::capture_loopback`]. Holds the receiver end of
+/// the frames channel plus the live backend keep-alive. Call
+/// [`CaptureHandle::split`] to hand the receiver to an async task while
+/// keeping the keep-alive on the calling (Send-free) thread.
 pub struct CaptureHandle {
     pub frames_rx: mpsc::Receiver<Vec<f32>>,
     pub info: CaptureInfo,
-    pub stream: cpal::Stream,
+    pub stream: CaptureKeepAlive,
 }
 
 impl CaptureHandle {
     /// Consume the handle and split it into the `Send` parts (the receiver
-    /// and metadata) and the `!Send` `cpal::Stream`, which the caller must
-    /// keep alive on the current thread for capture to continue.
-    pub fn split(self) -> (mpsc::Receiver<Vec<f32>>, CaptureInfo, cpal::Stream) {
+    /// and metadata) and the `!Send` keep-alive, which the caller must keep
+    /// alive on the current thread for capture to continue.
+    pub fn split(self) -> (mpsc::Receiver<Vec<f32>>, CaptureInfo, CaptureKeepAlive) {
         (self.frames_rx, self.info, self.stream)
     }
 }
@@ -40,10 +55,34 @@ impl CaptureHandle {
 /// whose `frames_rx` yields interleaved f32 frames at the device's native
 /// sample rate and channel count.
 pub fn capture_default_input() -> anyhow::Result<CaptureHandle> {
+    capture_input(None)
+}
+
+/// Open a specific input device by cpal name (or the default if `None`),
+/// start capturing, and return a handle whose `frames_rx` yields interleaved
+/// f32 frames at the device's native sample rate and channel count.
+///
+/// If `name` is `Some` but no device matches, returns an error — callers
+/// can choose to fall back to `capture_input(None)` and surface a banner.
+pub fn capture_input(name: Option<&str>) -> anyhow::Result<CaptureHandle> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+    let device = match name {
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?,
+        Some(want) => {
+            let mut found = None;
+            if let Ok(devices) = host.input_devices() {
+                for d in devices {
+                    if matches!(d.name(), Ok(n) if n == want) {
+                        found = Some(d);
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| anyhow!("input device not found: {want}"))?
+        }
+    };
     let config = device
         .default_input_config()
         .context("default input config")?;
@@ -107,6 +146,25 @@ pub fn capture_default_input() -> anyhow::Result<CaptureHandle> {
             sample_rate,
             channels,
         },
-        stream,
+        stream: CaptureKeepAlive::Cpal(stream),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_input_with_unknown_name_returns_err() {
+        match capture_input(Some("___definitely_not_a_real_device___")) {
+            Ok(_) => panic!("expected Err for bogus device name"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("not found"),
+                    "error message should mention 'not found', got: {msg}"
+                );
+            }
+        }
+    }
 }

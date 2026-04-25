@@ -1,6 +1,7 @@
 mod app;
 mod logger;
 mod platform;
+mod settings_view;
 mod ui;
 
 use std::io;
@@ -8,7 +9,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -137,7 +141,23 @@ fn main() -> Result<()> {
         }
     };
 
-    log::info!("Voice Bird CLI starting");
+    // Sentinel line: version + exe path + compile time so we can tell at
+    // a glance which binary was launched. If you don't see this with a
+    // fresh timestamp, you're running a stale build.
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    log::info!(
+        "Voice Bird v{} starting — ui=inline-devices-panel exe={} built_at={}",
+        env!("CARGO_PKG_VERSION"),
+        exe,
+        env!("VOICE_BIRD_BUILD_TS"),
+    );
+
+    // Route whisper.cpp + ggml logs (including Metal init) through the
+    // `log` crate so they land in our file log and don't scribble over
+    // the TUI on stderr.
+    whisper_rs::install_whisper_log_trampoline();
 
     // Setup terminal
     enable_raw_mode()?;
@@ -151,7 +171,22 @@ fn main() -> Result<()> {
     app.log_path = log_path;
     app.refresh_sessions();
 
+    // Seed cursor to the saved device if present; otherwise leave at 0.
+    if let Some(saved) = app.config.input_device.clone() {
+        if let Some(i) = app.sessions.iter().position(|s| s.device_name == saved) {
+            app.selected_index = i;
+        }
+    }
+
     log::info!("Found {} audio sessions", app.sessions.len());
+    for (i, s) in app.sessions.iter().enumerate() {
+        log::info!("  device[{}] = {:?} kind={:?}", i, s.device_name, s.kind);
+    }
+    log::info!(
+        "config.input_device = {:?}, cursor selected_index = {}",
+        app.config.input_device,
+        app.selected_index
+    );
 
     let result = run_app(&mut terminal, &mut app);
 
@@ -214,16 +249,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => {
                 consecutive_poll_errors = 0;
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        match app.mode {
+                            AppMode::Normal => handle_normal_mode(app, key.code),
+                            AppMode::ModelPicker => handle_picker_mode(app, key.code),
+                            AppMode::Help => handle_help_mode(app, key.code),
+                            AppMode::Settings => settings_view::handle_key(app, key.code),
+                        }
                     }
-
-                    match app.mode {
-                        AppMode::Normal => handle_normal_mode(app, key.code),
-                        AppMode::ModelPicker => handle_picker_mode(app, key.code),
-                        AppMode::Help => handle_help_mode(app, key.code),
+                    Event::Mouse(mouse) if app.mode == AppMode::Normal => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
+                            MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
+                            _ => {}
+                        }
                     }
+                    _ => {}
                 }
             }
             Ok(false) => {
@@ -251,20 +293,86 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyCode) {
+    let recording = matches!(app.status, RecordingStatus::Recording);
+    // Transcript scroll keys — always available, no mode conflict.
+    match key {
+        KeyCode::PageUp => {
+            app.scroll_transcript_up(10);
+            return;
+        }
+        KeyCode::PageDown => {
+            app.scroll_transcript_down(10);
+            return;
+        }
+        KeyCode::Home => {
+            app.scroll_transcript_home();
+            return;
+        }
+        KeyCode::End => {
+            app.scroll_transcript_end();
+            return;
+        }
+        _ => {}
+    }
     match key {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.toggle_help(),
-        KeyCode::Char('r') => {
-            if matches!(app.status, RecordingStatus::Idle | RecordingStatus::Error(_)) {
-                app.start_recording(voice_bird::session::layout::SessionSource::Microphone);
+        KeyCode::Up | KeyCode::Char('k') if !recording => {
+            if app.selected_index > 0 {
+                app.selected_index -= 1;
             }
         }
-        KeyCode::Char('s') => {
-            if matches!(app.status, RecordingStatus::Recording) {
-                app.stop_recording();
+        KeyCode::Down | KeyCode::Char('j') if !recording => {
+            if app.selected_index + 1 < app.sessions.len() {
+                app.selected_index += 1;
             }
         }
-        KeyCode::Char('m') => app.mode = AppMode::ModelPicker, // wired in Stage 3
+        KeyCode::Up | KeyCode::Char('k') if recording => app.scroll_transcript_up(1),
+        KeyCode::Down | KeyCode::Char('j') if recording => app.scroll_transcript_down(1),
+        KeyCode::Enter if !recording => {
+            // Persist the selected device (name + kind), then start recording.
+            use voice_bird::config::AudioSessionKind;
+            use voice_bird::session::layout::SessionSource;
+            let source = if let Some(dev) = app.sessions.get(app.selected_index).cloned() {
+                let name_changed =
+                    app.config.input_device.as_deref() != Some(dev.device_name.as_str());
+                let kind_changed = app.config.input_device_kind != Some(dev.kind);
+                if name_changed || kind_changed {
+                    app.config.input_device = Some(dev.device_name.clone());
+                    app.config.input_device_kind = Some(dev.kind);
+                    if let Err(e) = app.config.save() {
+                        log::error!("config save: {e}");
+                    }
+                }
+                match dev.kind {
+                    AudioSessionKind::Input => SessionSource::Microphone,
+                    AudioSessionKind::Output => SessionSource::System,
+                }
+            } else {
+                SessionSource::Microphone
+            };
+            app.start_recording(source);
+        }
+        KeyCode::Char('r') if !recording => {
+            // Refresh device list, preserving cursor on the same name if present.
+            let prior = app
+                .sessions
+                .get(app.selected_index)
+                .map(|s| s.device_name.clone());
+            app.refresh_sessions();
+            if let Some(name) = prior {
+                if let Some(i) = app.sessions.iter().position(|s| s.device_name == name) {
+                    app.selected_index = i;
+                }
+            }
+        }
+        KeyCode::Char('s') if !recording => {
+            settings_view::open(app);
+        }
+        KeyCode::Char('s') if recording => {
+            app.stop_recording();
+        }
+        KeyCode::Char('m') if !recording => app.mode = AppMode::ModelPicker,
         _ => {}
     }
 }

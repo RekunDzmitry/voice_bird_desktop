@@ -31,7 +31,7 @@ fn mock_engine_events_land_in_jsonl_and_finalize() {
         ]);
 
         let handle = engine
-            .start(EngineConfig {
+            .start(EngineConfig::Local {
                 model_path: "mock".into(),
                 language: None,
                 sample_rate: 16_000,

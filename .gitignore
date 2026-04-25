@@ -67,6 +67,22 @@ screenshots/
 voice-bird-cli/target/
 voice-bird-cli-crate/target/
 
+# Claude Code personal/local settings
+.claude/settings.local.json
+
+# Obsidian vault config (personal / churns); keep .obsidian/snippets/ tracked
+.obsidian/app.json
+.obsidian/appearance.json
+.obsidian/core-plugins.json
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# Generated schemas
+/gen/
+
+# macOS code-signing resources for the packaged CLI app
+npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app/Contents/_CodeSignature/
+
 # npm platform package binaries (populated by CI only)
 npm/@voice-bird/cli-win32-x64/voice-bird-cli.exe
 npm/@voice-bird/cli-darwin-x64/voice-bird-cli

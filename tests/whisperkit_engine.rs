@@ -24,7 +24,7 @@ fn sidecar_starts_and_emits_ready() {
     rt.block_on(async {
         let mut engine = WhisperKitEngine::new(sidecar);
         let handle = engine
-            .start(EngineConfig {
+            .start(EngineConfig::Local {
                 // WhisperKit takes a model id, not a gguf path — the
                 // sidecar decodes the handshake's `"model"` string and
                 // forwards it to `WhisperKit(model:)`.

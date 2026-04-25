@@ -74,6 +74,18 @@ impl TranscriptionEngine for WhisperKitEngine {
             .take()
             .ok_or_else(|| anyhow::anyhow!("sidecar stdout not captured"))?;
 
+        let (model_path, language, _sample_rate) = match cfg {
+            EngineConfig::Local {
+                model_path,
+                language,
+                sample_rate,
+                ..
+            } => (model_path, language, sample_rate),
+            EngineConfig::Cloud { .. } => {
+                anyhow::bail!("WhisperKitEngine requires EngineConfig::Local");
+            }
+        };
+
         // --- Handshake line: JSON with model + language --------------------
         // The Swift side decodes `[String: String]`, so we serialize a flat
         // map (no nested structs). model_path is interpreted by WhisperKit
@@ -81,12 +93,11 @@ impl TranscriptionEngine for WhisperKitEngine {
         // gguf file path — engine-selection code is expected to translate
         // before calling `start`.
         let handshake = serde_json::json!({
-            "model": cfg
-                .model_path
+            "model": model_path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| cfg.model_path.to_string_lossy().into_owned()),
-            "language": cfg.language.clone().unwrap_or_else(|| "auto".into()),
+                .unwrap_or_else(|| model_path.to_string_lossy().into_owned()),
+            "language": language.clone().unwrap_or_else(|| "auto".into()),
         });
         let mut handshake_bytes = serde_json::to_vec(&handshake)
             .map_err(|e| anyhow::anyhow!("serialize handshake: {e}"))?;

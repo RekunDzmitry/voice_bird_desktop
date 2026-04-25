@@ -4,15 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Voice Bird is a Rust TUI for fully-local voice transcription. It records microphone audio via `cpal`, resamples to 16 kHz mono with `rubato`, and runs Whisper locally — either through `whisper-rs` (whisper.cpp bindings, cross-platform, Metal on macOS) or through a WhisperKit Swift sidecar (macOS only, ANE-accelerated). Every session lives under `~/voice-bird/sessions/<timestamp>-<source>/` as an append-only `transcript.jsonl` plus finalized `transcript.{json,txt}`, `audio.wav`, and `meta.json`.
+Voice Bird is a Rust TUI for voice transcription that is **local by default** (via `whisper-rs` / WhisperKit) with an **optional cloud engine** (AssemblyAI Universal-Streaming) for users without sufficient local compute. It records microphone audio via `cpal`, resamples to 16 kHz mono with `rubato`, and — depending on `engine_prefer` — runs Whisper locally or streams PCM to AssemblyAI over a WebSocket. Every session lives under `~/voice-bird/sessions/<timestamp>-<source>/` as an append-only `transcript.jsonl` plus finalized `transcript.{json,txt}`, `audio.wav`, and `meta.json`.
 
-No audio, text, or telemetry leaves the machine.
+Cloud engines are opt-in, require an API key in `config.toml`, and are clearly indicated via a `CLOUD` badge in the TUI header plus a recording-start reminder.
 
 ## Architecture
 
 - `src/main.rs` — entry point, crossterm event loop / key handlers, `--recover` CLI flag.
 - `src/app.rs` — `App` state, start/stop recording, owns the tokio runtime handle and the cpal `Stream`, drives engine selection (WhisperKit → whisper-rs fallback).
 - `src/ui.rs` — ratatui render pipeline: header / committed zone / tentative line / status banner / footer, plus the first-run model-picker overlay.
+- `src/settings_view.rs` — full-screen in-app settings view (opens on `,` from Normal mode); edits `AppConfig` including the AssemblyAI API key.
 - `src/config.rs` — TOML-backed `AppConfig` (selected model, engine preference).
 - `src/audio/capture.rs` — cpal input stream, sample-format fan-in to `f32`.
 - `src/audio/resample.rs` — `rubato` 16 kHz mono resampler.
@@ -23,6 +24,7 @@ No audio, text, or telemetry leaves the machine.
 - `src/transcription/mod.rs` — `TranscriptionEngine` trait.
 - `src/transcription/whisper_rs_engine.rs` — `WhisperRsEngine`, whisper.cpp via `whisper-rs` 0.13.
 - `src/transcription/whisper_kit_engine.rs` — `WhisperKitEngine`, spawns the Swift sidecar and streams length-prefixed PCM over stdio, reads JSONL results.
+- `src/transcription/assemblyai_engine.rs` — AssemblyAI Universal-Streaming v3 WebSocket client. Streams 16 kHz i16 PCM, maps Turn events onto `EngineEvent`.
 - `src/transcription/mock.rs` — `MockEngine` for deterministic tests.
 - `src/transcription/local_agreement.rs` — `step()` implements LocalAgreement-2 for committed/tentative merge.
 - `src/transcription/models.rs` — model catalog (URLs, sizes, SHA-256) + downloader with resume + digest verify.
@@ -53,6 +55,7 @@ voice-bird --recover <session-dir>             # rebuild transcript.{json,txt} f
 - `transcript.jsonl` writes are flushed and fsync'd per segment — crash-mid-recording must still produce a recoverable file.
 - Every entry in `src/transcription/models.rs` must have a real SHA-256 digest before shipping a release; `<FILL>` placeholders are intentional mid-development and `xtask check-catalog` is the CI gate that prevents accidentally shipping unverified downloads.
 - Engine selection prefers WhisperKit on macOS when the sidecar binary is on `PATH` (or co-located with `voice-bird`), else falls back to `whisper-rs`.
+- Cloud engines are opt-in. `engine_prefer = "assemblyai"` requires `assemblyai_api_key` to be set; otherwise start_recording refuses and a persistent banner prompts the user to open settings. The CLOUD badge is driven by `App::is_cloud_engine`, set at start_recording, cleared at stop_recording.
 
 ## Known Gotchas
 
