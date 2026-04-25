@@ -366,17 +366,13 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 }
             }
         }
+        KeyCode::Char('s') if !recording => {
+            settings_view::open(app);
+        }
         KeyCode::Char('s') if recording => {
             app.stop_recording();
         }
         KeyCode::Char('m') if !recording => app.mode = AppMode::ModelPicker,
-        KeyCode::Char(',') => {
-            if !matches!(app.status, RecordingStatus::Recording) {
-                settings_view::open(app);
-            } else {
-                app.banner = Some("stop recording before opening settings".into());
-            }
-        }
         _ => {}
     }
 }

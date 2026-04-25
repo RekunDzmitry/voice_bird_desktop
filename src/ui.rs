@@ -380,7 +380,7 @@ fn render_banner(f: &mut Frame, area: Rect, app: &App) {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let keys = match &app.status {
         RecordingStatus::Idle => {
-            "[↑/↓] device  [Enter] start  [r] refresh  [m] model  [PgUp/PgDn/Home/End] scroll  [q] quit  [?] help"
+            "[↑/↓] device  [Enter] start  [r] refresh  [s] settings  [m] model  [PgUp/PgDn/Home/End] scroll  [q] quit  [?] help"
         }
         RecordingStatus::Recording => {
             "[s] stop  [↑/↓/PgUp/PgDn/Home/End] scroll  [q] quit"

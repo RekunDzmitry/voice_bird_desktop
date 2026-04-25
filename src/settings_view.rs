@@ -49,6 +49,152 @@ pub const FIELDS: &[Field] = &[
     Field { section: "Cloud", key: FieldKey::AssemblyAiApiKey, label: "AssemblyAI API key" },
 ];
 
+/// How a field is edited in the settings view.
+pub enum FieldKind {
+    /// Free-text input. Enter opens text edit, Backspace/Char/Enter as today.
+    Text,
+    /// Cycle through a hardcoded list of values. Left/Right (and h/l) advance
+    /// backward/forward; wraps at ends.
+    Cycle,
+    /// Numeric cycle through a preset list. Same UX as Cycle but the list is
+    /// integer values displayed with a unit suffix.
+    Numeric,
+}
+
+pub fn field_kind(key: FieldKey) -> FieldKind {
+    match key {
+        FieldKey::SessionDir | FieldKey::AssemblyAiApiKey => FieldKind::Text,
+        FieldKey::HopMs
+        | FieldKey::MinWindowMs
+        | FieldKey::RefinementWindowMs
+        | FieldKey::RefinementBeamSize => FieldKind::Numeric,
+        _ => FieldKind::Cycle,
+    }
+}
+
+fn cycle_options(key: FieldKey, app: &App) -> Vec<String> {
+    use voice_bird::transcription::models::Catalog;
+    match key {
+        FieldKey::DefaultModel => Catalog::builtin()
+            .all()
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect(),
+        FieldKey::Language => vec!["en", "auto", "es", "fr", "de", "ja", "zh"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        FieldKey::AudioDefaultSource => vec!["microphone".into(), "system".into()],
+        FieldKey::InputDevice => {
+            // First option is the empty/None marker rendered as "(OS default)"
+            // by field_display. Then enumerate currently-known devices from app.sessions.
+            let mut v = vec![String::new()];
+            for s in &app.sessions {
+                v.push(s.device_name.clone());
+            }
+            v
+        }
+        FieldKey::EnginePrefer => vec![
+            "auto".into(),
+            "whisperkit".into(),
+            "whisper_rs".into(),
+            "assemblyai".into(),
+        ],
+        FieldKey::RefinementModel => {
+            let mut v = vec![String::new()]; // empty = "(off)"
+            for m in Catalog::builtin().all() {
+                v.push(m.id.to_string());
+            }
+            v
+        }
+        // Fall back for unexpected non-cycle fields.
+        _ => Vec::new(),
+    }
+}
+
+fn numeric_options(key: FieldKey) -> Vec<u32> {
+    match key {
+        FieldKey::HopMs => vec![250, 500, 750, 1000, 1500, 2000],
+        FieldKey::MinWindowMs => vec![500, 750, 1000, 1500, 2000],
+        FieldKey::RefinementWindowMs => vec![10_000, 15_000, 20_000, 30_000, 60_000],
+        FieldKey::RefinementBeamSize => vec![1, 3, 5, 8, 10],
+        _ => Vec::new(),
+    }
+}
+
+fn current_string_value(app: &App, key: FieldKey) -> String {
+    let c = &app.config;
+    match key {
+        FieldKey::DefaultModel => c.default_model.clone(),
+        FieldKey::Language => c.language.clone(),
+        FieldKey::AudioDefaultSource => c.audio_default_source.clone(),
+        FieldKey::InputDevice => c.input_device.clone().unwrap_or_default(),
+        FieldKey::EnginePrefer => c.engine_prefer.clone(),
+        FieldKey::RefinementModel => c.refinement_model.clone().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn current_numeric_value(app: &App, key: FieldKey) -> u32 {
+    let c = &app.config;
+    match key {
+        FieldKey::HopMs => c.hop_ms,
+        FieldKey::MinWindowMs => c.min_window_ms,
+        FieldKey::RefinementWindowMs => c.refinement_window_ms,
+        FieldKey::RefinementBeamSize => c.refinement_beam_size as u32,
+        _ => 0,
+    }
+}
+
+/// Returns the index in `options` of `current`, or 0 if not found.
+fn index_of<T: PartialEq>(options: &[T], current: &T) -> usize {
+    options.iter().position(|x| x == current).unwrap_or(0)
+}
+
+fn cycle_string(app: &mut App, key: FieldKey, delta: i32) {
+    let opts = cycle_options(key, app);
+    if opts.is_empty() { return; }
+    let cur = current_string_value(app, key);
+    let i = index_of(&opts, &cur);
+    let n = opts.len() as i32;
+    let next = (((i as i32 + delta) % n) + n) % n;
+    let v = opts[next as usize].clone();
+    let c = &mut app.config;
+    match key {
+        FieldKey::DefaultModel => c.default_model = v,
+        FieldKey::Language => c.language = v,
+        FieldKey::AudioDefaultSource => c.audio_default_source = v,
+        FieldKey::InputDevice => {
+            c.input_device = if v.is_empty() { None } else { Some(v) };
+        }
+        FieldKey::EnginePrefer => c.engine_prefer = v,
+        FieldKey::RefinementModel => {
+            c.refinement_model = if v.is_empty() { None } else { Some(v) };
+        }
+        _ => {}
+    }
+    app.settings_error = None;
+}
+
+fn cycle_numeric(app: &mut App, key: FieldKey, delta: i32) {
+    let opts = numeric_options(key);
+    if opts.is_empty() { return; }
+    let cur = current_numeric_value(app, key);
+    let i = index_of(&opts, &cur);
+    let n = opts.len() as i32;
+    let next = (((i as i32 + delta) % n) + n) % n;
+    let v = opts[next as usize];
+    let c = &mut app.config;
+    match key {
+        FieldKey::HopMs => c.hop_ms = v,
+        FieldKey::MinWindowMs => c.min_window_ms = v,
+        FieldKey::RefinementWindowMs => c.refinement_window_ms = v,
+        FieldKey::RefinementBeamSize => c.refinement_beam_size = v as u8,
+        _ => {}
+    }
+    app.settings_error = None;
+}
+
 fn mask_api_key(key: &str) -> String {
     if key.is_empty() {
         "(unset)".into()
@@ -132,7 +278,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.settings_edit_buf.is_some() {
         "Enter: save field   Esc: cancel edit"
     } else {
-        "↑↓: move   Enter: edit   s: save   Esc: close"
+        let kind = current_field(app)
+            .map(|f| field_kind(f.key))
+            .unwrap_or(FieldKind::Text);
+        match kind {
+            FieldKind::Text => "↑↓: move   Enter: edit   s: save   Esc: close",
+            FieldKind::Cycle | FieldKind::Numeric => {
+                "↑↓: move   ←→: cycle   s: save   Esc: close"
+            }
+        }
     };
     lines.push(Line::from(Span::styled(
         hint,
@@ -259,6 +413,11 @@ pub fn handle_key(app: &mut App, key: KeyCode) {
         return;
     }
 
+    // Navigation mode: determine field kind for the currently focused field.
+    let kind = current_field(app)
+        .map(|f| field_kind(f.key))
+        .unwrap_or(FieldKind::Text);
+
     match key {
         KeyCode::Esc | KeyCode::Char('q') => cancel(app),
         KeyCode::Up | KeyCode::Char('k') => {
@@ -271,30 +430,105 @@ pub fn handle_key(app: &mut App, key: KeyCode) {
                 app.settings_cursor += 1;
             }
         }
-        KeyCode::Enter => {
-            if let Some(fld) = current_field(app).copied() {
-                let c = &app.config;
-                app.settings_edit_buf = Some(match fld.key {
-                    FieldKey::AssemblyAiApiKey => c.assemblyai_api_key.clone(),
-                    FieldKey::InputDevice => c.input_device.clone().unwrap_or_default(),
-                    FieldKey::RefinementModel => c.refinement_model.clone().unwrap_or_default(),
-                    FieldKey::DefaultModel => c.default_model.clone(),
-                    FieldKey::Language => c.language.clone(),
-                    FieldKey::SessionDir => c.session_dir.clone(),
-                    FieldKey::AudioDefaultSource => c.audio_default_source.clone(),
-                    FieldKey::EnginePrefer => c.engine_prefer.clone(),
-                    FieldKey::HopMs => c.hop_ms.to_string(),
-                    FieldKey::MinWindowMs => c.min_window_ms.to_string(),
-                    FieldKey::RefinementWindowMs => c.refinement_window_ms.to_string(),
-                    FieldKey::RefinementBeamSize => c.refinement_beam_size.to_string(),
-                });
+        KeyCode::Left | KeyCode::Char('h') => match kind {
+            FieldKind::Cycle => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_string(app, f.key, -1);
+                }
             }
-        }
+            FieldKind::Numeric => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_numeric(app, f.key, -1);
+                }
+            }
+            FieldKind::Text => {}
+        },
+        KeyCode::Right | KeyCode::Char('l') => match kind {
+            FieldKind::Cycle => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_string(app, f.key, 1);
+                }
+            }
+            FieldKind::Numeric => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_numeric(app, f.key, 1);
+                }
+            }
+            FieldKind::Text => {}
+        },
+        KeyCode::Enter => match kind {
+            FieldKind::Text => {
+                // Open text edit — preload current value into buffer.
+                if let Some(fld) = current_field(app).copied() {
+                    let c = &app.config;
+                    app.settings_edit_buf = Some(match fld.key {
+                        FieldKey::AssemblyAiApiKey => c.assemblyai_api_key.clone(),
+                        FieldKey::SessionDir => c.session_dir.clone(),
+                        _ => String::new(),
+                    });
+                }
+            }
+            FieldKind::Cycle => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_string(app, f.key, 1);
+                }
+            }
+            FieldKind::Numeric => {
+                if let Some(f) = current_field(app).copied() {
+                    cycle_numeric(app, f.key, 1);
+                }
+            }
+        },
         KeyCode::Char('s') => {
             if try_save(app) {
                 close(app);
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    /// Advance `engine_prefer` forward through the full cycle: auto →
+    /// whisperkit → whisper_rs → assemblyai → auto (wraps).
+    #[test]
+    fn cycle_string_engine_prefer_forward() {
+        let mut app = App::new();
+        app.config.engine_prefer = "auto".into();
+
+        cycle_string(&mut app, FieldKey::EnginePrefer, 1);
+        assert_eq!(app.config.engine_prefer, "whisperkit");
+
+        cycle_string(&mut app, FieldKey::EnginePrefer, 1);
+        assert_eq!(app.config.engine_prefer, "whisper_rs");
+
+        cycle_string(&mut app, FieldKey::EnginePrefer, 1);
+        assert_eq!(app.config.engine_prefer, "assemblyai");
+
+        // Wrap back to the start.
+        cycle_string(&mut app, FieldKey::EnginePrefer, 1);
+        assert_eq!(app.config.engine_prefer, "auto");
+    }
+
+    /// hop_ms forward: 750 → 1000 → 1500; backward: 750 → 500.
+    #[test]
+    fn cycle_numeric_hop_ms() {
+        let mut app = App::new();
+        app.config.hop_ms = 750;
+
+        cycle_numeric(&mut app, FieldKey::HopMs, 1);
+        assert_eq!(app.config.hop_ms, 1000);
+
+        cycle_numeric(&mut app, FieldKey::HopMs, 1);
+        assert_eq!(app.config.hop_ms, 1500);
+
+        // Reset and test backward.
+        app.config.hop_ms = 750;
+        cycle_numeric(&mut app, FieldKey::HopMs, -1);
+        assert_eq!(app.config.hop_ms, 500);
     }
 }
