@@ -5,6 +5,7 @@ mod settings_view;
 mod ui;
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -122,6 +123,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--debug-state-snapshot <path>` opts into a JSONL file where every
+    // key press appends a serialized App-state snapshot. Used by the
+    // e2e_human test harness to drive the TUI without relying on
+    // screenshot OCR. No-op when the flag is absent.
+    let debug_snapshot_path: Option<PathBuf> = args
+        .iter()
+        .position(|a| a == "--debug-state-snapshot")
+        .and_then(|pos| args.get(pos + 1))
+        .map(PathBuf::from);
+
     // When launched via macOS `open`, reconnect stdin to the real TTY
     // so crossterm gets proper keyboard input. Must happen before anything
     // reads from stdin.
@@ -171,9 +182,23 @@ fn main() -> Result<()> {
     app.log_path = log_path;
     app.refresh_sessions();
 
-    // Seed cursor to the saved device if present; otherwise leave at 0.
+    // Seed cursor to the saved device. Many devices (USB headsets like
+    // EPOS) appear twice — once as Input (mic) and once as Output (for
+    // loopback capture). Prefer matching on BOTH name and saved kind so
+    // a user who picked the loopback variant gets the loopback variant
+    // back. Falls back to name-only match for old configs that did not
+    // store input_device_kind.
     if let Some(saved) = app.config.input_device.clone() {
-        if let Some(i) = app.sessions.iter().position(|s| s.device_name == saved) {
+        let saved_kind = app.config.input_device_kind;
+        let by_name_and_kind = saved_kind.and_then(|k| {
+            app.sessions
+                .iter()
+                .position(|s| s.device_name == saved && s.kind == k)
+        });
+        let i = by_name_and_kind.or_else(|| {
+            app.sessions.iter().position(|s| s.device_name == saved)
+        });
+        if let Some(i) = i {
             app.selected_index = i;
         }
     }
@@ -188,7 +213,16 @@ fn main() -> Result<()> {
         app.selected_index
     );
 
-    let result = run_app(&mut terminal, &mut app);
+    if let Some(p) = &debug_snapshot_path {
+        log::info!("debug state snapshots → {}", p.display());
+        // Truncate any prior file so each run is fresh.
+        let _ = std::fs::write(p, "");
+        // Emit one initial snapshot so the e2e harness can read the
+        // device list before sending its first keystroke.
+        write_state_snapshot(&app, "<startup>", p);
+    }
+
+    let result = run_app(&mut terminal, &mut app, debug_snapshot_path.as_deref());
 
     // Restore terminal
     disable_raw_mode()?;
@@ -209,8 +243,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    debug_snapshot_path: Option<&Path>,
+) -> Result<()> {
     let mut consecutive_poll_errors: u32 = 0;
+    // Periodic snapshot: while recording, the snapshot file should
+    // also reflect transcript events that arrive between key presses.
+    // Throttled to once per second to keep file growth bounded.
+    let mut last_periodic_snapshot = std::time::Instant::now();
 
     loop {
         // Detect revoked stdin (e.g., TTY closed while app bundle still running).
@@ -257,6 +299,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::Settings => settings_view::handle_key(app, key.code),
                         }
+                        if let Some(path) = debug_snapshot_path {
+                            write_state_snapshot(app, &format!("{:?}", key.code), path);
+                        }
                     }
                     Event::Mouse(mouse) if app.mode == AppMode::Normal => {
                         match mouse.kind {
@@ -286,6 +331,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             // Stop all sessions before quitting
             stop_all_sessions(app);
             break;
+        }
+
+        // Periodic state snapshot — once per second, regardless of
+        // keys, so the e2e harness can observe transcripts arriving.
+        if let Some(path) = debug_snapshot_path {
+            if last_periodic_snapshot.elapsed() >= Duration::from_secs(1) {
+                write_state_snapshot(app, "<periodic>", path);
+                last_periodic_snapshot = std::time::Instant::now();
+            }
         }
     }
 
@@ -373,6 +427,21 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.stop_recording();
         }
         KeyCode::Char('m') if !recording => app.mode = AppMode::ModelPicker,
+        // Toggle live broadcast for the next recording. In-memory only —
+        // does not persist to config.toml; the user changes the default
+        // in Settings ('s'). Disabled mid-recording so a flip doesn't
+        // strand the active engine.
+        KeyCode::Char('b') if !recording => {
+            app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
+            let on = app.config.cloud_broadcast_enabled;
+            app.banner = Some(
+                if on {
+                    "Live broadcast: ON (next recording streams to voicebird.app)".into()
+                } else {
+                    "Live broadcast: OFF (next recording is local-only)".into()
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -434,4 +503,88 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
 fn stop_all_sessions(app: &mut App) {
     log::info!("Stopping all sessions");
     app.stop_recording();
+}
+
+/// Append one JSON-line snapshot of relevant App state to `path`.
+/// Used by the e2e_human harness to drive the TUI without relying on
+/// screenshot OCR. Errors are intentionally swallowed — debug-only feature
+/// must never crash the TUI.
+fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
+    use std::io::Write;
+
+    let status = match &app.status {
+        RecordingStatus::Idle => "Idle".to_string(),
+        RecordingStatus::Recording => "Recording".to_string(),
+        RecordingStatus::Error(s) => format!("Error: {s}"),
+    };
+
+    // When in Settings mode, surface the focused field's label, current
+    // displayed value, and the cycle options (if any) so the agent can
+    // pick the right key to send next without needing pixels.
+    let (settings_field_label, settings_field_value, settings_field_options) =
+        if app.mode == AppMode::Settings {
+            let fields = settings_view::FIELDS;
+            if let Some(fld) = fields.get(app.settings_cursor) {
+                let value = settings_view::field_display(app, fld.key);
+                let options = settings_view::cycle_options_for(fld.key, app);
+                (fld.label.to_string(), value, options)
+            } else {
+                (String::new(), String::new(), Vec::new())
+            }
+        } else {
+            (String::new(), String::new(), Vec::new())
+        };
+
+    let device_names: Vec<String> =
+        app.sessions.iter().map(|s| s.device_name.clone()).collect();
+    let selected_device_name = app
+        .sessions
+        .get(app.selected_index)
+        .map(|s| s.device_name.clone())
+        .unwrap_or_default();
+
+    let committed = app.committed.lock();
+    let committed_count = committed.len();
+    let last_committed_text = committed
+        .last()
+        .map(|c| c.text.clone())
+        .unwrap_or_default();
+    drop(committed);
+    let tentative_text = app.tentative.lock().clone();
+
+    let snap = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "last_key": last_key,
+        "mode": format!("{:?}", app.mode),
+        "status": status,
+        "cloud_broadcast_active": app.cloud_broadcast_active,
+        "engine_kind": app.engine_kind,
+        "duration_secs": app.duration,
+        "banner": app.banner,
+        "status_message": app.status_message,
+        "device_names": device_names,
+        "selected_device_index": app.selected_index,
+        "selected_device_name": selected_device_name,
+        "settings_cursor": app.settings_cursor,
+        "settings_field_label": settings_field_label,
+        "settings_field_value": settings_field_value,
+        "settings_field_options": settings_field_options,
+        "settings_edit_buf": app.settings_edit_buf,
+        "settings_error": app.settings_error,
+        "committed_count": committed_count,
+        "last_committed_text": last_committed_text,
+        "tentative_text": tentative_text,
+    });
+
+    let line = match serde_json::to_string(&snap) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }

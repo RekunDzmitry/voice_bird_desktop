@@ -1,8 +1,8 @@
-pub mod assemblyai_engine;
 pub mod local_agreement;
 pub mod mock;
 pub mod models;
 pub mod refinement_engine;
+pub mod voicebird_engine;
 pub mod whisper_kit_engine;
 pub mod whisper_rs_engine;
 
@@ -59,6 +59,13 @@ pub enum EngineConfig {
         api_key: String,
         language: Option<String>,
         sample_rate: u32,
+        /// WebSocket URL of the Voice Bird Web `/api/audio/stream`
+        /// endpoint to stream PCM to.
+        server_url: String,
+        /// Device label sent to voicebird.app in the init handshake;
+        /// surfaces in the live-session card so users can tell which
+        /// audio source is being streamed when multiple stream.
+        device_name: String,
     },
 }
 
@@ -103,26 +110,39 @@ pub fn select_engine(
 pub enum EngineKind {
     WhisperRs,
     WhisperKit,
-    AssemblyAi,
+    VoiceBirdWeb,
 }
 
 /// Typed variant of `select_engine`. Returns an error for cases that
-/// should surface to the user (e.g. cloud engine selected but no key).
+/// should surface to the user (e.g. cloud broadcast enabled but no key).
+///
+/// When `cloud_broadcast_enabled` is true, the cloud Voice Bird Web
+/// engine is selected unconditionally — it bypasses local Whisper and
+/// streams PCM to the user's voicebird.app account. `prefer` is only
+/// consulted for local-engine selection (whisperkit / whisper_rs).
 pub fn try_select_engine(
     prefer: &str,
-    assemblyai_api_key: &str,
+    cloud_broadcast_enabled: bool,
+    voicebird_api_key: &str,
+    voicebird_server_url: &str,
     sidecar_path: Option<&std::path::Path>,
 ) -> Result<(EngineKind, Box<dyn TranscriptionEngine>), String> {
-    if prefer == "assemblyai" {
-        if assemblyai_api_key.is_empty() {
+    if cloud_broadcast_enabled {
+        if voicebird_api_key.is_empty() {
             return Err(
-                "AssemblyAI selected but no API key — open settings (press ',')".into(),
+                "Live broadcast enabled but no Voice Bird API key — open settings (press ',')".into(),
+            );
+        }
+        if voicebird_server_url.is_empty() {
+            return Err(
+                "Live broadcast enabled but no Voice Bird server URL — open settings (press ',')".into(),
             );
         }
         return Ok((
-            EngineKind::AssemblyAi,
-            Box::new(assemblyai_engine::AssemblyAiEngine::new(
-                assemblyai_api_key.to_string(),
+            EngineKind::VoiceBirdWeb,
+            Box::new(voicebird_engine::VoiceBirdEngine::new(
+                voicebird_api_key.to_string(),
+                voicebird_server_url.to_string(),
             )),
         ));
     }
@@ -142,7 +162,7 @@ pub fn try_select_engine(
             }
         }
     }
-    let _ = sidecar_path;
+    let _ = (prefer, sidecar_path);
     Ok((
         EngineKind::WhisperRs,
         Box::<whisper_rs_engine::WhisperRsEngine>::default(),
@@ -179,22 +199,38 @@ pub fn sidecar_path() -> Option<std::path::PathBuf> {
 mod select_tests {
     use super::*;
 
+    const TEST_URL: &str = "wss://example.test/api/audio/stream";
+
     #[test]
-    fn assemblyai_with_key_returns_cloud_engine() {
-        let res = try_select_engine("assemblyai", "sk-fake", None);
+    fn broadcast_with_key_returns_cloud_engine() {
+        let res = try_select_engine("auto", true, "vb-fake", TEST_URL, None);
         let (kind, _engine) = res.expect("expected Ok");
-        assert_eq!(kind, EngineKind::AssemblyAi);
+        assert_eq!(kind, EngineKind::VoiceBirdWeb);
     }
 
     #[test]
-    fn assemblyai_without_key_returns_err() {
-        let err = try_select_engine("assemblyai", "", None).err().unwrap();
+    fn broadcast_without_key_returns_err() {
+        let err = try_select_engine("auto", true, "", TEST_URL, None).err().unwrap();
         assert!(err.to_lowercase().contains("api key"));
     }
 
     #[test]
-    fn non_cloud_preference_ignores_key() {
-        let (kind, _) = try_select_engine("whisper_rs", "", None).unwrap();
+    fn broadcast_without_url_returns_err() {
+        let err = try_select_engine("auto", true, "vb-fake", "", None).err().unwrap();
+        assert!(err.to_lowercase().contains("server url"));
+    }
+
+    #[test]
+    fn local_path_ignores_credentials() {
+        let (kind, _) = try_select_engine("whisper_rs", false, "", "", None).unwrap();
+        assert_eq!(kind, EngineKind::WhisperRs);
+    }
+
+    #[test]
+    fn local_path_when_broadcast_off_even_with_creds() {
+        // When broadcast is off, creds are irrelevant and we land on the
+        // local engine (whisper_rs without a sidecar path).
+        let (kind, _) = try_select_engine("whisper_rs", false, "vb-fake", TEST_URL, None).unwrap();
         assert_eq!(kind, EngineKind::WhisperRs);
     }
 }

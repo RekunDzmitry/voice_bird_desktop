@@ -28,9 +28,9 @@ rubato = "0.14"
 # Async
 tokio = { version = "1.0", features = ["full"] }
 
-# WebSocket client for AssemblyAI cloud engine. Uses rustls (consistent
-# with reqwest already in-tree) rather than native-tls to keep a single
-# TLS backend across the crate.
+# WebSocket client for the Voice Bird Web cloud engine. Uses rustls
+# (consistent with reqwest already in-tree) rather than native-tls to
+# keep a single TLS backend across the crate.
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 url = "2"
@@ -68,8 +68,9 @@ bytemuck = "1"
 
 [features]
 engine-smoke = []
-# Requires ASSEMBLYAI_API_KEY env var at test time; hits the real service.
-engine-smoke-assemblyai = []
+# Requires VOICEBIRD_API_KEY + VOICEBIRD_WS_URL env vars at test time;
+# hits a real voice_bird_web deployment.
+engine-smoke-voicebird = []
 
 [dev-dependencies]
 proptest = "1"
