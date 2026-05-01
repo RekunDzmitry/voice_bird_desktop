@@ -51,16 +51,18 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
     });
 }
 
-#[cfg(feature = "engine-smoke-assemblyai")]
+#[cfg(feature = "engine-smoke-voicebird")]
 #[test]
-fn assemblyai_produces_committed_event_for_fixture() {
+fn voicebird_produces_committed_event_for_fixture() {
     use std::time::Duration;
     use voice_bird::transcription::{
-        assemblyai_engine::AssemblyAiEngine, EngineConfig, EngineEvent, TranscriptionEngine,
+        voicebird_engine::VoiceBirdEngine, EngineConfig, EngineEvent, TranscriptionEngine,
     };
 
-    let key = std::env::var("ASSEMBLYAI_API_KEY")
-        .expect("ASSEMBLYAI_API_KEY must be set for this smoke test");
+    let key = std::env::var("VOICEBIRD_API_KEY")
+        .expect("VOICEBIRD_API_KEY must be set for this smoke test");
+    let url = std::env::var("VOICEBIRD_WS_URL")
+        .expect("VOICEBIRD_WS_URL must be set (e.g. wss://voicebird.app/api/audio/stream)");
 
     let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();
     let samples: Vec<f32> = spec
@@ -73,12 +75,14 @@ fn assemblyai_produces_committed_event_for_fixture() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let mut engine = AssemblyAiEngine::new(key.clone());
+        let mut engine = VoiceBirdEngine::new(key.clone(), url.clone());
         let handle = engine
             .start(EngineConfig::Cloud {
                 api_key: key,
                 language: Some("en".into()),
                 sample_rate: 16_000,
+                server_url: url,
+                device_name: "smoke-test".into(),
             })
             .unwrap();
 

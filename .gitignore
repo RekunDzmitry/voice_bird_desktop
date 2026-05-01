@@ -61,6 +61,7 @@ logs/
 # Build artifacts
 dist/
 debug.log
+errors.log
 screenshots/
 
 # CLI crate build artifacts

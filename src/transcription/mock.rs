@@ -115,6 +115,7 @@ mod tests {
             api_key: "sk-x".into(),
             language: None,
             sample_rate: 16_000,
+            server_url: "wss://example.test/api/audio/stream".into(),
         };
         let err = engine.start(cfg).err().expect("expected Err on Cloud");
         assert!(

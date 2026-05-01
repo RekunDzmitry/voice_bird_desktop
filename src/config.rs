@@ -42,10 +42,29 @@ pub struct AppConfig {
     /// Beam size for refinement. 1 = greedy (fastest, lowest quality).
     #[serde(default = "default_refinement_beam_size")]
     pub refinement_beam_size: u8,
-    /// AssemblyAI API key. Stored in plaintext in config.toml — file
+    /// Voice Bird Web API key. Stored in plaintext in config.toml — file
     /// permissions are the only protection. Empty string = unset.
     #[serde(default)]
-    pub assemblyai_api_key: String,
+    pub voicebird_api_key: String,
+
+    /// WebSocket URL of the Voice Bird Web `/api/audio/stream` endpoint
+    /// the desktop client streams to when `cloud_broadcast_enabled` is
+    /// true. Defaults to the hosted production server.
+    #[serde(default = "default_voicebird_server_url")]
+    pub voicebird_server_url: String,
+
+    /// When true, recordings stream PCM to `voicebird_server_url` and
+    /// transcripts are produced by the cloud model. The local Whisper
+    /// engine is bypassed and no session files are written to disk —
+    /// the recording lives entirely on the user's voicebird.app
+    /// account. When false (default), the local engine runs and writes
+    /// `~/voice-bird/sessions/<ts>/`.
+    #[serde(default)]
+    pub cloud_broadcast_enabled: bool,
+}
+
+fn default_voicebird_server_url() -> String {
+    "wss://voicebird.app/api/audio/stream".into()
 }
 
 fn default_refinement_window_ms() -> u32 {
@@ -71,7 +90,9 @@ impl Default for AppConfig {
             refinement_model: None,
             refinement_window_ms: default_refinement_window_ms(),
             refinement_beam_size: default_refinement_beam_size(),
-            assemblyai_api_key: String::new(),
+            voicebird_api_key: String::new(),
+            voicebird_server_url: default_voicebird_server_url(),
+            cloud_broadcast_enabled: false,
         }
     }
 }
@@ -106,7 +127,7 @@ impl AppConfig {
             std::fs::create_dir_all(p)?;
         }
         let body = toml::to_string_pretty(self)?;
-        let out = if self.assemblyai_api_key.is_empty() {
+        let out = if self.voicebird_api_key.is_empty() {
             body
         } else {
             format!("# Contains secrets. Do not share.\n{body}")
@@ -147,20 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn assemblyai_api_key_roundtrips_through_toml() {
+    fn voicebird_api_key_roundtrips_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let c = AppConfig { assemblyai_api_key: "sk-fake-12345".into(), ..AppConfig::default() };
+        let c = AppConfig { voicebird_api_key: "vb-fake-12345".into(), ..AppConfig::default() };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.assemblyai_api_key, "sk-fake-12345");
+        assert_eq!(loaded.voicebird_api_key, "vb-fake-12345");
     }
 
     #[test]
-    fn missing_assemblyai_api_key_deserializes_to_empty_string() {
+    fn missing_voicebird_fields_deserialize_to_defaults() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        // Write an old-style config without the field.
+        // Write an old-style config without the new fields.
         std::fs::write(
             &path,
             r#"
@@ -177,7 +198,9 @@ refinement_beam_size = 5
         )
         .unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.assemblyai_api_key, "");
+        assert_eq!(loaded.voicebird_api_key, "");
+        assert_eq!(loaded.voicebird_server_url, default_voicebird_server_url());
+        assert!(!loaded.cloud_broadcast_enabled);
     }
 
     #[test]
@@ -196,7 +219,7 @@ refinement_beam_size = 5
     fn save_with_secret_prepends_warning_comment() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let c = AppConfig { assemblyai_api_key: "sk-secret".into(), ..AppConfig::default() };
+        let c = AppConfig { voicebird_api_key: "vb-secret".into(), ..AppConfig::default() };
         c.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -232,7 +255,9 @@ refinement_beam_size = 5
             refinement_model: Some("large-v3-turbo".into()),
             refinement_window_ms: 20_000,
             refinement_beam_size: 5,
-            assemblyai_api_key: "sk-test".into(),
+            voicebird_api_key: "vb-test".into(),
+            voicebird_server_url: "wss://example.test/api/audio/stream".into(),
+            cloud_broadcast_enabled: true,
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();

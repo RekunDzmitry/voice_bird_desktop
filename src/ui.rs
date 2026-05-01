@@ -61,7 +61,7 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if has_reminder {
         let r = Paragraph::new(Span::styled(
-            "Audio is being sent to AssemblyAI.",
+            "Audio is being sent to Voice Bird.",
             Style::default().fg(Color::Yellow),
         ));
         f.render_widget(r, root[next_slot]);
@@ -227,9 +227,9 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(timer),
     ]);
 
-    if app.is_cloud_engine {
-        // Reserve 9 columns on the right for " CLOUD " (with border padding).
-        const BADGE_WIDTH: u16 = 9;
+    if app.cloud_broadcast_active {
+        // Reserve 8 columns on the right for " LIVE " (with border padding).
+        const BADGE_WIDTH: u16 = 8;
         let inner_w = area.width.saturating_sub(2); // subtract left+right borders
         let (title_w, badge_w) = if inner_w > BADGE_WIDTH {
             (inner_w - BADGE_WIDTH, BADGE_WIDTH)
@@ -253,7 +253,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
         if badge_w > 0 {
             let badge = Paragraph::new(Span::styled(
-                " CLOUD ",
+                " LIVE ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)

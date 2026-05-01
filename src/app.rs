@@ -149,7 +149,7 @@ pub struct App {
     /// True while a cloud engine is actively transmitting audio. Drives
     /// the CLOUD badge in the header. Set in `start_recording`, cleared
     /// in `stop_recording`.
-    pub is_cloud_engine: bool,
+    pub cloud_broadcast_active: bool,
 
     /// Snapshot of config taken on entering Settings mode. Used to
     /// discard edits on Cancel.
@@ -166,7 +166,7 @@ pub struct App {
     pub settings_error: Option<String>,
 
     /// When recording started with a cloud engine, the wall-clock time
-    /// at which the "Audio is being sent to AssemblyAI." reminder
+    /// at which the "Audio is being sent to Voice Bird." reminder
     /// should be hidden (3 s after recording start).
     pub cloud_reminder_until: Option<std::time::Instant>,
 
@@ -216,10 +216,10 @@ impl App {
             )
         };
 
-        let banner_on_launch = if config.engine_prefer == "assemblyai"
-            && config.assemblyai_api_key.is_empty()
+        let banner_on_launch = if config.cloud_broadcast_enabled
+            && config.voicebird_api_key.is_empty()
         {
-            Some("Cloud engine selected but no API key — open settings (press ',')".into())
+            Some("Live broadcast enabled but no API key — open settings (press ',')".into())
         } else {
             None
         };
@@ -255,7 +255,7 @@ impl App {
             config_was_loaded_from_disk,
             _capture_stream: None,
             engine_kind: String::new(),
-            is_cloud_engine: false,
+            cloud_broadcast_active: false,
             settings_snapshot: None,
             settings_cursor: 0,
             settings_edit_buf: None,
@@ -398,28 +398,37 @@ impl App {
     /// `WhisperRsEngine`, and drive the event consumer that fills
     /// `committed` / `tentative` and appends to `transcript.jsonl`.
     pub fn start_recording(&mut self, source: SessionSource) {
-        if self.config.engine_prefer == "assemblyai"
-            && self.config.assemblyai_api_key.is_empty()
+        if self.config.cloud_broadcast_enabled
+            && self.config.voicebird_api_key.is_empty()
         {
             self.banner = Some(
-                "Cloud engine selected but no API key — open settings (press ',')".into(),
+                "Live broadcast enabled but no API key — open settings (press ',')".into(),
             );
             self.status = RecordingStatus::Error("no api key".into());
             return;
         }
 
         let now = chrono::Utc::now();
-        let session_dir = voice_bird::session::layout::session_dir(
-            std::path::Path::new(&self.config.session_dir_expanded()),
-            now,
-            &source,
-        );
-        if let Err(e) = std::fs::create_dir_all(&session_dir) {
-            self.status = RecordingStatus::Error(format!("create session dir: {e}"));
-            return;
-        }
+        // Local-first persistence: when broadcasting, the recording lives
+        // entirely on voicebird.app and we skip creating a local session
+        // directory. `self.session_dir` stays None, which `stop_recording`
+        // checks before calling finalize.
+        let session_dir: Option<std::path::PathBuf> = if self.config.cloud_broadcast_enabled {
+            None
+        } else {
+            let dir = voice_bird::session::layout::session_dir(
+                std::path::Path::new(&self.config.session_dir_expanded()),
+                now,
+                &source,
+            );
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.status = RecordingStatus::Error(format!("create session dir: {e}"));
+                return;
+            }
+            Some(dir)
+        };
 
-        self.session_dir = Some(session_dir.clone());
+        self.session_dir = session_dir.clone();
         self.session_started_at = Some(now);
 
         // Clear live state
@@ -482,13 +491,15 @@ impl App {
                 }
             };
 
-        // --- 3. Engine (AssemblyAI cloud, WhisperKit sidecar, or whisper-rs fallback) --------
+        // --- 3. Engine (Voice Bird Web cloud, WhisperKit sidecar, or whisper-rs fallback) --------
         use voice_bird::transcription::EngineConfig;
         // Pick the engine based on user preference + sidecar availability.
         let sidecar = voice_bird::transcription::sidecar_path();
         let (engine_kind_used, mut engine) = match voice_bird::transcription::try_select_engine(
             &self.config.engine_prefer,
-            &self.config.assemblyai_api_key,
+            self.config.cloud_broadcast_enabled,
+            &self.config.voicebird_api_key,
+            &self.config.voicebird_server_url,
             sidecar.as_deref(),
         ) {
             Ok(pair) => pair,
@@ -501,13 +512,13 @@ impl App {
         self.engine_kind = match engine_kind_used {
             voice_bird::transcription::EngineKind::WhisperRs => "whisper_rs".into(),
             voice_bird::transcription::EngineKind::WhisperKit => "whisperkit".into(),
-            voice_bird::transcription::EngineKind::AssemblyAi => "assemblyai".into(),
+            voice_bird::transcription::EngineKind::VoiceBirdWeb => "voicebird".into(),
         };
-        self.is_cloud_engine = matches!(
+        self.cloud_broadcast_active = matches!(
             engine_kind_used,
-            voice_bird::transcription::EngineKind::AssemblyAi,
+            voice_bird::transcription::EngineKind::VoiceBirdWeb,
         );
-        if self.is_cloud_engine {
+        if self.cloud_broadcast_active {
             self.cloud_reminder_until = Some(
                 std::time::Instant::now() + std::time::Duration::from_secs(3),
             );
@@ -515,7 +526,7 @@ impl App {
             self.cloud_reminder_until = None;
         }
         self.banner = None; // clear stale banner from previous run
-        let model_path = if matches!(engine_kind_used, voice_bird::transcription::EngineKind::AssemblyAi) {
+        let model_path = if matches!(engine_kind_used, voice_bird::transcription::EngineKind::VoiceBirdWeb) {
             std::path::PathBuf::new() // unused for cloud
         } else {
             match voice_bird::transcription::models::gguf_path(&self.config.default_model) {
@@ -526,11 +537,27 @@ impl App {
                 }
             }
         };
-        let engine_cfg = if self.is_cloud_engine {
+        let engine_cfg = if self.cloud_broadcast_active {
+            // Surface the actual device the user picked in the init
+            // handshake so the live-session card on voicebird.app shows
+            // a meaningful label (e.g. "EPOS PC 8 USB") instead of a
+            // generic "voice-bird-desktop" placeholder.
+            let device_name = self
+                .config
+                .input_device
+                .clone()
+                .or_else(|| {
+                    self.sessions
+                        .get(self.selected_index)
+                        .map(|s| s.device_name.clone())
+                })
+                .unwrap_or_else(|| "voice-bird-desktop".into());
             EngineConfig::Cloud {
-                api_key: self.config.assemblyai_api_key.clone(),
+                api_key: self.config.voicebird_api_key.clone(),
                 language: Some(self.config.language.clone()).filter(|s| s != "auto"),
                 sample_rate: 16_000,
+                server_url: self.config.voicebird_server_url.clone(),
+                device_name,
             }
         } else {
             EngineConfig::Local {
@@ -541,7 +568,11 @@ impl App {
                 min_window_ms: self.config.min_window_ms,
             }
         };
-        let handle = match engine.start(engine_cfg) {
+        let handle = {
+            let _enter = self.rt.enter();
+            engine.start(engine_cfg)
+        };
+        let handle = match handle {
             Ok(h) => h,
             Err(e) => {
                 self.status = RecordingStatus::Error(format!("engine: {e}"));
@@ -550,19 +581,23 @@ impl App {
         };
 
         // --- 4. WAV writer on the resampled 16 kHz mono stream ------------
-        let wav_path = session_dir.join("audio.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut wav = match hound::WavWriter::create(&wav_path, spec) {
-            Ok(w) => w,
-            Err(e) => {
-                self.status = RecordingStatus::Error(format!("wav: {e}"));
-                return;
+        // Skipped when broadcasting — local audio is not persisted.
+        let mut wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = if let Some(dir) = session_dir.as_ref() {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            match hound::WavWriter::create(dir.join("audio.wav"), spec) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    self.status = RecordingStatus::Error(format!("wav: {e}"));
+                    return;
+                }
             }
+        } else {
+            None
         };
 
         let pcm_tx = handle.pcm_tx.clone();
@@ -570,7 +605,9 @@ impl App {
         let committed = self.committed.clone();
         let tentative = self.tentative.clone();
         let engine_error_channel = self.engine_error_channel.clone();
-        let writer_path = session_dir.join("transcript.jsonl");
+        // Skipped when broadcasting — no JSONL writer needed.
+        let writer_path: Option<std::path::PathBuf> =
+            session_dir.as_ref().map(|d| d.join("transcript.jsonl"));
 
         // Wall-clock anchor. The streaming engine emits buffer-relative
         // timestamps (they reset after each sliding-window trim), so the
@@ -582,7 +619,7 @@ impl App {
         // Spawned only when `refinement_model` is set in config AND the
         // model file is present on disk. If either check fails, refinement
         // is silently skipped and only the streaming engine runs.
-        let (refinement_pcm_tx, refinement_handle) = if self.is_cloud_engine {
+        let (refinement_pcm_tx, refinement_handle) = if self.cloud_broadcast_active {
             (None, None)
         } else {
             self.config
@@ -622,10 +659,12 @@ impl App {
             while let Some(frames) = frames_rx.recv().await {
                 match resampler.process(&frames) {
                     Ok(out) => {
-                        for s in &out {
-                            if let Err(e) = wav.write_sample(*s) {
-                                log::error!("wav write: {e}");
-                                break;
+                        if let Some(w) = wav.as_mut() {
+                            for s in &out {
+                                if let Err(e) = w.write_sample(*s) {
+                                    log::error!("wav write: {e}");
+                                    break;
+                                }
                             }
                         }
                         if let Some(ref rtx) = refinement_pcm_tx_for_producer {
@@ -648,8 +687,10 @@ impl App {
                     }
                 }
             }
-            if let Err(e) = wav.finalize() {
-                log::error!("wav finalize: {e}");
+            if let Some(w) = wav.take() {
+                if let Err(e) = w.finalize() {
+                    log::error!("wav finalize: {e}");
+                }
             }
         });
 
@@ -657,13 +698,20 @@ impl App {
         // Loops until the engine's broadcast channel closes, which only
         // happens after the engine thread exits — so we never miss the
         // final tail-flush Committed event emitted at end-of-stream.
+        // When broadcasting, `writer_path` is None and we skip JSONL
+        // persistence entirely — the cloud holds the authoritative
+        // transcript on the user's voicebird.app account.
         let join = self.rt.spawn(async move {
-            let mut writer = match voice_bird::session::writer::SegmentWriter::open(&writer_path) {
-                Ok(w) => w,
-                Err(e) => {
-                    log::error!("writer: {e}");
-                    return;
+            let mut writer = if let Some(p) = writer_path.as_ref() {
+                match voice_bird::session::writer::SegmentWriter::open(p) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        log::error!("writer: {e}");
+                        return;
+                    }
                 }
+            } else {
+                None
             };
             while let Ok(evt) = events_rx.recv().await {
                 match evt {
@@ -674,10 +722,12 @@ impl App {
                         *tentative.lock() = s;
                     }
                     voice_bird::transcription::EngineEvent::Committed(seg) => {
-                        let written = (&seg).into();
-                        if let Err(e) = writer.append(&written) {
-                            log::error!("writer append: {e}");
-                            break;
+                        if let Some(w) = writer.as_mut() {
+                            let written = (&seg).into();
+                            if let Err(e) = w.append(&written) {
+                                log::error!("writer append: {e}");
+                                break;
+                            }
                         }
                         // Override the engine's buffer-relative timestamp
                         // with wall-clock elapsed so the UI shows sane
@@ -717,7 +767,14 @@ impl App {
             // vec so the UI only shows streaming text as the live "tail"
             // since the most recent refinement cutoff.
             let committed_for_refinement = self.committed.clone();
-            let r_writer_path = session_dir.join("transcript.refined.jsonl");
+            // Refinement only spawns when not broadcasting (see the
+            // refinement_handle construction above, which short-circuits
+            // to None on `cloud_broadcast_enabled`), so session_dir is
+            // guaranteed Some here.
+            let r_writer_path = session_dir
+                .as_ref()
+                .expect("session_dir present whenever refinement runs")
+                .join("transcript.refined.jsonl");
             let r_join = self.rt.spawn(async move {
                 let mut writer = match voice_bird::session::writer::SegmentWriter::open(
                     &r_writer_path,
@@ -782,7 +839,7 @@ impl App {
 
     /// Stop the active recording and finalize the session files.
     pub fn stop_recording(&mut self) {
-        self.is_cloud_engine = false;
+        self.cloud_broadcast_active = false;
         self.cloud_reminder_until = None;
 
         // Drop the cpal stream first — this halts capture, the cpal callback

@@ -31,7 +31,9 @@ pub enum FieldKey {
     RefinementModel,
     RefinementWindowMs,
     RefinementBeamSize,
-    AssemblyAiApiKey,
+    VoiceBirdApiKey,
+    VoiceBirdServerUrl,
+    CloudBroadcastEnabled,
 }
 
 pub const FIELDS: &[Field] = &[
@@ -46,7 +48,9 @@ pub const FIELDS: &[Field] = &[
     Field { section: "Refinement (whisper only)", key: FieldKey::RefinementModel, label: "Refinement model" },
     Field { section: "Refinement (whisper only)", key: FieldKey::RefinementWindowMs, label: "Window (ms)" },
     Field { section: "Refinement (whisper only)", key: FieldKey::RefinementBeamSize, label: "Beam size" },
-    Field { section: "Cloud", key: FieldKey::AssemblyAiApiKey, label: "AssemblyAI API key" },
+    Field { section: "Cloud", key: FieldKey::VoiceBirdServerUrl, label: "Voice Bird server URL" },
+    Field { section: "Cloud", key: FieldKey::VoiceBirdApiKey, label: "Voice Bird API key" },
+    Field { section: "Cloud", key: FieldKey::CloudBroadcastEnabled, label: "Live broadcast" },
 ];
 
 /// How a field is edited in the settings view.
@@ -63,13 +67,23 @@ pub enum FieldKind {
 
 pub fn field_kind(key: FieldKey) -> FieldKind {
     match key {
-        FieldKey::SessionDir | FieldKey::AssemblyAiApiKey => FieldKind::Text,
+        FieldKey::SessionDir
+        | FieldKey::VoiceBirdApiKey
+        | FieldKey::VoiceBirdServerUrl => FieldKind::Text,
         FieldKey::HopMs
         | FieldKey::MinWindowMs
         | FieldKey::RefinementWindowMs
         | FieldKey::RefinementBeamSize => FieldKind::Numeric,
+        FieldKey::CloudBroadcastEnabled => FieldKind::Cycle,
         _ => FieldKind::Cycle,
     }
+}
+
+/// Public re-export for the debug snapshot writer in main.rs.
+/// Returns the same options used by the cycle UX, suffixed with the
+/// no-op marker for fields whose semantics include "(none)" / "(off)".
+pub fn cycle_options_for(key: FieldKey, app: &App) -> Vec<String> {
+    cycle_options(key, app)
 }
 
 fn cycle_options(key: FieldKey, app: &App) -> Vec<String> {
@@ -98,8 +112,8 @@ fn cycle_options(key: FieldKey, app: &App) -> Vec<String> {
             "auto".into(),
             "whisperkit".into(),
             "whisper_rs".into(),
-            "assemblyai".into(),
         ],
+        FieldKey::CloudBroadcastEnabled => vec!["off".into(), "on".into()],
         FieldKey::RefinementModel => {
             let mut v = vec![String::new()]; // empty = "(off)"
             for m in Catalog::builtin().all() {
@@ -131,6 +145,9 @@ fn current_string_value(app: &App, key: FieldKey) -> String {
         FieldKey::InputDevice => c.input_device.clone().unwrap_or_default(),
         FieldKey::EnginePrefer => c.engine_prefer.clone(),
         FieldKey::RefinementModel => c.refinement_model.clone().unwrap_or_default(),
+        FieldKey::CloudBroadcastEnabled => {
+            if c.cloud_broadcast_enabled { "on".into() } else { "off".into() }
+        }
         _ => String::new(),
     }
 }
@@ -170,6 +187,9 @@ fn cycle_string(app: &mut App, key: FieldKey, delta: i32) {
         FieldKey::EnginePrefer => c.engine_prefer = v,
         FieldKey::RefinementModel => {
             c.refinement_model = if v.is_empty() { None } else { Some(v) };
+        }
+        FieldKey::CloudBroadcastEnabled => {
+            c.cloud_broadcast_enabled = v == "on";
         }
         _ => {}
     }
@@ -227,7 +247,11 @@ pub fn field_display(app: &App, key: FieldKey) -> String {
             .unwrap_or_else(|| "(off)".into()),
         FieldKey::RefinementWindowMs => c.refinement_window_ms.to_string(),
         FieldKey::RefinementBeamSize => c.refinement_beam_size.to_string(),
-        FieldKey::AssemblyAiApiKey => format!("{} [plaintext]", mask_api_key(&c.assemblyai_api_key)),
+        FieldKey::VoiceBirdApiKey => format!("{} [plaintext]", mask_api_key(&c.voicebird_api_key)),
+        FieldKey::VoiceBirdServerUrl => c.voicebird_server_url.clone(),
+        FieldKey::CloudBroadcastEnabled => {
+            if c.cloud_broadcast_enabled { "on".into() } else { "off".into() }
+        }
     }
 }
 
@@ -376,17 +400,27 @@ fn apply_edit(app: &mut App) {
                 return;
             }
         },
-        FieldKey::AssemblyAiApiKey => c.assemblyai_api_key = buf,
+        FieldKey::VoiceBirdApiKey => c.voicebird_api_key = buf,
+        FieldKey::VoiceBirdServerUrl => c.voicebird_server_url = buf,
+        FieldKey::CloudBroadcastEnabled => {
+            // Toggle is edited via Cycle, not Text — apply_edit shouldn't
+            // be reached for it, but tolerate by parsing common boolean
+            // strings.
+            c.cloud_broadcast_enabled = matches!(buf.as_str(), "on" | "true" | "1" | "yes");
+        }
     }
     app.settings_error = None;
 }
 
 fn try_save(app: &mut App) -> bool {
-    if app.config.engine_prefer == "assemblyai"
-        && app.config.assemblyai_api_key.is_empty()
-    {
+    if app.config.cloud_broadcast_enabled && app.config.voicebird_api_key.is_empty() {
         app.settings_error =
-            Some("engine_prefer=assemblyai requires a non-empty AssemblyAI API key".into());
+            Some("Live broadcast requires a non-empty Voice Bird API key".into());
+        return false;
+    }
+    if app.config.cloud_broadcast_enabled && app.config.voicebird_server_url.is_empty() {
+        app.settings_error =
+            Some("Live broadcast requires a Voice Bird server URL".into());
         return false;
     }
     if let Err(e) = app.config.save() {
@@ -462,7 +496,8 @@ pub fn handle_key(app: &mut App, key: KeyCode) {
                 if let Some(fld) = current_field(app).copied() {
                     let c = &app.config;
                     app.settings_edit_buf = Some(match fld.key {
-                        FieldKey::AssemblyAiApiKey => c.assemblyai_api_key.clone(),
+                        FieldKey::VoiceBirdApiKey => c.voicebird_api_key.clone(),
+                        FieldKey::VoiceBirdServerUrl => c.voicebird_server_url.clone(),
                         FieldKey::SessionDir => c.session_dir.clone(),
                         _ => String::new(),
                     });
@@ -494,7 +529,8 @@ mod tests {
     use crate::app::App;
 
     /// Advance `engine_prefer` forward through the full cycle: auto →
-    /// whisperkit → whisper_rs → assemblyai → auto (wraps).
+    /// whisperkit → whisper_rs → auto (wraps). Cloud broadcast lives in
+    /// its own toggle now and is not part of this cycle.
     #[test]
     fn cycle_string_engine_prefer_forward() {
         let mut app = App::new();
@@ -506,12 +542,33 @@ mod tests {
         cycle_string(&mut app, FieldKey::EnginePrefer, 1);
         assert_eq!(app.config.engine_prefer, "whisper_rs");
 
-        cycle_string(&mut app, FieldKey::EnginePrefer, 1);
-        assert_eq!(app.config.engine_prefer, "assemblyai");
-
-        // Wrap back to the start.
+        // Wrap back to the start — voicebird is no longer in the cycle.
         cycle_string(&mut app, FieldKey::EnginePrefer, 1);
         assert_eq!(app.config.engine_prefer, "auto");
+    }
+
+    /// Cloud broadcast toggle cycles off ↔ on.
+    #[test]
+    fn cycle_string_cloud_broadcast_toggle() {
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = false;
+
+        cycle_string(&mut app, FieldKey::CloudBroadcastEnabled, 1);
+        assert!(app.config.cloud_broadcast_enabled);
+
+        cycle_string(&mut app, FieldKey::CloudBroadcastEnabled, 1);
+        assert!(!app.config.cloud_broadcast_enabled);
+    }
+
+    /// Saving with broadcast on but no API key surfaces an error.
+    #[test]
+    fn save_blocks_when_broadcast_on_without_key() {
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = true;
+        app.config.voicebird_api_key.clear();
+        let ok = try_save(&mut app);
+        assert!(!ok);
+        assert!(app.settings_error.as_deref().unwrap_or("").to_lowercase().contains("api key"));
     }
 
     /// hop_ms forward: 750 → 1000 → 1500; backward: 750 → 500.
