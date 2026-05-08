@@ -83,6 +83,7 @@ fn voicebird_produces_committed_event_for_fixture() {
                 sample_rate: 16_000,
                 server_url: url,
                 device_name: "smoke-test".into(),
+                app_name: String::new(),
             })
             .unwrap();
 

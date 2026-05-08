@@ -67,6 +67,13 @@ pub enum EngineConfig {
         /// surfaces in the live-session card so users can tell which
         /// audio source is being streamed when multiple stream.
         device_name: String,
+        /// Source-application label sent in the init handshake.
+        /// Empty for mic / system captures (UI falls back to
+        /// `device_name`); the app's display name (e.g. "Chrome",
+        /// "Safari") for `SessionSource::App` loopback captures so
+        /// each (device, app) pair gets its own row in the
+        /// Transcriptions tab.
+        app_name: String,
     },
 }
 

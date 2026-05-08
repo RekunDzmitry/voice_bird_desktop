@@ -74,18 +74,27 @@ fn ws_url_override() -> Option<String> {
 
 impl TranscriptionEngine for VoiceBirdEngine {
     fn start(&mut self, cfg: EngineConfig) -> anyhow::Result<EngineHandle> {
-        let (api_key_cfg, language, sample_rate, server_url_cfg, device_name) = match cfg {
-            EngineConfig::Cloud {
-                api_key,
-                language,
-                sample_rate,
-                server_url,
-                device_name,
-            } => (api_key, language, sample_rate, server_url, device_name),
-            EngineConfig::Local { .. } => {
-                anyhow::bail!("VoiceBirdEngine requires EngineConfig::Cloud");
-            }
-        };
+        let (api_key_cfg, language, sample_rate, server_url_cfg, device_name, app_name) =
+            match cfg {
+                EngineConfig::Cloud {
+                    api_key,
+                    language,
+                    sample_rate,
+                    server_url,
+                    device_name,
+                    app_name,
+                } => (
+                    api_key,
+                    language,
+                    sample_rate,
+                    server_url,
+                    device_name,
+                    app_name,
+                ),
+                EngineConfig::Local { .. } => {
+                    anyhow::bail!("VoiceBirdEngine requires EngineConfig::Cloud");
+                }
+            };
 
         // Engine-level api_key/url passed at construction win over the
         // per-call config only if the latter is empty (preserves the same
@@ -152,7 +161,7 @@ impl TranscriptionEngine for VoiceBirdEngine {
                 "session_id": session_id,
                 "device_name": device_name,
                 "device_type": "desktop",
-                "app_name": env!("CARGO_PKG_NAME"),
+                "app_name": app_name,
                 "sample_rate": sample_rate,
                 "channels": 1,
                 "audio_format": "pcm16le",
