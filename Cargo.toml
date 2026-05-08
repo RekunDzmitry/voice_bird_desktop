@@ -66,6 +66,11 @@ hex = "0.4"
 # WhisperKit sidecar IPC (length-prefixed binary samples over stdio)
 bytemuck = "1"
 
+# System introspection for auto-picking the local model on first launch
+# (RAM and CPU architecture). Default features include all platforms we
+# care about; we only call refresh_memory(), which is cheap.
+sysinfo = "0.32"
+
 [features]
 engine-smoke = []
 # Requires VOICEBIRD_API_KEY + VOICEBIRD_WS_URL env vars at test time;
@@ -91,6 +96,11 @@ screencapturekit = "0.3.6"
 core-foundation = "0.10"
 core-media-rs = "0.3"
 core-audio-types-rs = "0.3"
+# Used by `platform::enumerate_app_sessions` to walk
+# `NSWorkspace.runningApplications` directly (no Screen Recording
+# permission required, unlike SCShareableContent). Pinned to the same
+# `objc` 0.2 ecosystem `screencapturekit` 0.3.6 already depends on.
+objc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

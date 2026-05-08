@@ -29,6 +29,8 @@ pub enum CaptureKeepAlive {
     Cpal(cpal::Stream),
     #[cfg(target_os = "macos")]
     Sck(crate::audio::loopback::loopback_macos::LoopbackKeepAlive),
+    #[cfg(target_os = "windows")]
+    Wasapi(crate::audio::loopback::loopback_windows::WasapiKeepAlive),
 }
 
 /// Returned by [`capture_default_input`] / [`capture_input`] /

@@ -116,6 +116,7 @@ mod tests {
             language: None,
             sample_rate: 16_000,
             server_url: "wss://example.test/api/audio/stream".into(),
+            device_name: "mock-device".into(),
         };
         let err = engine.start(cfg).err().expect("expected Err on Cloud");
         assert!(

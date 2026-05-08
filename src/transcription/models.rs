@@ -72,6 +72,31 @@ impl Catalog {
     pub fn all(&self) -> &[ModelEntry] { &self.0 }
 }
 
+/// Reject combinations where a non-English language is requested but the
+/// configured local Whisper model is English-only. Without this, users
+/// selecting Russian/Polish/etc with a `.en` ggml file silently get
+/// gibberish English output. Returns `Ok(())` for known good combinations
+/// and for anything we can't verify (missing catalog entry, "auto" /
+/// English / empty language).
+pub fn validate_local_language(model_id: &str, language: &str) -> Result<(), String> {
+    let lang = language.trim();
+    if lang.is_empty() || lang == "en" || lang == "auto" {
+        return Ok(());
+    }
+    let catalog = Catalog::builtin();
+    let Some(entry) = catalog.get(model_id) else {
+        // Unknown model id: don't block — let the engine surface its own error.
+        return Ok(());
+    };
+    if entry.language == "en" {
+        return Err(format!(
+            "Model '{}' is English-only; pick distil-large-v3 or large-v3-turbo for {}.",
+            entry.id, lang
+        ));
+    }
+    Ok(())
+}
+
 pub fn cache_dir() -> anyhow::Result<PathBuf> {
     let base = dirs::cache_dir().ok_or_else(|| anyhow!("no cache dir"))?;
     Ok(base.join("voice-bird").join("models"))
@@ -139,5 +164,31 @@ mod tests {
         std::fs::write(tmp.path(), b"hello").unwrap();
         let wrong = "0".repeat(64);
         assert!(verify_sha256(tmp.path(), &wrong).is_err());
+    }
+
+    #[test]
+    fn validate_local_language_rejects_english_model_for_russian() {
+        let err = validate_local_language("tiny.en", "ru").unwrap_err();
+        assert!(err.contains("tiny.en"));
+        assert!(err.contains("ru"));
+    }
+
+    #[test]
+    fn validate_local_language_accepts_multilingual_for_russian() {
+        assert!(validate_local_language("distil-large-v3", "ru").is_ok());
+        assert!(validate_local_language("large-v3-turbo", "pl").is_ok());
+    }
+
+    #[test]
+    fn validate_local_language_passes_through_english_and_auto() {
+        assert!(validate_local_language("tiny.en", "en").is_ok());
+        assert!(validate_local_language("tiny.en", "auto").is_ok());
+        assert!(validate_local_language("tiny.en", "").is_ok());
+    }
+
+    #[test]
+    fn validate_local_language_ignores_unknown_model_id() {
+        // Unknown ids slip through — engine layer surfaces its own error.
+        assert!(validate_local_language("custom-user-model", "ru").is_ok());
     }
 }

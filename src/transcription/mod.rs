@@ -1,3 +1,4 @@
+pub mod auto_select;
 pub mod local_agreement;
 pub mod mock;
 pub mod models;
