@@ -23,6 +23,14 @@ struct FinalTranscript<'a> {
     meta: &'a SessionMeta,
 }
 
+/// Owned version of `FinalTranscript` — used to deserialize
+/// transcript.json for export/recovery.
+#[derive(Debug, Deserialize)]
+pub struct FinalTranscriptValue {
+    pub segments: Vec<WrittenSegment>,
+    pub meta: SessionMeta,
+}
+
 pub fn finalize(
     jsonl: &Path,
     out_json: &Path,

@@ -22,6 +22,7 @@ pub fn render(f: &mut Frame, app: &App) {
     // WhisperKit→whisper-rs restart on error; we surface errors via this
     // banner instead and let the user press `r` to retry.
     let has_banner = app.banner.is_some();
+    let has_export = app.export_banner.is_some();
     let has_reminder = app
         .focused_cloud_reminder_until()
         .map(|t| Instant::now() < t)
@@ -43,7 +44,10 @@ pub fn render(f: &mut Frame, app: &App) {
         constraints.push(Constraint::Length(1)); // reminder
     }
     if has_banner {
-        constraints.push(Constraint::Length(1)); // banner
+        constraints.push(Constraint::Length(1)); // error banner
+    }
+    if has_export {
+        constraints.push(Constraint::Length(1)); // export banner
     }
     constraints.push(Constraint::Length(1)); // footer/keys
 
@@ -82,11 +86,18 @@ pub fn render(f: &mut Frame, app: &App) {
         render_banner(f, root[next_slot], app);
         next_slot += 1;
     }
+    if has_export {
+        render_export_banner(f, root[next_slot], app);
+        next_slot += 1;
+    }
     render_footer(f, root[next_slot], app);
 
     // Modal overlay (rendered last so it sits on top of everything).
     if app.mode == AppMode::ApiKeyModal {
         render_api_key_modal(f, f.area(), app);
+    }
+    if app.mode == AppMode::PathModal {
+        render_path_modal(f, f.area(), app);
     }
 }
 
@@ -424,6 +435,13 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         " Mode "
     };
 
+    let path_raw = app.config.session_dir_expanded();
+    let path_display = if path_raw.len() > 24 {
+        format!("…{}", &path_raw[path_raw.len().saturating_sub(23)..])
+    } else {
+        path_raw.to_string()
+    };
+
     let lines = vec![
         Line::from(vec![
             Span::raw("Cloud:    "),
@@ -438,6 +456,14 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::Gray),
             ),
             Span::styled("  (m)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("Path:     "),
+            Span::styled(
+                &path_display,
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled("  (p)", Style::default().fg(Color::DarkGray)),
         ]),
     ];
     let p = Paragraph::new(lines)
@@ -484,6 +510,48 @@ fn render_api_key_modal(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Voice Bird API key ")
+        .style(Style::default().fg(Color::White));
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, popup);
+}
+
+/// Centered overlay for editing the session output directory. Same
+/// pattern as render_api_key_modal — the underlying UI stays visible
+/// behind the popup. Shows the raw input plus an expanded preview
+/// (resolving `~` to the real home directory).
+fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
+    let popup = centered(70, 6, area);
+    f.render_widget(Clear, popup);
+
+    let raw = app.path_buf.clone().unwrap_or_default();
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(rest).to_string_lossy().into_owned()
+        } else {
+            raw.clone()
+        }
+    } else {
+        raw.clone()
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "Edit output path — Enter to save, Esc to cancel",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            &raw,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("→ {}", expanded),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Output Path ")
         .style(Style::default().fg(Color::White));
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, popup);
@@ -792,12 +860,36 @@ fn render_banner(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+fn render_export_banner(f: &mut Frame, area: Rect, app: &App) {
+    let msg = app.export_banner.clone().unwrap_or_default();
+    let style = if msg.starts_with("Export failed") || msg.starts_with("Failed") {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else if msg == "Exporting…" {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // Success / already exported
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    let p = Paragraph::new(Line::from(Span::styled(format!(" {msg}"), style)));
+    f.render_widget(p, area);
+}
+
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let any_active = app.active_section_count() > 0;
     let keys: String = match (any_active, &app.mode) {
         (_, AppMode::ApiKeyModal) => "[Enter] save  [Esc] cancel".into(),
+        (_, AppMode::PathModal) => "[Enter] save  [Esc] cancel".into(),
         (false, _) => {
-            "[↑/↓] select  [←/→] pane  [Space] no app  [Enter] start  [Tab] focus  [r] refresh  [c]/[l]/[m] cfg  [x] clear  [q] quit  [?] help".into()
+            "[↑/↓] select  [←/→] pane  [Space] no app  [Enter] start  [Tab] focus  [r] refresh  [c]/[l]/[m] cfg  [e] export  [p] path  [x] clear  [q] quit  [?] help".into()
         }
         (true, _) => {
             "[↑/↓] select  [←/→] pane  [Enter] add  [Tab] focus  [s] stop  [S] stop all  [c]/[l]/[m] cfg  [PgUp/PgDn] scroll  [x] clear  [q] quit".into()

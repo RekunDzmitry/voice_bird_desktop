@@ -303,6 +303,7 @@ fn run_app<B: Backend>(
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
+                            AppMode::PathModal => handle_path_modal(app, key.code),
                         }
                         if let Some(path) = debug_snapshot_path {
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
@@ -629,6 +630,50 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 if let Err(e) = app.config.save() {
                     log::error!("config save (lang cycle): {e}");
                 }
+            }
+        }
+        // Export the most recent local transcript to the cloud.
+        // Idempotent — second press is a no-op once .uploaded exists.
+        KeyCode::Char('e') if app.active_section_count() == 0 => {
+            app.export_transcript();
+        }
+        // Open the output-path modal. Only when idle (can't change
+        // paths mid-recording — sessions have already landed).
+        KeyCode::Char('p') if app.active_section_count() == 0 => {
+            app.open_path_modal();
+        }
+        _ => {}
+    }
+}
+
+fn handle_path_modal(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.path_buf = None;
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(buf) = app.path_buf.take() {
+                app.config.session_dir = buf.trim().to_string();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (path modal): {e}");
+                    app.banner = Some(format!("Save failed: {e}"));
+                } else {
+                    app.banner = Some(
+                        format!("Output path → {}", app.config.session_dir_expanded()),
+                    );
+                }
+            }
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.path_buf.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some(buf) = app.path_buf.as_mut() {
+                buf.push(ch);
             }
         }
         _ => {}
