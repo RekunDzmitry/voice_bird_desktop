@@ -29,9 +29,7 @@ pub fn capture_loopback(name: Option<&str>) -> Result<CaptureHandle> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = name;
-        Err(anyhow!(
-            "loopback capture not yet wired on this platform"
-        ))
+        Err(anyhow!("loopback capture not yet wired on this platform"))
     }
 }
 
@@ -51,8 +49,6 @@ pub fn capture_app(identifier: &str) -> Result<CaptureHandle> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = identifier;
-        Err(anyhow!(
-            "per-app capture not yet wired on this platform"
-        ))
+        Err(anyhow!("per-app capture not yet wired on this platform"))
     }
 }

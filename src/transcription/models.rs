@@ -66,10 +66,16 @@ impl Catalog {
     }
 
     pub fn default_id(&self) -> &'static str {
-        self.0.iter().find(|m| m.is_default).map(|m| m.id).unwrap_or("distil-small.en")
+        self.0
+            .iter()
+            .find(|m| m.is_default)
+            .map(|m| m.id)
+            .unwrap_or("distil-small.en")
     }
 
-    pub fn all(&self) -> &[ModelEntry] { &self.0 }
+    pub fn all(&self) -> &[ModelEntry] {
+        &self.0
+    }
 }
 
 /// Reject combinations where a non-English language is requested but the
@@ -112,7 +118,12 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> anyhow::Result<()> {
     h.update(&data);
     let got = hex::encode(h.finalize());
     if got != expected_hex {
-        return Err(anyhow!("sha256 mismatch for {}: got {} expected {}", path.display(), got, expected_hex));
+        return Err(anyhow!(
+            "sha256 mismatch for {}: got {} expected {}",
+            path.display(),
+            got,
+            expected_hex
+        ));
     }
     Ok(())
 }
@@ -123,7 +134,9 @@ pub fn download_with_verify(
     expected_sha: &str,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> anyhow::Result<()> {
-    if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let resp = reqwest::blocking::get(url)?.error_for_status()?;
     let total = resp.content_length();
     let mut downloaded = 0u64;
@@ -132,7 +145,9 @@ pub fn download_with_verify(
     let mut buf = [0u8; 1 << 16];
     loop {
         let n = std::io::Read::read(&mut src, &mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         std::io::Write::write_all(&mut out, &buf[..n])?;
         downloaded += n as u64;
         progress(downloaded, total);
@@ -153,7 +168,13 @@ mod tests {
         let catalog = Catalog::builtin();
         let default = catalog.default_id();
         assert_eq!(default, "distil-small.en");
-        for id in ["distil-small.en", "distil-large-v3", "large-v3-turbo", "base.en", "tiny.en"] {
+        for id in [
+            "distil-small.en",
+            "distil-large-v3",
+            "large-v3-turbo",
+            "base.en",
+            "tiny.en",
+        ] {
             assert!(catalog.get(id).is_some(), "missing {id}");
         }
     }

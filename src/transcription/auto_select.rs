@@ -82,6 +82,9 @@ mod tests {
         // in the catalog so AppConfig::default_model stays in sync.
         let id = pick_default_model();
         let catalog = crate::transcription::models::Catalog::builtin();
-        assert!(catalog.get(id).is_some(), "auto-pick returned unknown id: {id}");
+        assert!(
+            catalog.get(id).is_some(),
+            "auto-pick returned unknown id: {id}"
+        );
     }
 }

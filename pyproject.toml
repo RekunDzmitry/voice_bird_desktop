@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-bird-cli"
+version = "0.3.0"
+description = "Voice Bird CLI - local-first voice transcription TUI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+  { name = "Voice Bird contributors" }
+]
+keywords = ["voice", "transcription", "whisper", "cli", "tui"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio :: Speech"
+]
+
+[project.urls]
+Homepage = "https://github.com/voice-bird/voice-bird-cli"
+Repository = "https://github.com/voice-bird/voice-bird-cli"
+Issues = "https://github.com/voice-bird/voice-bird-cli/issues"
+
+[project.scripts]
+voice-bird-cli = "voice_bird_cli.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]

@@ -8,7 +8,7 @@ use ratatui::{
 use std::time::Instant;
 
 use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, MAX_SECTIONS};
-use voice_bird::session::layout::SessionSource;
+use voice_bird_cli::session::layout::SessionSource;
 
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
@@ -258,7 +258,9 @@ fn source_label(source: &SessionSource) -> String {
     match source {
         SessionSource::Microphone => "mic".into(),
         SessionSource::System => "system".into(),
-        SessionSource::App { name, device_name, .. } => {
+        SessionSource::App {
+            name, device_name, ..
+        } => {
             if device_name.is_empty() {
                 name.clone()
             } else {
@@ -341,7 +343,7 @@ fn render_section_tentative(f: &mut Frame, area: Rect, section: &Section) {
 }
 
 pub fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
-    let catalog = voice_bird::transcription::models::Catalog::builtin();
+    let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
     let selected = app.picker.as_ref().map(|p| p.index);
     let items: Vec<Line> = catalog
         .all()
@@ -364,28 +366,20 @@ pub fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
         " Pick a model (first run — required) "
     };
 
-    let p = Paragraph::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let p = Paragraph::new(items).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 
     // Popup: download progress / error if a download is in flight.
-    if let Some(progress_arc) = app
-        .picker
-        .as_ref()
-        .and_then(|p| p.downloading.as_ref())
-    {
+    if let Some(progress_arc) = app.picker.as_ref().and_then(|p| p.downloading.as_ref()) {
         let g = progress_arc.lock();
         let msg = if let Some(err) = &g.error {
             format!("Download failed: {}: {}", g.model_id, err)
         } else {
-            let pct = g
-                .total
-                .map(|t| (g.bytes * 100 / t.max(1)))
-                .unwrap_or(0);
+            let pct = g.total.map(|t| (g.bytes * 100 / t.max(1))).unwrap_or(0);
             format!("Downloading {}: {pct}%", g.model_id)
         };
-        let popup = Paragraph::new(msg)
-            .block(Block::default().borders(Borders::ALL).title(" Download "));
+        let popup =
+            Paragraph::new(msg).block(Block::default().borders(Borders::ALL).title(" Download "));
         let popup_area = centered(60, 3, area);
         f.render_widget(Clear, popup_area);
         f.render_widget(popup, popup_area);
@@ -401,7 +395,9 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
     let cloud_on = app.display_cloud_on();
     let cloud_label = if cloud_on { "[ON] " } else { "[OFF]" };
     let cloud_style = if cloud_on {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -413,18 +409,12 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
                 app.display_language(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "  (l)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  (l)", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
             Span::raw("Language: "),
-            Span::styled(
-                "en (locked)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("en (locked)", Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -451,23 +441,16 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         lang_line,
         Line::from(vec![
             Span::raw("Model:    "),
-            Span::styled(
-                app.display_model(),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(app.display_model(), Style::default().fg(Color::Gray)),
             Span::styled("  (m)", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::raw("Path:     "),
-            Span::styled(
-                &path_display,
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(&path_display, Style::default().fg(Color::Gray)),
             Span::styled("  (p)", Style::default().fg(Color::DarkGray)),
         ]),
     ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
 
@@ -503,7 +486,9 @@ fn render_api_key_modal(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             masked,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
 
@@ -541,7 +526,9 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             &raw,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("→ {}", expanded),
@@ -612,18 +599,13 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
             let is_cursor = i == app.selected_device_index && focused;
             let marker = if is_cursor { "▶ " } else { "  " };
             let kind_tag = match d.kind {
-                AudioSessionKind::Input => Span::styled(
-                    " [input] ",
-                    Style::default().fg(Color::Cyan),
-                ),
-                AudioSessionKind::Output => Span::styled(
-                    " [output/loopback] ",
-                    Style::default().fg(Color::Magenta),
-                ),
-                AudioSessionKind::App => Span::styled(
-                    " [app] ",
-                    Style::default().fg(Color::Green),
-                ),
+                AudioSessionKind::Input => {
+                    Span::styled(" [input] ", Style::default().fg(Color::Cyan))
+                }
+                AudioSessionKind::Output => {
+                    Span::styled(" [output/loopback] ", Style::default().fg(Color::Magenta))
+                }
+                AudioSessionKind::App => Span::styled(" [app] ", Style::default().fg(Color::Green)),
             };
             let is_saved = Some(d.name.as_str()) == saved && saved_kind == Some(d.kind);
             let saved_tag = if is_saved { "  (saved)" } else { "" };
@@ -695,7 +677,9 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(none_marker),
         Span::styled(
             "(no app — device only)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ),
     ]));
 
@@ -722,12 +706,8 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
         None => 0u16,
         Some(i) => (i + 1) as u16,
     };
-    let scroll = clamp_scroll_for_render(
-        cursor_row,
-        app.app_scroll,
-        items.len() as u16,
-        inner.height,
-    );
+    let scroll =
+        clamp_scroll_for_render(cursor_row, app.app_scroll, items.len() as u16, inner.height);
 
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
@@ -952,7 +932,10 @@ mod tests {
         app.selected_device_index = 1;
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("Devices"), "title missing:\n{out}");
-        assert!(out.contains("MacBook Pro Microphone"), "device 0 missing:\n{out}");
+        assert!(
+            out.contains("MacBook Pro Microphone"),
+            "device 0 missing:\n{out}"
+        );
         assert!(out.contains("BlackHole 2ch"), "device 1 missing:\n{out}");
         assert!(out.contains("[input]"), "input kind tag missing:\n{out}");
     }
@@ -980,8 +963,14 @@ mod tests {
             output("MacBook Pro Speakers"),
         ];
         let out = render_to_string(&app, 140, 30);
-        assert!(out.contains("MacBook Pro Speakers"), "output device missing:\n{out}");
-        assert!(out.contains("[output/loopback]"), "output tag missing:\n{out}");
+        assert!(
+            out.contains("MacBook Pro Speakers"),
+            "output device missing:\n{out}"
+        );
+        assert!(
+            out.contains("[output/loopback]"),
+            "output tag missing:\n{out}"
+        );
     }
 
     #[test]
@@ -1132,10 +1121,7 @@ mod tests {
         assert!(out.contains("[1]"), "slot 1 title missing:\n{out}");
         assert!(out.contains("[2]"), "slot 2 title missing:\n{out}");
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
-        assert!(
-            out.contains("(empty"),
-            "empty placeholder missing:\n{out}"
-        );
+        assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
 
     /// Idle footer hint shows the new Tab/cfg keys.

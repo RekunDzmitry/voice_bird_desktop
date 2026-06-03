@@ -40,7 +40,13 @@ pub fn finalize(
 ) -> anyhow::Result<()> {
     let segments = read_jsonl(jsonl)?;
     write_atomic(out_json, |f| {
-        serde_json::to_writer_pretty(f, &FinalTranscript { segments: &segments, meta })?;
+        serde_json::to_writer_pretty(
+            f,
+            &FinalTranscript {
+                segments: &segments,
+                meta,
+            },
+        )?;
         Ok(())
     })?;
     write_atomic(out_txt, |f| {
@@ -61,14 +67,17 @@ fn read_jsonl(path: &Path) -> anyhow::Result<Vec<WrittenSegment>> {
     let mut out = Vec::new();
     for line in s.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         out.push(serde_json::from_str(line)?);
     }
     Ok(out)
 }
 
 fn write_atomic<F>(path: &Path, write: F) -> anyhow::Result<()>
-where F: FnOnce(&mut std::fs::File) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut std::fs::File) -> anyhow::Result<()>,
 {
     let tmp = path.with_extension("tmp");
     {
@@ -92,8 +101,18 @@ mod tests {
         let jsonl = dir.path().join("transcript.jsonl");
         {
             let mut w = SegmentWriter::open(&jsonl).unwrap();
-            w.append(&WrittenSegment { t_start_ms: 0,    t_end_ms: 1500, text: "hello".into() }).unwrap();
-            w.append(&WrittenSegment { t_start_ms: 1500, t_end_ms: 3000, text: "world".into() }).unwrap();
+            w.append(&WrittenSegment {
+                t_start_ms: 0,
+                t_end_ms: 1500,
+                text: "hello".into(),
+            })
+            .unwrap();
+            w.append(&WrittenSegment {
+                t_start_ms: 1500,
+                t_end_ms: 3000,
+                text: "world".into(),
+            })
+            .unwrap();
         }
 
         let meta = SessionMeta {
@@ -108,7 +127,7 @@ mod tests {
         };
 
         let out_json = dir.path().join("transcript.json");
-        let out_txt  = dir.path().join("transcript.txt");
+        let out_txt = dir.path().join("transcript.txt");
         let out_meta = dir.path().join("meta.json");
         finalize(&jsonl, &out_json, &out_txt, &out_meta, &meta).unwrap();
 
@@ -138,8 +157,12 @@ mod tests {
             &dir.path().join("transcript.txt"),
             &dir.path().join("meta.json"),
             &meta,
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert_eq!(std::fs::read_to_string(dir.path().join("transcript.txt")).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("transcript.txt")).unwrap(),
+            ""
+        );
     }
 }

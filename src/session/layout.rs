@@ -16,7 +16,9 @@ pub fn session_slug(ts: chrono::DateTime<chrono::Utc>, source: &SessionSource) -
     let src = match source {
         SessionSource::Microphone => "mic".to_string(),
         SessionSource::System => "system".to_string(),
-        SessionSource::App { name, device_name, .. } => {
+        SessionSource::App {
+            name, device_name, ..
+        } => {
             let app = normalize_slug(name);
             let dev = normalize_slug(device_name);
             if dev.is_empty() {
@@ -39,7 +41,13 @@ pub fn session_dir(
 
 fn normalize_slug(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -62,7 +70,9 @@ mod tests {
 
     #[test]
     fn slug_uses_timestamp_and_source() {
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 4, 16, 14, 32, 7).unwrap();
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 16, 14, 32, 7)
+            .unwrap();
         let s = session_slug(ts, &app_zoom_on("MacBook Pro Speakers"));
         assert_eq!(s, "2026-04-16_14-32-07-zoom-on-macbook-pro-speakers");
     }
@@ -101,8 +111,14 @@ mod tests {
     #[test]
     fn slug_for_mic_and_system() {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        assert_eq!(session_slug(ts, &SessionSource::Microphone), "2026-01-02_03-04-05-mic");
-        assert_eq!(session_slug(ts, &SessionSource::System),     "2026-01-02_03-04-05-system");
+        assert_eq!(
+            session_slug(ts, &SessionSource::Microphone),
+            "2026-01-02_03-04-05-mic"
+        );
+        assert_eq!(
+            session_slug(ts, &SessionSource::System),
+            "2026-01-02_03-04-05-system"
+        );
     }
 
     #[test]
@@ -110,6 +126,9 @@ mod tests {
         let ts = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let root = std::path::PathBuf::from("/tmp/voice-bird/sessions");
         let dir = session_dir(&root, ts, &SessionSource::Microphone);
-        assert_eq!(dir, std::path::PathBuf::from("/tmp/voice-bird/sessions/2026-01-02_03-04-05-mic"));
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/tmp/voice-bird/sessions/2026-01-02_03-04-05-mic")
+        );
     }
 }

@@ -38,27 +38,23 @@ impl RefinementEngine {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = events_tx
-                        .send(EngineEvent::Error(format!("refinement load model: {e}")));
+                    let _ =
+                        events_tx.send(EngineEvent::Error(format!("refinement load model: {e}")));
                     return;
                 }
             };
             let _ = events_tx.send(EngineEvent::ModelLoaded {
                 name: format!(
                     "refine:{}",
-                    model_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
+                    model_path.file_name().unwrap_or_default().to_string_lossy()
                 ),
             });
 
             let mut state = match ctx.create_state() {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = events_tx.send(EngineEvent::Error(format!(
-                        "refinement create state: {e}"
-                    )));
+                    let _ =
+                        events_tx.send(EngineEvent::Error(format!("refinement create state: {e}")));
                     return;
                 }
             };

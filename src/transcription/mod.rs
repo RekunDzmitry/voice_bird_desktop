@@ -33,7 +33,7 @@ impl From<&Segment> for WrittenSegment {
     fn from(s: &Segment) -> Self {
         WrittenSegment {
             t_start_ms: s.t_start.as_millis() as u64,
-            t_end_ms:   s.t_end.as_millis() as u64,
+            t_end_ms: s.t_end.as_millis() as u64,
             text: s.text.clone(),
         }
     }
@@ -138,12 +138,14 @@ pub fn try_select_engine(
     if cloud_broadcast_enabled {
         if voicebird_api_key.is_empty() {
             return Err(
-                "Live broadcast enabled but no Voice Bird API key — open settings (press ',')".into(),
+                "Live broadcast enabled but no Voice Bird API key — open settings (press ',')"
+                    .into(),
             );
         }
         if voicebird_server_url.is_empty() {
             return Err(
-                "Live broadcast enabled but no Voice Bird server URL — open settings (press ',')".into(),
+                "Live broadcast enabled but no Voice Bird server URL — open settings (press ',')"
+                    .into(),
             );
         }
         return Ok((
@@ -195,7 +197,7 @@ pub fn sidecar_path() -> Option<std::path::PathBuf> {
     if sibling.exists() {
         return Some(sibling);
     }
-    // project dev fallback (running via `cargo run`, target/debug/voice-bird)
+    // project dev fallback (running via `cargo run`, target/debug/voice-bird-cli)
     let dev = dir.join("../../whisperkit-helper/.build/release/voice-bird-whisperkit");
     if dev.exists() {
         return Some(dev);
@@ -218,13 +220,17 @@ mod select_tests {
 
     #[test]
     fn broadcast_without_key_returns_err() {
-        let err = try_select_engine("auto", true, "", TEST_URL, None).err().unwrap();
+        let err = try_select_engine("auto", true, "", TEST_URL, None)
+            .err()
+            .unwrap();
         assert!(err.to_lowercase().contains("api key"));
     }
 
     #[test]
     fn broadcast_without_url_returns_err() {
-        let err = try_select_engine("auto", true, "vb-fake", "", None).err().unwrap();
+        let err = try_select_engine("auto", true, "vb-fake", "", None)
+            .err()
+            .unwrap();
         assert!(err.to_lowercase().contains("server url"));
     }
 

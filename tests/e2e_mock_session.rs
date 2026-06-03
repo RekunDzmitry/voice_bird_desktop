@@ -2,9 +2,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 
-use voice_bird::session::finalize::{finalize, SessionMeta};
-use voice_bird::session::writer::SegmentWriter;
-use voice_bird::transcription::{
+use voice_bird_cli::session::finalize::{finalize, SessionMeta};
+use voice_bird_cli::session::writer::SegmentWriter;
+use voice_bird_cli::transcription::{
     mock::{MockEngine, MockEvent},
     EngineConfig, EngineEvent, TranscriptionEngine,
 };

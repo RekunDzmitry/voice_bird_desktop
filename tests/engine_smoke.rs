@@ -1,36 +1,49 @@
 #![cfg(feature = "engine-smoke")]
 
 use std::time::Duration;
-use voice_bird::transcription::{
-    whisper_rs_engine::WhisperRsEngine,
-    EngineConfig, EngineEvent, TranscriptionEngine,
+use voice_bird_cli::transcription::{
+    whisper_rs_engine::WhisperRsEngine, EngineConfig, EngineEvent, TranscriptionEngine,
 };
 
 #[test]
 fn whisper_rs_produces_non_empty_transcript_for_fixture() {
     // Downloads tiny.en on demand. Path is cached; test is slow first time.
-    let tiny = voice_bird::transcription::models::Catalog::builtin()
-        .get("tiny.en").unwrap().clone();
-    let cache = voice_bird::transcription::models::gguf_path("tiny.en").unwrap();
+    let tiny = voice_bird_cli::transcription::models::Catalog::builtin()
+        .get("tiny.en")
+        .unwrap()
+        .clone();
+    let cache = voice_bird_cli::transcription::models::gguf_path("tiny.en").unwrap();
     if !cache.exists() {
-        voice_bird::transcription::models::download_with_verify(
-            tiny.gguf_url, &cache, tiny.gguf_sha256, &mut |_, _| {},
-        ).unwrap();
+        voice_bird_cli::transcription::models::download_with_verify(
+            tiny.gguf_url,
+            &cache,
+            tiny.gguf_sha256,
+            &mut |_, _| {},
+        )
+        .unwrap();
     }
 
     let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();
-    let samples: Vec<f32> = spec.into_samples::<i16>()
-        .map(|s| s.unwrap() as f32 / i16::MAX as f32).collect();
+    let samples: Vec<f32> = spec
+        .into_samples::<i16>()
+        .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+        .collect();
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let mut engine = WhisperRsEngine::default();
-        let handle = engine.start(EngineConfig::Local {
-            model_path: cache,
-            language: Some("en".into()),
-            sample_rate: 16_000,
-            hop_ms: 750, min_window_ms: 1000,
-        }).unwrap();
+        let handle = engine
+            .start(EngineConfig::Local {
+                model_path: cache,
+                language: Some("en".into()),
+                sample_rate: 16_000,
+                hop_ms: 750,
+                min_window_ms: 1000,
+            })
+            .unwrap();
 
         // Feed in 500ms chunks
         for chunk in samples.chunks(8_000) {
@@ -47,7 +60,11 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
                 transcript.push(' ');
             }
         }
-        assert!(transcript.to_lowercase().contains("hello"), "transcript = {:?}", transcript);
+        assert!(
+            transcript.to_lowercase().contains("hello"),
+            "transcript = {:?}",
+            transcript
+        );
     });
 }
 
@@ -55,7 +72,7 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
 #[test]
 fn voicebird_produces_committed_event_for_fixture() {
     use std::time::Duration;
-    use voice_bird::transcription::{
+    use voice_bird_cli::transcription::{
         voicebird_engine::VoiceBirdEngine, EngineConfig, EngineEvent, TranscriptionEngine,
     };
 
@@ -96,9 +113,7 @@ fn voicebird_produces_committed_event_for_fixture() {
 
         let mut rx = handle.events_rx;
         let mut saw_committed = false;
-        while let Ok(Ok(ev)) =
-            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
-        {
+        while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
             if matches!(ev, EngineEvent::Committed(_)) {
                 saw_committed = true;
                 break;

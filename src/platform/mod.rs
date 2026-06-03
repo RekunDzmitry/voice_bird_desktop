@@ -2,7 +2,7 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 
-pub use voice_bird::config::AudioSessionKind;
+pub use voice_bird_cli::config::AudioSessionKind;
 
 /// A capturable physical audio device. Always either an input (mic) or
 /// an output (loopback target). The App dimension is its own list — see
@@ -191,8 +191,8 @@ fn enumerate_app_sessions() -> Result<Vec<AppSession>> {
     use windows::core::Interface;
     use windows::Win32::Foundation::{CloseHandle, HMODULE};
     use windows::Win32::Media::Audio::{
-        eConsole, eRender, IAudioSessionControl2, IAudioSessionEnumerator,
-        IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
+        eConsole, eRender, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
+        IMMDeviceEnumerator, MMDeviceEnumerator,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -211,8 +211,7 @@ fn enumerate_app_sessions() -> Result<Vec<AppSession>> {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             let endpoint = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-            let session_mgr: IAudioSessionManager2 =
-                endpoint.Activate(CLSCTX_ALL, None)?;
+            let session_mgr: IAudioSessionManager2 = endpoint.Activate(CLSCTX_ALL, None)?;
             let session_enum: IAudioSessionEnumerator = session_mgr.GetSessionEnumerator()?;
             let count = session_enum.GetCount()?; // returns i32
             for i in 0..count {

@@ -14,20 +14,10 @@ use super::{EngineConfig, EngineEvent, EngineHandle, Segment, Token, Transcripti
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum SidecarEvent {
-    Ready {
-        model: String,
-    },
-    Committed {
-        t0: f64,
-        t1: f64,
-        text: String,
-    },
-    Tentative {
-        text: String,
-    },
-    Error {
-        message: String,
-    },
+    Ready { model: String },
+    Committed { t0: f64, t1: f64, text: String },
+    Tentative { text: String },
+    Error { message: String },
 }
 
 /// Rust client for the `voice-bird-whisperkit` Swift sidecar. The engine
@@ -237,8 +227,7 @@ impl TranscriptionEngine for WhisperKitEngine {
                     )));
                 }
                 Err(e) => {
-                    let _ = events_tx_child
-                        .send(EngineEvent::Error(format!("sidecar wait: {e}")));
+                    let _ = events_tx_child.send(EngineEvent::Error(format!("sidecar wait: {e}")));
                 }
             }
         });

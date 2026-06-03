@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
-use voice_bird::transcription::{
+use voice_bird_cli::transcription::{
     whisper_kit_engine::WhisperKitEngine, EngineConfig, EngineEvent, TranscriptionEngine,
 };
 

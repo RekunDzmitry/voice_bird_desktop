@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird::config::AppConfig;
-use voice_bird::session::layout::SessionSource;
+use voice_bird_cli::config::AppConfig;
+use voice_bird_cli::session::layout::SessionSource;
 
 /// Application running mode
 #[derive(Debug, Clone, PartialEq)]
@@ -24,8 +24,7 @@ pub enum AppMode {
 /// Languages offered in the cloud-mode language selector. Local mode
 /// always transcribes English regardless of this list — the selector
 /// is hidden and the engine call is forced to "en".
-pub const CLOUD_LANGUAGES: &[&str] =
-    &["en", "es", "fr", "de", "it", "pt", "ja", "zh", "ru", "pl"];
+pub const CLOUD_LANGUAGES: &[&str] = &["en", "es", "fr", "de", "it", "pt", "ja", "zh", "ru", "pl"];
 
 /// Maximum number of parallel recording sections.
 pub const MAX_SECTIONS: usize = 3;
@@ -120,7 +119,7 @@ pub struct Section {
     pub runtime: RecordingRuntime,
     /// Live capture keep-alive (cpal `Stream` or SCK `SCStream`). Pinned
     /// to the App-owning thread because `cpal::Stream` is `!Send`.
-    pub _capture_stream: voice_bird::audio::capture::CaptureKeepAlive,
+    pub _capture_stream: voice_bird_cli::audio::capture::CaptureKeepAlive,
     /// Committed (finalized) transcript lines.
     pub committed: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Refined transcript lines from the background refinement engine.
@@ -280,10 +279,8 @@ impl App {
         let mut config = AppConfig::load().unwrap_or_default();
 
         let config_path = AppConfig::config_path().ok();
-        let mut config_was_loaded_from_disk = config_path
-            .as_ref()
-            .map(|p| p.exists())
-            .unwrap_or(false);
+        let mut config_was_loaded_from_disk =
+            config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
         // First launch: auto-pick a local model from system specs, persist
         // immediately, and skip the manual model-picker overlay. The user
@@ -291,7 +288,7 @@ impl App {
         // "loaded from disk" once it exists so the picker behaves like a
         // normal navigation, not a first-run gate.
         if !config_was_loaded_from_disk {
-            let picked = voice_bird::transcription::auto_select::pick_default_model();
+            let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
             log::info!("first run: auto-picked local model = {picked}");
             config.default_model = picked.into();
             if let Err(e) = config.save() {
@@ -301,13 +298,12 @@ impl App {
             }
         }
 
-        let mut banner_on_launch: Option<String> = if config.cloud_broadcast_enabled
-            && config.voicebird_api_key.is_empty()
-        {
-            Some("Cloud is on but no API key — press 'c' to paste one".into())
-        } else {
-            None
-        };
+        let mut banner_on_launch: Option<String> =
+            if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
+                Some("Cloud is on but no API key — press 'c' to paste one".into())
+            } else {
+                None
+            };
 
         // macOS: warn early if Screen Recording permission is missing.
         // Without it, system-audio loopback and per-app capture both fail
@@ -316,8 +312,8 @@ impl App {
         // remedy is "grant + restart".
         #[cfg(target_os = "macos")]
         {
-            if !voice_bird::audio::loopback::loopback_macos::screen_recording_permission_granted()
-            {
+            if !voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted(
+            ) {
                 banner_on_launch = Some(
                     "Screen Recording permission required for system / per-app audio — \
                      System Settings → Privacy & Security → Screen Recording → enable \
@@ -374,7 +370,9 @@ impl App {
     /// Currently focused section (the one `c`/`l`/`m`/`s` operate on),
     /// or `None` if no section is running in that slot.
     pub fn focused(&self) -> Option<&Section> {
-        self.sections.get(self.focused_section).and_then(|s| s.as_ref())
+        self.sections
+            .get(self.focused_section)
+            .and_then(|s| s.as_ref())
     }
 
     /// Mutable variant of [`focused`].
@@ -507,7 +505,7 @@ impl App {
             }
         };
 
-        let transcript: voice_bird::session::finalize::FinalTranscriptValue =
+        let transcript: voice_bird_cli::session::finalize::FinalTranscriptValue =
             match serde_json::from_str(&transcript_json) {
                 Ok(v) => v,
                 Err(e) => {
@@ -591,7 +589,10 @@ impl App {
 
         match result {
             Ok(json) => {
-                let dup = json.get("duplicate").and_then(|v| v.as_bool()).unwrap_or(false);
+                let dup = json
+                    .get("duplicate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let id = json
                     .get("transcription_id")
                     .and_then(|v| v.as_str())
@@ -691,8 +692,7 @@ impl App {
                 self.apps = inv.apps;
             }
             Err(e) => {
-                self.status_message =
-                    Some(format!("Failed to enumerate audio inventory: {}", e));
+                self.status_message = Some(format!("Failed to enumerate audio inventory: {}", e));
             }
         }
 
@@ -923,7 +923,7 @@ impl App {
     /// paired device so "Zoom on Speakers" and "Zoom on AirPods" don't
     /// share overrides.
     pub fn source_key_for(&self, source: &SessionSource) -> String {
-        use voice_bird::config::{device_source_id, source_id, AudioSessionKind};
+        use voice_bird_cli::config::{device_source_id, source_id, AudioSessionKind};
         match source {
             SessionSource::Microphone | SessionSource::System => {
                 if let (Some(name), Some(kind)) = (
@@ -951,9 +951,11 @@ impl App {
     /// the engine. For now, the running engine is unaffected and the
     /// new value is what the next start will use.
     pub fn persist_focused_settings(&mut self) {
-        let Some(section) = self.focused() else { return };
+        let Some(section) = self.focused() else {
+            return;
+        };
         let key = self.source_key_for(&section.source);
-        let ov = voice_bird::config::SourceSettingsOverride {
+        let ov = voice_bird_cli::config::SourceSettingsOverride {
             cloud_on: section.settings.cloud_on,
             language: section.settings.language.clone(),
             model: section.settings.model.clone(),
@@ -985,9 +987,7 @@ impl App {
         }
 
         if settings.cloud_on && self.config.voicebird_api_key.is_empty() {
-            self.banner = Some(
-                "Cloud is on but no API key — press 'c' to paste one".into(),
-            );
+            self.banner = Some("Cloud is on but no API key — press 'c' to paste one".into());
             self.status = RecordingStatus::Error("no api key".into());
             self.open_api_key_modal();
             return Err("missing api key".into());
@@ -1010,7 +1010,7 @@ impl App {
         let session_dir: Option<std::path::PathBuf> = if settings.cloud_on {
             None
         } else {
-            let dir = voice_bird::session::layout::session_dir(
+            let dir = voice_bird_cli::session::layout::session_dir(
                 std::path::Path::new(&self.config.session_dir_expanded()),
                 now,
                 &source,
@@ -1055,31 +1055,23 @@ impl App {
 
         let capture_result = match &source {
             SessionSource::Microphone => {
-                voice_bird::audio::capture::capture_input(self.config.input_device.as_deref())
+                voice_bird_cli::audio::capture::capture_input(self.config.input_device.as_deref())
             }
-            SessionSource::System => {
-                voice_bird::audio::loopback::capture_loopback(
-                    self.config.input_device.as_deref(),
-                )
-            }
-            SessionSource::App { id, .. } => {
-                voice_bird::audio::loopback::capture_app(id)
-            }
+            SessionSource::System => voice_bird_cli::audio::loopback::capture_loopback(
+                self.config.input_device.as_deref(),
+            ),
+            SessionSource::App { id, .. } => voice_bird_cli::audio::loopback::capture_app(id),
         };
         let capture = match capture_result {
             Ok(c) => c,
-            Err(e) if matches!(source, SessionSource::Microphone)
-                && self.config.input_device.is_some() =>
+            Err(e)
+                if matches!(source, SessionSource::Microphone)
+                    && self.config.input_device.is_some() =>
             {
                 let want = self.config.input_device.as_deref().unwrap_or("");
-                log::warn!(
-                    "selected input device unavailable ({e}); falling back to default"
-                );
-                self.banner = Some(format!(
-                    "input '{}' not found — using default",
-                    want
-                ));
-                match voice_bird::audio::capture::capture_input(None) {
+                log::warn!("selected input device unavailable ({e}); falling back to default");
+                self.banner = Some(format!("input '{}' not found — using default", want));
+                match voice_bird_cli::audio::capture::capture_input(None) {
                     Ok(c) => c,
                     Err(e2) => {
                         return Err(format!("capture: {e2}"));
@@ -1093,21 +1085,23 @@ impl App {
         let (mut frames_rx, info, stream) = capture.split();
 
         // --- 2. Resampler (device-native → 16 kHz mono) --------------------
-        let mut resampler =
-            match voice_bird::audio::resample::Resampler::new(info.sample_rate, info.channels) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(format!("resample: {e}"));
-                }
-            };
+        let mut resampler = match voice_bird_cli::audio::resample::Resampler::new(
+            info.sample_rate,
+            info.channels,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!("resample: {e}"));
+            }
+        };
 
         // --- 3. Engine (Voice Bird Web cloud, WhisperKit sidecar, or whisper-rs fallback) --------
-        use voice_bird::transcription::EngineConfig;
-        let sidecar = voice_bird::transcription::sidecar_path();
+        use voice_bird_cli::transcription::EngineConfig;
+        let sidecar = voice_bird_cli::transcription::sidecar_path();
         let prefer = self.config.engine_prefer.clone();
         let api_key = self.config.voicebird_api_key.clone();
         let server_url = self.config.voicebird_server_url.clone();
-        let (engine_kind_used, mut engine) = match voice_bird::transcription::try_select_engine(
+        let (engine_kind_used, mut engine) = match voice_bird_cli::transcription::try_select_engine(
             &prefer,
             settings.cloud_on,
             &api_key,
@@ -1121,13 +1115,13 @@ impl App {
             }
         };
         let engine_kind = match engine_kind_used {
-            voice_bird::transcription::EngineKind::WhisperRs => "whisper_rs".to_string(),
-            voice_bird::transcription::EngineKind::WhisperKit => "whisperkit".to_string(),
-            voice_bird::transcription::EngineKind::VoiceBirdWeb => "voicebird".to_string(),
+            voice_bird_cli::transcription::EngineKind::WhisperRs => "whisper_rs".to_string(),
+            voice_bird_cli::transcription::EngineKind::WhisperKit => "whisperkit".to_string(),
+            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb => "voicebird".to_string(),
         };
         let cloud_active = matches!(
             engine_kind_used,
-            voice_bird::transcription::EngineKind::VoiceBirdWeb,
+            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb,
         );
         let cloud_reminder_until = if cloud_active {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(3))
@@ -1140,8 +1134,11 @@ impl App {
         // language we pass via params.set_language, but English-only ggml
         // models (e.g. distil-small.en, base.en, tiny.en) will produce
         // gibberish if asked to transcribe Russian / Polish / etc.
-        if !matches!(engine_kind_used, voice_bird::transcription::EngineKind::VoiceBirdWeb) {
-            if let Err(msg) = voice_bird::transcription::models::validate_local_language(
+        if !matches!(
+            engine_kind_used,
+            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb
+        ) {
+            if let Err(msg) = voice_bird_cli::transcription::models::validate_local_language(
                 &settings.model,
                 &effective_language,
             ) {
@@ -1150,10 +1147,13 @@ impl App {
             }
         }
 
-        let model_path = if matches!(engine_kind_used, voice_bird::transcription::EngineKind::VoiceBirdWeb) {
+        let model_path = if matches!(
+            engine_kind_used,
+            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb
+        ) {
             std::path::PathBuf::new() // unused for cloud
         } else {
-            match voice_bird::transcription::models::gguf_path(&settings.model) {
+            match voice_bird_cli::transcription::models::gguf_path(&settings.model) {
                 Ok(p) => p,
                 Err(e) => {
                     return Err(format!("model path: {e}"));
@@ -1180,9 +1180,9 @@ impl App {
                         .unwrap_or_else(|| "voice-bird-desktop".into());
                     (dev, String::new())
                 }
-                SessionSource::App { name, device_name, .. } => {
-                    (device_name.clone(), name.clone())
-                }
+                SessionSource::App {
+                    name, device_name, ..
+                } => (device_name.clone(), name.clone()),
             };
             EngineConfig::Cloud {
                 api_key: api_key.clone(),
@@ -1214,22 +1214,23 @@ impl App {
 
         // --- 4. WAV writer on the resampled 16 kHz mono stream ------------
         // Skipped when broadcasting — local audio is not persisted.
-        let mut wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = if let Some(dir) = session_dir.as_ref() {
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            };
-            match hound::WavWriter::create(dir.join("audio.wav"), spec) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    return Err(format!("wav: {e}"));
+        let mut wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> =
+            if let Some(dir) = session_dir.as_ref() {
+                let spec = hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 16_000,
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                };
+                match hound::WavWriter::create(dir.join("audio.wav"), spec) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        return Err(format!("wav: {e}"));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let pcm_tx = handle.pcm_tx.clone();
         let mut events_rx = handle.events_rx;
@@ -1251,7 +1252,7 @@ impl App {
                 .refinement_model
                 .as_ref()
                 .and_then(|id| {
-                    let path = voice_bird::transcription::models::gguf_path(id).ok()?;
+                    let path = voice_bird_cli::transcription::models::gguf_path(id).ok()?;
                     if !path.exists() {
                         log::warn!(
                             "refinement_model '{}' set but file missing at {} — disabled",
@@ -1260,7 +1261,7 @@ impl App {
                         );
                         return None;
                     }
-                    let eng = voice_bird::transcription::refinement_engine::RefinementEngine {
+                    let eng = voice_bird_cli::transcription::refinement_engine::RefinementEngine {
                         model_path: path,
                         // Refinement only runs in local mode (the
                         // surrounding `if !cloud_active` block); local
@@ -1320,7 +1321,7 @@ impl App {
         // --- 6. Consumer task: engine events → live state + JSONL ---------
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
-                match voice_bird::session::writer::SegmentWriter::open(p) {
+                match voice_bird_cli::session::writer::SegmentWriter::open(p) {
                     Ok(w) => Some(w),
                     Err(e) => {
                         log::error!("writer: {e}");
@@ -1332,13 +1333,13 @@ impl App {
             };
             while let Ok(evt) = events_rx.recv().await {
                 match evt {
-                    voice_bird::transcription::EngineEvent::ModelLoaded { name } => {
+                    voice_bird_cli::transcription::EngineEvent::ModelLoaded { name } => {
                         log::info!("engine loaded: {}", name);
                     }
-                    voice_bird::transcription::EngineEvent::Tentative(s) => {
+                    voice_bird_cli::transcription::EngineEvent::Tentative(s) => {
                         *tentative_for_consumer.lock() = s;
                     }
-                    voice_bird::transcription::EngineEvent::Committed(seg) => {
+                    voice_bird_cli::transcription::EngineEvent::Committed(seg) => {
                         if let Some(w) = writer.as_mut() {
                             let written = (&seg).into();
                             if let Err(e) = w.append(&written) {
@@ -1354,7 +1355,7 @@ impl App {
                         });
                         tentative_for_consumer.lock().clear();
                     }
-                    voice_bird::transcription::EngineEvent::Error(e) => {
+                    voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
                         if let Ok(mut slot) = engine_error_for_consumer.lock() {
                             *slot = Some(e);
@@ -1377,21 +1378,20 @@ impl App {
                 .expect("session_dir present whenever refinement runs")
                 .join("transcript.refined.jsonl");
             let r_join = self.rt.spawn(async move {
-                let mut writer = match voice_bird::session::writer::SegmentWriter::open(
-                    &r_writer_path,
-                ) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::error!("refinement writer: {e}");
-                        return;
-                    }
-                };
+                let mut writer =
+                    match voice_bird_cli::session::writer::SegmentWriter::open(&r_writer_path) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            log::error!("refinement writer: {e}");
+                            return;
+                        }
+                    };
                 while let Ok(evt) = r_events_rx.recv().await {
                     match evt {
-                        voice_bird::transcription::EngineEvent::ModelLoaded { name } => {
+                        voice_bird_cli::transcription::EngineEvent::ModelLoaded { name } => {
                             log::info!("refinement loaded: {}", name);
                         }
-                        voice_bird::transcription::EngineEvent::Committed(seg) => {
+                        voice_bird_cli::transcription::EngineEvent::Committed(seg) => {
                             let written = (&seg).into();
                             if let Err(e) = writer.append(&written) {
                                 log::error!("refined append: {e}");
@@ -1404,8 +1404,8 @@ impl App {
                             });
                             committed_for_refinement.lock().clear();
                         }
-                        voice_bird::transcription::EngineEvent::Tentative(_) => {}
-                        voice_bird::transcription::EngineEvent::Error(e) => {
+                        voice_bird_cli::transcription::EngineEvent::Tentative(_) => {}
+                        voice_bird_cli::transcription::EngineEvent::Error(e) => {
                             log::error!("refinement error: {e}");
                         }
                     }
@@ -1511,7 +1511,7 @@ impl App {
             } else {
                 section.engine_kind.clone()
             };
-            let meta = voice_bird::session::finalize::SessionMeta {
+            let meta = voice_bird_cli::session::finalize::SessionMeta {
                 version: env!("CARGO_PKG_VERSION").into(),
                 model: section.settings.model.clone(),
                 engine: engine_for_meta,
@@ -1521,7 +1521,7 @@ impl App {
                 ended_at: ended.to_rfc3339(),
                 duration_ms: (ended - started).num_milliseconds().max(0) as u64,
             };
-            if let Err(e) = voice_bird::session::finalize::finalize(
+            if let Err(e) = voice_bird_cli::session::finalize::finalize(
                 &dir.join("transcript.jsonl"),
                 &dir.join("transcript.json"),
                 &dir.join("transcript.txt"),
@@ -1577,9 +1577,9 @@ impl App {
     /// back to `AppMode::Normal`.
     pub fn begin_model_download(
         &mut self,
-        entry: &voice_bird::transcription::models::ModelEntry,
+        entry: &voice_bird_cli::transcription::models::ModelEntry,
     ) {
-        let dest = match voice_bird::transcription::models::gguf_path(entry.id) {
+        let dest = match voice_bird_cli::transcription::models::gguf_path(entry.id) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("gguf_path: {e}");
@@ -1616,7 +1616,7 @@ impl App {
                 g.bytes = bytes;
                 g.total = total;
             };
-            let res = voice_bird::transcription::models::download_with_verify(
+            let res = voice_bird_cli::transcription::models::download_with_verify(
                 &url, &dest, &sha, &mut cb,
             );
             if let Err(e) = res {
@@ -1640,9 +1640,7 @@ impl App {
         // Snapshot under the lock, release before mutating self.
         let (done, err, model_id) = {
             let g = progress_arc.lock();
-            let done = g.error.is_none()
-                && g.total.is_some()
-                && Some(g.bytes) == g.total;
+            let done = g.error.is_none() && g.total.is_some() && Some(g.bytes) == g.total;
             (done, g.error.clone(), g.model_id.clone())
         };
 
@@ -1688,7 +1686,9 @@ pub fn section_column_label(slot: usize, section: Option<&Section>) -> String {
             let label = match &s.source {
                 SessionSource::Microphone => "mic",
                 SessionSource::System => "system",
-                SessionSource::App { name, device_name, .. } => {
+                SessionSource::App {
+                    name, device_name, ..
+                } => {
                     if device_name.is_empty() {
                         name.as_str()
                     } else {
@@ -1697,16 +1697,24 @@ pub fn section_column_label(slot: usize, section: Option<&Section>) -> String {
                         return format!(
                             " [{n}] {name} on {device_name} · cloud:{cloud} · {lang} · {model} ",
                             cloud = if s.settings.cloud_on { "ON" } else { "OFF" },
-                            lang = if s.settings.cloud_on { s.settings.language.as_str() } else { "en" },
+                            lang = if s.settings.cloud_on {
+                                s.settings.language.as_str()
+                            } else {
+                                "en"
+                            },
                             model = s.settings.model,
                         );
                     }
-                },
+                }
             };
             format!(
                 " [{n}] {label} · cloud:{cloud} · {lang} · {model} ",
                 cloud = if s.settings.cloud_on { "ON" } else { "OFF" },
-                lang = if s.settings.cloud_on { s.settings.language.as_str() } else { "en" },
+                lang = if s.settings.cloud_on {
+                    s.settings.language.as_str()
+                } else {
+                    "en"
+                },
                 model = s.settings.model,
             )
         }
@@ -1852,10 +1860,7 @@ mod tests {
 
     #[test]
     fn ws_url_no_scheme_falls_through_to_https() {
-        assert_eq!(
-            ws_url_to_http("voicebird.app"),
-            "https://voicebird.app"
-        );
+        assert_eq!(ws_url_to_http("voicebird.app"), "https://voicebird.app");
     }
 
     #[test]
@@ -1910,7 +1915,10 @@ mod tests {
         std::fs::write(newer.join("transcript.json"), "{}").unwrap();
 
         let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(found, newer, "should pick lexicographically latest (= newest timestamp)");
+        assert_eq!(
+            found, newer,
+            "should pick lexicographically latest (= newest timestamp)"
+        );
     }
 
     #[test]
@@ -1925,7 +1933,10 @@ mod tests {
         std::fs::write(fresh.join("transcript.json"), "{}").unwrap();
 
         let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(found, uploaded, "should return the most recent session even if uploaded");
+        assert_eq!(
+            found, uploaded,
+            "should return the most recent session even if uploaded"
+        );
     }
 
     #[test]
@@ -1972,7 +1983,7 @@ mod tests {
 
     /// Helper: write a minimal valid transcript.json into `session_dir`.
     fn write_minimal_transcript(session_dir: &std::path::Path) {
-        let meta = voice_bird::session::finalize::SessionMeta {
+        let meta = voice_bird_cli::session::finalize::SessionMeta {
             version: "1.0".into(),
             model: "whisper-large-v3".into(),
             engine: "whisperkit".into(),
@@ -1982,13 +1993,12 @@ mod tests {
             ended_at: "2026-05-13T10:05:00Z".into(),
             duration_ms: 300_000,
         };
-        let segments: Vec<voice_bird::session::writer::WrittenSegment> = vec![
-            voice_bird::session::writer::WrittenSegment {
+        let segments: Vec<voice_bird_cli::session::writer::WrittenSegment> =
+            vec![voice_bird_cli::session::writer::WrittenSegment {
                 t_start_ms: 0,
                 t_end_ms: 2500,
                 text: "Hello world".into(),
-            },
-        ];
+            }];
         let json = serde_json::json!({
             "segments": segments,
             "meta": meta,
@@ -2006,7 +2016,10 @@ mod tests {
 
         assert!(app.export_banner.is_some());
         assert!(
-            app.export_banner.as_deref().unwrap().contains("No sessions"),
+            app.export_banner
+                .as_deref()
+                .unwrap()
+                .contains("No sessions"),
             "got: {:?}",
             app.export_banner
         );
@@ -2075,8 +2088,12 @@ mod tests {
 
                 // We have a connection. Switch back to blocking for r/w.
                 stream.set_nonblocking(false).ok();
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-                stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
 
                 let mut raw = String::new();
                 let mut content_length: usize = 0;
@@ -2084,55 +2101,58 @@ mod tests {
                 {
                     let mut reader = BufReader::new(&stream);
 
+                    // request line
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() {
+                        raw.push_str(&line);
+                    }
 
-                            // request line
-                            let mut line = String::new();
-                            if reader.read_line(&mut line).is_ok() {
-                                raw.push_str(&line);
-                            }
+                    // headers
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            raw.push_str(&line);
+                            break;
+                        }
+                        let lower = line.to_lowercase();
+                        if lower.starts_with("content-length:") {
+                            content_length = line
+                                .split(':')
+                                .nth(1)
+                                .unwrap_or("0")
+                                .trim()
+                                .parse()
+                                .unwrap_or(0);
+                        }
+                        raw.push_str(&line);
+                    }
 
-                            // headers
-                            loop {
-                                line.clear();
-                                if reader.read_line(&mut line).is_err() {
-                                    break;
-                                }
-                                if line == "\r\n" || line == "\n" {
-                                    raw.push_str(&line);
-                                    break;
-                                }
-                                let lower = line.to_lowercase();
-                                if lower.starts_with("content-length:") {
-                                    content_length = line
-                                        .split(':')
-                                        .nth(1)
-                                        .unwrap_or("0")
-                                        .trim()
-                                        .parse()
-                                        .unwrap_or(0);
-                                }
-                                raw.push_str(&line);
-                            }
+                    // body
+                    if content_length > 0 {
+                        let mut buf = vec![0u8; content_length];
+                        if reader.read_exact(&mut buf).is_ok() {
+                            raw.push_str(&String::from_utf8_lossy(&buf));
+                        }
+                    }
+                } // reader dropped — releases &borrow on stream
 
-                            // body
-                            if content_length > 0 {
-                                let mut buf = vec![0u8; content_length];
-                                if reader.read_exact(&mut buf).is_ok() {
-                                    raw.push_str(&String::from_utf8_lossy(&buf));
-                                }
-                            }
-                        } // reader dropped — releases &borrow on stream
+                *c.lock().unwrap() = Some(raw);
 
-                        *c.lock().unwrap() = Some(raw);
-
-                        let resp = format!(
+                let resp = format!(
                             "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
                             len = body.len()
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(resp.as_bytes());
             });
 
-            MockHttp { port, captured, handle: Some(handle) }
+            MockHttp {
+                port,
+                captured,
+                handle: Some(handle),
+            }
         }
 
         fn captured_request(&self) -> Option<String> {
@@ -2151,8 +2171,7 @@ mod tests {
     fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
         let mut app = App::new();
         app.config.session_dir = dir.path().to_string_lossy().to_string();
-        app.config.voicebird_server_url =
-            format!("ws://127.0.0.1:{port}/api/audio/stream");
+        app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
         app.config.voicebird_api_key = "test-key-abc123".into();
         app
     }
@@ -2194,14 +2213,17 @@ mod tests {
         assert_eq!(marker_content, "abc-123");
 
         let raw = mock.captured_request();
-        assert_request_contains(&raw, &[
-            "POST /api/transcripts/upload HTTP/1.1",
-            "Authorization: Bearer test-key-abc123",
-            "Content-Type: application/json",
-            "\"session_id\":\"2026-05-13_10-00-00-mic\"",
-            "\"title\":\"mic \u{2014} 2026-05-13\"",
-            "\"text\":\"Hello world\"",
-        ]);
+        assert_request_contains(
+            &raw,
+            &[
+                "POST /api/transcripts/upload HTTP/1.1",
+                "Authorization: Bearer test-key-abc123",
+                "Content-Type: application/json",
+                "\"session_id\":\"2026-05-13_10-00-00-mic\"",
+                "\"title\":\"mic \u{2014} 2026-05-13\"",
+                "\"text\":\"Hello world\"",
+            ],
+        );
     }
 
     #[test]
@@ -2304,7 +2326,7 @@ mod tests {
         // Older session
         let older = dir.path().join("2026-05-13_08-00-00-system");
         std::fs::create_dir(&older).unwrap();
-        let meta_old = voice_bird::session::finalize::SessionMeta {
+        let meta_old = voice_bird_cli::session::finalize::SessionMeta {
             started_at: "2026-05-13T08:00:00Z".into(),
             source: "system".into(),
             version: "1.0".into(),
@@ -2314,7 +2336,7 @@ mod tests {
             ended_at: "2026-05-13T08:05:00Z".into(),
             duration_ms: 300_000,
         };
-        let seg = voice_bird::session::writer::WrittenSegment {
+        let seg = voice_bird_cli::session::writer::WrittenSegment {
             t_start_ms: 0,
             t_end_ms: 1000,
             text: "older".into(),
@@ -2322,7 +2344,8 @@ mod tests {
         std::fs::write(
             older.join("transcript.json"),
             serde_json::json!({"segments":[seg],"meta":meta_old}).to_string(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let newer = dir.path().join("2026-05-13_12-00-00-mic");
         std::fs::create_dir(&newer).unwrap();
@@ -2335,13 +2358,20 @@ mod tests {
 
         let raw = mock.captured_request();
         assert!(
-            raw.as_deref().unwrap_or("").contains("2026-05-13_12-00-00-mic"),
+            raw.as_deref()
+                .unwrap_or("")
+                .contains("2026-05-13_12-00-00-mic"),
             "should export the most recent session"
         );
         assert!(
-            !raw.as_deref().unwrap_or("").contains("2026-05-13_08-00-00-system"),
+            !raw.as_deref()
+                .unwrap_or("")
+                .contains("2026-05-13_08-00-00-system"),
             "should NOT export the older session"
         );
-        assert_eq!(app.export_banner.as_deref(), Some("Exported \u{2713} \u{2014} newest"));
+        assert_eq!(
+            app.export_banner.as_deref(),
+            Some("Exported \u{2713} \u{2014} newest")
+        );
     }
 }

@@ -10,8 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -79,7 +78,11 @@ fn init_macos_app_event_handler() {
     extern "C" {
         fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
         fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        fn objc_msgSend(obj: *mut std::ffi::c_void, sel: *mut std::ffi::c_void, ...) -> *mut std::ffi::c_void;
+        fn objc_msgSend(
+            obj: *mut std::ffi::c_void,
+            sel: *mut std::ffi::c_void,
+            ...
+        ) -> *mut std::ffi::c_void;
     }
 
     std::thread::spawn(|| {
@@ -117,7 +120,7 @@ fn main() -> Result<()> {
         let dir = args
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--recover requires a path"))?;
-        voice_bird::session::recover::recover(std::path::Path::new(dir))?;
+        voice_bird_cli::session::recover::recover(std::path::Path::new(dir))?;
         println!("Recovered transcripts in {}", dir);
         return Ok(());
     }
@@ -190,10 +193,11 @@ fn main() -> Result<()> {
     if let Some(saved) = app.config.input_device.clone() {
         let saved_kind = app.config.input_device_kind;
         let by_name_and_kind = saved_kind.and_then(|k| {
-            app.devices.iter().position(|d| d.name == saved && d.kind == k)
+            app.devices
+                .iter()
+                .position(|d| d.name == saved && d.kind == k)
         });
-        let i = by_name_and_kind
-            .or_else(|| app.devices.iter().position(|d| d.name == saved));
+        let i = by_name_and_kind.or_else(|| app.devices.iter().position(|d| d.name == saved));
         if let Some(i) = i {
             app.selected_device_index = i;
         }
@@ -309,13 +313,11 @@ fn run_app<B: Backend>(
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
                         }
                     }
-                    Event::Mouse(mouse) if app.mode == AppMode::Normal => {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
-                            MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
-                            _ => {}
-                        }
-                    }
+                    Event::Mouse(mouse) if app.mode == AppMode::Normal => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -420,19 +422,18 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // Pick the next free slot (or refuse if all are full).
             let Some(slot) = app.next_free_slot() else {
                 log::info!("keys: Enter → refused (all 3 sections full)");
-                app.banner = Some(
-                    "All 3 sections are recording — stop one first ([s])".into(),
-                );
+                app.banner = Some("All 3 sections are recording — stop one first ([s])".into());
                 return;
             };
-            use voice_bird::config::AudioSessionKind;
-            use voice_bird::session::layout::SessionSource;
+            use voice_bird_cli::config::AudioSessionKind;
+            use voice_bird_cli::session::layout::SessionSource;
 
             let Some(dev) = app.devices.get(app.selected_device_index).cloned() else {
-                log::warn!("keys: Enter → refused (no device at idx {})", app.selected_device_index);
-                app.banner = Some(
-                    "No audio device selected — press [r] to refresh".into(),
+                log::warn!(
+                    "keys: Enter → refused (no device at idx {})",
+                    app.selected_device_index
                 );
+                app.banner = Some("No audio device selected — press [r] to refresh".into());
                 return;
             };
             let app_pick = app.focused_app().cloned();
@@ -456,8 +457,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
 
             // Persist the selected device + last app id.
-            let name_changed =
-                app.config.input_device.as_deref() != Some(dev.name.as_str());
+            let name_changed = app.config.input_device.as_deref() != Some(dev.name.as_str());
             let kind_changed = app.config.input_device_kind != Some(dev.kind);
             let app_id_changed =
                 app.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
@@ -481,9 +481,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 (AudioSessionKind::App, _) => {
                     // Devices pane never emits AudioSessionKind::App
                     // entries (apps live in the Apps pane), but be safe.
-                    app.banner = Some(
-                        "Unexpected device kind — press [r] to refresh".into(),
-                    );
+                    app.banner = Some("Unexpected device kind — press [r] to refresh".into());
                     return;
                 }
             };
@@ -494,7 +492,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.focused_section = slot;
             log::info!(
                 "keys: Enter → resolved source={:?}; calling start_section[{}]",
-                source, slot
+                source,
+                slot
             );
             match app.start_section(slot, source, settings) {
                 Ok(()) => {
@@ -538,8 +537,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // saved/preserved).
         KeyCode::Char('x') => {
             let slot = app.focused_section;
-            let had_text = app.focused_committed().lock().len() > 0
-                || app.transcript_saved[slot].is_some();
+            let had_text =
+                app.focused_committed().lock().len() > 0 || app.transcript_saved[slot].is_some();
             app.clear_slot_transcript(slot);
             if had_text {
                 log::info!("keys: x → cleared transcript for slot {slot}");
@@ -553,7 +552,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the
             // global default) so the user sees what's already chosen.
-            let catalog = voice_bird::transcription::models::Catalog::builtin();
+            let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
             let current = app.display_model();
             let current_idx = catalog
                 .all()
@@ -577,13 +576,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 section.settings.cloud_on = !section.settings.cloud_on;
                 let on = section.settings.cloud_on;
                 app.persist_focused_settings();
-                app.banner = Some(
-                    if on {
-                        "Cloud: ON for focused section (applies on next start)".into()
-                    } else {
-                        "Cloud: OFF for focused section (applies on next start)".into()
-                    },
-                );
+                app.banner = Some(if on {
+                    "Cloud: ON for focused section (applies on next start)".into()
+                } else {
+                    "Cloud: OFF for focused section (applies on next start)".into()
+                });
             } else {
                 app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
                 let on = app.config.cloud_broadcast_enabled;
@@ -593,13 +590,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 if on && app.config.voicebird_api_key.is_empty() {
                     app.open_api_key_modal();
                 } else {
-                    app.banner = Some(
-                        if on {
-                            "Cloud: ON (next recording streams to voicebird.app)".into()
-                        } else {
-                            "Cloud: OFF (next recording is local-only)".into()
-                        },
-                    );
+                    app.banner = Some(if on {
+                        "Cloud: ON (next recording streams to voicebird.app)".into()
+                    } else {
+                        "Cloud: OFF (next recording is local-only)".into()
+                    });
                 }
             }
         }
@@ -659,9 +654,10 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
                     log::error!("config save (path modal): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
                 } else {
-                    app.banner = Some(
-                        format!("Output path → {}", app.config.session_dir_expanded()),
-                    );
+                    app.banner = Some(format!(
+                        "Output path → {}",
+                        app.config.session_dir_expanded()
+                    ));
                 }
             }
             app.mode = AppMode::Normal;
@@ -702,9 +698,7 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
                     log::error!("config save (modal save): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
                 } else {
-                    app.banner = Some(
-                        "API key saved — start a recording to verify".into(),
-                    );
+                    app.banner = Some("API key saved — start a recording to verify".into());
                 }
             }
             app.mode = AppMode::Normal;
@@ -735,7 +729,7 @@ fn handle_picker_mode(app: &mut App, key: KeyCode) {
         return;
     }
 
-    let catalog = voice_bird::transcription::models::Catalog::builtin();
+    let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
     let total = catalog.all().len();
 
     match key {
@@ -795,8 +789,7 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         RecordingStatus::Error(s) => format!("Error: {s}"),
     };
 
-    let device_names: Vec<String> =
-        app.devices.iter().map(|d| d.name.clone()).collect();
+    let device_names: Vec<String> = app.devices.iter().map(|d| d.name.clone()).collect();
     let selected_device_name = app
         .devices
         .get(app.selected_device_index)
@@ -812,10 +805,7 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
     let committed_arc = app.focused_committed();
     let committed = committed_arc.lock();
     let committed_count = committed.len();
-    let last_committed_text = committed
-        .last()
-        .map(|c| c.text.clone())
-        .unwrap_or_default();
+    let last_committed_text = committed.last().map(|c| c.text.clone()).unwrap_or_default();
     drop(committed);
     let tentative_text = app.focused_tentative().lock().clone();
 

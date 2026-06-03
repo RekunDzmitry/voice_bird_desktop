@@ -15,16 +15,13 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use core_foundation::base::TCFType;
-use core_media_rs::cm_sample_buffer::CMSampleBuffer;
 use core_media_rs::cm_format_description::CMFormatDescriptionRef;
+use core_media_rs::cm_sample_buffer::CMSampleBuffer;
 use screencapturekit::{
     shareable_content::SCShareableContent,
     stream::{
-        configuration::SCStreamConfiguration,
-        content_filter::SCContentFilter,
-        output_trait::SCStreamOutputTrait,
-        output_type::SCStreamOutputType,
-        SCStream,
+        configuration::SCStreamConfiguration, content_filter::SCContentFilter,
+        output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType, SCStream,
     },
 };
 
@@ -105,11 +102,7 @@ struct ObservedFormat {
 }
 
 impl SCStreamOutputTrait for AudioOutput {
-    fn did_output_sample_buffer(
-        &self,
-        sample_buffer: CMSampleBuffer,
-        of_type: SCStreamOutputType,
-    ) {
+    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
         if !matches!(of_type, SCStreamOutputType::Audio) {
             // Video frames from the 2x2 dummy config — drop them.
             return;
@@ -289,8 +282,11 @@ pub fn capture_app(bundle_id: &str) -> Result<CaptureHandle> {
         target.bundle_identifier(),
         target.process_id()
     );
-    let filter = SCContentFilter::new()
-        .with_display_including_application_excepting_windows(&display, &[target], &[]);
+    let filter = SCContentFilter::new().with_display_including_application_excepting_windows(
+        &display,
+        &[target],
+        &[],
+    );
 
     start_sck_capture(filter)
 }
@@ -356,9 +352,7 @@ fn start_sck_capture(filter: SCContentFilter) -> Result<CaptureHandle> {
         .add_output_handler(audio_output, SCStreamOutputType::Audio)
         .is_none()
     {
-        return Err(anyhow!(
-            "failed to add audio output handler to SCStream"
-        ));
+        return Err(anyhow!("failed to add audio output handler to SCStream"));
     }
 
     // --- 5. Start capture ------------------------------------------------

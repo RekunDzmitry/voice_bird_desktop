@@ -1,0 +1,26 @@
+{
+  "name": "voice-bird-cli",
+  "version": "0.3.0",
+  "description": "Voice Bird CLI - local-first voice transcription TUI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voice-bird/voice-bird-cli.git"
+  },
+  "bin": {
+    "voice-bird-cli": "bin/voice-bird-cli"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "keywords": [
+    "voice",
+    "transcription",
+    "whisper",
+    "cli",
+    "tui"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

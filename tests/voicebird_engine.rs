@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-use voice_bird::transcription::{
+use voice_bird_cli::transcription::{
     voicebird_engine::VoiceBirdEngine, EngineConfig, EngineEvent, TranscriptionEngine,
 };
 
@@ -20,7 +20,11 @@ const TEST_URL: &str = "wss://example.test/api/audio/stream";
 /// address and a handle to the recorded frames.
 async fn spawn_recording_server(
     after_init: Vec<String>,
-) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<String>>>) {
+) -> (
+    SocketAddr,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -443,8 +447,7 @@ async fn init_message_carries_device_and_app_names() {
     let init = texts
         .first()
         .expect("expected init JSON to be captured by mock server");
-    let parsed: serde_json::Value =
-        serde_json::from_str(init).expect("init must be valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(init).expect("init must be valid JSON");
     assert_eq!(parsed["type"], "init", "got: {init}");
     assert_eq!(parsed["device_name"], "EPOS PC 8 USB", "got: {init}");
     assert_eq!(parsed["app_name"], "Chrome", "got: {init}");

@@ -45,7 +45,11 @@ pub fn step(prev: &[Token], curr: &[Token], committed_upto: Duration) -> Agreeme
 fn longest_agreeing_prefix(prev: &[Token], curr: &[Token]) -> usize {
     let mut n = 0;
     for (p, c) in prev.iter().zip(curr.iter()) {
-        if tokens_agree(p, c) { n += 1; } else { break; }
+        if tokens_agree(p, c) {
+            n += 1;
+        } else {
+            break;
+        }
     }
     n
 }
@@ -63,7 +67,9 @@ fn normalize(s: &str) -> String {
 }
 
 fn group_into_sentences(tokens: &[Token]) -> Vec<Segment> {
-    if tokens.is_empty() { return Vec::new(); }
+    if tokens.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut group: Vec<Token> = Vec::new();
 
@@ -75,7 +81,10 @@ fn group_into_sentences(tokens: &[Token]) -> Vec<Segment> {
                 group.clear();
             }
         }
-        let ends_sentence = t.text.trim_end().ends_with(|c: char| matches!(c, '.'|'?'|'!'));
+        let ends_sentence = t
+            .text
+            .trim_end()
+            .ends_with(|c: char| matches!(c, '.' | '?' | '!'));
         group.push(t.clone());
         if ends_sentence {
             out.push(make_segment(&group));
@@ -97,7 +106,7 @@ fn make_segment(tokens: &[Token]) -> Segment {
         .join(" ");
     Segment {
         t_start: Duration::from_millis(tokens.first().unwrap().t_start_ms),
-        t_end:   Duration::from_millis(tokens.last().unwrap().t_end_ms),
+        t_end: Duration::from_millis(tokens.last().unwrap().t_end_ms),
         text,
         tokens: tokens.to_vec(),
     }
@@ -110,7 +119,11 @@ mod tests {
     use std::time::Duration;
 
     fn tok(text: &str, t0: u64, t1: u64) -> Token {
-        Token { text: text.into(), t_start_ms: t0, t_end_ms: t1 }
+        Token {
+            text: text.into(),
+            t_start_ms: t0,
+            t_end_ms: t1,
+        }
     }
 
     #[test]
@@ -135,8 +148,16 @@ mod tests {
 
     #[test]
     fn partial_prefix_agreement_commits_prefix_only() {
-        let prev = vec![tok("hello", 0, 500), tok("world", 500, 1000), tok("again", 1000, 1500)];
-        let curr = vec![tok("hello", 0, 500), tok("world", 500, 1000), tok("friend", 1000, 1500)];
+        let prev = vec![
+            tok("hello", 0, 500),
+            tok("world", 500, 1000),
+            tok("again", 1000, 1500),
+        ];
+        let curr = vec![
+            tok("hello", 0, 500),
+            tok("world", 500, 1000),
+            tok("friend", 1000, 1500),
+        ];
         let out = step(&prev, &curr, Duration::from_millis(0));
         assert_eq!(out.committed_segments[0].text, "hello world");
         assert_eq!(out.tentative_text, "friend");
@@ -145,15 +166,18 @@ mod tests {
     #[test]
     fn normalizes_punctuation_and_case_when_matching() {
         let prev = vec![tok("Hello,", 0, 500), tok("World.", 500, 1000)];
-        let curr = vec![tok("hello",  0, 500), tok("world",  500, 1000)];
+        let curr = vec![tok("hello", 0, 500), tok("world", 500, 1000)];
         let out = step(&prev, &curr, Duration::from_millis(0));
-        assert!(!out.committed_segments.is_empty(), "should commit via normalized match");
+        assert!(
+            !out.committed_segments.is_empty(),
+            "should commit via normalized match"
+        );
     }
 
     #[test]
     fn timestamp_skew_within_tolerance_matches() {
         let prev = vec![tok("hello", 0, 500)];
-        let curr = vec![tok("hello", 100, 600)];  // 100ms skew, within 300
+        let curr = vec![tok("hello", 100, 600)]; // 100ms skew, within 300
         let out = step(&prev, &curr, Duration::from_millis(0));
         assert!(!out.committed_segments.is_empty());
     }
@@ -179,8 +203,8 @@ mod tests {
     #[test]
     fn sentence_split_on_period() {
         let prev = vec![
-            tok("one",    0,   300),
-            tok("two.",  300,  700),
+            tok("one", 0, 300),
+            tok("two.", 300, 700),
             tok("three", 700, 1100),
         ];
         let curr = prev.clone();
@@ -193,8 +217,8 @@ mod tests {
     #[test]
     fn sentence_split_on_gap() {
         let prev = vec![
-            tok("before",  0,    300),
-            tok("pause", 300,   700),   // 900ms silence after
+            tok("before", 0, 300),
+            tok("pause", 300, 700), // 900ms silence after
             tok("after", 1600, 2000),
         ];
         let curr = prev.clone();

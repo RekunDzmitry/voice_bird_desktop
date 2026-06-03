@@ -35,8 +35,8 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use crate::audio::capture::{CaptureHandle, CaptureInfo, CaptureKeepAlive};
 
@@ -85,8 +85,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
         operation: Option<&IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
         let result = (|| -> Result<IAudioClient> {
-            let operation =
-                operation.ok_or_else(|| anyhow!("ActivateCompleted: no operation"))?;
+            let operation = operation.ok_or_else(|| anyhow!("ActivateCompleted: no operation"))?;
             unsafe {
                 let mut hr_activate: HRESULT = HRESULT(0);
                 let mut activated_interface: Option<windows::core::IUnknown> = None;

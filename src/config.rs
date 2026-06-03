@@ -44,7 +44,9 @@ pub fn source_id(source: &SessionSource, kind: Option<AudioSessionKind>) -> Stri
             "device:{}:default",
             kind_str(kind.unwrap_or(AudioSessionKind::Output))
         ),
-        SessionSource::App { name, device_name, .. } => {
+        SessionSource::App {
+            name, device_name, ..
+        } => {
             if device_name.is_empty() {
                 format!("app:{name}")
             } else {
@@ -265,7 +267,10 @@ mod tests {
     fn voicebird_api_key_roundtrips_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let c = AppConfig { voicebird_api_key: "vb-fake-12345".into(), ..AppConfig::default() };
+        let c = AppConfig {
+            voicebird_api_key: "vb-fake-12345".into(),
+            ..AppConfig::default()
+        };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.voicebird_api_key, "vb-fake-12345");
@@ -313,7 +318,10 @@ refinement_beam_size = 5
     fn save_with_secret_prepends_warning_comment() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        let c = AppConfig { voicebird_api_key: "vb-secret".into(), ..AppConfig::default() };
+        let c = AppConfig {
+            voicebird_api_key: "vb-secret".into(),
+            ..AppConfig::default()
+        };
         c.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(

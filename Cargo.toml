@@ -1,15 +1,20 @@
 [package]
-name = "voice-bird"
+name = "voice-bird-cli"
 version = "0.3.0"
 edition = "2021"
-description = "Voice Bird — local voice transcription TUI"
+description = "Voice Bird CLI - local-first voice transcription TUI"
+license = "MIT"
+repository = "https://github.com/voice-bird/voice-bird-cli"
+readme = "README.md"
+keywords = ["transcription", "whisper", "tui", "audio", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [[bin]]
-name = "voice-bird"
+name = "voice-bird-cli"
 path = "src/main.rs"
 
 [lib]
-name = "voice_bird"
+name = "voice_bird_cli"
 path = "src/lib.rs"
 
 [workspace]
