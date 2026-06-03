@@ -17,7 +17,7 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 
     // When a banner is set (engine error surfaced to the user), insert a
-    // single-line red strip between the tentative zone and the footer.
+    // single-line red strip below the main workspace.
     // Plan deviation: the plan originally called for a silent
     // WhisperKit→whisper-rs restart on error; we surface errors via this
     // banner instead and let the user press `r` to retry.
@@ -36,9 +36,8 @@ pub fn render(f: &mut Frame, app: &App) {
     let max_pane_len = app.devices.len().max(app.apps.len()) as u16;
     let devices_h = (max_pane_len + 2).clamp(8, 14);
     let mut constraints: Vec<Constraint> = vec![
-        Constraint::Length(3),         // [0] header
-        Constraint::Length(devices_h), // [1] devices + mode panel row
-        Constraint::Min(6),            // [2] sections row (3 columns)
+        Constraint::Length(3), // [0] header
+        Constraint::Min(6),    // [1] main content + sidebar
     ];
     if has_reminder {
         constraints.push(Constraint::Length(1)); // reminder
@@ -49,8 +48,6 @@ pub fn render(f: &mut Frame, app: &App) {
     if has_export {
         constraints.push(Constraint::Length(1)); // export banner
     }
-    constraints.push(Constraint::Length(1)); // footer/keys
-
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -58,21 +55,26 @@ pub fn render(f: &mut Frame, app: &App) {
 
     render_header(f, root[0], app);
 
-    // Row 1 splits horizontally: devices on the left, mode panel on the
-    // right. The mode panel is fixed width — wide enough to fit
-    // "Language: portuguese" without truncation but narrow enough that the
-    // devices panel still has room for long device names.
-    let row1 = Layout::default()
+    // Main body splits horizontally: the recorder workspace on the left
+    // and a fixed-width sidebar for mode + hotkeys on the right. Keeping
+    // the key list out of a one-line bottom bar prevents truncation on normal
+    // terminal widths.
+    let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(34)])
+        .constraints([Constraint::Min(72), Constraint::Length(36)])
         .split(root[1]);
-    render_devices(f, row1[0], app);
-    render_mode_panel(f, row1[1], app);
 
-    render_sections(f, root[2], app);
+    let workspace = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(devices_h), Constraint::Min(6)])
+        .split(main[0]);
+    render_devices(f, workspace[0], app);
+    render_sections(f, workspace[1], app);
+
+    render_sidebar(f, main[1], app);
 
     // Running index for the optional rows after the sections row.
-    let mut next_slot: usize = 3;
+    let mut next_slot: usize = 2;
 
     if has_reminder {
         let r = Paragraph::new(Span::styled(
@@ -88,9 +90,7 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     if has_export {
         render_export_banner(f, root[next_slot], app);
-        next_slot += 1;
     }
-    render_footer(f, root[next_slot], app);
 
     // Modal overlay (rendered last so it sits on top of everything).
     if app.mode == AppMode::ApiKeyModal {
@@ -883,20 +883,78 @@ fn render_export_banner(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(6)])
+        .split(area);
+    render_mode_panel(f, rows[0], app);
+    render_hotkeys_panel(f, rows[1], app);
+}
+
+fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
     let any_active = app.active_section_count() > 0;
-    let keys: String = match (any_active, &app.mode) {
-        (_, AppMode::ApiKeyModal) => "[Enter] save  [Esc] cancel".into(),
-        (_, AppMode::PathModal) => "[Enter] save  [Esc] cancel".into(),
-        (false, _) => {
-            "[↑/↓] select  [←/→] pane  [Space] no app  [Enter] start  [Tab] focus  [r] refresh  [c]/[l]/[m] cfg  [e] export  [p] path  [x] clear  [q] quit  [?] help".into()
-        }
-        (true, _) => {
-            "[↑/↓] select  [←/→] pane  [Enter] add  [Tab] focus  [s] stop  [S] stop all  [c]/[l]/[m] cfg  [PgUp/PgDn] scroll  [x] clear  [q] quit".into()
-        }
+    let lines: Vec<Line> = match (any_active, &app.mode) {
+        (_, AppMode::ApiKeyModal) | (_, AppMode::PathModal) => vec![
+            hotkey_line("[Enter]", "save"),
+            hotkey_line("[Esc]", "cancel"),
+        ],
+        (false, _) => vec![
+            hotkey_line("[↑/↓]", "select"),
+            hotkey_line("[←/→]", "pane"),
+            hotkey_line("[Space]", "no app"),
+            hotkey_line("[Enter]", "start"),
+            hotkey_line("[Tab]", "focus slot"),
+            hotkey_line("[r]", "refresh"),
+            hotkey_line("[c]", "cloud"),
+            hotkey_line("[l]", "language"),
+            hotkey_line("[m]", "model"),
+            hotkey_line("[e]", "export"),
+            hotkey_line("[p]", "path"),
+            hotkey_line("[x]", "clear"),
+            hotkey_line("[q]", "quit"),
+            hotkey_line("[?]", "help"),
+        ],
+        (true, _) => vec![
+            hotkey_line("[↑/↓]", "select"),
+            hotkey_line("[←/→]", "pane"),
+            hotkey_line("[Enter]", "add"),
+            hotkey_line("[Tab]", "focus slot"),
+            hotkey_line("[s]", "stop"),
+            hotkey_line("[S]", "stop all"),
+            hotkey_line("[c]", "cloud"),
+            hotkey_line("[l]", "language"),
+            hotkey_line("[m]", "model"),
+            hotkey_line("[PgUp]", "scroll up"),
+            hotkey_line("[PgDn]", "scroll down"),
+            hotkey_line("[Home]", "top"),
+            hotkey_line("[End]", "bottom"),
+            hotkey_line("[x]", "clear"),
+            hotkey_line("[q]", "quit"),
+            hotkey_line("[?]", "help"),
+        ],
     };
-    let p = Paragraph::new(keys).style(Style::default().fg(Color::Gray));
+
+    let visible = area.height.saturating_sub(2);
+    let hidden = (lines.len() as u16).saturating_sub(visible);
+    let title = if hidden > 0 {
+        format!(" Keys ({} more) ", hidden)
+    } else {
+        " Keys ".into()
+    };
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((0, 0))
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
+}
+
+fn hotkey_line(key: &'static str, action: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(key, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(action, Style::default().fg(Color::Gray)),
+    ])
 }
 
 #[cfg(test)]
@@ -958,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_enter_and_refresh_when_idle() {
+    fn key_sidebar_shows_enter_and_refresh_when_idle() {
         let app = App::new();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("[Enter] start"), "enter hint missing:\n{out}");
@@ -1087,7 +1145,7 @@ mod tests {
         assert!(out.contains("(l)"), "language cycle hint missing:\n{out}");
     }
 
-    /// The footer flips to the modal-specific hint while ApiKeyModal
+    /// The key sidebar flips to the modal-specific hint while ApiKeyModal
     /// is active. The modal itself renders the prompt text.
     #[test]
     fn api_key_modal_renders_when_active() {
@@ -1105,7 +1163,7 @@ mod tests {
         );
         assert!(
             out.contains("[Enter] save"),
-            "footer modal hint missing:\n{out}"
+            "modal key hint missing:\n{out}"
         );
         // Last 4 chars of the buffer are shown unmasked.
         assert!(out.contains("-key"), "masked tail missing:\n{out}");
@@ -1138,9 +1196,9 @@ mod tests {
         );
     }
 
-    /// Idle footer hint shows the new Tab/cfg keys.
+    /// Idle key sidebar shows the new Tab/cfg keys.
     #[test]
-    fn footer_shows_tab_and_cfg_hints_when_idle() {
+    fn key_sidebar_shows_tab_and_cfg_hints_when_idle() {
         let app = App::new();
         let out = render_to_string(&app, 180, 40);
         assert!(out.contains("[Tab]"), "Tab hint missing:\n{out}");
@@ -1148,5 +1206,17 @@ mod tests {
             out.contains("[c]/[l]/[m]") || out.contains("[c]") && out.contains("[l]"),
             "cfg hint missing:\n{out}"
         );
+    }
+
+    #[test]
+    fn key_sidebar_shows_all_idle_hotkeys_at_normal_height() {
+        let app = App::new();
+        let out = render_to_string(&app, 160, 30);
+        for key in [
+            "[↑/↓]", "[←/→]", "[Space]", "[Enter]", "[Tab]", "[r]", "[c]", "[l]", "[m]", "[e]",
+            "[p]", "[x]", "[q]", "[?]",
+        ] {
+            assert!(out.contains(key), "hotkey {key} missing:\n{out}");
+        }
     }
 }
