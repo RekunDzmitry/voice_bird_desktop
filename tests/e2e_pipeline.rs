@@ -18,12 +18,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 
-use voice_bird::session::finalize::{finalize, SessionMeta};
-use voice_bird::session::writer::SegmentWriter;
-use voice_bird::transcription::{
-    refinement_engine::RefinementEngine,
-    whisper_rs_engine::WhisperRsEngine,
-    EngineConfig, EngineEvent, TranscriptionEngine,
+use voice_bird_cli::session::finalize::{finalize, SessionMeta};
+use voice_bird_cli::session::writer::SegmentWriter;
+use voice_bird_cli::transcription::{
+    refinement_engine::RefinementEngine, whisper_rs_engine::WhisperRsEngine, EngineConfig,
+    EngineEvent, TranscriptionEngine,
 };
 
 const FIXTURE_WAV: &str = "tests/fixtures/hello_world_16k.wav";
@@ -39,13 +38,13 @@ fn load_fixture_pcm() -> Vec<f32> {
 
 /// Download tiny.en if not cached. Returns the local gguf path.
 fn ensure_tiny_en() -> PathBuf {
-    let cache = voice_bird::transcription::models::gguf_path("tiny.en").unwrap();
+    let cache = voice_bird_cli::transcription::models::gguf_path("tiny.en").unwrap();
     if !cache.exists() {
-        let entry = voice_bird::transcription::models::Catalog::builtin()
+        let entry = voice_bird_cli::transcription::models::Catalog::builtin()
             .get("tiny.en")
             .unwrap()
             .clone();
-        voice_bird::transcription::models::download_with_verify(
+        voice_bird_cli::transcription::models::download_with_verify(
             entry.gguf_url,
             &cache,
             entry.gguf_sha256,
@@ -107,9 +106,7 @@ fn streaming_engine_writes_jsonl_and_finalizes_to_text() {
         let mut writer = SegmentWriter::open(&jsonl).unwrap();
         let mut rx = handle.events_rx;
         let mut got_commit = false;
-        while let Ok(Ok(evt)) =
-            tokio::time::timeout(Duration::from_secs(60), rx.recv()).await
-        {
+        while let Ok(Ok(evt)) = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await {
             if let EngineEvent::Committed(seg) = evt {
                 writer.append(&(&seg).into()).unwrap();
                 got_commit = true;
@@ -164,9 +161,7 @@ fn refinement_engine_emits_committed_on_windowed_audio() {
 
         let mut rx = handle.events_rx;
         let mut commits: Vec<String> = Vec::new();
-        while let Ok(Ok(evt)) =
-            tokio::time::timeout(Duration::from_secs(120), rx.recv()).await
-        {
+        while let Ok(Ok(evt)) = tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
             if let EngineEvent::Committed(seg) = evt {
                 commits.push(seg.text);
             }
@@ -212,9 +207,7 @@ fn refinement_engine_flushes_tail_when_pcm_channel_closes() {
 
         let mut rx = handle.events_rx;
         let mut commits: Vec<String> = Vec::new();
-        while let Ok(Ok(evt)) =
-            tokio::time::timeout(Duration::from_secs(60), rx.recv()).await
-        {
+        while let Ok(Ok(evt)) = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await {
             if let EngineEvent::Committed(seg) = evt {
                 commits.push(seg.text);
             }
@@ -342,11 +335,7 @@ fn dual_pipeline_writes_both_jsonls_in_parallel() {
         // Both JSONLs exist and are non-empty.
         for path in [&streaming_jsonl, &refined_jsonl] {
             let bytes = std::fs::read(path).unwrap();
-            assert!(
-                !bytes.is_empty(),
-                "{:?} was empty",
-                path
-            );
+            assert!(!bytes.is_empty(), "{:?} was empty", path);
         }
     });
 }

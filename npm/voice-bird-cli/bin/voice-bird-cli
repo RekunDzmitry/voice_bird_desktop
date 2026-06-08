@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+
+const { spawnSync } = require("node:child_process");
+const { existsSync } = require("node:fs");
+const { join } = require("node:path");
+const { homedir } = require("node:os");
+
+const exe = join(homedir(), ".cargo", "bin", process.platform === "win32" ? "voice-bird-cli.exe" : "voice-bird-cli");
+
+if (!existsSync(exe)) {
+  const install = spawnSync("cargo", ["install", "voice-bird-cli", "--locked"], { stdio: "inherit" });
+  if (install.status !== 0) {
+    process.exit(install.status || 1);
+  }
+}
+
+const child = spawnSync(exe, process.argv.slice(2), { stdio: "inherit" });
+process.exit(child.status || 0);

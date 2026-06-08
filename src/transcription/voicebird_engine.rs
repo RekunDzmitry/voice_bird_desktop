@@ -24,7 +24,10 @@ pub struct VoiceBirdEngine {
 
 impl VoiceBirdEngine {
     pub fn new(api_key: String, server_url: String) -> Self {
-        Self { api_key, server_url }
+        Self {
+            api_key,
+            server_url,
+        }
     }
 }
 
@@ -74,14 +77,23 @@ fn ws_url_override() -> Option<String> {
 
 impl TranscriptionEngine for VoiceBirdEngine {
     fn start(&mut self, cfg: EngineConfig) -> anyhow::Result<EngineHandle> {
-        let (api_key_cfg, language, sample_rate, server_url_cfg, device_name) = match cfg {
+        let (api_key_cfg, language, sample_rate, server_url_cfg, device_name, app_name) = match cfg
+        {
             EngineConfig::Cloud {
                 api_key,
                 language,
                 sample_rate,
                 server_url,
                 device_name,
-            } => (api_key, language, sample_rate, server_url, device_name),
+                app_name,
+            } => (
+                api_key,
+                language,
+                sample_rate,
+                server_url,
+                device_name,
+                app_name,
+            ),
             EngineConfig::Local { .. } => {
                 anyhow::bail!("VoiceBirdEngine requires EngineConfig::Cloud");
             }
@@ -111,16 +123,10 @@ impl TranscriptionEngine for VoiceBirdEngine {
 
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<f32>>(32);
         let (events_tx, events_rx) = broadcast::channel::<EngineEvent>(256);
-        // The trait requires a `shutdown` oneshot in EngineHandle, but this
-        // engine does not listen on it: `oneshot::Receiver` resolves with
-        // `Err(RecvError)` the moment the matching `Sender` is dropped, and
-        // callers (see `app.rs::start_recording`) routinely drop the handle
-        // they get back without holding on to `.shutdown`. Listening here
-        // would break the loop before the first PCM frame ever arrives,
-        // sending `terminate` immediately and producing zero-byte sessions
-        // on the server. PCM-channel closure (driven by `stop_recording`
-        // aborting the producer task) is the actual shutdown signal —
-        // matching the pattern used for the refinement engine in `app.rs`.
+        // The trait exposes a shutdown sender, but callers may drop it
+        // immediately. Treating a dropped sender as shutdown closes the
+        // WebSocket before the first PCM frame, so this engine shuts down when
+        // the PCM channel closes.
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
 
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -152,7 +158,7 @@ impl TranscriptionEngine for VoiceBirdEngine {
                 "session_id": session_id,
                 "device_name": device_name,
                 "device_type": "desktop",
-                "app_name": env!("CARGO_PKG_NAME"),
+                "app_name": app_name,
                 "sample_rate": sample_rate,
                 "channels": 1,
                 "audio_format": "pcm16le",
@@ -165,7 +171,7 @@ impl TranscriptionEngine for VoiceBirdEngine {
 
             // Wait for `init_success` before forwarding any PCM. The server's
             // init handler is async (validates the API key, initializes the
-            // DB stream row, opens the upstream AssemblyAI socket) and
+            // DB stream row and opens the upstream transcription socket) and
             // `ws.sessionMetadata` is only populated after that finishes.
             // Binary frames arriving during that window are rejected with
             // `Session not initialized. Send init message first.` and the
@@ -173,12 +179,13 @@ impl TranscriptionEngine for VoiceBirdEngine {
             // producer from running away while we wait.
             let mut handshake_ok = false;
             while !handshake_ok {
-                let Some(msg) = ws.next().await else { return; };
+                let Some(msg) = ws.next().await else {
+                    return;
+                };
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => {
-                        let _ = events_tx
-                            .send(EngineEvent::Error(format!("ws recv: {e}")));
+                        let _ = events_tx.send(EngineEvent::Error(format!("ws recv: {e}")));
                         return;
                     }
                 };
@@ -203,9 +210,8 @@ impl TranscriptionEngine for VoiceBirdEngine {
                             handshake_ok = true;
                         }
                         Ok(ServerMessage::Error { message, code }) => {
-                            let m = message.unwrap_or_else(|| {
-                                code.unwrap_or_else(|| "server error".into())
-                            });
+                            let m = message
+                                .unwrap_or_else(|| code.unwrap_or_else(|| "server error".into()));
                             let _ = events_tx.send(EngineEvent::Error(m));
                             return;
                         }

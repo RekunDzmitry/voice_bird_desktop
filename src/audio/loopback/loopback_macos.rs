@@ -15,16 +15,13 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use core_foundation::base::TCFType;
-use core_media_rs::cm_sample_buffer::CMSampleBuffer;
 use core_media_rs::cm_format_description::CMFormatDescriptionRef;
+use core_media_rs::cm_sample_buffer::CMSampleBuffer;
 use screencapturekit::{
     shareable_content::SCShareableContent,
     stream::{
-        configuration::SCStreamConfiguration,
-        content_filter::SCContentFilter,
-        output_trait::SCStreamOutputTrait,
-        output_type::SCStreamOutputType,
-        SCStream,
+        configuration::SCStreamConfiguration, content_filter::SCContentFilter,
+        output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType, SCStream,
     },
 };
 
@@ -105,11 +102,7 @@ struct ObservedFormat {
 }
 
 impl SCStreamOutputTrait for AudioOutput {
-    fn did_output_sample_buffer(
-        &self,
-        sample_buffer: CMSampleBuffer,
-        of_type: SCStreamOutputType,
-    ) {
+    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
         if !matches!(of_type, SCStreamOutputType::Audio) {
             // Video frames from the 2x2 dummy config — drop them.
             return;
@@ -248,20 +241,92 @@ pub fn capture(name: Option<&str>) -> Result<CaptureHandle> {
     );
 
     // --- 1. Content filter: any available display ------------------------
-    let content = SCShareableContent::get()
-        .map_err(|e| anyhow!("SCShareableContent::get failed: {:?} — if this is a permission error, grant 'Screen & System Audio Recording' in System Settings > Privacy & Security > Screen Recording and restart voice-bird", e))?;
+    let content = sck_shareable_content()?;
+    let display = first_display(&content)?;
+    let filter = SCContentFilter::new().with_display_excluding_windows(&display, &[]);
+
+    start_sck_capture(filter)
+}
+
+/// Start per-application audio capture for `bundle_id` (or — when no
+/// bundle id is known — the human-readable application name).
+/// ScreenCaptureKit's filter takes an `SCRunningApplication` and emits
+/// only that app's audio; system audio from other apps is excluded.
+pub fn capture_app(bundle_id: &str) -> Result<CaptureHandle> {
+    log::info!("loopback: capturing per-app audio for {:?}", bundle_id);
+
+    let content = sck_shareable_content()?;
+    let display = first_display(&content)?;
+    let apps = content.applications();
+    let target = apps
+        .iter()
+        .find(|a| {
+            let bid = a.bundle_identifier();
+            !bid.is_empty() && bid == bundle_id
+        })
+        .or_else(|| {
+            // Fallback: match on application name (some processes report
+            // empty bundle_identifier — pick the named app instead).
+            apps.iter().find(|a| a.application_name() == bundle_id)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "application '{}' not found among {} running apps — try refreshing ([r])",
+                bundle_id,
+                apps.len()
+            )
+        })?;
+    log::info!(
+        "loopback: per-app target = {} (bundle={}, pid={})",
+        target.application_name(),
+        target.bundle_identifier(),
+        target.process_id()
+    );
+    let filter = SCContentFilter::new().with_display_including_application_excepting_windows(
+        &display,
+        &[target],
+        &[],
+    );
+
+    start_sck_capture(filter)
+}
+
+fn sck_shareable_content() -> Result<screencapturekit::shareable_content::SCShareableContent> {
+    SCShareableContent::get()
+        .map_err(|e| anyhow!("SCShareableContent::get failed: {:?} — if this is a permission error, grant 'Screen & System Audio Recording' in System Settings > Privacy & Security > Screen Recording and restart voice-bird", e))
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// Whether the current process has Screen Recording permission. Non-prompting:
+/// returns the cached TCC decision. macOS does not propagate a fresh grant to
+/// already-running processes, so a `false` result means the user must grant
+/// permission and restart voice-bird.
+pub fn screen_recording_permission_granted() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+fn first_display(
+    content: &screencapturekit::shareable_content::SCShareableContent,
+) -> Result<screencapturekit::shareable_content::SCDisplay> {
     let mut displays = content.displays();
     if displays.is_empty() {
         return Err(anyhow!(
             "no displays available for ScreenCaptureKit (screen recording permission may be denied)"
         ));
     }
-    let display = displays.remove(0);
-    let filter = SCContentFilter::new().with_display_excluding_windows(&display, &[]);
+    Ok(displays.remove(0))
+}
 
+/// Configure an `SCStream` for the given content filter (audio enabled,
+/// minimal video) and start it. Returns the same [`CaptureHandle`] shape
+/// as the mic and per-app paths so the resampler/engine pipeline doesn't
+/// need to know which capture variant is feeding it.
+fn start_sck_capture(filter: SCContentFilter) -> Result<CaptureHandle> {
     // --- 2. Stream configuration: audio on, video minimal ----------------
-    // `core-foundation::CFError` doesn't impl `std::error::Error`, so we
-    // can't use anyhow's `.context(..)` directly; format the debug repr.
     let config = SCStreamConfiguration::new()
         .set_captures_audio(true)
         .map_err(|e| anyhow!("set_captures_audio: {:?}", e))?
@@ -287,9 +352,7 @@ pub fn capture(name: Option<&str>) -> Result<CaptureHandle> {
         .add_output_handler(audio_output, SCStreamOutputType::Audio)
         .is_none()
     {
-        return Err(anyhow!(
-            "failed to add audio output handler to SCStream"
-        ));
+        return Err(anyhow!("failed to add audio output handler to SCStream"));
     }
 
     // --- 5. Start capture ------------------------------------------------
@@ -301,13 +364,8 @@ pub fn capture(name: Option<&str>) -> Result<CaptureHandle> {
     })?;
 
     // SCK is asynchronous — we don't get an ASBD until the first sample
-    // buffer lands. We'd rather not block `start_recording` on that, so we
-    // return a conservative default (the SCK documented default: 48 kHz
-    // stereo Float32) in `CaptureInfo`. The resampler handles whatever the
-    // producer task actually ships; if SCK decides to deliver 44.1 kHz mono
-    // (rare but possible), the samples would be resampled from a slightly
-    // wrong rate. TODO: push the observed ASBD back into the resampler so
-    // it retunes after the first frame, or block here with a short timeout.
+    // buffer lands. Returning the documented default keeps the pipeline
+    // moving; the resampler handles whatever rate actually shows up.
     let info = CaptureInfo {
         sample_rate: 48_000,
         channels: 2,

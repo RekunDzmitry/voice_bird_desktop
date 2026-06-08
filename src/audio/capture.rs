@@ -29,6 +29,8 @@ pub enum CaptureKeepAlive {
     Cpal(cpal::Stream),
     #[cfg(target_os = "macos")]
     Sck(crate::audio::loopback::loopback_macos::LoopbackKeepAlive),
+    #[cfg(target_os = "windows")]
+    Wasapi(crate::audio::loopback::loopback_windows::WasapiKeepAlive),
 }
 
 /// Returned by [`capture_default_input`] / [`capture_input`] /
@@ -111,8 +113,7 @@ pub fn capture_input(name: Option<&str>) -> anyhow::Result<CaptureHandle> {
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let v: Vec<f32> =
-                        data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
+                    let v: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
                     let _ = tx.blocking_send(v);
                 },
                 err_fn,

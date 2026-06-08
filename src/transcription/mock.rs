@@ -8,7 +8,11 @@ use super::{EngineConfig, EngineEvent, EngineHandle, Segment, TranscriptionEngin
 pub enum MockEvent {
     ModelLoaded(String),
     Tentative(String),
-    Committed { t_start_ms: u64, t_end_ms: u64, text: String },
+    Committed {
+        t_start_ms: u64,
+        t_end_ms: u64,
+        text: String,
+    },
 }
 
 pub struct MockEngine {
@@ -59,7 +63,11 @@ impl TranscriptionEngine for MockEngine {
             }
         });
 
-        Ok(EngineHandle { pcm_tx, events_rx, shutdown: shutdown_tx })
+        Ok(EngineHandle {
+            pcm_tx,
+            events_rx,
+            shutdown: shutdown_tx,
+        })
     }
 }
 
@@ -75,7 +83,9 @@ mod tests {
             MockEvent::Tentative("hel".into()),
             MockEvent::Tentative("hello".into()),
             MockEvent::Committed {
-                t_start_ms: 0, t_end_ms: 1000, text: "hello".into(),
+                t_start_ms: 0,
+                t_end_ms: 1000,
+                text: "hello".into(),
             },
         ];
         let mut engine = MockEngine::new(script);
@@ -116,6 +126,8 @@ mod tests {
             language: None,
             sample_rate: 16_000,
             server_url: "wss://example.test/api/audio/stream".into(),
+            device_name: "mock-device".into(),
+            app_name: String::new(),
         };
         let err = engine.start(cfg).err().expect("expected Err on Cloud");
         assert!(

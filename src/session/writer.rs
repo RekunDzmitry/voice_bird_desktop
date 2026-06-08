@@ -20,18 +20,17 @@ impl SegmentWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self { file: BufWriter::new(file) })
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file: BufWriter::new(file),
+        })
     }
 
     pub fn append(&mut self, seg: &WrittenSegment) -> anyhow::Result<()> {
         serde_json::to_writer(&mut self.file, seg)?;
         self.file.write_all(b"\n")?;
         self.file.flush()?;
-        self.file.get_ref().sync_data()?;  // fsync per segment
+        self.file.get_ref().sync_data()?; // fsync per segment
         Ok(())
     }
 }
@@ -45,7 +44,7 @@ mod tests {
     fn seg(t0: f64, t1: f64, text: &str) -> WrittenSegment {
         WrittenSegment {
             t_start_ms: (t0 * 1000.0) as u64,
-            t_end_ms:   (t1 * 1000.0) as u64,
+            t_end_ms: (t1 * 1000.0) as u64,
             text: text.into(),
         }
     }

@@ -1,73 +1,111 @@
-# Voice Bird
+# Voice Bird CLI
 
-Terminal-based voice transcription. Runs **locally by default** — your audio never leaves your machine. An optional cloud engine (AssemblyAI) is available for users without a GPU or ANE; it is off by default and requires both an API key and an explicit change to `engine_prefer`. When active, a `CLOUD` badge is shown in the header.
+Voice Bird CLI is a terminal voice transcription app. It runs **locally by default** with Whisper models, so local recordings stay on your machine. When you want hosted transcription, you can opt in per source to VoiceBird Web cloud mode.
+
+![Voice Bird CLI basic flow](docs/assets/basic-flow.svg)
+
+## Basic Flow
+
+1. Pick a microphone, system-output loopback device, or app audio source.
+2. Choose local or cloud mode for that source.
+3. Press `Enter` to start a transcription slot.
+4. Watch committed and tentative transcript text stream into the TUI.
+5. In local mode, review session files under `~/voice-bird/sessions/<timestamp>-<source>/`.
+
+Local sessions contain:
+
+| File | Content |
+| --- | --- |
+| `audio.wav` | 16 kHz mono recording |
+| `transcript.jsonl` | Append-only transcript log, useful after crashes |
+| `transcript.json` | Finalized transcript segments and metadata |
+| `transcript.txt` | Plain-text transcript |
+| `meta.json` | Device, source, model, engine, and duration |
+
+## Getting Started
+
+Install one of the CLI packages, then run:
+
+```bash
+voice-bird-cli
+```
+
+On first launch, Voice Bird picks a local Whisper model and downloads it into your OS cache directory. The default model is `distil-small.en`. Settings are stored in `~/.config/voice-bird/config.toml` on Linux/macOS and `%APPDATA%\voice-bird\config.toml` on Windows.
+
+macOS users may need to grant Screen Recording permission for system or app audio capture. Apple Silicon users can optionally build the WhisperKit sidecar for ANE-accelerated local inference:
+
+```bash
+cargo run -p xtask -- build-sidecar
+```
+
+Without the sidecar, Voice Bird falls back to `whisper-rs` with whisper.cpp.
 
 ## Install
 
-```bash
-cargo install voice-bird
-```
-
-Voice Bird downloads Whisper models on first run (defaults to `distil-small.en`, ~250 MB) and caches them under your OS cache directory.
-
-### macOS bonus: ANE-accelerated inference
-
-On Apple Silicon, a bundled WhisperKit sidecar can run Whisper on the Neural Engine. Building it requires a working Swift toolchain (full Xcode or a repaired Command Line Tools install):
+Cargo installs the native Rust binary directly:
 
 ```bash
-cd whisperkit-helper
-swift build -c release
-# then copy the binary next to the voice-bird binary:
-cp .build/release/voice-bird-whisperkit "$(dirname "$(which voice-bird)")/"
+cargo install voice-bird-cli
 ```
 
-Without the sidecar, Voice Bird falls back to `whisper-rs` (whisper.cpp bindings with Metal acceleration) — still fully local, just without ANE.
+PyPI installs a small wrapper that installs/runs the Cargo binary:
 
-### Cloud engines (optional)
+```bash
+pipx install voice-bird-cli
+# or
+pip install voice-bird-cli
+```
 
-If your machine can't keep up with local Whisper, Voice Bird can stream audio to AssemblyAI's Universal-Streaming service instead. This is off by default; when on, a `CLOUD` badge is shown in the header and a reminder appears at the start of each recording.
+npm installs a small wrapper that installs/runs the Cargo binary:
 
-1. Get an API key from https://www.assemblyai.com/.
-2. Open Voice Bird and press `,` to open Settings.
-3. Set `Engine preference` to `assemblyai`, paste your key into `AssemblyAI API key`, press `s` to save.
+```bash
+npm install -g voice-bird-cli
+```
 
-Your key lives in `~/.config/voice-bird/config.toml` in plaintext (chmod `0600` on Unix). Anyone with read access to that file can read your key.
+From source:
+
+```bash
+git clone https://github.com/voice-bird/voice-bird-cli.git
+cd voice-bird-cli
+cargo install --path .
+```
+
+The npm and PyPI packages require Rust Cargo on the machine. Use the Cargo or source install when you want the simplest path.
+
+## Local And Cloud Modes
+
+**Free local mode** is the default. It uses local Whisper inference through `whisper-rs`, or WhisperKit on macOS when the sidecar is available. Local mode does not send audio to a server and writes session artifacts to disk. Current local models are English-focused in the app flow.
+
+**Cloud mode** streams audio to VoiceBird Web at `wss://voicebird.app/api/audio/stream`. It is opt-in, requires a Voice Bird API key, and is useful when local hardware cannot keep up or when you want cloud language support. Cloud recordings live in your VoiceBird Web account instead of the local sessions folder.
+
+Your Voice Bird API key is stored in plaintext in `config.toml`; on Unix the app sets the file to `0600` best-effort.
 
 ## Usage
 
 ```bash
-voice-bird                          # start the TUI
-voice-bird --recover <session-dir>  # rebuild transcript.{json,txt} after a crash
+voice-bird-cli                         # start the TUI
+voice-bird-cli --recover <session-dir> # rebuild transcript.{json,txt} after a crash
 ```
-
-On first launch you pick a model. Subsequent launches remember your choice (stored in `~/.config/voice-bird/config.toml` on Linux/macOS, `%APPDATA%\voice-bird\config.toml` on Windows).
-
-Recordings live under `~/voice-bird/sessions/<timestamp>-<source>/`:
-
-| File | Content |
-|------|---------|
-| `audio.wav` | 16 kHz mono |
-| `transcript.jsonl` | Append-only log, crash-safe |
-| `transcript.json` | Finalized segments + metadata |
-| `transcript.txt` | Plain text, one line per segment |
-| `meta.json` | Device, model, engine, duration |
 
 ## Keys
 
 | Key | Action |
-|-----|--------|
-| `r` | start recording |
-| `s` | stop |
-| `m` | change model (first-run picker) |
-| `,` | open settings |
-| `q` | quit |
-| `?` | help |
-
-## Scope caveats (current release)
-
-- Capture is microphone-only. System-audio loopback (via ScreenCaptureKit on macOS / WASAPI on Windows) is deferred to a follow-up release.
-- WhisperKit sidecar must be built by the user (see install notes).
+| --- | --- |
+| `↑` / `↓` | Select device or app |
+| `←` / `→` | Move between panes |
+| `Enter` | Start the selected source |
+| `Space` | Clear selected app pairing |
+| `Tab` | Move between transcript slots |
+| `r` | Refresh devices and apps |
+| `c` | Toggle cloud mode for the focused source |
+| `l` | Change language for cloud mode |
+| `m` | Change model |
+| `e` | Export the latest local transcript |
+| `p` | Change local session path |
+| `x` | Clear stopped transcript slot |
+| `q` | Quit |
+| `?` | Help |
 
 ## License
 
-Proprietary.
+MIT

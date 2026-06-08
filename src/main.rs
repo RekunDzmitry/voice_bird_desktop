@@ -1,7 +1,6 @@
 mod app;
 mod logger;
 mod platform;
-mod settings_view;
 mod ui;
 
 use std::io;
@@ -11,8 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -80,7 +78,11 @@ fn init_macos_app_event_handler() {
     extern "C" {
         fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
         fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        fn objc_msgSend(obj: *mut std::ffi::c_void, sel: *mut std::ffi::c_void, ...) -> *mut std::ffi::c_void;
+        fn objc_msgSend(
+            obj: *mut std::ffi::c_void,
+            sel: *mut std::ffi::c_void,
+            ...
+        ) -> *mut std::ffi::c_void;
     }
 
     std::thread::spawn(|| {
@@ -118,7 +120,7 @@ fn main() -> Result<()> {
         let dir = args
             .get(pos + 1)
             .ok_or_else(|| anyhow::anyhow!("--recover requires a path"))?;
-        voice_bird::session::recover::recover(std::path::Path::new(dir))?;
+        voice_bird_cli::session::recover::recover(std::path::Path::new(dir))?;
         println!("Recovered transcripts in {}", dir);
         return Ok(());
     }
@@ -180,37 +182,44 @@ fn main() -> Result<()> {
     // Create app and run
     let mut app = App::new();
     app.log_path = log_path;
-    app.refresh_sessions();
+    app.refresh_inventory();
 
-    // Seed cursor to the saved device. Many devices (USB headsets like
-    // EPOS) appear twice — once as Input (mic) and once as Output (for
-    // loopback capture). Prefer matching on BOTH name and saved kind so
-    // a user who picked the loopback variant gets the loopback variant
-    // back. Falls back to name-only match for old configs that did not
-    // store input_device_kind.
+    // Seed Devices-pane cursor to the saved device. Many devices (USB
+    // headsets like EPOS) appear twice — once as Input (mic) and once
+    // as Output (for loopback capture). Prefer matching on BOTH name
+    // and saved kind so a user who picked the loopback variant gets the
+    // loopback variant back. Falls back to name-only match for old
+    // configs that did not store input_device_kind.
     if let Some(saved) = app.config.input_device.clone() {
         let saved_kind = app.config.input_device_kind;
         let by_name_and_kind = saved_kind.and_then(|k| {
-            app.sessions
+            app.devices
                 .iter()
-                .position(|s| s.device_name == saved && s.kind == k)
+                .position(|d| d.name == saved && d.kind == k)
         });
-        let i = by_name_and_kind.or_else(|| {
-            app.sessions.iter().position(|s| s.device_name == saved)
-        });
+        let i = by_name_and_kind.or_else(|| app.devices.iter().position(|d| d.name == saved));
         if let Some(i) = i {
-            app.selected_index = i;
+            app.selected_device_index = i;
         }
     }
+    // Seed Apps-pane cursor to the last-used app id, if it still exists.
+    if let Some(last_id) = app.config.last_app_id.clone() {
+        app.selected_app_index = app.apps.iter().position(|a| a.id == last_id);
+    }
 
-    log::info!("Found {} audio sessions", app.sessions.len());
-    for (i, s) in app.sessions.iter().enumerate() {
-        log::info!("  device[{}] = {:?} kind={:?}", i, s.device_name, s.kind);
+    log::info!(
+        "Found {} devices, {} apps",
+        app.devices.len(),
+        app.apps.len()
+    );
+    for (i, d) in app.devices.iter().enumerate() {
+        log::info!("  device[{}] = {:?} kind={:?}", i, d.name, d.kind);
     }
     log::info!(
-        "config.input_device = {:?}, cursor selected_index = {}",
+        "config.input_device = {:?}, cursor selected_device_index = {}, selected_app_index = {:?}",
         app.config.input_device,
-        app.selected_index
+        app.selected_device_index,
+        app.selected_app_index,
     );
 
     if let Some(p) = &debug_snapshot_path {
@@ -297,19 +306,18 @@ fn run_app<B: Backend>(
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
-                            AppMode::Settings => settings_view::handle_key(app, key.code),
+                            AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
+                            AppMode::PathModal => handle_path_modal(app, key.code),
                         }
                         if let Some(path) = debug_snapshot_path {
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
                         }
                     }
-                    Event::Mouse(mouse) if app.mode == AppMode::Normal => {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
-                            MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
-                            _ => {}
-                        }
-                    }
+                    Event::Mouse(mouse) if app.mode == AppMode::Normal => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -347,7 +355,6 @@ fn run_app<B: Backend>(
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyCode) {
-    let recording = matches!(app.status, RecordingStatus::Recording);
     // Transcript scroll keys — always available, no mode conflict.
     match key {
         KeyCode::PageUp => {
@@ -371,76 +378,340 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.toggle_help(),
-        KeyCode::Up | KeyCode::Char('k') if !recording => {
-            if app.selected_index > 0 {
-                app.selected_index -= 1;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') if !recording => {
-            if app.selected_index + 1 < app.sessions.len() {
-                app.selected_index += 1;
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') if recording => app.scroll_transcript_up(1),
-        KeyCode::Down | KeyCode::Char('j') if recording => app.scroll_transcript_down(1),
-        KeyCode::Enter if !recording => {
-            // Persist the selected device (name + kind), then start recording.
-            use voice_bird::config::AudioSessionKind;
-            use voice_bird::session::layout::SessionSource;
-            let source = if let Some(dev) = app.sessions.get(app.selected_index).cloned() {
-                let name_changed =
-                    app.config.input_device.as_deref() != Some(dev.device_name.as_str());
-                let kind_changed = app.config.input_device_kind != Some(dev.kind);
-                if name_changed || kind_changed {
-                    app.config.input_device = Some(dev.device_name.clone());
-                    app.config.input_device_kind = Some(dev.kind);
-                    if let Err(e) = app.config.save() {
-                        log::error!("config save: {e}");
-                    }
-                }
-                match dev.kind {
-                    AudioSessionKind::Input => SessionSource::Microphone,
-                    AudioSessionKind::Output => SessionSource::System,
-                }
-            } else {
-                SessionSource::Microphone
-            };
-            app.start_recording(source);
-        }
-        KeyCode::Char('r') if !recording => {
-            // Refresh device list, preserving cursor on the same name if present.
-            let prior = app
-                .sessions
-                .get(app.selected_index)
-                .map(|s| s.device_name.clone());
-            app.refresh_sessions();
-            if let Some(name) = prior {
-                if let Some(i) = app.sessions.iter().position(|s| s.device_name == name) {
-                    app.selected_index = i;
-                }
-            }
-        }
-        KeyCode::Char('s') if !recording => {
-            settings_view::open(app);
-        }
-        KeyCode::Char('s') if recording => {
-            app.stop_recording();
-        }
-        KeyCode::Char('m') if !recording => app.mode = AppMode::ModelPicker,
-        // Toggle live broadcast for the next recording. In-memory only —
-        // does not persist to config.toml; the user changes the default
-        // in Settings ('s'). Disabled mid-recording so a flip doesn't
-        // strand the active engine.
-        KeyCode::Char('b') if !recording => {
-            app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
-            let on = app.config.cloud_broadcast_enabled;
-            app.banner = Some(
-                if on {
-                    "Live broadcast: ON (next recording streams to voicebird.app)".into()
-                } else {
-                    "Live broadcast: OFF (next recording is local-only)".into()
-                },
+        // Tab cycles which section the c/l/m/s/PgUp keys target.
+        KeyCode::Tab => {
+            app.focus_next();
+            log::info!(
+                "keys: Tab → focused_section = {} (sections active = {})",
+                app.focused_section,
+                app.active_section_count()
             );
+        }
+        KeyCode::BackTab => {
+            app.focus_prev();
+            log::info!(
+                "keys: BackTab → focused_section = {} (sections active = {})",
+                app.focused_section,
+                app.active_section_count()
+            );
+        }
+        // ↑/↓/k/j navigate within the focused picker pane.
+        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+        // ←/→ switch picker pane focus. `h` / `l` are deliberately not
+        // bound here: `l` already cycles cloud language. `h` is free
+        // and aliased to `←` for vim-style users.
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.picker_focus = crate::app::PickerFocus::Devices;
+            log::info!("keys: Left → picker_focus = Devices");
+        }
+        KeyCode::Right => {
+            app.picker_focus = crate::app::PickerFocus::Apps;
+            log::info!("keys: Right → picker_focus = Apps");
+        }
+        // Space clears the Apps cursor → starts the section with the
+        // device alone. Only meaningful with the Apps pane focused; in
+        // the Devices pane it's a no-op (avoids surprising behaviour).
+        KeyCode::Char(' ') => {
+            if app.picker_focus == crate::app::PickerFocus::Apps {
+                app.clear_app_selection();
+                log::info!("keys: Space → cleared app selection");
+            }
+        }
+        KeyCode::Enter => {
+            // Pick the next free slot (or refuse if all are full).
+            let Some(slot) = app.next_free_slot() else {
+                log::info!("keys: Enter → refused (all 3 sections full)");
+                app.banner = Some("All 3 sections are recording — stop one first ([s])".into());
+                return;
+            };
+            use voice_bird_cli::config::AudioSessionKind;
+            use voice_bird_cli::session::layout::SessionSource;
+
+            let Some(dev) = app.devices.get(app.selected_device_index).cloned() else {
+                log::warn!(
+                    "keys: Enter → refused (no device at idx {})",
+                    app.selected_device_index
+                );
+                app.banner = Some("No audio device selected — press [r] to refresh".into());
+                return;
+            };
+            let app_pick = app.focused_app().cloned();
+            log::info!(
+                "keys: Enter → slot={} focused_section_before={} dev=({:?}, {:?}) app={:?}",
+                slot,
+                app.focused_section,
+                dev.name,
+                dev.kind,
+                app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
+            );
+
+            // Reject Input + App: per-app loopback can't pair with a
+            // mic capture, and combining them silently would just record
+            // the mic.
+            if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
+                app.banner = Some(
+                    "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app".into(),
+                );
+                return;
+            }
+
+            // Persist the selected device + last app id.
+            let name_changed = app.config.input_device.as_deref() != Some(dev.name.as_str());
+            let kind_changed = app.config.input_device_kind != Some(dev.kind);
+            let app_id_changed =
+                app.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
+            if name_changed || kind_changed || app_id_changed {
+                app.config.input_device = Some(dev.name.clone());
+                app.config.input_device_kind = Some(dev.kind);
+                app.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
+                if let Err(e) = app.config.save() {
+                    log::error!("config save: {e}");
+                }
+            }
+
+            let source = match (dev.kind, app_pick) {
+                (AudioSessionKind::Input, _) => SessionSource::Microphone,
+                (AudioSessionKind::Output, None) => SessionSource::System,
+                (AudioSessionKind::Output, Some(a)) => SessionSource::App {
+                    id: a.id,
+                    name: a.name,
+                    device_name: dev.name.clone(),
+                },
+                (AudioSessionKind::App, _) => {
+                    // Devices pane never emits AudioSessionKind::App
+                    // entries (apps live in the Apps pane), but be safe.
+                    app.banner = Some("Unexpected device kind — press [r] to refresh".into());
+                    return;
+                }
+            };
+
+            // Start in the chosen slot; route through the per-section API
+            // so settings come from `effective_settings_for(source)`.
+            let settings = app.effective_settings_for(&source);
+            app.focused_section = slot;
+            log::info!(
+                "keys: Enter → resolved source={:?}; calling start_section[{}]",
+                source,
+                slot
+            );
+            match app.start_section(slot, source, settings) {
+                Ok(()) => {
+                    log::info!(
+                        "keys: Enter → start_section[{}] OK; sections active = {}",
+                        slot,
+                        app.active_section_count()
+                    );
+                }
+                Err(msg) => {
+                    log::warn!("keys: Enter → start_section[{}] FAILED: {}", slot, msg);
+                    app.banner = Some(msg.clone());
+                    app.status = RecordingStatus::Error(msg);
+                }
+            }
+        }
+        KeyCode::Char('r') => {
+            // Refresh inventory; refresh_inventory preserves both cursors.
+            let before_d = app.devices.len();
+            let before_a = app.apps.len();
+            app.refresh_inventory();
+            log::info!(
+                "keys: r refresh_inventory: devices {} → {}, apps {} → {}",
+                before_d,
+                app.devices.len(),
+                before_a,
+                app.apps.len()
+            );
+        }
+        // 's' stops the focused section (no-op if its slot is empty).
+        KeyCode::Char('s') => {
+            let slot = app.focused_section;
+            if app.sections[slot].is_some() {
+                log::info!("keys: s → stop_section[{}]", slot);
+                app.stop_section(slot);
+            } else {
+                log::info!("keys: s → no-op (slot {} empty)", slot);
+            }
+        }
+        // 'x' clears the transcript for the focused slot (both live and
+        // saved/preserved).
+        KeyCode::Char('x') => {
+            let slot = app.focused_section;
+            let had_text =
+                app.focused_committed().lock().len() > 0 || app.transcript_saved[slot].is_some();
+            app.clear_slot_transcript(slot);
+            if had_text {
+                log::info!("keys: x → cleared transcript for slot {slot}");
+            }
+        }
+        // Shift-S stops every active section in one go.
+        KeyCode::Char('S') => {
+            app.stop_all_sections();
+        }
+        KeyCode::Char('m') => {
+            // Manual model override. Seeds the picker at the current
+            // displayed model (focused section's if running, else the
+            // global default) so the user sees what's already chosen.
+            let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
+            let current = app.display_model();
+            let current_idx = catalog
+                .all()
+                .iter()
+                .position(|m| m.id == current.as_str())
+                .unwrap_or(0);
+            app.picker = Some(crate::app::PickerState {
+                index: current_idx,
+                downloading: None,
+            });
+            app.mode = AppMode::ModelPicker;
+        }
+        // Toggle cloud transcription. When idle, mutates the global
+        // config so the next-start defaults flip (and the mode panel
+        // updates). When a section is focused, mutates that section's
+        // settings AND persists a per-source override. The running
+        // engine itself is untouched until the user stops & restarts —
+        // mid-flight engine rebuild is Stage 3+.
+        KeyCode::Char('c') => {
+            if let Some(section) = app.focused_mut() {
+                section.settings.cloud_on = !section.settings.cloud_on;
+                let on = section.settings.cloud_on;
+                app.persist_focused_settings();
+                app.banner = Some(if on {
+                    "Cloud: ON for focused section (applies on next start)".into()
+                } else {
+                    "Cloud: OFF for focused section (applies on next start)".into()
+                });
+            } else {
+                app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
+                let on = app.config.cloud_broadcast_enabled;
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (cloud toggle): {e}");
+                }
+                if on && app.config.voicebird_api_key.is_empty() {
+                    app.open_api_key_modal();
+                } else {
+                    app.banner = Some(if on {
+                        "Cloud: ON (next recording streams to voicebird.app)".into()
+                    } else {
+                        "Cloud: OFF (next recording is local-only)".into()
+                    });
+                }
+            }
+        }
+        // Cycle the cloud language. When idle, mutates the global config
+        // (and is hidden when cloud is off). When focused-section
+        // recording, cycles that section's language and persists the
+        // override.
+        KeyCode::Char('l') => {
+            let langs = crate::app::CLOUD_LANGUAGES;
+            if let Some(section) = app.focused_mut() {
+                if !section.settings.cloud_on {
+                    return;
+                }
+                let i = langs
+                    .iter()
+                    .position(|&l| l == section.settings.language)
+                    .unwrap_or(0);
+                let next = (i + 1) % langs.len();
+                section.settings.language = langs[next].into();
+                app.persist_focused_settings();
+            } else if app.config.cloud_broadcast_enabled {
+                let i = langs
+                    .iter()
+                    .position(|&l| l == app.config.language)
+                    .unwrap_or(0);
+                let next = (i + 1) % langs.len();
+                app.config.language = langs[next].into();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (lang cycle): {e}");
+                }
+            }
+        }
+        // Export the most recent local transcript to the cloud.
+        // Idempotent — second press is a no-op once .uploaded exists.
+        KeyCode::Char('e') if app.active_section_count() == 0 => {
+            app.export_transcript();
+        }
+        // Open the output-path modal. Only when idle (can't change
+        // paths mid-recording — sessions have already landed).
+        KeyCode::Char('p') if app.active_section_count() == 0 => {
+            app.open_path_modal();
+        }
+        _ => {}
+    }
+}
+
+fn handle_path_modal(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.path_buf = None;
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(buf) = app.path_buf.take() {
+                app.config.session_dir = buf.trim().to_string();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (path modal): {e}");
+                    app.banner = Some(format!("Save failed: {e}"));
+                } else {
+                    app.banner = Some(format!(
+                        "Output path → {}",
+                        app.config.session_dir_expanded()
+                    ));
+                }
+            }
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.path_buf.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some(buf) = app.path_buf.as_mut() {
+                buf.push(ch);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_api_key_modal(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            // Cancel: revert the cloud toggle so the user isn't left
+            // with cloud=on and no key — that would block the next
+            // recording. Leaves the saved key untouched, so a partial
+            // edit is discarded.
+            app.config.cloud_broadcast_enabled = false;
+            if let Err(e) = app.config.save() {
+                log::error!("config save (modal cancel): {e}");
+            }
+            app.api_key_buf = None;
+            app.mode = AppMode::Normal;
+            app.banner = Some("Cloud: OFF (cancelled API key entry)".into());
+        }
+        KeyCode::Enter => {
+            if let Some(buf) = app.api_key_buf.take() {
+                app.config.voicebird_api_key = buf.trim().to_string();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (modal save): {e}");
+                    app.banner = Some(format!("Save failed: {e}"));
+                } else {
+                    app.banner = Some("API key saved — start a recording to verify".into());
+                }
+            }
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.api_key_buf.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some(buf) = app.api_key_buf.as_mut() {
+                buf.push(ch);
+            }
         }
         _ => {}
     }
@@ -458,7 +729,7 @@ fn handle_picker_mode(app: &mut App, key: KeyCode) {
         return;
     }
 
-    let catalog = voice_bird::transcription::models::Catalog::builtin();
+    let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
     let total = catalog.all().len();
 
     match key {
@@ -502,7 +773,7 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
 
 fn stop_all_sessions(app: &mut App) {
     log::info!("Stopping all sessions");
-    app.stop_recording();
+    app.stop_all_sections();
 }
 
 /// Append one JSON-line snapshot of relevant App state to `path`.
@@ -518,59 +789,59 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         RecordingStatus::Error(s) => format!("Error: {s}"),
     };
 
-    // When in Settings mode, surface the focused field's label, current
-    // displayed value, and the cycle options (if any) so the agent can
-    // pick the right key to send next without needing pixels.
-    let (settings_field_label, settings_field_value, settings_field_options) =
-        if app.mode == AppMode::Settings {
-            let fields = settings_view::FIELDS;
-            if let Some(fld) = fields.get(app.settings_cursor) {
-                let value = settings_view::field_display(app, fld.key);
-                let options = settings_view::cycle_options_for(fld.key, app);
-                (fld.label.to_string(), value, options)
-            } else {
-                (String::new(), String::new(), Vec::new())
-            }
-        } else {
-            (String::new(), String::new(), Vec::new())
-        };
-
-    let device_names: Vec<String> =
-        app.sessions.iter().map(|s| s.device_name.clone()).collect();
+    let device_names: Vec<String> = app.devices.iter().map(|d| d.name.clone()).collect();
     let selected_device_name = app
-        .sessions
-        .get(app.selected_index)
-        .map(|s| s.device_name.clone())
+        .devices
+        .get(app.selected_device_index)
+        .map(|d| d.name.clone())
+        .unwrap_or_default();
+    let app_names: Vec<String> = app.apps.iter().map(|a| a.name.clone()).collect();
+    let selected_app_name = app
+        .selected_app_index
+        .and_then(|i| app.apps.get(i))
+        .map(|a| a.name.clone())
         .unwrap_or_default();
 
-    let committed = app.committed.lock();
+    let committed_arc = app.focused_committed();
+    let committed = committed_arc.lock();
     let committed_count = committed.len();
-    let last_committed_text = committed
-        .last()
-        .map(|c| c.text.clone())
-        .unwrap_or_default();
+    let last_committed_text = committed.last().map(|c| c.text.clone()).unwrap_or_default();
     drop(committed);
-    let tentative_text = app.tentative.lock().clone();
+    let tentative_text = app.focused_tentative().lock().clone();
+
+    // Mask the API key so the snapshot file is safe to ship in test
+    // artifacts. The e2e harness only needs to know whether a key is
+    // present (length > 0), not what it is.
+    let api_key_masked = if app.config.voicebird_api_key.is_empty() {
+        String::new()
+    } else {
+        let n = app.config.voicebird_api_key.len();
+        format!("•••{n}")
+    };
+    let api_key_buf_len = app.api_key_buf.as_ref().map(|s| s.len()).unwrap_or(0);
 
     let snap = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "last_key": last_key,
         "mode": format!("{:?}", app.mode),
         "status": status,
-        "cloud_broadcast_active": app.cloud_broadcast_active,
-        "engine_kind": app.engine_kind,
+        "cloud_broadcast_active": app.focused_cloud_active(),
+        "cloud_broadcast_enabled": app.config.cloud_broadcast_enabled,
+        "language": app.config.language,
+        "default_model": app.config.default_model,
+        "engine_kind": app.focused_engine_kind(),
         "duration_secs": app.duration,
         "banner": app.banner,
         "status_message": app.status_message,
         "device_names": device_names,
-        "selected_device_index": app.selected_index,
+        "selected_device_index": app.selected_device_index,
         "selected_device_name": selected_device_name,
-        "settings_cursor": app.settings_cursor,
-        "settings_field_label": settings_field_label,
-        "settings_field_value": settings_field_value,
-        "settings_field_options": settings_field_options,
-        "settings_edit_buf": app.settings_edit_buf,
-        "settings_error": app.settings_error,
+        "app_names": app_names,
+        "selected_app_index": app.selected_app_index,
+        "selected_app_name": selected_app_name,
+        "picker_focus": format!("{:?}", app.picker_focus),
+        "voicebird_api_key_masked": api_key_masked,
+        "api_key_buf_len": api_key_buf_len,
         "committed_count": committed_count,
         "last_committed_text": last_committed_text,
         "tentative_text": tentative_text,

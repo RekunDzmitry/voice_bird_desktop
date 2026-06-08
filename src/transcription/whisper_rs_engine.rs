@@ -63,8 +63,7 @@ impl TranscriptionEngine for WhisperRsEngine {
             let mut state = match ctx.create_state() {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = events_tx
-                        .send(EngineEvent::Error(format!("create state: {e}")));
+                    let _ = events_tx.send(EngineEvent::Error(format!("create state: {e}")));
                     return;
                 }
             };
@@ -98,9 +97,7 @@ impl TranscriptionEngine for WhisperRsEngine {
                     }
                     continue;
                 }
-                if !end_of_stream
-                    && last_run.elapsed() < std::time::Duration::from_millis(hop_ms)
-                {
+                if !end_of_stream && last_run.elapsed() < std::time::Duration::from_millis(hop_ms) {
                     continue;
                 }
                 last_run = std::time::Instant::now();
@@ -191,13 +188,14 @@ impl TranscriptionEngine for WhisperRsEngine {
                             .collect::<Vec<_>>()
                             .join(" ");
                         if !text.is_empty() {
-                            let t_start = Duration::from_millis(
-                                hypothesis.first().unwrap().t_start_ms,
-                            );
+                            let t_start =
+                                Duration::from_millis(hypothesis.first().unwrap().t_start_ms);
                             let t_end = Duration::from_millis(
-                                hypothesis.last().unwrap().t_end_ms.max(
-                                    hypothesis.first().unwrap().t_end_ms,
-                                ),
+                                hypothesis
+                                    .last()
+                                    .unwrap()
+                                    .t_end_ms
+                                    .max(hypothesis.first().unwrap().t_end_ms),
                             );
                             let seg = super::Segment {
                                 t_start,
@@ -209,8 +207,7 @@ impl TranscriptionEngine for WhisperRsEngine {
                         }
                     }
                 } else {
-                    let out: AgreementOutput =
-                        step(&prev_hypothesis, &hypothesis, committed_upto);
+                    let out: AgreementOutput = step(&prev_hypothesis, &hypothesis, committed_upto);
                     committed_upto = out.new_committed_upto;
 
                     for seg in out.committed_segments {

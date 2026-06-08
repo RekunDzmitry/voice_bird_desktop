@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-use voice_bird::transcription::{
+use voice_bird_cli::transcription::{
     voicebird_engine::VoiceBirdEngine, EngineConfig, EngineEvent, TranscriptionEngine,
 };
 
@@ -20,7 +20,11 @@ const TEST_URL: &str = "wss://example.test/api/audio/stream";
 /// address and a handle to the recorded frames.
 async fn spawn_recording_server(
     after_init: Vec<String>,
-) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<String>>>) {
+) -> (
+    SocketAddr,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -94,6 +98,7 @@ fn rejects_empty_api_key() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .err()
         .expect("expected Err on empty key");
@@ -110,6 +115,7 @@ fn rejects_non_16khz_sample_rate() {
             sample_rate: 44_100,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .err()
         .expect("expected Err on wrong sample rate");
@@ -138,6 +144,7 @@ async fn emits_model_loaded_on_init_success() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
 
@@ -176,6 +183,7 @@ async fn forwards_pcm_as_i16_binary_frames() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
 
@@ -192,7 +200,6 @@ async fn forwards_pcm_as_i16_binary_frames() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     drop(handle.pcm_tx);
-    let _ = handle.shutdown.send(());
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let frames = frames.lock().await;
@@ -237,6 +244,7 @@ async fn transcript_partial_maps_to_tentative_and_final_to_committed() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
     let mut rx = handle.events_rx;
@@ -308,6 +316,7 @@ async fn shutdown_sends_terminate_text_message() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
     let mut rx = handle.events_rx;
@@ -316,7 +325,7 @@ async fn shutdown_sends_terminate_text_message() {
             .await
             .ok();
 
-    let _ = handle.shutdown.send(());
+    drop(handle.pcm_tx);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let texts = texts.lock().await;
@@ -349,6 +358,7 @@ async fn error_message_maps_to_engine_error() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
     let mut rx = handle.events_rx;
@@ -384,6 +394,7 @@ async fn init_success_with_transcription_unavailable_raises_engine_error() {
             sample_rate: 16_000,
             server_url: TEST_URL.into(),
             device_name: "test-device".into(),
+            app_name: String::new(),
         })
         .unwrap();
     let mut rx = handle.events_rx;
@@ -395,4 +406,48 @@ async fn init_success_with_transcription_unavailable_raises_engine_error() {
         EngineEvent::Error(msg) => assert!(msg.contains("upstream down"), "got: {msg}"),
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn init_message_carries_device_and_app_names() {
+    // Regression: the init handshake must surface both `device_name` and
+    // `app_name` from EngineConfig::Cloud verbatim so voicebird.app can
+    // group sessions by (device, app) — pre-fix, app_name was hardcoded
+    // to the crate name.
+    let (addr, _frames, texts) = spawn_recording_server(vec![
+        r#"{"type":"init_success","session_id":"s1","transcription_available":true}"#.into(),
+    ])
+    .await;
+    unsafe {
+        std::env::set_var(
+            "VOICEBIRD_WS_URL_OVERRIDE",
+            format!("ws://{}/api/audio/stream", addr),
+        );
+    }
+
+    let mut e = VoiceBirdEngine::new("vb-x".into(), TEST_URL.into());
+    let handle = e
+        .start(EngineConfig::Cloud {
+            api_key: "vb-x".into(),
+            language: None,
+            sample_rate: 16_000,
+            server_url: TEST_URL.into(),
+            device_name: "EPOS PC 8 USB".into(),
+            app_name: "Chrome".into(),
+        })
+        .unwrap();
+
+    // Wait for the handshake to land before snapshotting captured texts.
+    let mut rx = handle.events_rx;
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+
+    let texts = texts.lock().await;
+    let init = texts
+        .first()
+        .expect("expected init JSON to be captured by mock server");
+    let parsed: serde_json::Value = serde_json::from_str(init).expect("init must be valid JSON");
+    assert_eq!(parsed["type"], "init", "got: {init}");
+    assert_eq!(parsed["device_name"], "EPOS PC 8 USB", "got: {init}");
+    assert_eq!(parsed["app_name"], "Chrome", "got: {init}");
 }

@@ -3,9 +3,9 @@ use std::path::Path;
 use crate::session::finalize::{finalize, SessionMeta};
 
 pub fn recover(session_dir: &Path) -> anyhow::Result<()> {
-    let jsonl    = session_dir.join("transcript.jsonl");
+    let jsonl = session_dir.join("transcript.jsonl");
     let out_json = session_dir.join("transcript.json");
-    let out_txt  = session_dir.join("transcript.txt");
+    let out_txt = session_dir.join("transcript.txt");
     let out_meta = session_dir.join("meta.json");
 
     let meta = if out_meta.exists() {

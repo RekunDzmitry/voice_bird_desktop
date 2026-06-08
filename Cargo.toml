@@ -1,15 +1,20 @@
 [package]
-name = "voice-bird"
-version = "0.3.0"
+name = "voice-bird-cli"
+version = "0.3.1"
 edition = "2021"
-description = "Voice Bird — local voice transcription TUI"
+description = "Voice Bird CLI - local-first voice transcription TUI"
+license = "MIT"
+repository = "https://github.com/voice-bird/voice-bird-cli"
+readme = "README.md"
+keywords = ["transcription", "whisper", "tui", "audio", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [[bin]]
-name = "voice-bird"
+name = "voice-bird-cli"
 path = "src/main.rs"
 
 [lib]
-name = "voice_bird"
+name = "voice_bird_cli"
 path = "src/lib.rs"
 
 [workspace]
@@ -50,6 +55,7 @@ serde_json = "1.0"
 toml = "0.8"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
+ureq = { version = "2.10", features = ["json"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 
@@ -65,6 +71,11 @@ hex = "0.4"
 
 # WhisperKit sidecar IPC (length-prefixed binary samples over stdio)
 bytemuck = "1"
+
+# System introspection for auto-picking the local model on first launch
+# (RAM and CPU architecture). Default features include all platforms we
+# care about; we only call refresh_memory(), which is cheap.
+sysinfo = "0.32"
 
 [features]
 engine-smoke = []
@@ -91,6 +102,11 @@ screencapturekit = "0.3.6"
 core-foundation = "0.10"
 core-media-rs = "0.3"
 core-audio-types-rs = "0.3"
+# Used by `platform::enumerate_app_sessions` to walk
+# `NSWorkspace.runningApplications` directly (no Screen Recording
+# permission required, unlike SCShareableContent). Pinned to the same
+# `objc` 0.2 ecosystem `screencapturekit` 0.3.6 already depends on.
+objc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

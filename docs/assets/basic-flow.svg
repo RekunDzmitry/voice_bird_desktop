@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Voice Bird CLI basic transcription flow</title>
+  <desc id="desc">A terminal UI showing selected devices, apps, mode settings, keyboard shortcuts, and an English transcript.</desc>
+  <rect width="1440" height="900" fill="#20252b"/>
+  <g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#e8edf2">
+    <rect x="20" y="22" width="1400" height="52" fill="none" stroke="#e8edf2" stroke-width="2"/>
+    <text x="36" y="55" font-weight="700">Voice Bird</text>
+    <text x="180" y="55">|  base.en  |  in: EPOS PC 8 USB  |  engine: voicebird  |  idle  |  00:00</text>
+
+    <rect x="20" y="104" width="540" height="275" fill="none" stroke="#f5b958" stroke-width="2"/>
+    <text x="38" y="128" fill="#f5b958" font-weight="700">Devices  ▸  [↑/↓] select   [→] apps   [Enter] start</text>
+    <text x="54" y="158" font-weight="700">EPOS PC 8 USB <tspan fill="#76c7bd">[input]</tspan></text>
+    <text x="54" y="186" font-weight="700">HD Pro Webcam C920 <tspan fill="#76c7bd">[input]</tspan></text>
+    <rect x="42" y="202" width="160" height="26" fill="#eef2f6"/>
+    <text x="24" y="222" fill="#eef2f6">▶</text>
+    <text x="54" y="222" fill="#20252b" font-weight="700">EPOS PC 8 USB</text>
+    <text x="218" y="222" fill="#c78ad0">[output/loopback]</text>
+    <text x="54" y="252" font-weight="700">Smart M70D <tspan fill="#c78ad0">[output/loopback]</tspan></text>
+    <text x="54" y="282" font-weight="700">Mac mini Speakers <tspan fill="#c78ad0">[output/loopback]</tspan></text>
+
+    <rect x="580" y="104" width="440" height="275" fill="none" stroke="#bfc6ce" stroke-width="2"/>
+    <text x="600" y="128" fill="#bfc6ce">Apps  ([→] focus)</text>
+    <text x="620" y="158" font-weight="700">Ghostty</text>
+    <text x="620" y="186" font-weight="700">Google Chrome</text>
+    <text x="620" y="214" font-weight="700">Notes</text>
+    <text x="620" y="242" font-weight="700">Safari</text>
+    <text x="620" y="270" font-weight="700">Terminal</text>
+    <text x="620" y="298" font-weight="700">Xcode</text>
+    <text x="620" y="326" font-weight="700">YouTube Music</text>
+
+    <rect x="1040" y="104" width="380" height="160" fill="none" stroke="#e8edf2" stroke-width="2"/>
+    <text x="1060" y="128">Mode</text>
+    <text x="1060" y="158">Cloud:   <tspan fill="#f5b958" font-weight="700">[ON]</tspan>  <tspan fill="#80858c">(c)</tspan></text>
+    <text x="1060" y="186">Language: en <tspan fill="#80858c">(l)</tspan></text>
+    <text x="1060" y="214">Model:    base.en <tspan fill="#80858c">(m)</tspan></text>
+    <text x="1060" y="242">Path:     ~/voice-bird/sessions</text>
+
+    <rect x="1040" y="292" width="380" height="560" fill="none" stroke="#e8edf2" stroke-width="2"/>
+    <text x="1060" y="318">Keys</text>
+    <text x="1060" y="348" fill="#f5b958">[↑/↓] <tspan fill="#bfc6ce">select</tspan></text>
+    <text x="1060" y="376" fill="#f5b958">[←/→] <tspan fill="#bfc6ce">pane</tspan></text>
+    <text x="1060" y="404" fill="#f5b958">[Space] <tspan fill="#bfc6ce">no app</tspan></text>
+    <text x="1060" y="432" fill="#f5b958">[Enter] <tspan fill="#bfc6ce">start</tspan></text>
+    <text x="1060" y="460" fill="#f5b958">[Tab] <tspan fill="#bfc6ce">focus slot</tspan></text>
+    <text x="1060" y="488" fill="#f5b958">[c] <tspan fill="#bfc6ce">cloud</tspan></text>
+    <text x="1060" y="516" fill="#f5b958">[l] <tspan fill="#bfc6ce">language</tspan></text>
+    <text x="1060" y="544" fill="#f5b958">[m] <tspan fill="#bfc6ce">model</tspan></text>
+    <text x="1060" y="572" fill="#f5b958">[e] <tspan fill="#bfc6ce">export</tspan></text>
+    <text x="1060" y="600" fill="#f5b958">[q] <tspan fill="#bfc6ce">quit</tspan></text>
+
+    <rect x="20" y="410" width="410" height="442" fill="none" stroke="#f5b958" stroke-width="2"/>
+    <text x="38" y="434" fill="#f5b958" font-weight="700">[1] YouTube Music on EPOS</text>
+    <text x="38" y="466" fill="#70757c">00:02</text><text x="116" y="466">Every person has a</text>
+    <text x="38" y="494">different superpower.</text>
+    <text x="38" y="526" fill="#70757c">00:05</text><text x="116" y="526">What is yours?</text>
+    <text x="38" y="558" fill="#70757c">00:08</text><text x="116" y="558">I can listen closely,</text>
+    <text x="38" y="586">capture the details,</text>
+    <text x="38" y="614">and turn speech into text.</text>
+    <text x="38" y="646" fill="#70757c">00:13</text><text x="116" y="646">Recording is live.</text>
+    <text x="38" y="824" fill="#70757c" font-style="italic">... paused - press [x] to clear</text>
+
+    <rect x="445" y="410" width="275" height="442" fill="none" stroke="#6b7178" stroke-width="2"/>
+    <text x="463" y="434" fill="#70757c">[2] (empty)</text>
+    <text x="463" y="824" fill="#70757c" font-style="italic">... paused</text>
+
+    <rect x="735" y="410" width="285" height="442" fill="none" stroke="#6b7178" stroke-width="2"/>
+    <text x="753" y="434" fill="#70757c">[3] (empty)</text>
+    <text x="753" y="466" fill="#70757c">Pick a device, [Enter] to fill</text>
+  </g>
+</svg>
