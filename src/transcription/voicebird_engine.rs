@@ -123,7 +123,11 @@ impl TranscriptionEngine for VoiceBirdEngine {
 
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<f32>>(32);
         let (events_tx, events_rx) = broadcast::channel::<EngineEvent>(256);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // The trait exposes a shutdown sender, but callers may drop it
+        // immediately. Treating a dropped sender as shutdown closes the
+        // WebSocket before the first PCM frame, so this engine shuts down when
+        // the PCM channel closes.
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let lang_for_init = language.clone().unwrap_or_else(|| "en".into());
@@ -227,15 +231,8 @@ impl TranscriptionEngine for VoiceBirdEngine {
                 }
             }
 
-            let mut shutdown_closed = false;
             loop {
                 tokio::select! {
-                    shutdown = &mut shutdown_rx, if !shutdown_closed => {
-                        shutdown_closed = true;
-                        if shutdown.is_ok() {
-                            break;
-                        }
-                    }
                     maybe_pcm = pcm_rx.recv() => {
                         let Some(chunk) = maybe_pcm else { break; };
                         // ~50 ms frames at 16 kHz mono = 800 samples = 1600 bytes.

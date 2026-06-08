@@ -931,7 +931,12 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
 
 fn hotkey_line(key: &'static str, action: &'static str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(key, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            key,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled(action, Style::default().fg(Color::Gray)),
     ])
@@ -1199,8 +1204,20 @@ mod tests {
         let app = App::new();
         let out = render_to_string(&app, 160, 30);
         for key in [
-            "[↑/↓]", "[←/→]", "[Space]", "[Enter]", "[Tab]", "[r]", "[c]", "[l]", "[m]", "[e]",
-            "[p]", "[x]", "[q]", "[?]",
+            "[↑/↓]",
+            "[←/→]",
+            "[Space]",
+            "[Enter]",
+            "[Tab]",
+            "[r]",
+            "[c]",
+            "[l]",
+            "[m]",
+            "[e]",
+            "[p]",
+            "[x]",
+            "[q]",
+            "[?]",
         ] {
             assert!(out.contains(key), "hotkey {key} missing:\n{out}");
         }

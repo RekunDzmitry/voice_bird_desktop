@@ -200,7 +200,6 @@ async fn forwards_pcm_as_i16_binary_frames() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     drop(handle.pcm_tx);
-    let _ = handle.shutdown.send(());
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let frames = frames.lock().await;
@@ -326,7 +325,7 @@ async fn shutdown_sends_terminate_text_message() {
             .await
             .ok();
 
-    let _ = handle.shutdown.send(());
+    drop(handle.pcm_tx);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let texts = texts.lock().await;
