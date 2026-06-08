@@ -12,19 +12,19 @@ cd "$(dirname "$0")/.."
 echo "Bumping public packages to v$VERSION..."
 
 # Rust CLI Cargo.toml
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 echo "  Updated Cargo.toml"
 
 # pyproject.toml
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
 echo "  Updated pyproject.toml"
 
 # Python wrapper
-sed -i "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" python/voice_bird_cli/__init__.py
+sed -i '' "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" python/voice_bird_cli/__init__.py
 echo "  Updated python/voice_bird_cli/__init__.py"
 
 # npm package
-sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" npm/voice-bird-cli/package.json
+sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" npm/voice-bird-cli/package.json
 echo "  Updated npm/voice-bird-cli/package.json"
 
 echo ""
