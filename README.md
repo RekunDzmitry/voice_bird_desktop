@@ -32,6 +32,8 @@ voice-bird-cli
 
 On first launch, Voice Bird picks a local Whisper model and downloads it into your OS cache directory. The default model is `distil-small.en`. Settings are stored in `~/.config/voice-bird/config.toml` on Linux/macOS and `%APPDATA%\voice-bird\config.toml` on Windows.
 
+Press `m` to change models. The picker includes `nemotron-3.5-asr-streaming-0.6b`, NVIDIA's latest Nemotron 3.5 ASR streaming model via the local `parakeet-rs` engine. Select it, let the package download/unpack, then start recording; the engine label and `meta.json` should show `nemotron`.
+
 macOS users may need to grant Screen Recording permission for system or app audio capture. Apple Silicon users can optionally build the WhisperKit sidecar for ANE-accelerated local inference:
 
 ```bash

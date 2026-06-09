@@ -77,6 +77,8 @@ bytemuck = "1"
 # (RAM and CPU architecture). Default features include all platforms we
 # care about; we only call refresh_memory(), which is cheap.
 sysinfo = "0.32"
+flate2 = "1"
+tar = "0.4"
 
 [features]
 engine-smoke = []
