@@ -102,9 +102,12 @@ libc = "0.2"
 # CoreML (ANE) encoder acceleration is macOS-only. The `coreml` feature makes
 # whisper.cpp build with WHISPER_COREML=ON + WHISPER_COREML_ALLOW_FALLBACK=1,
 # so models without a `<model>-encoder.mlmodelc` still init via Metal/CPU.
-# Cargo unions these features with the base `whisper-rs` entry above, so macOS
-# gets metal+coreml while other targets keep metal only (CoreML won't link there).
-whisper-rs = { version = "0.13", features = ["metal", "whisper-cpp-log", "coreml"] }
+# Cargo UNIONS features across dependency tables for the same crate, so on macOS
+# whisper-rs resolves to metal+whisper-cpp-log (from [dependencies]) PLUS coreml
+# (here); other targets see only the base entry, so CoreML never links there.
+# We therefore list ONLY the macOS-extra feature here — base features are
+# inherited automatically, so new flags added above need no mirroring.
+whisper-rs = { version = "0.13", features = ["coreml"] }
 # System-audio loopback on macOS via ScreenCaptureKit.
 # Pinned to 0.3.x because 0.3.6 uses the `objc` 0.2 ecosystem with no Swift
 # build-script bridge, and the trait-based API here is significantly smaller
