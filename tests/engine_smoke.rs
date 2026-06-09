@@ -14,13 +14,8 @@ fn whisper_rs_produces_non_empty_transcript_for_fixture() {
         .clone();
     let cache = voice_bird_cli::transcription::models::gguf_path("tiny.en").unwrap();
     if !cache.exists() {
-        voice_bird_cli::transcription::models::download_with_verify(
-            tiny.gguf_url,
-            &cache,
-            tiny.gguf_sha256,
-            &mut |_, _| {},
-        )
-        .unwrap();
+        voice_bird_cli::transcription::models::download_model_with_verify(&tiny, &mut |_, _| {})
+            .unwrap();
     }
 
     let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();

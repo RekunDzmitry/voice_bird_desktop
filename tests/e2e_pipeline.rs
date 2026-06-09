@@ -44,13 +44,8 @@ fn ensure_tiny_en() -> PathBuf {
             .get("tiny.en")
             .unwrap()
             .clone();
-        voice_bird_cli::transcription::models::download_with_verify(
-            entry.gguf_url,
-            &cache,
-            entry.gguf_sha256,
-            &mut |_, _| {},
-        )
-        .unwrap();
+        voice_bird_cli::transcription::models::download_model_with_verify(&entry, &mut |_, _| {})
+            .unwrap();
     }
     cache
 }

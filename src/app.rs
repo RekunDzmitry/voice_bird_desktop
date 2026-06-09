@@ -1097,28 +1097,33 @@ impl App {
 
         // --- 3. Engine (Voice Bird Web cloud, WhisperKit sidecar, or whisper-rs fallback) --------
         use voice_bird_cli::transcription::EngineConfig;
+        let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
+        if catalog.get(&settings.model).is_none() {
+            let msg = format!(
+                "Model '{}' is not supported by this release; pick one from the model picker.",
+                settings.model
+            );
+            self.banner = Some(msg.clone());
+            return Err(msg);
+        }
         let sidecar = voice_bird_cli::transcription::sidecar_path();
         let prefer = self.config.engine_prefer.clone();
         let api_key = self.config.voicebird_api_key.clone();
         let server_url = self.config.voicebird_server_url.clone();
-        let (engine_kind_used, mut engine) = match voice_bird_cli::transcription::try_select_engine(
-            &prefer,
-            settings.cloud_on,
-            &api_key,
-            &server_url,
-            sidecar.as_deref(),
-        ) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                self.banner = Some(msg.clone());
-                return Err("engine selection failed".into());
-            }
-        };
-        let engine_kind = match engine_kind_used {
-            voice_bird_cli::transcription::EngineKind::WhisperRs => "whisper_rs".to_string(),
-            voice_bird_cli::transcription::EngineKind::WhisperKit => "whisperkit".to_string(),
-            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb => "voicebird".to_string(),
-        };
+        let (mut engine_kind_used, mut engine) =
+            match voice_bird_cli::transcription::try_select_engine(
+                &prefer,
+                settings.cloud_on,
+                &api_key,
+                &server_url,
+                sidecar.as_deref(),
+            ) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    self.banner = Some(msg.clone());
+                    return Err("engine selection failed".into());
+                }
+            };
         let cloud_active = matches!(
             engine_kind_used,
             voice_bird_cli::transcription::EngineKind::VoiceBirdWeb,
@@ -1153,13 +1158,28 @@ impl App {
         ) {
             std::path::PathBuf::new() // unused for cloud
         } else {
-            match voice_bird_cli::transcription::models::gguf_path(&settings.model) {
+            match voice_bird_cli::transcription::models::model_path(&settings.model) {
                 Ok(p) => p,
                 Err(e) => {
                     return Err(format!("model path: {e}"));
                 }
             }
         };
+        if !cloud_active
+            && voice_bird_cli::transcription::models::is_nemotron_model(&settings.model)
+        {
+            engine_kind_used = voice_bird_cli::transcription::EngineKind::Nemotron;
+            engine =
+                Box::<voice_bird_cli::transcription::nemotron_engine::NemotronEngine>::default();
+        }
+
+        let engine_kind = match engine_kind_used {
+            voice_bird_cli::transcription::EngineKind::WhisperRs => "whisper_rs".to_string(),
+            voice_bird_cli::transcription::EngineKind::WhisperKit => "whisperkit".to_string(),
+            voice_bird_cli::transcription::EngineKind::Nemotron => "nemotron".to_string(),
+            voice_bird_cli::transcription::EngineKind::VoiceBirdWeb => "voicebird".to_string(),
+        };
+
         let engine_cfg = if cloud_active {
             // Surface the actual (device, app) pair the user picked in the
             // init handshake so the Transcriptions tab on voicebird.app
@@ -1252,10 +1272,10 @@ impl App {
                 .refinement_model
                 .as_ref()
                 .and_then(|id| {
-                    let path = voice_bird_cli::transcription::models::gguf_path(id).ok()?;
-                    if !path.exists() {
+                    let path = voice_bird_cli::transcription::models::model_path(id).ok()?;
+                    if !voice_bird_cli::transcription::models::is_model_available(id) {
                         log::warn!(
-                            "refinement_model '{}' set but file missing at {} — disabled",
+                            "refinement_model '{}' set but not available at {} — disabled",
                             id,
                             path.display()
                         );
@@ -1579,10 +1599,10 @@ impl App {
         &mut self,
         entry: &voice_bird_cli::transcription::models::ModelEntry,
     ) {
-        let dest = match voice_bird_cli::transcription::models::gguf_path(entry.id) {
+        let _dest = match voice_bird_cli::transcription::models::model_path(entry.id) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("gguf_path: {e}");
+                log::error!("model_path: {e}");
                 if let Some(picker) = self.picker.as_mut() {
                     picker.downloading = Some(Arc::new(PlMutex::new(DownloadProgress {
                         model_id: entry.id.into(),
@@ -1606,8 +1626,7 @@ impl App {
             picker.downloading = Some(progress.clone());
         }
 
-        let url = entry.gguf_url.to_string();
-        let sha = entry.gguf_sha256.to_string();
+        let entry = entry.clone();
         let progress_for_thread = progress.clone();
 
         std::thread::spawn(move || {
@@ -1616,12 +1635,14 @@ impl App {
                 g.bytes = bytes;
                 g.total = total;
             };
-            let res = voice_bird_cli::transcription::models::download_with_verify(
-                &url, &dest, &sha, &mut cb,
-            );
+            let res =
+                voice_bird_cli::transcription::models::download_model_with_verify(&entry, &mut cb);
             if let Err(e) = res {
                 let mut g = progress_for_thread.lock();
                 g.error = Some(format!("{e}"));
+            } else {
+                let mut g = progress_for_thread.lock();
+                g.total = Some(g.bytes);
             }
         });
     }

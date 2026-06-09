@@ -1,15 +1,26 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use tar::Archive;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFormat {
+    WhisperGguf,
+    NemotronPackage,
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub id: &'static str,
     pub size_mb: u32,
     pub language: &'static str,
-    pub gguf_url: &'static str,
-    pub gguf_sha256: &'static str,
+    pub format: ModelFormat,
+    /// Source URL for the primary artifact: a Whisper GGUF `.bin` for
+    /// `WhisperGguf`, or the Nemotron `.tar.gz` package for `NemotronPackage`.
+    pub download_url: &'static str,
+    pub download_sha256: &'static str,
     pub coreml_url: Option<&'static str>,
     pub coreml_sha256: Option<&'static str>,
     pub is_default: bool,
@@ -21,86 +32,107 @@ impl Catalog {
     pub fn builtin() -> Self {
         Catalog(vec![
             ModelEntry {
-                id: "distil-small.en", size_mb: 250, language: "en",
-                gguf_url: "https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: Some("https://huggingface.co/distil-whisper/distil-small.en/resolve/main/coreml-distil-small.en.zip"),
-                coreml_sha256: Some("<FILL>"),
+                id: "distil-small.en",
+                size_mb: 250,
+                language: "en",
+                format: ModelFormat::WhisperGguf,
+                download_url: "https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en.bin",
+                download_sha256: "7691eb11167ab7aaf6b3e05d8266f2fd9ad89c550e433f86ac266ebdee6c970a",
+                // No standalone CoreML zip is published for this model;
+                // argmaxinc/whisperkit-coreml serves .mlmodelc directory trees, not zips.
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: true,
             },
             ModelEntry {
-                id: "distil-large-v3", size_mb: 1_500, language: "multi",
-                gguf_url: "https://huggingface.co/distil-whisper/distil-large-v3/resolve/main/ggml-distil-large-v3.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: Some("https://huggingface.co/distil-whisper/distil-large-v3/resolve/main/coreml-distil-large-v3.zip"),
-                coreml_sha256: Some("<FILL>"),
+                id: "distil-large-v3",
+                size_mb: 1_500,
+                language: "multi",
+                format: ModelFormat::WhisperGguf,
+                download_url: "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin",
+                download_sha256: "2883a11b90fb10ed592d826edeaee7d2929bf1ab985109fe9e1e7b4d2b69a298",
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: false,
             },
             ModelEntry {
-                id: "large-v3-turbo", size_mb: 1_600, language: "multi",
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: Some("https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/main/openai_whisper-large-v3-turbo.zip"),
-                coreml_sha256: Some("<FILL>"),
+                id: "large-v3-turbo",
+                size_mb: 1_600,
+                language: "multi",
+                format: ModelFormat::WhisperGguf,
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+                download_sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+                // argmaxinc/whisperkit-coreml publishes .mlmodelc directory trees, not a
+                // single downloadable zip; no standalone CoreML artifact to pin here.
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: false,
             },
             ModelEntry {
-                id: "base.en", size_mb: 150, language: "en",
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: None, coreml_sha256: None,
+                id: "nemotron-3.5-asr-streaming-0.6b",
+                size_mb: 740,
+                language: "multi",
+                format: ModelFormat::NemotronPackage,
+                download_url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/nemotron-3.5-asr-streaming-0.6b-int8.tar.gz",
+                download_sha256: "d1d57d86212528fa03dfdbb88979f1dd637814dec6db31257a603739c73bd9d2",
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: false,
             },
             ModelEntry {
-                id: "tiny.en", size_mb: 75, language: "en",
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: None, coreml_sha256: None,
+                id: "base.en",
+                size_mb: 150,
+                language: "en",
+                format: ModelFormat::WhisperGguf,
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+                download_sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+                coreml_url: None,
+                coreml_sha256: None,
+                is_default: false,
+            },
+            ModelEntry {
+                id: "tiny.en",
+                size_mb: 75,
+                language: "en",
+                format: ModelFormat::WhisperGguf,
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+                download_sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: false,
             },
         ])
     }
 
-    pub fn get(&self, id: &str) -> Option<&ModelEntry> {
-        self.0.iter().find(|m| m.id == id)
-    }
-
-    pub fn default_id(&self) -> &'static str {
-        self.0
-            .iter()
-            .find(|m| m.is_default)
-            .map(|m| m.id)
-            .unwrap_or("distil-small.en")
-    }
-
     pub fn all(&self) -> &[ModelEntry] {
         &self.0
     }
+
+    pub fn get(&self, id: &str) -> Option<&ModelEntry> {
+        self.0.iter().find(|m| m.id == id)
+    }
 }
 
-/// Reject combinations where a non-English language is requested but the
-/// configured local Whisper model is English-only. Without this, users
-/// selecting Russian/Polish/etc with a `.en` ggml file silently get
-/// gibberish English output. Returns `Ok(())` for known good combinations
-/// and for anything we can't verify (missing catalog entry, "auto" /
-/// English / empty language).
 pub fn validate_local_language(model_id: &str, language: &str) -> Result<(), String> {
     let lang = language.trim();
     if lang.is_empty() || lang == "en" || lang == "auto" {
         return Ok(());
     }
+
     let catalog = Catalog::builtin();
     let Some(entry) = catalog.get(model_id) else {
         return Err(format!(
             "Model '{model_id}' is not supported by this release; pick one from the model picker."
         ));
     };
+
     if entry.language == "en" {
         return Err(format!(
-            "Model '{}' is English-only; pick distil-large-v3 or large-v3-turbo for {}.",
+            "Model '{}' is English-only; pick distil-large-v3, large-v3-turbo, or nemotron-3.5-asr-streaming-0.6b for {}.",
             entry.id, lang
         ));
     }
+
     Ok(())
 }
 
@@ -111,6 +143,41 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
 
 pub fn gguf_path(id: &str) -> anyhow::Result<PathBuf> {
     Ok(cache_dir()?.join(format!("{id}.gguf")))
+}
+
+pub fn nemotron_model_dir(id: &str) -> anyhow::Result<PathBuf> {
+    Ok(cache_dir()?.join(id))
+}
+
+pub fn model_path(id: &str) -> anyhow::Result<PathBuf> {
+    let catalog = Catalog::builtin();
+    match catalog.get(id).map(|m| m.format) {
+        Some(ModelFormat::NemotronPackage) => nemotron_model_dir(id),
+        _ => gguf_path(id),
+    }
+}
+
+pub fn is_nemotron_model(id: &str) -> bool {
+    let catalog = Catalog::builtin();
+    matches!(
+        catalog.get(id).map(|m| m.format),
+        Some(ModelFormat::NemotronPackage)
+    )
+}
+
+/// Whether a model is present on disk and usable. For Whisper GGUF models this
+/// is a plain file-exists check; for the Nemotron package it verifies the
+/// unpacked directory actually contains the ONNX artifacts the engine loads,
+/// so a half-unpacked or empty directory is not mistaken for a ready model.
+pub fn is_model_available(id: &str) -> bool {
+    let Ok(path) = model_path(id) else {
+        return false;
+    };
+    if is_nemotron_model(id) {
+        path.join("encoder.onnx").exists() && path.join("decoder_joint.onnx").exists()
+    } else {
+        path.exists()
+    }
 }
 
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> anyhow::Result<()> {
@@ -160,6 +227,74 @@ pub fn download_with_verify(
     Ok(())
 }
 
+pub fn download_model_with_verify(
+    entry: &ModelEntry,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> anyhow::Result<()> {
+    match entry.format {
+        ModelFormat::WhisperGguf => download_with_verify(
+            entry.download_url,
+            &gguf_path(entry.id)?,
+            entry.download_sha256,
+            progress,
+        ),
+        ModelFormat::NemotronPackage => {
+            let archive_path = cache_dir()?.join(format!("{}.tar.gz", entry.id));
+            download_with_verify(
+                entry.download_url,
+                &archive_path,
+                entry.download_sha256,
+                progress,
+            )?;
+            progress(0, None);
+            unpack_nemotron_archive(&archive_path, &nemotron_model_dir(entry.id)?)?;
+            progress(1, Some(1));
+            Ok(())
+        }
+    }
+}
+
+fn unpack_nemotron_archive(archive_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
+    let tmp_dir = dest_dir.with_extension("tmp");
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let archive = std::fs::File::open(archive_path)?;
+    let decoder = GzDecoder::new(archive);
+    Archive::new(decoder).unpack(&tmp_dir)?;
+
+    let model_dir = locate_nemotron_dir(&tmp_dir).ok_or_else(|| {
+        anyhow!("Nemotron package did not contain encoder.onnx and decoder_joint.onnx")
+    })?;
+    if let Some(parent) = dest_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(model_dir, dest_dir)?;
+    let _ = std::fs::remove_dir_all(tmp_dir);
+    Ok(())
+}
+
+fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join("encoder.onnx").exists() && dir.join("decoder_joint.onnx").exists() {
+            return Some(dir);
+        }
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            if entry.file_type().ok()?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,17 +302,28 @@ mod tests {
     #[test]
     fn catalog_has_default_and_required_ids() {
         let catalog = Catalog::builtin();
-        let default = catalog.default_id();
-        assert_eq!(default, "distil-small.en");
-        for id in [
-            "distil-small.en",
-            "distil-large-v3",
-            "large-v3-turbo",
-            "base.en",
-            "tiny.en",
-        ] {
-            assert!(catalog.get(id).is_some(), "missing {id}");
-        }
+        assert!(catalog.all().iter().any(|m| m.is_default));
+        assert!(catalog.get("distil-small.en").is_some());
+        assert!(catalog.get("large-v3-turbo").is_some());
+        assert!(catalog.get("nemotron-3.5-asr-streaming-0.6b").is_some());
+    }
+
+    #[test]
+    fn nemotron_uses_directory_model_path() {
+        let path = model_path("nemotron-3.5-asr-streaming-0.6b").unwrap();
+        assert!(path.ends_with("nemotron-3.5-asr-streaming-0.6b"));
+        assert!(is_nemotron_model("nemotron-3.5-asr-streaming-0.6b"));
+    }
+
+    #[test]
+    fn locate_nemotron_dir_uses_parakeet_rs_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested").join("model");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("encoder.onnx"), b"encoder").unwrap();
+        std::fs::write(nested.join("decoder_joint.onnx"), b"decoder").unwrap();
+
+        assert_eq!(locate_nemotron_dir(tmp.path()).unwrap(), nested);
     }
 
     #[test]
@@ -199,13 +345,13 @@ mod tests {
     fn validate_local_language_accepts_multilingual_for_russian() {
         assert!(validate_local_language("distil-large-v3", "ru").is_ok());
         assert!(validate_local_language("large-v3-turbo", "pl").is_ok());
+        assert!(validate_local_language("nemotron-3.5-asr-streaming-0.6b", "pl").is_ok());
     }
 
     #[test]
     fn validate_local_language_passes_through_english_and_auto() {
         assert!(validate_local_language("tiny.en", "en").is_ok());
         assert!(validate_local_language("tiny.en", "auto").is_ok());
-        assert!(validate_local_language("tiny.en", "").is_ok());
     }
 
     #[test]
