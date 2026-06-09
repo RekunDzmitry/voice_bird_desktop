@@ -91,8 +91,9 @@ pub fn validate_local_language(model_id: &str, language: &str) -> Result<(), Str
     }
     let catalog = Catalog::builtin();
     let Some(entry) = catalog.get(model_id) else {
-        // Unknown model id: don't block — let the engine surface its own error.
-        return Ok(());
+        return Err(format!(
+            "Model '{model_id}' is not supported by this release; pick one from the model picker."
+        ));
     };
     if entry.language == "en" {
         return Err(format!(
@@ -208,8 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_local_language_ignores_unknown_model_id() {
-        // Unknown ids slip through — engine layer surfaces its own error.
-        assert!(validate_local_language("custom-user-model", "ru").is_ok());
+    fn validate_local_language_rejects_unknown_model_id() {
+        let err = validate_local_language("custom-user-model", "ru").unwrap_err();
+        assert!(err.contains("custom-user-model"));
+        assert!(err.contains("not supported"));
     }
 }

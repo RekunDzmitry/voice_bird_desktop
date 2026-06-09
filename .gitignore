@@ -50,6 +50,7 @@ Desktop.ini
 .env
 .env.local
 .env.release
+.npmrc.publish
 *.local
 
 # Test outputs
