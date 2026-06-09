@@ -2,6 +2,7 @@ pub mod auto_select;
 pub mod local_agreement;
 pub mod mock;
 pub mod models;
+pub mod nemotron_engine;
 pub mod refinement_engine;
 pub mod voicebird_engine;
 pub mod whisper_kit_engine;
@@ -118,6 +119,7 @@ pub fn select_engine(
 pub enum EngineKind {
     WhisperRs,
     WhisperKit,
+    Nemotron,
     VoiceBirdWeb,
 }
 

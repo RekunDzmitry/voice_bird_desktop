@@ -63,6 +63,7 @@ parking_lot = "0.12"
 # `metal` enables whisper.cpp's Metal backend on macOS (~5–10× CPU speedup).
 # Non-Apple targets ignore the feature at whisper.cpp's build.rs level.
 whisper-rs = { version = "0.13", features = ["metal", "whisper-cpp-log"] }
+parakeet-rs = "0.3.6"
 
 # Model download + verification
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }

@@ -1097,26 +1097,63 @@ impl App {
 
         // --- 3. Engine (Voice Bird Web cloud, WhisperKit sidecar, or whisper-rs fallback) --------
         use voice_bird_cli::transcription::EngineConfig;
+        let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
+        let model_entry = match catalog.get(&settings.model) {
+            Some(entry) => *entry,
+            None => {
+                let msg = format!(
+                    "Model '{}' is not supported by this release; pick one from the model picker.",
+                    settings.model
+                );
+                self.banner = Some(msg.clone());
+                return Err(msg);
+            }
+        };
         let sidecar = voice_bird_cli::transcription::sidecar_path();
         let prefer = self.config.engine_prefer.clone();
         let api_key = self.config.voicebird_api_key.clone();
         let server_url = self.config.voicebird_server_url.clone();
-        let (engine_kind_used, mut engine) = match voice_bird_cli::transcription::try_select_engine(
-            &prefer,
-            settings.cloud_on,
-            &api_key,
-            &server_url,
-            sidecar.as_deref(),
-        ) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                self.banner = Some(msg.clone());
-                return Err("engine selection failed".into());
+        let (engine_kind_used, mut engine) = if settings.cloud_on {
+            match voice_bird_cli::transcription::try_select_engine(
+                &prefer,
+                true,
+                &api_key,
+                &server_url,
+                sidecar.as_deref(),
+            ) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    self.banner = Some(msg.clone());
+                    return Err("engine selection failed".into());
+                }
+            }
+        } else if model_entry.runtime()
+            == voice_bird_cli::transcription::models::ModelRuntime::NemotronOnnx
+        {
+            (
+                voice_bird_cli::transcription::EngineKind::Nemotron,
+                Box::new(voice_bird_cli::transcription::nemotron_engine::NemotronEngine)
+                    as Box<dyn voice_bird_cli::transcription::TranscriptionEngine>,
+            )
+        } else {
+            match voice_bird_cli::transcription::try_select_engine(
+                &prefer,
+                false,
+                &api_key,
+                &server_url,
+                sidecar.as_deref(),
+            ) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    self.banner = Some(msg.clone());
+                    return Err("engine selection failed".into());
+                }
             }
         };
         let engine_kind = match engine_kind_used {
             voice_bird_cli::transcription::EngineKind::WhisperRs => "whisper_rs".to_string(),
             voice_bird_cli::transcription::EngineKind::WhisperKit => "whisperkit".to_string(),
+            voice_bird_cli::transcription::EngineKind::Nemotron => "nemotron".to_string(),
             voice_bird_cli::transcription::EngineKind::VoiceBirdWeb => "voicebird".to_string(),
         };
         let cloud_active = matches!(
@@ -1153,7 +1190,7 @@ impl App {
         ) {
             std::path::PathBuf::new() // unused for cloud
         } else {
-            match voice_bird_cli::transcription::models::gguf_path(&settings.model) {
+            match voice_bird_cli::transcription::models::model_path(&model_entry) {
                 Ok(p) => p,
                 Err(e) => {
                     return Err(format!("model path: {e}"));
@@ -1579,10 +1616,10 @@ impl App {
         &mut self,
         entry: &voice_bird_cli::transcription::models::ModelEntry,
     ) {
-        let dest = match voice_bird_cli::transcription::models::gguf_path(entry.id) {
+        let _dest = match voice_bird_cli::transcription::models::model_path(entry) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("gguf_path: {e}");
+                log::error!("model_path: {e}");
                 if let Some(picker) = self.picker.as_mut() {
                     picker.downloading = Some(Arc::new(PlMutex::new(DownloadProgress {
                         model_id: entry.id.into(),
@@ -1606,8 +1643,7 @@ impl App {
             picker.downloading = Some(progress.clone());
         }
 
-        let url = entry.gguf_url.to_string();
-        let sha = entry.gguf_sha256.to_string();
+        let entry_for_thread = *entry;
         let progress_for_thread = progress.clone();
 
         std::thread::spawn(move || {
@@ -1616,12 +1652,16 @@ impl App {
                 g.bytes = bytes;
                 g.total = total;
             };
-            let res = voice_bird_cli::transcription::models::download_with_verify(
-                &url, &dest, &sha, &mut cb,
+            let res = voice_bird_cli::transcription::models::download_model_with_verify(
+                &entry_for_thread,
+                &mut cb,
             );
             if let Err(e) = res {
                 let mut g = progress_for_thread.lock();
                 g.error = Some(format!("{e}"));
+            } else {
+                let mut g = progress_for_thread.lock();
+                g.total = Some(g.bytes);
             }
         });
     }
