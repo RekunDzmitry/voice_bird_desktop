@@ -62,10 +62,8 @@ impl Catalog {
                 format: ModelFormat::WhisperGguf,
                 download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
                 download_sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
-                // argmaxinc/whisperkit-coreml publishes .mlmodelc directory trees, not a
-                // single downloadable zip; no standalone CoreML artifact to pin here.
-                coreml_url: None,
-                coreml_sha256: None,
+                coreml_url: Some("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-encoder.mlmodelc.zip"),
+                coreml_sha256: Some("84bedfe895bd7b5de6e8e89a0803dfc5addf8c0c5bc4c937451716bf7cf7988a"),
                 is_default: false,
             },
             ModelEntry {
@@ -86,8 +84,8 @@ impl Catalog {
                 format: ModelFormat::WhisperGguf,
                 download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
                 download_sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-                coreml_url: None,
-                coreml_sha256: None,
+                coreml_url: Some("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-encoder.mlmodelc.zip"),
+                coreml_sha256: Some("8cf860309e2449e2bdc8be834cf838ab2565747ecc8c0ef914ef5975115e192b"),
                 is_default: false,
             },
             ModelEntry {
@@ -97,8 +95,8 @@ impl Catalog {
                 format: ModelFormat::WhisperGguf,
                 download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
                 download_sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
-                coreml_url: None,
-                coreml_sha256: None,
+                coreml_url: Some("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-encoder.mlmodelc.zip"),
+                coreml_sha256: Some("82b32eef73c94bb0c432a776a047b757d9525c26d84038a15d8798d7c8d1ee58"),
                 is_default: false,
             },
         ])
@@ -143,6 +141,14 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
 
 pub fn gguf_path(id: &str) -> anyhow::Result<PathBuf> {
     Ok(cache_dir()?.join(format!("{id}.gguf")))
+}
+
+/// Directory where the CoreML encoder for a GGUF model must live for
+/// whisper.cpp to auto-load it. whisper.cpp derives this from the GGUF path by
+/// stripping the extension and appending `-encoder.mlmodelc`, so for
+/// `<cache>/{id}.gguf` it looks for `<cache>/{id}-encoder.mlmodelc`.
+pub fn coreml_path(id: &str) -> anyhow::Result<PathBuf> {
+    Ok(cache_dir()?.join(format!("{id}-encoder.mlmodelc")))
 }
 
 pub fn nemotron_model_dir(id: &str) -> anyhow::Result<PathBuf> {
@@ -232,12 +238,26 @@ pub fn download_model_with_verify(
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> anyhow::Result<()> {
     match entry.format {
-        ModelFormat::WhisperGguf => download_with_verify(
-            entry.download_url,
-            &gguf_path(entry.id)?,
-            entry.download_sha256,
-            progress,
-        ),
+        ModelFormat::WhisperGguf => {
+            download_with_verify(
+                entry.download_url,
+                &gguf_path(entry.id)?,
+                entry.download_sha256,
+                progress,
+            )?;
+            // Optional CoreML (ANE) encoder. Only published for some models;
+            // whisper.cpp auto-loads `{id}-encoder.mlmodelc` next to the GGUF
+            // and falls back to Metal/CPU when it is absent, so a missing or
+            // failed CoreML package never blocks the GGUF from working.
+            if let (Some(url), Some(sha)) = (entry.coreml_url, entry.coreml_sha256) {
+                let zip_path = cache_dir()?.join(format!("{}-encoder.mlmodelc.zip", entry.id));
+                download_with_verify(url, &zip_path, sha, progress)?;
+                progress(0, None);
+                unpack_coreml_zip(&zip_path, &coreml_path(entry.id)?)?;
+                progress(1, Some(1));
+            }
+            Ok(())
+        }
         ModelFormat::NemotronPackage => {
             let archive_path = cache_dir()?.join(format!("{}.tar.gz", entry.id));
             download_with_verify(
@@ -295,6 +315,59 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Extract a `*-encoder.mlmodelc.zip` and install the encoder directory at
+/// `dest_dir` (e.g. `<cache>/base.en-encoder.mlmodelc`). The zip's top-level
+/// directory is named `ggml-<id>-encoder.mlmodelc`, so we locate it by suffix
+/// and rename, dropping the `ggml-` prefix to match whisper.cpp's lookup path.
+fn unpack_coreml_zip(zip_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
+    let tmp_dir = dest_dir.with_extension("ziptmp");
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("open coreml zip {}", zip_path.display()))?;
+    archive.extract(&tmp_dir)?;
+
+    let model_dir = locate_coreml_dir(&tmp_dir).ok_or_else(|| {
+        anyhow!("CoreML package did not contain a *-encoder.mlmodelc directory")
+    })?;
+    if let Some(parent) = dest_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(model_dir, dest_dir)?;
+    let _ = std::fs::remove_dir_all(tmp_dir);
+    Ok(())
+}
+
+fn locate_coreml_dir(root: &Path) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            if !entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Skip the AppleDouble metadata folder some macOS zips carry.
+            if name == "__MACOSX" {
+                continue;
+            }
+            if name.ends_with("-encoder.mlmodelc") {
+                return Some(path);
+            }
+            stack.push(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +397,46 @@ mod tests {
         std::fs::write(nested.join("decoder_joint.onnx"), b"decoder").unwrap();
 
         assert_eq!(locate_nemotron_dir(tmp.path()).unwrap(), nested);
+    }
+
+    #[test]
+    fn coreml_path_matches_whisper_cpp_lookup() {
+        // whisper.cpp derives the CoreML dir from `{id}.gguf` by stripping the
+        // extension and appending `-encoder.mlmodelc`. The gguf and coreml
+        // paths must share a parent and the exact `{id}-encoder.mlmodelc` name.
+        let gguf = gguf_path("base.en").unwrap();
+        let coreml = coreml_path("base.en").unwrap();
+        assert_eq!(gguf.parent(), coreml.parent());
+        assert!(coreml.ends_with("base.en-encoder.mlmodelc"));
+    }
+
+    #[test]
+    fn coreml_models_have_paired_url_and_sha() {
+        let catalog = Catalog::builtin();
+        for m in catalog.all() {
+            assert_eq!(
+                m.coreml_url.is_some(),
+                m.coreml_sha256.is_some(),
+                "{} has a half-populated CoreML pair",
+                m.id
+            );
+        }
+        // The three Whisper models with published whisper.cpp CoreML encoders.
+        for id in ["base.en", "tiny.en", "large-v3-turbo"] {
+            assert!(catalog.get(id).unwrap().coreml_url.is_some(), "{id} missing CoreML url");
+        }
+    }
+
+    #[test]
+    fn locate_coreml_dir_finds_encoder_and_skips_macosx() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Simulate the zip layout: an AppleDouble folder plus the encoder dir.
+        std::fs::create_dir_all(tmp.path().join("__MACOSX")).unwrap();
+        let enc = tmp.path().join("ggml-base.en-encoder.mlmodelc");
+        std::fs::create_dir_all(enc.join("weights")).unwrap();
+        std::fs::write(enc.join("weights").join("weight.bin"), b"w").unwrap();
+
+        assert_eq!(locate_coreml_dir(tmp.path()).unwrap(), enc);
     }
 
     #[test]
