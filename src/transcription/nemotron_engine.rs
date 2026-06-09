@@ -43,7 +43,7 @@ impl TranscriptionEngine for NemotronEngine {
                 .and_then(nemotron_language)
             {
                 if model.mode() == NemotronMode::Multilingual {
-                    if let Err(e) = model.set_target_lang(lang) {
+                    if let Err(e) = model.set_target_lang(&lang) {
                         let _ = events_tx.send(EngineEvent::Error(format!(
                             "set Nemotron language {lang}: {e}"
                         )));
@@ -155,22 +155,22 @@ fn samples_to_ms(samples: usize) -> u64 {
     (samples as u64 * 1_000) / NEMOTRON_SAMPLE_RATE as u64
 }
 
-fn nemotron_language(language: &str) -> Option<&'static str> {
-    match language {
-        "auto" => Some("auto"),
-        "en" => Some("en-US"),
-        "es" => Some("es-ES"),
-        "fr" => Some("fr-FR"),
-        "de" => Some("de-DE"),
-        "it" => Some("it-IT"),
-        "pt" => Some("pt-BR"),
-        "ja" => Some("ja-JP"),
-        "zh" => Some("zh-CN"),
-        "ru" => Some("ru-RU"),
-        "pl" => Some("pl-PL"),
-        _ if language.len() == 5 && language.as_bytes()[2] == b'-' => {
-            Some(Box::leak(language.to_string().into_boxed_str()))
-        }
-        _ => None,
-    }
+fn nemotron_language(language: &str) -> Option<String> {
+    let mapped = match language {
+        "auto" => "auto",
+        "en" => "en-US",
+        "es" => "es-ES",
+        "fr" => "fr-FR",
+        "de" => "de-DE",
+        "it" => "it-IT",
+        "pt" => "pt-BR",
+        "ja" => "ja-JP",
+        "zh" => "zh-CN",
+        "ru" => "ru-RU",
+        "pl" => "pl-PL",
+        // Already-qualified BCP-47 tags (e.g. "pt-PT", "zh-TW") pass through as-is.
+        _ if language.len() == 5 && language.as_bytes()[2] == b'-' => language,
+        _ => return None,
+    };
+    Some(mapped.to_string())
 }

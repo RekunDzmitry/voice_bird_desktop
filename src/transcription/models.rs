@@ -17,8 +17,10 @@ pub struct ModelEntry {
     pub size_mb: u32,
     pub language: &'static str,
     pub format: ModelFormat,
-    pub gguf_url: &'static str,
-    pub gguf_sha256: &'static str,
+    /// Source URL for the primary artifact: a Whisper GGUF `.bin` for
+    /// `WhisperGguf`, or the Nemotron `.tar.gz` package for `NemotronPackage`.
+    pub download_url: &'static str,
+    pub download_sha256: &'static str,
     pub coreml_url: Option<&'static str>,
     pub coreml_sha256: Option<&'static str>,
     pub is_default: bool,
@@ -34,10 +36,12 @@ impl Catalog {
                 size_mb: 250,
                 language: "en",
                 format: ModelFormat::WhisperGguf,
-                gguf_url: "https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: Some("https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en-encoder.mlmodelc.zip"),
-                coreml_sha256: Some("<FILL>"),
+                download_url: "https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en.bin",
+                download_sha256: "7691eb11167ab7aaf6b3e05d8266f2fd9ad89c550e433f86ac266ebdee6c970a",
+                // No standalone CoreML zip is published for this model;
+                // argmaxinc/whisperkit-coreml serves .mlmodelc directory trees, not zips.
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: true,
             },
             ModelEntry {
@@ -45,8 +49,8 @@ impl Catalog {
                 size_mb: 1_500,
                 language: "multi",
                 format: ModelFormat::WhisperGguf,
-                gguf_url: "https://huggingface.co/distil-whisper/distil-large-v3/resolve/main/ggml-distil-large-v3.bin",
-                gguf_sha256: "<FILL>",
+                download_url: "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin",
+                download_sha256: "2883a11b90fb10ed592d826edeaee7d2929bf1ab985109fe9e1e7b4d2b69a298",
                 coreml_url: None,
                 coreml_sha256: None,
                 is_default: false,
@@ -56,10 +60,12 @@ impl Catalog {
                 size_mb: 1_600,
                 language: "multi",
                 format: ModelFormat::WhisperGguf,
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-                gguf_sha256: "<FILL>",
-                coreml_url: Some("https://huggingface.co/argmaxinc/whisperkit-coreml/resolve/main/openai_whisper-large-v3-turbo.zip"),
-                coreml_sha256: Some("<FILL>"),
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+                download_sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+                // argmaxinc/whisperkit-coreml publishes .mlmodelc directory trees, not a
+                // single downloadable zip; no standalone CoreML artifact to pin here.
+                coreml_url: None,
+                coreml_sha256: None,
                 is_default: false,
             },
             ModelEntry {
@@ -67,8 +73,8 @@ impl Catalog {
                 size_mb: 740,
                 language: "multi",
                 format: ModelFormat::NemotronPackage,
-                gguf_url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/nemotron-3.5-asr-streaming-0.6b-int8.tar.gz",
-                gguf_sha256: "<FILL>",
+                download_url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/nemotron-3.5-asr-streaming-0.6b-int8.tar.gz",
+                download_sha256: "d1d57d86212528fa03dfdbb88979f1dd637814dec6db31257a603739c73bd9d2",
                 coreml_url: None,
                 coreml_sha256: None,
                 is_default: false,
@@ -78,8 +84,8 @@ impl Catalog {
                 size_mb: 150,
                 language: "en",
                 format: ModelFormat::WhisperGguf,
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-                gguf_sha256: "<FILL>",
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+                download_sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
                 coreml_url: None,
                 coreml_sha256: None,
                 is_default: false,
@@ -89,8 +95,8 @@ impl Catalog {
                 size_mb: 75,
                 language: "en",
                 format: ModelFormat::WhisperGguf,
-                gguf_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-                gguf_sha256: "<FILL>",
+                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+                download_sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
                 coreml_url: None,
                 coreml_sha256: None,
                 is_default: false,
@@ -159,6 +165,21 @@ pub fn is_nemotron_model(id: &str) -> bool {
     )
 }
 
+/// Whether a model is present on disk and usable. For Whisper GGUF models this
+/// is a plain file-exists check; for the Nemotron package it verifies the
+/// unpacked directory actually contains the ONNX artifacts the engine loads,
+/// so a half-unpacked or empty directory is not mistaken for a ready model.
+pub fn is_model_available(id: &str) -> bool {
+    let Ok(path) = model_path(id) else {
+        return false;
+    };
+    if is_nemotron_model(id) {
+        path.join("encoder.onnx").exists() && path.join("decoder_joint.onnx").exists()
+    } else {
+        path.exists()
+    }
+}
+
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> anyhow::Result<()> {
     let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mut h = Sha256::new();
@@ -212,14 +233,19 @@ pub fn download_model_with_verify(
 ) -> anyhow::Result<()> {
     match entry.format {
         ModelFormat::WhisperGguf => download_with_verify(
-            entry.gguf_url,
+            entry.download_url,
             &gguf_path(entry.id)?,
-            entry.gguf_sha256,
+            entry.download_sha256,
             progress,
         ),
         ModelFormat::NemotronPackage => {
             let archive_path = cache_dir()?.join(format!("{}.tar.gz", entry.id));
-            download_with_verify(entry.gguf_url, &archive_path, entry.gguf_sha256, progress)?;
+            download_with_verify(
+                entry.download_url,
+                &archive_path,
+                entry.download_sha256,
+                progress,
+            )?;
             progress(0, None);
             unpack_nemotron_archive(&archive_path, &nemotron_model_dir(entry.id)?)?;
             progress(1, Some(1));

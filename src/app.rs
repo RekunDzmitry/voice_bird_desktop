@@ -1273,9 +1273,9 @@ impl App {
                 .as_ref()
                 .and_then(|id| {
                     let path = voice_bird_cli::transcription::models::model_path(id).ok()?;
-                    if !path.exists() {
+                    if !voice_bird_cli::transcription::models::is_model_available(id) {
                         log::warn!(
-                            "refinement_model '{}' set but file missing at {} — disabled",
+                            "refinement_model '{}' set but not available at {} — disabled",
                             id,
                             path.display()
                         );
