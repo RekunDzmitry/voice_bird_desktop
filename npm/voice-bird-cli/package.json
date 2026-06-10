@@ -1,6 +1,6 @@
 {
   "name": "voice-bird-cli",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Voice Bird CLI - local-first voice transcription TUI",
   "license": "MIT",
   "repository": {
