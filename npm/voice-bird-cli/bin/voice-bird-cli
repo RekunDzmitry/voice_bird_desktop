@@ -1,17 +1,43 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const { homedir } = require("node:os");
 
-const exe = join(homedir(), ".cargo", "bin", process.platform === "win32" ? "voice-bird-cli.exe" : "voice-bird-cli");
+const version = require("../package.json").version;
+const binDir = join(homedir(), ".cargo", "bin");
+const exe = join(binDir, process.platform === "win32" ? "voice-bird-cli.exe" : "voice-bird-cli");
+const marker = join(binDir, ".voice-bird-cli.version");
 
-if (!existsSync(exe)) {
-  const install = spawnSync("cargo", ["install", "voice-bird-cli", "--locked"], { stdio: "inherit" });
-  if (install.status !== 0) {
+// Marker file records the version we installed. The native binary has no
+// headless `--version`, so this is how we know whether it matches this package.
+function installedVersion() {
+  try {
+    return existsSync(exe) ? readFileSync(marker, "utf8").trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// Install/upgrade on first run or after a version bump, then cache via the
+// marker so subsequent launches skip cargo entirely and stay fast.
+if (installedVersion() !== version) {
+  const install = spawnSync(
+    "cargo",
+    ["install", "voice-bird-cli", "--version", version, "--locked", "--force"],
+    { stdio: "inherit" }
+  );
+  if (install.status === 0) {
+    try {
+      writeFileSync(marker, version + "\n");
+    } catch {}
+  } else if (!existsSync(exe)) {
+    // No usable binary and the install failed — cannot proceed.
+    console.error("voice-bird-cli: failed to install the native binary. Ensure Rust Cargo is installed (https://rustup.rs/).");
     process.exit(install.status || 1);
   }
+  // Otherwise an older binary is present: fall through and run it.
 }
 
 const child = spawnSync(exe, process.argv.slice(2), { stdio: "inherit" });

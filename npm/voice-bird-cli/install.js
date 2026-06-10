@@ -1,11 +1,26 @@
 const { spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const { homedir } = require("node:os");
 
-const exe = join(homedir(), ".cargo", "bin", process.platform === "win32" ? "voice-bird-cli.exe" : "voice-bird-cli");
+const version = require("./package.json").version;
+const binDir = join(homedir(), ".cargo", "bin");
+const exe = join(binDir, process.platform === "win32" ? "voice-bird-cli.exe" : "voice-bird-cli");
+const marker = join(binDir, ".voice-bird-cli.version");
 
-if (existsSync(exe)) {
+// We record the version we installed in a marker file next to the binary. The
+// native binary has no headless `--version` (it opens an audio device), so the
+// marker is how we detect whether the installed build matches this package.
+function installedVersion() {
+  try {
+    return existsSync(exe) ? readFileSync(marker, "utf8").trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// Already on the matching version — nothing to do.
+if (installedVersion() === version) {
   process.exit(0);
 }
 
@@ -15,5 +30,16 @@ if (check.status !== 0) {
   process.exit(1);
 }
 
-const install = spawnSync("cargo", ["install", "voice-bird-cli", "--locked"], { stdio: "inherit" });
+// Pin to this package's exact version and force, so an existing older binary is
+// upgraded rather than left in place (cargo would otherwise no-op on presence).
+const install = spawnSync(
+  "cargo",
+  ["install", "voice-bird-cli", "--version", version, "--locked", "--force"],
+  { stdio: "inherit" }
+);
+if (install.status === 0) {
+  try {
+    writeFileSync(marker, version + "\n");
+  } catch {}
+}
 process.exit(install.status || 0);
