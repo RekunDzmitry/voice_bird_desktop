@@ -1,6 +1,6 @@
 [package]
 name = "voice-bird-cli"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Voice Bird CLI - local-first voice transcription TUI"
 license = "MIT"
@@ -60,9 +60,12 @@ uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 
 # Transcription (populated in Stage 3)
-# `metal` enables whisper.cpp's Metal backend on macOS (~5–10× CPU speedup).
-# Non-Apple targets ignore the feature at whisper.cpp's build.rs level.
-whisper-rs = { version = "0.13", features = ["metal", "whisper-cpp-log"] }
+# Base features apply to EVERY target, so Apple-only backends must NOT live here.
+# `metal` is enabled in the macOS-only [target.'cfg(target_os = "macos")'] entry
+# below (Cargo unions features across tables). Enabling `metal` here broke every
+# non-Apple build: ggml's CMake runs find_library(Foundation), which exists only
+# on macOS, so the link fails on Windows/Linux.
+whisper-rs = { version = "0.13", features = ["whisper-cpp-log"] }
 parakeet-rs = "0.3.6"
 
 # Model download + verification
@@ -99,15 +102,16 @@ serial_test = "3.4.0"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# CoreML (ANE) encoder acceleration is macOS-only. The `coreml` feature makes
-# whisper.cpp build with WHISPER_COREML=ON + WHISPER_COREML_ALLOW_FALLBACK=1,
-# so models without a `<model>-encoder.mlmodelc` still init via Metal/CPU.
-# Cargo UNIONS features across dependency tables for the same crate, so on macOS
-# whisper-rs resolves to metal+whisper-cpp-log (from [dependencies]) PLUS coreml
-# (here); other targets see only the base entry, so CoreML never links there.
-# We therefore list ONLY the macOS-extra feature here — base features are
-# inherited automatically, so new flags added above need no mirroring.
-whisper-rs = { version = "0.13", features = ["coreml"] }
+# Apple-only whisper.cpp backends. Cargo UNIONS features across dependency
+# tables for the same crate, so on macOS whisper-rs resolves to whisper-cpp-log
+# (from [dependencies]) PLUS metal + coreml (here); other targets see only the
+# base entry, so neither Metal nor CoreML is ever requested there.
+#  - `metal`:  Metal GPU backend (~5–10× CPU speedup). MUST stay macOS-only —
+#    ggml's CMake does find_library(Foundation), which fails off-Apple.
+#  - `coreml`: ANE encoder acceleration (WHISPER_COREML=ON +
+#    WHISPER_COREML_ALLOW_FALLBACK=1), so models without a
+#    `<model>-encoder.mlmodelc` still init via Metal/CPU.
+whisper-rs = { version = "0.13", features = ["coreml", "metal"] }
 # System-audio loopback on macOS via ScreenCaptureKit.
 # Pinned to 0.3.x because 0.3.6 uses the `objc` 0.2 ecosystem with no Swift
 # build-script bridge, and the trait-based API here is significantly smaller
