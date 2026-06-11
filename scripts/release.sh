@@ -84,7 +84,14 @@ cmd_cargo() {
 
 cmd_npm() {
   bold "Publishing npm wrapper..."
-  run npm publish --access public --prefix npm/voice-bird-cli
+  # `npm publish` acts on the current directory; --prefix only changes the
+  # install location, not the publish target (npm looked for package.json at
+  # the repo root and failed). cd into the package dir instead.
+  if [ "$DRY_RUN" = "1" ]; then
+    blue "[dry-run] (cd npm/voice-bird-cli && npm publish --access public)"
+    return
+  fi
+  (cd npm/voice-bird-cli && npm publish --access public)
 }
 
 cmd_pypi() {
