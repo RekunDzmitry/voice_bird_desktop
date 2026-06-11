@@ -1,4 +1,5 @@
-#![cfg(feature = "engine-smoke")]
+// Local whisper engines don't exist on cloud-only Windows.
+#![cfg(all(feature = "engine-smoke", not(windows)))]
 
 use std::time::Duration;
 use voice_bird_cli::transcription::{

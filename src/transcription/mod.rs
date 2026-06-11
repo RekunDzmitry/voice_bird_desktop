@@ -1,11 +1,18 @@
+// Local inference engines (and their helpers) are gated off Windows:
+// Windows is cloud-only since 0.4.0, so whisper-rs / parakeet-rs / sysinfo
+// never enter the Windows dependency graph (see Cargo.toml).
+#[cfg(not(windows))]
 pub mod auto_select;
 pub mod local_agreement;
 pub mod mock;
 pub mod models;
+#[cfg(not(windows))]
 pub mod nemotron_engine;
+#[cfg(not(windows))]
 pub mod refinement_engine;
 pub mod voicebird_engine;
 pub mod whisper_kit_engine;
+#[cfg(not(windows))]
 pub mod whisper_rs_engine;
 
 use std::time::Duration;
@@ -88,33 +95,6 @@ pub trait TranscriptionEngine: Send {
     fn start(&mut self, cfg: EngineConfig) -> anyhow::Result<EngineHandle>;
 }
 
-/// Build a transcription engine based on user preference and whether the
-/// WhisperKit sidecar binary is available on disk. `prefer` comes from
-/// `config.toml`'s `engine_prefer` field (`"auto"`, `"whisperkit"`, or
-/// `"whisper_rs"`). On macOS, `"auto"` and `"whisperkit"` pick the
-/// sidecar iff `sidecar_path` is `Some` and points to an existing file;
-/// otherwise we fall back to `whisper-rs` transparently.
-pub fn select_engine(
-    prefer: &str,
-    sidecar_path: Option<&std::path::Path>,
-) -> Box<dyn TranscriptionEngine> {
-    #[cfg(target_os = "macos")]
-    {
-        if prefer == "whisperkit" || prefer == "auto" {
-            if let Some(path) = sidecar_path {
-                if path.exists() {
-                    return Box::new(whisper_kit_engine::WhisperKitEngine::new(
-                        path.to_path_buf(),
-                    ));
-                }
-            }
-        }
-    }
-    // Silence the unused-parameter warning on non-macOS builds.
-    let _ = (prefer, sidecar_path);
-    Box::new(whisper_rs_engine::WhisperRsEngine::default())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineKind {
     WhisperRs,
@@ -123,8 +103,9 @@ pub enum EngineKind {
     VoiceBirdWeb,
 }
 
-/// Typed variant of `select_engine`. Returns an error for cases that
-/// should surface to the user (e.g. cloud broadcast enabled but no key).
+/// Select the transcription engine for a recording. Returns an error for
+/// cases that should surface to the user (e.g. cloud broadcast enabled but
+/// no key, or local mode requested on cloud-only Windows).
 ///
 /// When `cloud_broadcast_enabled` is true, the cloud Voice Bird Web
 /// engine is selected unconditionally — it bypasses local Whisper and
@@ -159,26 +140,41 @@ pub fn try_select_engine(
         ));
     }
 
-    #[cfg(target_os = "macos")]
+    // Windows has no local engines (cloud-only since 0.4.0). This branch is
+    // defensive — the app forces cloud on at config load and clamps per-source
+    // settings — but it guarantees a coherent error if a hand-edited config
+    // slips through with cloud off.
+    #[cfg(windows)]
     {
-        if prefer == "whisperkit" || prefer == "auto" {
-            if let Some(path) = sidecar_path {
-                if path.exists() {
-                    return Ok((
-                        EngineKind::WhisperKit,
-                        Box::new(whisper_kit_engine::WhisperKitEngine::new(
-                            path.to_path_buf(),
-                        )),
-                    ));
+        let _ = (prefer, sidecar_path);
+        Err("Local transcription is not supported on Windows — Windows is cloud-only. \
+             Press 'c' to set your Voice Bird API key."
+            .into())
+    }
+
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        {
+            if prefer == "whisperkit" || prefer == "auto" {
+                if let Some(path) = sidecar_path {
+                    if path.exists() {
+                        return Ok((
+                            EngineKind::WhisperKit,
+                            Box::new(whisper_kit_engine::WhisperKitEngine::new(
+                                path.to_path_buf(),
+                            )),
+                        ));
+                    }
                 }
             }
         }
+        let _ = (prefer, sidecar_path);
+        Ok((
+            EngineKind::WhisperRs,
+            Box::<whisper_rs_engine::WhisperRsEngine>::default(),
+        ))
     }
-    let _ = (prefer, sidecar_path);
-    Ok((
-        EngineKind::WhisperRs,
-        Box::<whisper_rs_engine::WhisperRsEngine>::default(),
-    ))
 }
 
 /// Locate the `voice-bird-whisperkit` Swift sidecar binary. We probe, in
@@ -236,17 +232,28 @@ mod select_tests {
         assert!(err.to_lowercase().contains("server url"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn local_path_ignores_credentials() {
         let (kind, _) = try_select_engine("whisper_rs", false, "", "", None).unwrap();
         assert_eq!(kind, EngineKind::WhisperRs);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn local_path_when_broadcast_off_even_with_creds() {
         // When broadcast is off, creds are irrelevant and we land on the
         // local engine (whisper_rs without a sidecar path).
         let (kind, _) = try_select_engine("whisper_rs", false, "vb-fake", TEST_URL, None).unwrap();
         assert_eq!(kind, EngineKind::WhisperRs);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_without_cloud_returns_err() {
+        // Windows has no local engines; asking for one must surface the
+        // cloud-only error rather than panic or silently pick anything.
+        let err = try_select_engine("auto", false, "", "", None).err().unwrap();
+        assert!(err.to_lowercase().contains("cloud-only"));
     }
 }

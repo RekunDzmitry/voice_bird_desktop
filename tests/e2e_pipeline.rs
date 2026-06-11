@@ -10,7 +10,8 @@
 //!   - Streaming + refinement run in parallel on the same PCM stream and
 //!     both produce their own JSONL output (the App's dual-engine layout).
 
-#![cfg(feature = "engine-smoke")]
+// Local whisper engines don't exist on cloud-only Windows.
+#![cfg(all(feature = "engine-smoke", not(windows)))]
 
 use std::path::PathBuf;
 use std::time::Duration;

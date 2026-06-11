@@ -278,6 +278,14 @@ impl App {
     pub fn new() -> Self {
         let mut config = AppConfig::load().unwrap_or_default();
 
+        // Windows is cloud-only: force cloud on in memory regardless of what
+        // the config says (covers configs copied from another OS or
+        // hand-edited). The on-disk format stays identical across platforms.
+        #[cfg(windows)]
+        {
+            config.cloud_broadcast_enabled = true;
+        }
+
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -288,9 +296,15 @@ impl App {
         // "loaded from disk" once it exists so the picker behaves like a
         // normal navigation, not a first-run gate.
         if !config_was_loaded_from_disk {
-            let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
-            log::info!("first run: auto-picked local model = {picked}");
-            config.default_model = picked.into();
+            // No local models on cloud-only Windows — just persist the
+            // defaults; the API-key modal below replaces the model picker
+            // as the first-run gate.
+            #[cfg(not(windows))]
+            {
+                let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
+                log::info!("first run: auto-picked local model = {picked}");
+                config.default_model = picked.into();
+            }
             if let Err(e) = config.save() {
                 log::error!("config save (first run): {e}");
             } else {
@@ -298,6 +312,8 @@ impl App {
             }
         }
 
+        // Only the macOS screen-recording check below mutates this.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut banner_on_launch: Option<String> =
             if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
                 Some("Cloud is on but no API key — press 'c' to paste one".into())
@@ -329,7 +345,8 @@ impl App {
             .build()
             .expect("tokio runtime");
 
-        Self {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut app = Self {
             mode: AppMode::Normal,
             devices: Vec::new(),
             apps: Vec::new(),
@@ -362,7 +379,17 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
+        };
+
+        // Windows first run (or missing key): land directly in the API-key
+        // modal — cloud is the only mode, so the key is the only thing the
+        // user must provide before recording.
+        #[cfg(windows)]
+        if app.config.voicebird_api_key.is_empty() {
+            app.open_api_key_modal();
         }
+
+        app
     }
 
     // -- Section accessors --------------------------------------------------
@@ -465,7 +492,9 @@ impl App {
     }
 
     /// Open the output-path modal, seeding the buffer with the
-    /// current `session_dir` from config.
+    /// current `session_dir` from config. Local-only concept — the 'p'
+    /// key doesn't exist on cloud-only Windows.
+    #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
         self.path_buf = Some(self.config.session_dir.clone());
         self.mode = AppMode::PathModal;
@@ -474,7 +503,9 @@ impl App {
     /// Export the most recent un-exported local transcript to the
     /// Voice Bird cloud. Idempotent — if the session already has a
     /// `.uploaded` marker, returns early with a "Already uploaded"
-    /// message.
+    /// message. Local-only concept — the 'e' key doesn't exist on
+    /// cloud-only Windows.
+    #[cfg(not(windows))]
     pub fn export_transcript(&mut self) {
         // Clear any previous export banner
         self.export_banner = None;
@@ -979,6 +1010,16 @@ impl App {
         source: SessionSource,
         settings: SectionSettings,
     ) -> Result<(), String> {
+        // Windows is cloud-only: clamp the per-source setting at the one
+        // choke point every recording passes through. Covers stale
+        // cloud_on=false overrides persisted by a pre-0.4.0 config.
+        #[cfg(windows)]
+        let settings = {
+            let mut s = settings;
+            s.cloud_on = true;
+            s
+        };
+
         if slot >= MAX_SECTIONS {
             return Err(format!("invalid section slot: {slot}"));
         }
@@ -1110,6 +1151,8 @@ impl App {
         let prefer = self.config.engine_prefer.clone();
         let api_key = self.config.voicebird_api_key.clone();
         let server_url = self.config.voicebird_server_url.clone();
+        // Only the (not(windows)) Nemotron swap below mutates these.
+        #[cfg_attr(windows, allow(unused_mut))]
         let (mut engine_kind_used, mut engine) =
             match voice_bird_cli::transcription::try_select_engine(
                 &prefer,
@@ -1165,6 +1208,9 @@ impl App {
                 }
             }
         };
+        // Local engine only — never reached on cloud-only Windows
+        // (cloud_active is always true there).
+        #[cfg(not(windows))]
         if !cloud_active
             && voice_bird_cli::transcription::models::is_nemotron_model(&settings.model)
         {
@@ -1265,6 +1311,14 @@ impl App {
         let session_start = std::time::Instant::now();
 
         // --- 4b. Optional refinement engine (beam-search on wider windows) -
+        // Refinement is a local-whisper concept; on cloud-only Windows the
+        // module doesn't exist, so the pair is statically (None, None).
+        #[cfg(windows)]
+        let (refinement_pcm_tx, refinement_handle): (
+            Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
+            Option<voice_bird_cli::transcription::EngineHandle>,
+        ) = (None, None);
+        #[cfg(not(windows))]
         let (refinement_pcm_tx, refinement_handle) = if cloud_active {
             (None, None)
         } else {
@@ -1754,6 +1808,7 @@ impl Default for App {
 /// Skips directories that don't contain transcript.json but does NOT
 /// filter by `.uploaded` — the caller decides what to do with that.
 /// Returns `None` if no sessions exist.
+#[cfg(not(windows))]
 fn find_latest_session(base: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(base) {
         Ok(rd) => rd
@@ -1779,6 +1834,7 @@ fn find_latest_session(base: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Derive an HTTP base URL from the WebSocket server URL.
 /// E.g., `wss://voicebird.app/api/audio/stream` → `https://voicebird.app`
 /// `ws://localhost:3000/api/audio/stream`     → `http://localhost:3000`
+#[cfg(not(windows))]
 fn ws_url_to_http(ws_url: &str) -> String {
     let (scheme, rest) = if let Some(r) = ws_url.strip_prefix("wss://") {
         ("https", r)
@@ -1852,6 +1908,13 @@ mod tests {
         assert_eq!(s.language, "ru");
         assert_eq!(s.model, "tiny.en");
     }
+
+    // Everything below exercises the local-session export path
+    // (ws_url_to_http / find_latest_session / export_transcript), which
+    // doesn't exist on cloud-only Windows.
+    #[cfg(not(windows))]
+    mod local_export {
+    use super::*;
 
     // ── ws_url_to_http tests (phase 1) ────────────────────────────────
 
@@ -2394,5 +2457,6 @@ mod tests {
             app.export_banner.as_deref(),
             Some("Exported \u{2713} \u{2014} newest")
         );
+    }
     }
 }

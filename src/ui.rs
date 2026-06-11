@@ -243,10 +243,15 @@ fn section_column_title(slot: usize, section: Option<&Section>) -> String {
             } else {
                 "en"
             };
-            format!(
-                " [{n}] {label} · cloud:{cloud} · {lang} · {model} ",
-                model = s.settings.model
-            )
+            // Cloud-only Windows has no local model to report.
+            if cfg!(windows) {
+                format!(" [{n}] {label} · cloud:{cloud} · {lang} ")
+            } else {
+                format!(
+                    " [{n}] {label} · cloud:{cloud} · {lang} · {model} ",
+                    model = s.settings.model
+                )
+            }
         }
     }
 }
@@ -432,24 +437,35 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         path_raw.to_string()
     };
 
-    let lines = vec![
+    // Windows is cloud-only: the cloud line is informational (no toggle),
+    // 'c' manages the API key, and the local-only Model/Path lines are
+    // omitted entirely.
+    let cloud_line = if cfg!(windows) {
+        Line::from(vec![
+            Span::raw("Cloud:    "),
+            Span::styled("[ON] (cloud-only)", cloud_style),
+            Span::styled("  (c: API key)", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
         Line::from(vec![
             Span::raw("Cloud:    "),
             Span::styled(cloud_label, cloud_style),
             Span::styled("  (c)", Style::default().fg(Color::DarkGray)),
-        ]),
-        lang_line,
-        Line::from(vec![
+        ])
+    };
+    let mut lines = vec![cloud_line, lang_line];
+    if cfg!(not(windows)) {
+        lines.push(Line::from(vec![
             Span::raw("Model:    "),
             Span::styled(app.display_model(), Style::default().fg(Color::Gray)),
             Span::styled("  (m)", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
+        ]));
+        lines.push(Line::from(vec![
             Span::raw("Path:     "),
             Span::styled(&path_display, Style::default().fg(Color::Gray)),
             Span::styled("  (p)", Style::default().fg(Color::DarkGray)),
-        ]),
-    ];
+        ]));
+    }
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -874,45 +890,59 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
     let any_active = app.active_section_count() > 0;
+    // Windows is cloud-only: 'c' manages the API key instead of toggling
+    // modes, and the local-only model/export/path keys don't exist.
+    let local_keys = cfg!(not(windows));
+    let cloud_key_label = if local_keys { "cloud" } else { "API key" };
     let lines: Vec<Line> = match (any_active, &app.mode) {
         (_, AppMode::ApiKeyModal) | (_, AppMode::PathModal) => vec![
             hotkey_line("[Enter]", "save"),
             hotkey_line("[Esc]", "cancel"),
         ],
-        (false, _) => vec![
-            hotkey_line("[↑/↓]", "select"),
-            hotkey_line("[←/→]", "pane"),
-            hotkey_line("[Space]", "no app"),
-            hotkey_line("[Enter]", "start"),
-            hotkey_line("[Tab]", "focus slot"),
-            hotkey_line("[r]", "refresh"),
-            hotkey_line("[c]", "cloud"),
-            hotkey_line("[l]", "language"),
-            hotkey_line("[m]", "model"),
-            hotkey_line("[e]", "export"),
-            hotkey_line("[p]", "path"),
-            hotkey_line("[x]", "clear"),
-            hotkey_line("[q]", "quit"),
-            hotkey_line("[?]", "help"),
-        ],
-        (true, _) => vec![
-            hotkey_line("[↑/↓]", "select"),
-            hotkey_line("[←/→]", "pane"),
-            hotkey_line("[Enter]", "add"),
-            hotkey_line("[Tab]", "focus slot"),
-            hotkey_line("[s]", "stop"),
-            hotkey_line("[S]", "stop all"),
-            hotkey_line("[c]", "cloud"),
-            hotkey_line("[l]", "language"),
-            hotkey_line("[m]", "model"),
-            hotkey_line("[PgUp]", "scroll up"),
-            hotkey_line("[PgDn]", "scroll down"),
-            hotkey_line("[Home]", "top"),
-            hotkey_line("[End]", "bottom"),
-            hotkey_line("[x]", "clear"),
-            hotkey_line("[q]", "quit"),
-            hotkey_line("[?]", "help"),
-        ],
+        (false, _) => {
+            let mut lines = vec![
+                hotkey_line("[↑/↓]", "select"),
+                hotkey_line("[←/→]", "pane"),
+                hotkey_line("[Space]", "no app"),
+                hotkey_line("[Enter]", "start"),
+                hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[r]", "refresh"),
+                hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[l]", "language"),
+            ];
+            if local_keys {
+                lines.push(hotkey_line("[m]", "model"));
+                lines.push(hotkey_line("[e]", "export"));
+                lines.push(hotkey_line("[p]", "path"));
+            }
+            lines.push(hotkey_line("[x]", "clear"));
+            lines.push(hotkey_line("[q]", "quit"));
+            lines.push(hotkey_line("[?]", "help"));
+            lines
+        }
+        (true, _) => {
+            let mut lines = vec![
+                hotkey_line("[↑/↓]", "select"),
+                hotkey_line("[←/→]", "pane"),
+                hotkey_line("[Enter]", "add"),
+                hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[s]", "stop"),
+                hotkey_line("[S]", "stop all"),
+                hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[l]", "language"),
+            ];
+            if local_keys {
+                lines.push(hotkey_line("[m]", "model"));
+            }
+            lines.push(hotkey_line("[PgUp]", "scroll up"));
+            lines.push(hotkey_line("[PgDn]", "scroll down"));
+            lines.push(hotkey_line("[Home]", "top"));
+            lines.push(hotkey_line("[End]", "bottom"));
+            lines.push(hotkey_line("[x]", "clear"));
+            lines.push(hotkey_line("[q]", "quit"));
+            lines.push(hotkey_line("[?]", "help"));
+            lines
+        }
     };
 
     let visible = area.height.saturating_sub(2);
