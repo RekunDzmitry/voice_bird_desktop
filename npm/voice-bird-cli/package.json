@@ -2,10 +2,10 @@
   "name": "voice-bird-cli",
   "version": "0.4.0",
   "description": "Voice Bird CLI - local-first voice transcription TUI",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/voice-bird/voice-bird-cli.git"
+    "url": "git+https://github.com/RekunDzmitry/voice_bird_desktop.git"
   },
   "bin": {
     "voice-bird-cli": "bin/voice-bird-cli"
