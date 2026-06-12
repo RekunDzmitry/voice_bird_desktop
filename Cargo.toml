@@ -1,6 +1,6 @@
 [package]
 name = "voice-bird-cli"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 description = "Voice Bird CLI - local-first voice transcription TUI"
 license = "MIT"
@@ -59,15 +59,6 @@ ureq = { version = "2.10", features = ["json"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 
-# Transcription (populated in Stage 3)
-# Base features apply to EVERY target, so Apple-only backends must NOT live here.
-# `metal` is enabled in the macOS-only [target.'cfg(target_os = "macos")'] entry
-# below (Cargo unions features across tables). Enabling `metal` here broke every
-# non-Apple build: ggml's CMake runs find_library(Foundation), which exists only
-# on macOS, so the link fails on Windows/Linux.
-whisper-rs = { version = "0.13", features = ["whisper-cpp-log"] }
-parakeet-rs = "0.3.6"
-
 # Model download + verification
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
 sha2 = "0.10"
@@ -76,10 +67,6 @@ hex = "0.4"
 # WhisperKit sidecar IPC (length-prefixed binary samples over stdio)
 bytemuck = "1"
 
-# System introspection for auto-picking the local model on first launch
-# (RAM and CPU architecture). Default features include all platforms we
-# care about; we only call refresh_memory(), which is cheap.
-sysinfo = "0.32"
 flate2 = "1"
 tar = "0.4"
 # CoreML encoder packages ship as .mlmodelc.zip (whisper.cpp format).
@@ -101,11 +88,26 @@ serial_test = "3.4.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(not(windows))'.dependencies]
+# Local transcription engines. Windows is CLOUD-ONLY since 0.4.0: whisper-rs
+# pulls in whisper.cpp (CMake + a C/C++ toolchain + bindgen/libclang), which
+# repeatedly broke Windows installs (wrong link.exe, libclang 19+ bindgen bug —
+# see docs/windows-install.md). Gating the local engines off Windows lets the
+# crate build there with just the stock Rust MSVC toolchain.
+# Base features apply to every cfg(not(windows)) target; Apple-only backends
+# (`metal`, `coreml`) live in the macOS table below — Cargo unions features
+# across tables, so macOS gets whisper-cpp-log + coreml + metal.
+whisper-rs = { version = "0.13", features = ["whisper-cpp-log"] }
+parakeet-rs = "0.3.6"
+# System introspection for auto-picking the local model on first launch
+# (RAM and CPU architecture); only used by transcription::auto_select.
+sysinfo = "0.32"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Apple-only whisper.cpp backends. Cargo UNIONS features across dependency
 # tables for the same crate, so on macOS whisper-rs resolves to whisper-cpp-log
-# (from [dependencies]) PLUS metal + coreml (here); other targets see only the
-# base entry, so neither Metal nor CoreML is ever requested there.
+# (from the cfg(not(windows)) table above) PLUS metal + coreml (here); Linux
+# sees only the base entry, so neither Metal nor CoreML is requested there.
 #  - `metal`:  Metal GPU backend (~5–10× CPU speedup). MUST stay macOS-only —
 #    ggml's CMake does find_library(Foundation), which fails off-Apple.
 #  - `coreml`: ANE encoder acceleration (WHISPER_COREML=ON +
@@ -130,6 +132,7 @@ objc = "0.2"
 windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_System_ProcessStatus",

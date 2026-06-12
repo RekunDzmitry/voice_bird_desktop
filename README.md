@@ -1,6 +1,6 @@
 # Voice Bird CLI
 
-Voice Bird CLI is a terminal voice transcription app. It runs **locally by default** with Whisper models, so local recordings stay on your machine. When you want hosted transcription, you can opt in per source to VoiceBird Web cloud mode.
+Voice Bird CLI is a terminal voice transcription app. On macOS and Linux it runs **locally by default** with Whisper models, so local recordings stay on your machine, and you can opt in per source to VoiceBird Web cloud mode. **Windows is cloud-only** (since 0.4.0) and requires a Voice Bird API key.
 
 ![Voice Bird CLI basic flow](docs/assets/basic-flow.svg)
 
@@ -30,7 +30,7 @@ Install one of the CLI packages, then run:
 voice-bird-cli
 ```
 
-On first launch, Voice Bird picks a local Whisper model and downloads it into your OS cache directory. The default model is `distil-small.en`. Settings are stored in `~/.config/voice-bird/config.toml` on Linux/macOS and `%APPDATA%\voice-bird\config.toml` on Windows.
+On first launch (macOS/Linux), Voice Bird picks a local Whisper model and downloads it into your OS cache directory. The default model is `distil-small.en`. On Windows, first launch prompts for your Voice Bird API key instead — there are no local models. Settings are stored in `~/.config/voice-bird/config.toml` on Linux/macOS and `%APPDATA%\voice-bird\config.toml` on Windows.
 
 Press `m` to change models. The picker includes `nemotron-3.5-asr-streaming-0.6b`, NVIDIA's latest Nemotron 3.5 ASR streaming model via the local `parakeet-rs` engine. Select it, let the package download/unpack, then start recording; the engine label and `meta.json` should show `nemotron`.
 
@@ -74,11 +74,13 @@ cargo install --path .
 
 The npm and PyPI packages require Rust Cargo on the machine. Use the Cargo or source install when you want the simplest path.
 
+**Windows:** cloud-only since 0.4.0 — no local Whisper inference, so the build needs only the standard Rust MSVC toolchain (no CMake, no LLVM, no whisper.cpp compile). See [docs/windows-install.md](docs/windows-install.md).
+
 ## Local And Cloud Modes
 
-**Free local mode** is the default. It uses local Whisper inference through `whisper-rs`, or WhisperKit on macOS when the sidecar is available. Local mode does not send audio to a server and writes session artifacts to disk. Current local models are English-focused in the app flow.
+**Free local mode** is the default on macOS and Linux. It uses local Whisper inference through `whisper-rs`, or WhisperKit on macOS when the sidecar is available. Local mode does not send audio to a server and writes session artifacts to disk. Current local models are English-focused in the app flow.
 
-**Cloud mode** streams audio to VoiceBird Web at `wss://voicebird.app/api/audio/stream`. It is opt-in, requires a Voice Bird API key, and is useful when local hardware cannot keep up or when you want cloud language support. Cloud recordings live in your VoiceBird Web account instead of the local sessions folder.
+**Cloud mode** streams audio to VoiceBird Web at `wss://voicebird.app/api/audio/stream`. It requires a Voice Bird API key and is useful when local hardware cannot keep up or when you want cloud language support. Cloud recordings live in your VoiceBird Web account instead of the local sessions folder. On macOS/Linux it is opt-in per source; **on Windows it is the only mode** — first launch prompts for the API key.
 
 Your Voice Bird API key is stored in plaintext in `config.toml`; on Unix the app sets the file to `0600` best-effort.
 
@@ -107,6 +109,8 @@ voice-bird-cli --recover <session-dir> # rebuild transcript.{json,txt} after a c
 | `x` | Clear stopped transcript slot |
 | `q` | Quit |
 | `?` | Help |
+
+On Windows, `c` opens the API-key dialog (cloud is always on), and the local-only keys `m`, `e`, and `p` are not available.
 
 ## License
 

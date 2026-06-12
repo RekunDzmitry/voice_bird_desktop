@@ -169,7 +169,8 @@ fn main() -> Result<()> {
 
     // Route whisper.cpp + ggml logs (including Metal init) through the
     // `log` crate so they land in our file log and don't scribble over
-    // the TUI on stderr.
+    // the TUI on stderr. No whisper.cpp on cloud-only Windows.
+    #[cfg(not(windows))]
     whisper_rs::install_whisper_log_trampoline();
 
     // Setup terminal
@@ -548,6 +549,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('S') => {
             app.stop_all_sections();
         }
+        #[cfg(not(windows))]
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the
@@ -565,12 +567,25 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             });
             app.mode = AppMode::ModelPicker;
         }
+        #[cfg(windows)]
+        KeyCode::Char('m') => {
+            // No local models on cloud-only Windows; keep the key from
+            // being silently dead.
+            app.banner = Some("Windows is cloud-only — no local models".into());
+        }
+        // Windows is cloud-only: 'c' never toggles the mode, it only
+        // opens the API-key modal (the one cloud setting that matters).
+        #[cfg(windows)]
+        KeyCode::Char('c') => {
+            app.open_api_key_modal();
+        }
         // Toggle cloud transcription. When idle, mutates the global
         // config so the next-start defaults flip (and the mode panel
         // updates). When a section is focused, mutates that section's
         // settings AND persists a per-source override. The running
         // engine itself is untouched until the user stops & restarts —
         // mid-flight engine rebuild is Stage 3+.
+        #[cfg(not(windows))]
         KeyCode::Char('c') => {
             if let Some(section) = app.focused_mut() {
                 section.settings.cloud_on = !section.settings.cloud_on;
@@ -629,11 +644,15 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         }
         // Export the most recent local transcript to the cloud.
         // Idempotent — second press is a no-op once .uploaded exists.
+        // Local-only concept: gated off cloud-only Windows.
+        #[cfg(not(windows))]
         KeyCode::Char('e') if app.active_section_count() == 0 => {
             app.export_transcript();
         }
         // Open the output-path modal. Only when idle (can't change
         // paths mid-recording — sessions have already landed).
+        // Local-only concept: gated off cloud-only Windows.
+        #[cfg(not(windows))]
         KeyCode::Char('p') if app.active_section_count() == 0 => {
             app.open_path_modal();
         }
@@ -683,13 +702,24 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
             // with cloud=on and no key — that would block the next
             // recording. Leaves the saved key untouched, so a partial
             // edit is discarded.
-            app.config.cloud_broadcast_enabled = false;
-            if let Err(e) = app.config.save() {
-                log::error!("config save (modal cancel): {e}");
+            #[cfg(not(windows))]
+            {
+                app.config.cloud_broadcast_enabled = false;
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (modal cancel): {e}");
+                }
+                app.banner = Some("Cloud: OFF (cancelled API key entry)".into());
+            }
+            // Windows can't fall back to local, so cloud stays on; the
+            // start-recording guard re-opens this modal when needed.
+            #[cfg(windows)]
+            {
+                app.banner = Some(
+                    "Windows is cloud-only — press 'c' to set an API key before recording".into(),
+                );
             }
             app.api_key_buf = None;
             app.mode = AppMode::Normal;
-            app.banner = Some("Cloud: OFF (cancelled API key entry)".into());
         }
         KeyCode::Enter => {
             if let Some(buf) = app.api_key_buf.take() {

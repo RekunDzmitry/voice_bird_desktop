@@ -25,8 +25,7 @@ use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc;
-use windows::core::HSTRING;
-use windows::Win32::Foundation::HRESULT;
+use windows::core::{Interface, HRESULT, HSTRING, PROPVARIANT};
 use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -35,7 +34,6 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use crate::audio::capture::{CaptureHandle, CaptureInfo, CaptureKeepAlive};
