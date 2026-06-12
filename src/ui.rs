@@ -243,7 +243,8 @@ fn section_column_title(slot: usize, section: Option<&Section>) -> String {
             } else {
                 "en"
             };
-            // Cloud-only Windows has no local model to report.
+            // Cloud-only Windows has no local model to report
+            // (compile-time constant branch).
             if cfg!(windows) {
                 format!(" [{n}] {label} · cloud:{cloud} · {lang} ")
             } else {
@@ -439,7 +440,9 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
 
     // Windows is cloud-only: the cloud line is informational (no toggle),
     // 'c' manages the API key, and the local-only Model/Path lines are
-    // omitted entirely.
+    // omitted entirely. cfg!(windows) is a compile-time constant (the
+    // branch folds away); it's used instead of #[cfg] so both layouts
+    // stay type-checked from any host.
     let cloud_line = if cfg!(windows) {
         Line::from(vec![
             Span::raw("Cloud:    "),
@@ -892,6 +895,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
     let any_active = app.active_section_count() > 0;
     // Windows is cloud-only: 'c' manages the API key instead of toggling
     // modes, and the local-only model/export/path keys don't exist.
+    // cfg!(...) here is a compile-time constant, not a runtime check.
     let local_keys = cfg!(not(windows));
     let cloud_key_label = if local_keys { "cloud" } else { "API key" };
     let lines: Vec<Line> = match (any_active, &app.mode) {

@@ -278,13 +278,7 @@ impl App {
     pub fn new() -> Self {
         let mut config = AppConfig::load().unwrap_or_default();
 
-        // Windows is cloud-only: force cloud on in memory regardless of what
-        // the config says (covers configs copied from another OS or
-        // hand-edited). The on-disk format stays identical across platforms.
-        #[cfg(windows)]
-        {
-            config.cloud_broadcast_enabled = true;
-        }
+        enforce_cloud_only_platform(&mut config);
 
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
@@ -1008,17 +1002,9 @@ impl App {
         &mut self,
         slot: usize,
         source: SessionSource,
-        settings: SectionSettings,
+        mut settings: SectionSettings,
     ) -> Result<(), String> {
-        // Windows is cloud-only: clamp the per-source setting at the one
-        // choke point every recording passes through. Covers stale
-        // cloud_on=false overrides persisted by a pre-0.4.0 config.
-        #[cfg(windows)]
-        let settings = {
-            let mut s = settings;
-            s.cloud_on = true;
-            s
-        };
+        clamp_section_settings_for_platform(&mut settings);
 
         if slot >= MAX_SECTIONS {
             return Err(format!("invalid section slot: {slot}"));
@@ -1802,6 +1788,27 @@ impl Default for App {
     }
 }
 
+// ── Platform invariants ────────────────────────────────────────────────
+
+/// Windows is cloud-only: force cloud on in memory regardless of what the
+/// config says (covers configs copied from another OS or hand-edited). The
+/// on-disk format stays identical across platforms. `cfg!` (rather than an
+/// attribute) keeps the body compiled and testable on every target.
+fn enforce_cloud_only_platform(config: &mut AppConfig) {
+    if cfg!(windows) {
+        config.cloud_broadcast_enabled = true;
+    }
+}
+
+/// Windows is cloud-only: clamp the per-source setting at the one choke
+/// point every recording passes through (`start_section`). Covers stale
+/// cloud_on=false overrides persisted by a pre-0.4.0 config.
+fn clamp_section_settings_for_platform(settings: &mut SectionSettings) {
+    if cfg!(windows) {
+        settings.cloud_on = true;
+    }
+}
+
 // ── Export helpers ─────────────────────────────────────────────────────
 
 /// Find the most recent session directory that has a `transcript.json`.
@@ -1907,6 +1914,21 @@ mod tests {
         assert!(s.cloud_on);
         assert_eq!(s.language, "ru");
         assert_eq!(s.model, "tiny.en");
+    }
+
+    // Runs on every platform: asserts the forcing on Windows and the
+    // no-op everywhere else, since the helpers branch on cfg! at runtime.
+    #[test]
+    fn cloud_only_platform_invariants() {
+        let mut config = AppConfig::default();
+        config.cloud_broadcast_enabled = false;
+        enforce_cloud_only_platform(&mut config);
+        assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
+
+        let mut settings = SectionSettings::from_global_config(&config);
+        settings.cloud_on = false;
+        clamp_section_settings_for_platform(&mut settings);
+        assert_eq!(settings.cloud_on, cfg!(windows));
     }
 
     // Everything below exercises the local-session export path
