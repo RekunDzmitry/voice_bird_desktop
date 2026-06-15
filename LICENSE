@@ -1,21 +1,75 @@
-MIT License
+Voice Bird Personal Use License
 
-Copyright (c) 2026 Voice Bird contributors
+Copyright (c) 2026 Dzmitry Rekun
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Definitions
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+   "Software" means the contents of this repository, including source code,
+   documentation, and assets, in source or binary form, and any official
+   builds published to package registries (crates.io, npm, PyPI) or GitHub
+   Releases.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   "Personal Use" means use by an individual, on devices they own or
+   control, for their own private purposes — including hobby projects,
+   personal note-taking, learning, and evaluation. Personal Use excludes
+   any use for, on behalf of, or for the benefit of a company, organization,
+   government body, or other entity, and any use that directly or
+   indirectly generates revenue.
+
+2. Grant
+
+   Permission is hereby granted, free of charge, to any individual to use,
+   copy, and modify the Software for Personal Use, subject to the
+   conditions below.
+
+3. Conditions
+
+   a. This license text and the copyright notice above must be retained in
+      all copies or substantial portions of the Software.
+
+   b. Modified copies must be clearly marked as modified and must not be
+      represented as the original Software.
+
+4. Reserved rights
+
+   All rights not expressly granted are reserved. In particular, the
+   following require prior written permission from the copyright holder:
+
+   a. Any commercial use, including use inside or on behalf of a company
+      or other organization;
+
+   b. Redistributing the Software or modified versions of it, including
+      publishing forks for general use or repackaging it on any package
+      registry;
+
+   c. Offering the Software, or a service substantially based on it, to
+      third parties (paid or free);
+
+   d. Incorporating the Software or substantial portions of it into
+      another product.
+
+   To request permission, contact the copyright holder via the repository
+   at https://github.com/RekunDzmitry/voice_bird_desktop (e.g. by opening
+   an issue).
+
+5. Third-party components
+
+   The Software depends on third-party packages that are licensed under
+   their own terms. This license applies only to the Software itself and
+   does not modify the licenses of those dependencies.
+
+6. Termination
+
+   This license terminates automatically if you breach its terms. Upon
+   termination you must stop using the Software and destroy all copies in
+   your possession.
+
+7. Disclaimer
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
