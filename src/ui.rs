@@ -1348,4 +1348,23 @@ mod tests {
             assert!(out.contains(key), "hotkey {key} missing:\n{out}");
         }
     }
+    /// Visual reference snapshot of the idle TUI at a common terminal
+    /// size. Writes the rendered buffer to `target/snapshot-idle.txt` so
+    /// a human can eyeball layout regressions. Asserts nothing — the
+    /// targeted assertions above already cover behaviour; this is a
+    /// plain `cargo test` snapshot to keep manual review cheap.
+    #[test]
+    fn snapshot_idle_layout_for_visual_review() {
+        let mut app = App::new();
+        app.devices = vec![
+            input("MacBook Pro Microphone"),
+            input("BlackHole 2ch"),
+        ];
+        let out = render_to_string(&app, 180, 40);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("snapshot-idle.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &out).unwrap();
+    }
 }
