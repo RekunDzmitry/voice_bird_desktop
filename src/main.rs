@@ -383,16 +383,16 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Tab => {
             app.focus_next();
             log::info!(
-                "keys: Tab → focused_section = {} (sections active = {})",
-                app.focused_section,
+                "keys: Tab → focused_slot = {} (sections active = {})",
+                app.focused_slot,
                 app.active_section_count()
             );
         }
         KeyCode::BackTab => {
             app.focus_prev();
             log::info!(
-                "keys: BackTab → focused_section = {} (sections active = {})",
-                app.focused_section,
+                "keys: BackTab → focused_slot = {} (sections active = {})",
+                app.focused_slot,
                 app.active_section_count()
             );
         }
@@ -439,9 +439,9 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             };
             let app_pick = app.focused_app().cloned();
             log::info!(
-                "keys: Enter → slot={} focused_section_before={} dev=({:?}, {:?}) app={:?}",
+                "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
                 slot,
-                app.focused_section,
+                app.focused_slot,
                 dev.name,
                 dev.kind,
                 app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
@@ -490,7 +490,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // Start in the chosen slot; route through the per-section API
             // so settings come from `effective_settings_for(source)`.
             let settings = app.effective_settings_for(&source);
-            app.focused_section = slot;
+            app.focused_slot = slot;
             log::info!(
                 "keys: Enter → resolved source={:?}; calling start_section[{}]",
                 source,
@@ -526,30 +526,35 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         }
         // 's' stops the focused section (no-op if its slot is empty).
         KeyCode::Char('s') => {
-            let slot = app.focused_section;
-            if app.sections[slot].is_some() {
+            let slot = app.focused_slot;
+            let pos = app.slot_index(slot);
+            let is_recording = pos
+                .and_then(|i| app.slots.get(i))
+                .map(|s| matches!(s.kind, crate::app::SlotKind::Recording { .. }))
+                .unwrap_or(false);
+            if is_recording {
                 log::info!("keys: s → stop_section[{}]", slot);
                 app.stop_section(slot);
             } else {
-                log::info!("keys: s → no-op (slot {} empty)", slot);
+                log::info!("keys: s → no-op (slot {slot} empty)");
             }
         }
         // 'x' clears the transcript for the focused slot (both live and
         // saved/preserved).
         KeyCode::Char('x') => {
-            let slot = app.focused_section;
-            let had_text =
-                app.focused_committed().lock().len() > 0 || app.transcript_saved[slot].is_some();
+            let slot = app.focused_slot;
+            let had_text = app.focused_committed().lock().len() > 0
+                || app
+                    .slot_index(slot)
+                    .and_then(|i| app.slots.get(i))
+                    .map(|s| matches!(s.kind, crate::app::SlotKind::Saved { .. }))
+                    .unwrap_or(false);
             app.clear_slot_transcript(slot);
             if had_text {
                 log::info!("keys: x → cleared transcript for slot {slot}");
             }
         }
-        // Shift-S stops every active section in one go.
-        KeyCode::Char('S') => {
-            app.stop_all_sections();
-        }
-        #[cfg(not(windows))]
+
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the

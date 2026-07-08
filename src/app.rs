@@ -6,7 +6,7 @@ use parking_lot::Mutex as PlMutex;
 use crate::platform::{AppSession, AudioDevice};
 use voice_bird_cli::config::AppConfig;
 use voice_bird_cli::session::layout::SessionSource;
-
+use voice_bird_cli::session::target::Target;
 /// Application running mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -70,9 +70,10 @@ pub struct SavedTranscript {
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Column-title label from the stopped section (e.g. "mic · cloud:OFF").
     pub label: String,
+    /// Target the stopped section was using. Keeps the Targets pane
+    /// honest about what the saved text was being routed to.
+    pub target: Target,
 }
-
-/// Handles to a running recording pipeline.
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
     /// Producer task: pulls cpal frames, resamples, tees to WAV + engine.
@@ -148,8 +149,96 @@ pub struct Section {
     /// to show the latest content. Set false on manual scroll, restored
     /// by End.
     pub transcript_follow: bool,
+    /// Where this section is sending its transcript. Derived from
+    /// `settings.cloud_on` at start time and kept in sync on the
+    /// `Target` axis so the Targets pane can show it without poking
+    /// into the per-section settings.
+    pub target: Target,
 }
 
+/// Stable identifier for a `Slot`. Allocated once when the slot is
+/// created and reused for the slot's lifetime. The id stays valid even
+/// if the slot's `kind` cycles between `Empty`, `Recording`, and
+/// `Saved` — render code and key handlers can hold a `SlotId` and trust
+/// it to keep addressing the same physical pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlotId(pub u32);
+
+impl std::fmt::Display for SlotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// The state of a single transcript slot. `Empty` is the rest state
+/// the user starts in; `Recording` is an actively-running section;
+/// `Saved` is a stopped section whose transcript is kept visible in
+/// the UI until cleared with `x` or overwritten by a fresh start.
+pub enum SlotKind {
+    Empty,
+    Recording { section: Section },
+    Saved { saved: SavedTranscript },
+}
+
+impl std::fmt::Debug for SlotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotKind::Empty => f.write_str("Empty"),
+            SlotKind::Recording { section } => f
+                .debug_struct("Recording")
+                .field("source", &section.source)
+                .field("target", &section.target)
+                .field("cloud_on", &section.settings.cloud_on)
+                .finish(),
+            SlotKind::Saved { saved } => f
+                .debug_struct("Saved")
+                .field("label", &saved.label)
+                .field("target", &saved.target)
+                .finish(),
+        }
+    }
+}
+
+/// One TUI pane and its current state. The pane's `id` is stable; the
+/// position in `App::slots` is incidental.
+pub struct Slot {
+    pub id: SlotId,
+    pub kind: SlotKind,
+}
+
+impl Slot {
+    pub fn empty(id: SlotId) -> Self {
+        Self { id, kind: SlotKind::Empty }
+    }
+
+    /// Read-only view of the running section, if any. Used by the
+    /// accessors that answer "what's in the focused slot".
+    pub fn as_section(&self) -> Option<&Section> {
+        match &self.kind {
+            SlotKind::Recording { section } => Some(section),
+            _ => None,
+        }
+    }
+
+    /// The target this slot is currently (or was last) routing to.
+    /// `None` only when the slot has never been used.
+    pub fn target(&self) -> Option<Target> {
+        match &self.kind {
+            SlotKind::Empty => None,
+            SlotKind::Recording { section } => Some(section.target),
+            SlotKind::Saved { saved } => Some(saved.target),
+        }
+    }
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
 /// Which pane the picker arrows / Enter key target. Devices is the
 /// physical-input/output column on the left; Apps is the
 /// per-application column on the right. Each pane has its own cursor
@@ -216,12 +305,15 @@ pub struct App {
     /// Always-running tokio runtime for the recording pipeline.
     pub rt: tokio::runtime::Runtime,
 
-    /// Parallel recording slots. `Some` slots are actively recording.
-    pub sections: [Option<Section>; MAX_SECTIONS],
+    /// Parallel recording slots. Each entry owns its own id, kind
+    /// (`Empty` / `Recording` / `Saved`), and — for the non-empty
+    /// variants — the per-section state. The Vec is fixed at
+    /// `MAX_SECTIONS` for Phase A; Phase B will grow it via `n`.
+    pub slots: Vec<Slot>,
 
-    /// Slot the c/l/m/Tab keys currently target. Stage 3 will wire
-    /// Tab-cycling; Stage 1 keeps this pinned to 0.
-    pub focused_section: usize,
+    /// Slot the c/l/m/Tab keys currently target. Stable across the
+    /// slot's lifetime — never a positional index.
+    pub focused_slot: SlotId,
 
     /// First-run model picker state; `Some` while in `AppMode::ModelPicker`.
     pub picker: Option<PickerState>,
@@ -258,12 +350,6 @@ pub struct App {
     /// content. Set false when the user manually scrolls up. Pressing
     /// End re-enables it.
     pub transcript_follow: bool,
-
-    /// Per-slot transcript state preserved across section stop/start.
-    /// When a section stops, its committed/refined Arcs move here so
-    /// the text stays visible. Starting a new section in the same slot
-    /// reattaches them — new segments append to existing content.
-    pub transcript_saved: [Option<SavedTranscript>; MAX_SECTIONS],
 
     /// Empty fallback Arcs returned by `focused_*` accessors when no
     /// section is active — keeps the UI render path Arc-shaped without
@@ -359,8 +445,8 @@ impl App {
             error_channel: Arc::new(Mutex::new(None)),
             log_path: None,
             rt,
-            sections: [None, None, None],
-            focused_section: 0,
+            slots: Self::fresh_slots(),
+            focused_slot: SlotId(1),
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
@@ -369,14 +455,10 @@ impl App {
             banner: banner_on_launch,
             transcript_scroll: 0,
             transcript_follow: true,
-            transcript_saved: [None, None, None],
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
         };
-
-        // Windows first run (or missing key): land directly in the API-key
-        // modal — cloud is the only mode, so the key is the only thing the
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
@@ -386,26 +468,64 @@ impl App {
         app
     }
 
+
+    // -- Slot helpers -------------------------------------------------------
+
+    /// Build the initial three empty slots. IDs start at 1 so the
+    /// visible `[1] [2] [3]` labels (one-based) match `SlotId.0`
+    /// directly. Stable for the app's lifetime — `n` (Phase B) will
+    /// append new slots without renumbering.
+    fn fresh_slots() -> Vec<Slot> {
+        (1..=MAX_SECTIONS as u32)
+            .map(|i| Slot::empty(SlotId(i)))
+            .collect()
+    }
+
+    /// Look up a slot's current Vec index from its stable id. Returns
+    /// `None` if the id was never allocated (e.g. freed by a Phase B
+    /// shrink). The Vec is the source of truth — ids are a stable
+    /// handle for outside callers.
+    pub fn slot_index(&self, id: SlotId) -> Option<usize> {
+        self.slots.iter().position(|s| s.id == id)
+    }
+
+    /// Read-only access to a slot by id.
+    fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
+        self.slots.iter().find(|s| s.id == id)
+    }
+
+    /// Mutable access to a slot by id.
+    fn slot_by_id_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.id == id)
+    }
+
     // -- Section accessors --------------------------------------------------
 
     /// Currently focused section (the one `c`/`l`/`m`/`s` operate on),
     /// or `None` if no section is running in that slot.
     pub fn focused(&self) -> Option<&Section> {
-        self.sections
-            .get(self.focused_section)
-            .and_then(|s| s.as_ref())
+        self.slot_by_id(self.focused_slot)
+            .and_then(|s| s.as_section())
     }
 
     /// Mutable variant of [`focused`].
     pub fn focused_mut(&mut self) -> Option<&mut Section> {
-        self.sections
-            .get_mut(self.focused_section)
-            .and_then(|s| s.as_mut())
+        let id = self.focused_slot;
+        self.slots
+            .iter_mut()
+            .find(|s| s.id == id)
+            .and_then(|s| match &mut s.kind {
+                SlotKind::Recording { section } => Some(section),
+                _ => None,
+            })
     }
 
     /// Number of slots currently recording.
     pub fn active_section_count(&self) -> usize {
-        self.sections.iter().filter(|s| s.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|s| matches!(s.kind, SlotKind::Recording { .. }))
+            .count()
     }
 
     /// Engine kind label for the focused section. Empty string when idle.
@@ -447,15 +567,23 @@ impl App {
             .unwrap_or_else(|| self.config.default_model.clone())
     }
 
+    /// The focused slot's current target (Stdout / Cloud), or `None`
+    /// when the slot has never been used. UI uses this to drive the
+    /// Targets pane.
+    pub fn focused_target(&self) -> Option<Target> {
+        self.slot_by_id(self.focused_slot).and_then(|s| s.target())
+    }
+
     /// Committed-transcript Arc for the focused section, or saved
     /// transcript, or an empty fallback when nothing is available.
     pub fn focused_committed(&self) -> Arc<PlMutex<Vec<CommittedLine>>> {
         self.focused()
             .map(|s| s.committed.clone())
             .or_else(|| {
-                self.transcript_saved
-                    .get(self.focused_section)
-                    .and_then(|t| t.as_ref().map(|t| t.committed.clone()))
+                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
+                    SlotKind::Saved { saved } => Some(saved.committed.clone()),
+                    _ => None,
+                })
             })
             .unwrap_or_else(|| self.empty_committed.clone())
     }
@@ -464,9 +592,10 @@ impl App {
         self.focused()
             .map(|s| s.refined.clone())
             .or_else(|| {
-                self.transcript_saved
-                    .get(self.focused_section)
-                    .and_then(|t| t.as_ref().map(|t| t.refined.clone()))
+                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
+                    SlotKind::Saved { saved } => Some(saved.refined.clone()),
+                    _ => None,
+                })
             })
             .unwrap_or_else(|| self.empty_refined.clone())
     }
@@ -476,6 +605,7 @@ impl App {
             .map(|s| s.tentative.clone())
             .unwrap_or_else(|| self.empty_tentative.clone())
     }
+    // -- Section accessors --------------------------------------------------
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
@@ -685,18 +815,46 @@ impl App {
     }
 
     /// Cycle the focused section forward (Tab). Wraps from slot 2 → 0.
+    /// Cycle the focused section forward (Tab). Skips Empty slots so
+    /// focus lands on the first slot with a section (Recording or
+    /// Saved). When the focused slot is empty, jumps to the first
+    /// populated one. Wraps around the end of the slot list.
     pub fn focus_next(&mut self) {
-        self.focused_section = (self.focused_section + 1) % MAX_SECTIONS;
+        if let Some(idx) = self.slot_index(self.focused_slot) {
+            let n = self.slots.len();
+            for off in 1..=n {
+                let next_idx = (idx + off) % n;
+                let next_id = self.slots[next_idx].id;
+                if !matches!(self.slots[next_idx].kind, SlotKind::Empty) || off == n {
+                    self.focused_slot = next_id;
+                    return;
+                    }
+            }
+        }
     }
 
-    /// Cycle the focused section backward (Shift-Tab).
+    /// Cycle the focused section backward (Shift-Tab). Same skip-empty
+    /// behaviour as [`focus_next`].
     pub fn focus_prev(&mut self) {
-        self.focused_section = (self.focused_section + MAX_SECTIONS - 1) % MAX_SECTIONS;
+        if let Some(idx) = self.slot_index(self.focused_slot) {
+            let n = self.slots.len();
+            for off in 1..=n {
+                let prev_idx = (idx + n - off) % n;
+                let prev_id = self.slots[prev_idx].id;
+                if !matches!(self.slots[prev_idx].kind, SlotKind::Empty) || off == n {
+                    self.focused_slot = prev_id;
+                    return;
+                    }
+            }
+        }
     }
 
-    /// Pick the lowest-numbered free slot, or `None` if all are running.
-    pub fn next_free_slot(&self) -> Option<usize> {
-        self.sections.iter().position(|s| s.is_none())
+    /// Pick the lowest-id free slot, or `None` if all are running.
+    pub fn next_free_slot(&self) -> Option<SlotId> {
+        self.slots
+            .iter()
+            .find(|s| matches!(s.kind, SlotKind::Empty))
+            .map(|s| s.id)
     }
 
     /// Refresh both panes' inventory. Preserves cursors by name when the
@@ -885,24 +1043,13 @@ impl App {
         // Drain all sections, but only one banner — the most recent error
         // wins (last write of multiple in the same tick survives).
         let mut drained: Option<String> = None;
-        for slot in self.sections.iter() {
-            if let Some(section) = slot.as_ref() {
+        for slot in self.slots.iter() {
+            if let SlotKind::Recording { section } = &slot.kind {
                 if let Ok(mut err) = section.engine_error_channel.lock() {
                     if let Some(msg) = err.take() {
                         drained = Some(msg);
                     }
                 }
-            }
-        }
-        if let Some(msg) = drained {
-            let auth_failure = looks_like_auth_error(&msg);
-            self.banner = Some(msg.clone());
-            self.status = RecordingStatus::Error(msg);
-            // Server rejected the saved key — surface the paste modal
-            // immediately so the user can replace it without hunting
-            // for a key binding.
-            if auth_failure && self.config.cloud_broadcast_enabled {
-                self.open_api_key_modal();
             }
         }
     }
@@ -922,7 +1069,7 @@ impl App {
     /// in `banner` + `status` so the UI can surface them.
     pub fn start_recording(&mut self, source: SessionSource) {
         let settings = self.effective_settings_for(&source);
-        let slot = self.focused_section;
+        let slot = self.focused_slot;
         if let Err(msg) = self.start_section(slot, source, settings) {
             self.banner = Some(msg.clone());
             self.status = RecordingStatus::Error(msg);
@@ -1000,16 +1147,18 @@ impl App {
     /// avoid clobbering the modal with a banner.
     pub fn start_section(
         &mut self,
-        slot: usize,
+        slot: SlotId,
         source: SessionSource,
         mut settings: SectionSettings,
     ) -> Result<(), String> {
         clamp_section_settings_for_platform(&mut settings);
 
-        if slot >= MAX_SECTIONS {
-            return Err(format!("invalid section slot: {slot}"));
-        }
-        if self.sections[slot].is_some() {
+        // Look up the slot up front. An invalid id is the caller's
+        // bug — usually a freed Phase B id — so we refuse cleanly.
+        let pos = self
+            .slot_index(slot)
+            .ok_or_else(|| format!("invalid section slot: {slot}"))?;
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("section slot {slot} already running"));
         }
 
@@ -1028,6 +1177,15 @@ impl App {
             settings.language.clone()
         } else {
             "en".to_string()
+        };
+
+        // Where this section is heading. `cloud_on == true` → Cloud,
+        // else local Stdout. Computed once so the Section + the
+        // Targets pane agree without an extra accessor hop.
+        let target = if settings.cloud_on {
+            Target::Cloud
+        } else {
+            Target::Stdout
         };
 
         let now = chrono::Utc::now();
@@ -1049,20 +1207,21 @@ impl App {
         };
 
         // Per-section live state. Reattach preserved transcript if the
-        // slot had one from a prior stop; otherwise start fresh.
-        let (committed, refined) = if let Some(saved) = self.transcript_saved[slot].take() {
-            (saved.committed, saved.refined)
-        } else {
-            (
+        // slot had a Saved variant; otherwise start fresh.
+        let (committed, refined) = match &self.slots[pos].kind {
+            SlotKind::Saved { saved } => {
+                (saved.committed.clone(), saved.refined.clone())
+            }
+            _ => (
                 Arc::new(PlMutex::new(Vec::new())),
                 Arc::new(PlMutex::new(Vec::new())),
-            )
+            ),
         };
         let tentative: Arc<PlMutex<String>> = Arc::new(PlMutex::new(String::new()));
         let engine_error_channel: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Reset focused-section transcript scroll when the focused slot starts.
-        if slot == self.focused_section {
+        if slot == self.focused_slot {
             self.transcript_scroll = 0;
             self.transcript_follow = true;
         }
@@ -1504,12 +1663,14 @@ impl App {
             cloud_reminder_until,
             transcript_scroll: 0,
             transcript_follow: true,
+            target,
         };
-        self.sections[slot] = Some(section);
-
-        // Aggregate App-level recording state. With multiple sections,
-        // start_time tracks the EARLIEST active section's start.
-        self.status = RecordingStatus::Recording;
+        // Park the running section in the slot. `pos` was validated at
+        // the top of the function, so a successful match here is the
+        // only way the Recording variant can land.
+        if let Some(slot_ref) = self.slots.get_mut(pos) {
+            slot_ref.kind = SlotKind::Recording { section };
+        }
         let now_inst = std::time::Instant::now();
         self.start_time = Some(match self.start_time {
             Some(prev) if prev < now_inst => prev,
@@ -1520,27 +1681,39 @@ impl App {
 
     /// Stop the active recording in `slot` and finalize its session files.
     /// No-op if the slot is empty.
-    pub fn stop_section(&mut self, slot: usize) {
+    pub fn stop_section(&mut self, slot: SlotId) {
         log::info!("stop_section[{slot}]: entered");
-        if slot >= MAX_SECTIONS {
-            log::warn!("stop_section[{slot}]: invalid slot, refusing");
-            return;
-        }
-        // Preserve the transcript before taking the section so the text
-        // stays visible in the UI after stop.
-        if let Some(section) = self.sections[slot].as_ref() {
-            let label = section_column_label(slot, Some(section));
-            self.transcript_saved[slot] = Some(SavedTranscript {
-                committed: section.committed.clone(),
-                refined: section.refined.clone(),
-                label,
-            });
-        }
-
-        let Some(section) = self.sections[slot].take() else {
-            log::info!("stop_section[{slot}]: slot was empty (no-op)");
-            return;
+        let pos = match self.slot_index(slot) {
+            Some(p) => p,
+            None => {
+                log::warn!("stop_section[{slot}]: invalid slot, refusing");
+                return;
+            }
         };
+
+        // Take the section out so we can finalize its session files.
+        // We replace the slot with a Saved variant carrying the same
+        // transcripts so the UI keeps showing the text after stop.
+        let section = match std::mem::replace(&mut self.slots[pos].kind, SlotKind::Empty) {
+            SlotKind::Recording { section } => section,
+            other => {
+                // Empty or already Saved: nothing to stop, put the
+                // slot back exactly as it was.
+                self.slots[pos].kind = other;
+                log::info!("stop_section[{slot}]: slot was empty (no-op)");
+                return;
+            }
+        };
+        let label = section_column_label(slot, Some(&section));
+        let target = section.target;
+        let saved = SavedTranscript {
+            committed: section.committed.clone(),
+            refined: section.refined.clone(),
+            label,
+            target,
+        };
+        self.slots[pos].kind = SlotKind::Saved { saved };
+
         log::info!(
             "stop_section[{slot}]: stopping source = {:?}",
             section.source
@@ -1606,28 +1779,42 @@ impl App {
 
     /// Clear the transcript for the given slot — both any live section's
     /// committed/refined data and the saved (preserved) transcript.
-    pub fn clear_slot_transcript(&mut self, slot: usize) {
-        self.transcript_saved[slot] = None;
-        if let Some(section) = self.sections[slot].as_ref() {
-            section.committed.lock().clear();
-            section.refined.lock().clear();
-            section.tentative.lock().clear();
+    pub fn clear_slot_transcript(&mut self, slot: SlotId) {
+        let Some(pos) = self.slot_index(slot) else {
+            return;
+        };
+        match &mut self.slots[pos].kind {
+            SlotKind::Recording { section } => {
+                section.committed.lock().clear();
+                section.refined.lock().clear();
+                section.tentative.lock().clear();
+            }
+            SlotKind::Saved { .. } => {
+                self.slots[pos].kind = SlotKind::Empty;
+            }
+            SlotKind::Empty => {}
         }
     }
 
     /// Stop the focused section. Backwards-compatible shim for callers
     /// that haven't been updated to the per-section API yet.
     pub fn stop_recording(&mut self) {
-        let slot = self.focused_section;
+        let slot = self.focused_slot;
         self.stop_section(slot);
     }
 
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
-        for slot in 0..MAX_SECTIONS {
-            if self.sections[slot].is_some() {
-                self.stop_section(slot);
-            }
+        // Collect ids first so we don't hold a borrow on `self.slots`
+        // while mutating each one through `stop_section`.
+        let recording_ids: Vec<SlotId> = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.kind, SlotKind::Recording { .. }))
+            .map(|s| s.id)
+            .collect();
+        for slot in recording_ids {
+            self.stop_section(slot);
         }
     }
 
@@ -1739,8 +1926,8 @@ impl App {
 /// placeholders). Mirrors `section_column_title` in ui.rs so the saved-
 /// transcript path can reconstruct the label without depending on the ui
 /// module.
-pub fn section_column_label(slot: usize, section: Option<&Section>) -> String {
-    let n = slot + 1;
+pub fn section_column_label(slot: SlotId, section: Option<&Section>) -> String {
+    let n = slot.0;
     match section {
         None => format!(" [{n}] (empty) "),
         Some(s) => {
