@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -7,7 +7,7 @@ use ratatui::{
 };
 use std::time::Instant;
 
-use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, MAX_SECTIONS};
+use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotId, SlotKind};
 use voice_bird_cli::session::layout::SessionSource;
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -64,12 +64,20 @@ pub fn render(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(72), Constraint::Length(36)])
         .split(root[1]);
 
+    // Three rows stacked: devices/apps picker, the Targets chip strip
+    // (one cell per slot), and the slot row. Heights are weighted so
+    // the picker keeps its room while the chip strip stays compact.
     let workspace = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(devices_h), Constraint::Min(6)])
+        .constraints([
+            Constraint::Length(devices_h),
+            Constraint::Length(3),
+            Constraint::Min(6),
+        ])
         .split(main[0]);
     render_devices(f, workspace[0], app);
-    render_sections(f, workspace[1], app);
+    render_targets_pane(f, workspace[1], app);
+    render_sections(f, workspace[2], app);
 
     render_sidebar(f, main[1], app);
 
@@ -101,33 +109,41 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
-/// Render the 3-column section row. Each slot draws as its own block
-/// with a per-section Mode header in the title and the transcript +
-/// tentative line stacked inside. Empty slots show a placeholder. The
-/// focused slot's border is highlighted.
+/// Render the slot row. Each slot draws as its own block with a
+/// per-slot Mode header in the title and the transcript + tentative
+/// line stacked inside. Empty slots show a placeholder. The focused
+/// slot's border is highlighted. Slot count grows with the Vec —
+/// Phase A is hard-coded to three (the initial layout) but the
+/// render path already iterates the Vec directly.
 fn render_sections(f: &mut Frame, area: Rect, app: &App) {
+    let n = app.slots.len();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, MAX_SECTIONS as u32); MAX_SECTIONS])
+        .constraints(vec![Constraint::Ratio(1, n as u32); n])
         .split(area);
-    for slot in 0..MAX_SECTIONS {
-        render_section_column(f, cols[slot], app, slot);
+    for (i, slot) in app.slots.iter().enumerate() {
+        render_section_column(f, cols[i], app, slot);
     }
 }
 
-fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
-    let is_focused = slot == app.focused_section;
-    let section = app.sections.get(slot).and_then(|s| s.as_ref());
+fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
+    let slot_id = slot.id;
+    let is_focused = slot_id == app.focused_slot;
+    let section = slot.as_section();
+    let saved = match &slot.kind {
+        SlotKind::Saved { saved } => Some(saved),
+        _ => None,
+    };
 
     // Title: per-slot Mode header (compact: cloud/lang/model summary).
     // Falls back to the saved label when a section was stopped but its
     // transcript is still preserved.
     let title_text = if let Some(s) = section {
-        section_column_title(slot, Some(s))
-    } else if let Some(saved) = &app.transcript_saved[slot] {
+        section_column_title(slot_id, Some(s))
+    } else if let Some(saved) = saved {
         saved.label.clone()
     } else {
-        section_column_title(slot, None)
+        section_column_title(slot_id, None)
     };
     let border_style = if is_focused {
         Style::default()
@@ -148,7 +164,7 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
 
     let Some(section) = section else {
         // Check for preserved (saved) transcript from a prior stop.
-        if let Some(saved) = &app.transcript_saved[slot] {
+        if let Some(saved) = saved {
             let committed = saved.committed.lock();
             let refined = saved.refined.lock();
             let mut lines: Vec<Line> = Vec::with_capacity(refined.len() + committed.len());
@@ -231,8 +247,8 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
 /// Title shown in the column's border. Includes the slot number, the
 /// source label (or "(empty)" / "(paused)"), and a compact `Cloud:[ON] pl base.en`
 /// summary so the user can read settings at a glance per column.
-fn section_column_title(slot: usize, section: Option<&Section>) -> String {
-    let n = slot + 1;
+fn section_column_title(slot: SlotId, section: Option<&Section>) -> String {
+    let n = slot.0;
     match section {
         None => format!(" [{n}] (empty) "),
         Some(s) => {
@@ -571,6 +587,66 @@ fn render_devices(f: &mut Frame, area: Rect, app: &App) {
     render_devices_pane(f, cols[0], app);
     render_apps_pane(f, cols[1], app);
 }
+/// Read-only strip showing each slot's current `Target` (Stdout / Cloud).
+/// Sits between the devices/apps picker and the slot row so the user
+/// can see at a glance where every pane's transcript is going. Empty
+/// slots render as a dimmed "—" placeholder. The strip mirrors the
+/// slot row's N-column layout, so as the slot count grows the chips
+/// grow with it.
+fn render_targets_pane(f: &mut Frame, area: Rect, app: &App) {
+    let n = app.slots.len();
+    if n == 0 {
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![Constraint::Ratio(1, n as u32); n])
+        .split(area);
+    for (i, slot) in app.slots.iter().enumerate() {
+        render_target_chip(f, cols[i], app, slot);
+    }
+}
+
+fn render_target_chip(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
+    use voice_bird_cli::session::target::Target;
+
+    let is_focused = slot.id == app.focused_slot;
+    let (label, style) = match slot.target() {
+        Some(Target::Stdout) => (
+            "▸ Stdout",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Some(Target::Cloud) => (
+            "▸ Cloud",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => (
+            "—",
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    let border_style = if is_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(format!(" [{}] target ", slot.id.0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let p = Paragraph::new(Line::from(Span::styled(label, style)))
+        .alignment(Alignment::Center);
+    f.render_widget(p, inner);
+}
+
 
 fn pane_border_style(focused: bool) -> Style {
     if focused {
@@ -1219,6 +1295,22 @@ mod tests {
         assert!(out.contains("[2]"), "slot 2 title missing:\n{out}");
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
+    }
+    /// Targets strip sits between the picker and the slot row and shows
+    /// one column per slot with the current routing target (Stdout /
+    /// Cloud / —). With no active sections every chip renders an em-dash
+    /// placeholder under its `[N] target` block title.
+    #[test]
+    fn targets_pane_renders_one_column_per_slot_with_dashes_when_idle() {
+        let app = App::new();
+        let out = render_to_string(&app, 180, 40);
+        assert!(out.contains("[1] target"), "slot 1 chip title missing:\n{out}");
+        assert!(out.contains("[2] target"), "slot 2 chip title missing:\n{out}");
+        assert!(out.contains("[3] target"), "slot 3 chip title missing:\n{out}");
+        assert!(
+            out.contains("—"),
+            "em-dash placeholder missing from chips:\n{out}"
+        );
     }
 
     /// Idle key sidebar shows the new Tab/cfg keys.
