@@ -42,6 +42,15 @@ fn mcp_path(home_dir: &Path) -> PathBuf {
     home_dir.join(MCP_FILE)
 }
 
+/// Resolve `~/.omp/` (the directory omp reads `agent/mcp.json` from).
+/// We honour `$OMP_HOME` for tests / sandboxing; default is `$HOME/.omp`.
+pub fn register_home() -> PathBuf {
+    if let Ok(p) = std::env::var("OMP_HOME") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".omp")
+}
+
 fn read_file(path: &Path) -> anyhow::Result<McpFile> {
     if !path.exists() {
         return Ok(McpFile::default());
@@ -102,6 +111,7 @@ pub fn unregister(home_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn register_then_unregister_round_trips() {
@@ -145,5 +155,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unregister(dir.path()).unwrap();
         // No panic, no error.
+    }
+
+    #[test]
+    #[serial]
+    fn register_home_default_uses_home_env() {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_omp = std::env::var("OMP_HOME").ok();
+        std::env::set_var("HOME", "/tmp/vb-test-home");
+        std::env::remove_var("OMP_HOME");
+        let got = register_home();
+        restore("HOME", prev_home);
+        restore("OMP_HOME", prev_omp);
+        assert_eq!(got, std::path::PathBuf::from("/tmp/vb-test-home/.omp"));
+    }
+
+    #[test]
+    #[serial]
+    fn register_home_honours_omp_home_override() {
+        let prev = std::env::var("OMP_HOME").ok();
+        std::env::set_var("OMP_HOME", "/tmp/vb-omp-override");
+        let got = register_home();
+        restore("OMP_HOME", prev);
+        assert_eq!(got, std::path::PathBuf::from("/tmp/vb-omp-override"));
+    }
+
+    fn restore(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

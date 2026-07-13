@@ -506,11 +506,32 @@ impl App {
         match voice_bird_cli::omp::detect() {
             Ok(det) => {
                 log::info!("omp detected: {} v{}", det.path.display(), det.version);
+                let det_path = det.path.clone();
+                let det_source = det.source.clone();
                 app.omp = voice_bird_cli::omp::OmpStatus::Ready {
                     path: det.path,
                     version: det.version,
                 };
                 app.omp_detection_source = Some(det.source);
+                // Auto-register this binary as an MCP server in
+                // ~/.omp/agent/mcp.json so the user's `omp` picks
+                // voice-bird up on next launch. Best-effort: any
+                // error here just means the user has to run
+                // `voice-bird-cli --register` manually. Idempotent —
+                // repeated launches overwrite only the `voice-bird`
+                // key and leave other entries intact.
+                let home = voice_bird_cli::omp::register::register_home();
+                match voice_bird_cli::omp::register::register(&det_path, &home) {
+                    Ok(()) => log::info!(
+                        "registered MCP server in {}/agent/mcp.json (source: {:?})",
+                        home.display(),
+                        det_source,
+                    ),
+                    Err(e) => log::warn!(
+                        "could not register MCP server: {e} (source: {:?})",
+                        det_source,
+                    ),
+                }
             }
             Err(status) => {
                 app.omp = status;

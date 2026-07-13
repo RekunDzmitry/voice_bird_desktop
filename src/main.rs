@@ -136,6 +136,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--register` writes this binary's path into ~/.omp/agent/mcp.json
+    // so the user's `omp` picks up voice-bird as an MCP server on next
+    // launch. Idempotent: re-running updates the entry in place. The
+    // binary path defaults to current_exe(); pass a different one as
+    // the first arg to register a different build (e.g., a release
+    // copy under ~/bin). Intended for users who never run the TUI
+    // (CI, sandboxed agent runs, or just to wire up MCP before
+    // launching the TUI for the first time).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--register") {
+        let binary = match args.get(pos + 1) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::env::current_exe()?,
+        };
+        let home = voice_bird_cli::omp::register::register_home();
+        voice_bird_cli::omp::register::register(&binary, &home)?;
+        println!(
+            "registered {} in {}/agent/mcp.json",
+            binary.display(),
+            home.display(),
+        );
+        return Ok(());
+    }
     // `--debug-state-snapshot <path>` opts into a JSONL file where every
     // key press appends a serialized App-state snapshot. Used by the
     // e2e_human test harness to drive the TUI without relying on
