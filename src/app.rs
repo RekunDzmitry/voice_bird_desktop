@@ -377,6 +377,13 @@ pub struct App {
     /// value is consumed (set back to `None`) by start_section so it
     /// only affects the very next start.
     pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
+
+    /// MCP-server state shared with the `--mcp-server` mediator task
+    /// spawned when omp launches us. The TUI also pushes into this
+    /// same buffer when the focused slot's target is `Target::Omp`,
+    /// so a single source of truth serves both the in-process
+    /// recorder and the out-of-process omp agent.
+    omp_state: voice_bird_cli::omp::mcp_server::ServerState,
 }
 
 impl App {
@@ -481,6 +488,9 @@ impl App {
             omp: voice_bird_cli::omp::OmpStatus::NotFound,
             omp_detection_source: None,
             pending_target_overrides: std::collections::BTreeMap::new(),
+            omp_state: voice_bird_cli::omp::mcp_server::ServerState::new(
+                voice_bird_cli::omp::OmpSessionId::default_session(),
+            ),
         };
         // user must provide before recording.
         #[cfg(windows)]

@@ -8,16 +8,22 @@
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcRequest {
-    pub jsonrpc: &'static str,
+    #[serde(default = "default_jsonrpc")]
+    pub jsonrpc: String,
     pub id: u64,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
 
+fn default_jsonrpc() -> String {
+    "2.0".into()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcResponse {
-    pub jsonrpc: &'static str,
+    #[serde(default = "default_jsonrpc")]
+    pub jsonrpc: String,
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
@@ -36,7 +42,7 @@ pub struct JsonRpcError {
 impl JsonRpcResponse {
     pub fn ok(id: u64, result: serde_json::Value) -> Self {
         Self {
-            jsonrpc: "2.0",
+            jsonrpc: "2.0".into(),
             id,
             result: Some(result),
             error: None,
@@ -44,7 +50,7 @@ impl JsonRpcResponse {
     }
     pub fn err(id: u64, code: i32, message: impl Into<String>) -> Self {
         Self {
-            jsonrpc: "2.0",
+            jsonrpc: "2.0".into(),
             id,
             result: None,
             error: Some(JsonRpcError {

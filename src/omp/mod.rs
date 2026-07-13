@@ -2,8 +2,9 @@
 //!
 //! Voice-bird-cli plays the role of MCP *server*. A user's `omp` process
 //! is the MCP *client*; voice-bird-cli registers itself in
-//! `~/.omp/agent/mcp.json` on first `Target::Omp` slot start and exposes
-//! tools `voice_bird__push_segment` and `voice_bird__pull_recent`. See
+//! `~/.omp/agent/mcp.json` on first launch and exposes tools
+//! `voice_bird__push_segment` and `voice_bird__pull_recent` on its
+//! stdin/stdout when omp spawns it via `--mcp-server`. See
 //! `docs/plans/omp-integration.md` for the full rationale and the
 //! commit-by-commit rollout this module implements.
 //!
@@ -13,6 +14,8 @@
 //! without touching the slot model or the renderer.
 
 pub mod install;
+pub mod mcp_server;
+pub mod register;
 pub mod rpc;
 pub mod session;
 

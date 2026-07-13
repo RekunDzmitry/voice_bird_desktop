@@ -113,6 +113,17 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
+    // `--mcp-server` runs voice-bird as a stdio MCP server for omp.
+    // Disables the TUI; blocks on stdin/stdout JSON-RPC. We
+    // intentionally check this before any TTY setup so the parent
+    // (omp) gets a clean pipe instead of a raw-mode terminal.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp-server") {
+        let session = voice_bird_cli::omp::OmpSessionId::default_session();
+        let state = voice_bird_cli::omp::mcp_server::ServerState::new(session);
+        return voice_bird_cli::omp::mcp_server::run_on_stdio(state);
+    }
+
     // Handle `--recover <dir>` before any TTY/terminal setup so it works
     // from non-TTY shells (e.g., piped or macOS `open` invocations).
     let args: Vec<String> = std::env::args().collect();
