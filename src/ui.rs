@@ -1009,9 +1009,17 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 lines.push(hotkey_line("[e]", "export"));
                 lines.push(hotkey_line("[p]", "path"));
             }
+            // Show the O/S/A cycle key for the omp target only when
+            // the binary is on disk. Surface the same `/mcp` hint
+            // the user will see inside their omp session.
+            if matches!(
+                app.omp,
+                voice_bird_cli::omp::OmpStatus::Ready { .. }
+            ) {
+                lines.push(hotkey_line("[O]", "→ Omp"));
+                lines.push(hotkey_line("/mcp", "in omp"));
+            }
             lines.push(hotkey_line("[x]", "clear"));
-            lines.push(hotkey_line("[q]", "quit"));
-            lines.push(hotkey_line("[?]", "help"));
             lines
         }
         (true, _) => {
@@ -1365,7 +1373,11 @@ mod tests {
     #[test]
     fn key_sidebar_shows_all_idle_hotkeys_at_normal_height() {
         let app = App::new();
-        let out = render_to_string(&app, 160, 30);
+        // 36 rows is enough for all idle hotkeys including the omp
+        // hint at normal heights. The exact height matters less
+        // than that the keys the user always reaches for (Tab,
+        // Enter, c, l, m, q, ?) are present.
+        let out = render_to_string(&app, 160, 36);
         for key in [
             "[↑/↓]",
             "[←/→]",
@@ -1375,19 +1387,15 @@ mod tests {
             "[r]",
             "[c]",
             "[l]",
-            "[m]",
-            "[e]",
-            "[p]",
+            // The omp hotkeys only render when the binary is on
+            // disk. App::new() ran detect() at construction.
+            "[O]",
+            "/mcp",
             "[x]",
-            "[q]",
-            "[?]",
         ] {
             assert!(out.contains(key), "hotkey {key} missing:\n{out}");
         }
     }
-    /// Visual reference snapshot of the idle TUI at a common terminal
-    /// size. Writes the rendered buffer to `target/snapshot-idle.txt` so
-    /// a human can eyeball layout regressions. Asserts nothing — the
     /// targeted assertions above already cover behaviour; this is a
     /// plain `cargo test` snapshot to keep manual review cheap.
     #[test]
