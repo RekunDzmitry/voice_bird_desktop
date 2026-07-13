@@ -20,4 +20,5 @@ pub mod rpc;
 pub mod session;
 
 pub use install::{detect, OmpDetection, OmpDetectionSource};
+pub use mcp_server::resolve_initial_session_id;
 pub use session::{OmpSessionId, OmpStatus, OmpTarget};

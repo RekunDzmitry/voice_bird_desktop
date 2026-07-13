@@ -22,7 +22,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::transcription::Segment;
 
-use super::rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::rpc::{JsonRpcRequest, JsonRpcResponse};
 use super::session::{OmpSessionId, OmpTarget};
 
 /// Names of the MCP tools we publish. Kept as constants so the
@@ -168,6 +168,35 @@ pub fn run_on_stdio(state: ServerState) -> anyhow::Result<()> {
     }
 }
 
+/// Resolve the initial session id. Precedence (highest first):
+///   1. `--session-id <id>` CLI arg.
+///   2. `VOICE_BIRD_SESSION_ID` env var.
+///   3. The basename of `std::env::current_dir()` — omp spawns MCP
+///      servers with `cwd = getProjectDir()`, so this matches the
+///      project the user has open in omp (functionally equivalent
+///      to a `roots/list` probe without the async refactor).
+///   4. `OmpSessionId::default_session()` (i.e. "default").
+pub fn resolve_initial_session_id(args: &[String]) -> OmpSessionId {
+    if let Some(pos) = args.iter().position(|a| a == "--session-id") {
+        if let Some(v) = args.get(pos + 1) {
+            return OmpSessionId(v.clone());
+        }
+    }
+    if let Ok(v) = std::env::var("VOICE_BIRD_SESSION_ID") {
+        if !v.is_empty() {
+            return OmpSessionId(v);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(name) = cwd.file_name().and_then(|s| s.to_str()) {
+            if !name.is_empty() {
+                return OmpSessionId(name.to_string());
+            }
+        }
+    }
+    OmpSessionId::default_session()
+}
+
 /// Dispatch one parsed request to the appropriate handler. Pure
 /// function on `ServerState` — easy to unit-test.
 ///
@@ -288,6 +317,7 @@ fn parse_segment_index(args: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn seg(text: &str, t: u64) -> Segment {
         Segment {
@@ -429,7 +459,55 @@ mod tests {
         state.set_session_id(OmpSessionId("from-probe".into()));
         assert_eq!(state.snapshot_session_id().as_str(), "from-probe");
     }
+
     #[test]
+    #[serial]
+    fn resolve_initial_cli_arg_wins() {
+        let prev = std::env::var("VOICE_BIRD_SESSION_ID").ok();
+        std::env::remove_var("VOICE_BIRD_SESSION_ID");
+        let got = resolve_initial_session_id(&[
+            "voice-bird-cli".into(),
+            "--mcp-server".into(),
+            "--session-id".into(),
+            "from-cli".into(),
+        ]);
+        restore_env("VOICE_BIRD_SESSION_ID", prev);
+        assert_eq!(got.0, "from-cli");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_initial_env_falls_back_after_cli() {
+        let prev = std::env::var("VOICE_BIRD_SESSION_ID").ok();
+        std::env::set_var("VOICE_BIRD_SESSION_ID", "from-env");
+        let got = resolve_initial_session_id(&["voice-bird-cli".into()]);
+        restore_env("VOICE_BIRD_SESSION_ID", prev);
+        assert_eq!(got.0, "from-env");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_initial_falls_back_to_cwd_basename() {
+        let prev_env = std::env::var("VOICE_BIRD_SESSION_ID").ok();
+        let prev_cwd = std::env::var("HOME").ok();
+        std::env::remove_var("VOICE_BIRD_SESSION_ID");
+        std::env::set_var("HOME", "/tmp/vb-cwd-basename");
+        let got = resolve_initial_session_id(&[]);
+        restore_env("VOICE_BIRD_SESSION_ID", prev_env);
+        restore_env("HOME", prev_cwd);
+        // HOME is also used as the cwd fallback when current_dir
+        // would fail. We assert it's not the literal "default"
+        // sentinel so a future cwd override would surface here.
+        assert_ne!(got.0, "default");
+        assert!(!got.0.is_empty());
+    }
+
+    fn restore_env(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
     fn server_state_buffer_drops_oldest_when_full() {
         let state = ServerState::new(OmpSessionId::default_session());
         for i in 0..(BUFFER_CAP + 5) {

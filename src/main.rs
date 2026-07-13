@@ -119,7 +119,7 @@ fn main() -> Result<()> {
     // (omp) gets a clean pipe instead of a raw-mode terminal.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--mcp-server") {
-        let session = voice_bird_cli::omp::OmpSessionId::default_session();
+        let session = voice_bird_cli::omp::mcp_server::resolve_initial_session_id(&args);
         let state = voice_bird_cli::omp::mcp_server::ServerState::new(session);
         return voice_bird_cli::omp::mcp_server::run_on_stdio(state);
     }
