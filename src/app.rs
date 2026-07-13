@@ -520,8 +520,14 @@ impl App {
                 // `voice-bird-cli --register` manually. Idempotent —
                 // repeated launches overwrite only the `voice-bird`
                 // key and leave other entries intact.
+                // Register THIS binary (voice-bird-cli), not the omp
+                // path we just detected. `det.path` is where omp lives;
+                // what omp needs in `command` is the absolute path of
+                // the stdio MCP server it'll spawn — i.e., us.
                 let home = voice_bird_cli::omp::register::register_home();
-                match voice_bird_cli::omp::register::register(&det_path, &home) {
+                let binary = std::env::current_exe()
+                    .unwrap_or_else(|_| det_path.clone());
+                match voice_bird_cli::omp::register::register(&binary, &home) {
                     Ok(()) => log::info!(
                         "registered MCP server in {}/agent/mcp.json (source: {:?})",
                         home.display(),

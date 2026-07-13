@@ -124,6 +124,7 @@ mod tests {
         let entry = body.mcp_servers.get(SERVER_NAME).unwrap();
         assert_eq!(entry.command, fake_bin.to_string_lossy());
         assert_eq!(entry.r#type, "stdio");
+        assert_eq!(entry.args, vec!["--mcp-server".to_string()]);
 
         unregister(dir.path()).unwrap();
         let body = read_file(&mcp_path(dir.path())).unwrap();
@@ -155,6 +156,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unregister(dir.path()).unwrap();
         // No panic, no error.
+    }
+    #[test]
+    fn register_overwrites_with_later_path() {
+        // Regression: App::new() used to register the omp binary path
+        // (passed via OmpDetection.path) instead of voice-bird's own
+        // current_exe(). The fix is at the call site in app.rs; this
+        // test pins the contract that whoever passes the binary path
+        // owns the resulting `command` field — re-registering with a
+        // different path must overwrite.
+        let dir = tempfile::tempdir().unwrap();
+        let omp_path = dir.path().join("omp");
+        let voice_bird_path = dir.path().join("voice-bird-cli");
+        std::fs::write(&omp_path, "#!/bin/sh\n").unwrap();
+        std::fs::write(&voice_bird_path, "#!/bin/sh\n").unwrap();
+
+        register(&omp_path, dir.path()).unwrap();
+        register(&voice_bird_path, dir.path()).unwrap();
+
+        let body = read_file(&mcp_path(dir.path())).unwrap();
+        let entry = body.mcp_servers.get(SERVER_NAME).unwrap();
+        assert_eq!(
+            entry.command,
+            voice_bird_path.to_string_lossy(),
+            "the later registration (voice-bird binary) must win",
+        );
+        assert_eq!(entry.args, vec!["--mcp-server".to_string()]);
     }
 
     #[test]
