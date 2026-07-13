@@ -14,6 +14,7 @@
 //! without touching the slot model or the renderer.
 
 pub mod install;
+pub mod live;
 pub mod mcp_server;
 pub mod register;
 pub mod rpc;

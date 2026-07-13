@@ -39,23 +39,36 @@ fn fake_segment(text: &str, t_ms: u64) -> Segment {
 fn deserialize_response(line: &str) -> JsonRpcResponse {
     serde_json::from_str(line).expect("envelope must be valid JSON-RPC")
 }
-
 #[test]
+#[serial_test::serial]
 fn push_and_pull_recent_round_trip_via_handle() {
-    // Phase 1: the TUI pushes 50 segments into the shared buffer via
-    // the StdoutMcpTarget — same path the consumer task takes at
-    // runtime.
-    let state = ServerState::new(OmpSessionId::default_session());
-    let target = StdoutMcpTarget::new(state.clone());
+    // Phase 1: the TUI pushes 50 segments into the live tail via
+    // crate::omp::live::append — same path the consumer task takes
+    // at runtime. Point HOME at a tempdir so the test exercises the
+    // real on-disk path (the MCP server reads from there).
+    let prev_home = std::env::var("HOME").ok();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", dir.path());
+    let slot: u8 = 1;
+    voice_bird_cli::omp::live::truncate_slot(slot).unwrap();
     for i in 0..50 {
-        target
-            .push_segment(&fake_segment(&format!("segment-{i}"), i * 1000))
-            .unwrap();
+        voice_bird_cli::omp::live::append(
+            slot,
+            &voice_bird_cli::omp::live::LiveSegment {
+                segment_index: i,
+                t_start_ms: i * 1000,
+                t_end_ms: i * 1000 + 500,
+                text: format!("segment-{i}"),
+                tokens: vec![],
+                session_id: "test".into(),
+            },
+        )
+        .unwrap();
     }
 
     // Phase 2: a fake omp client calls voice_bird__pull_recent with
-    // limit=50 and reads the response. We round-trip through the
-    // exact JSON envelope the mediator writes on stdout.
+    // limit=50 and reads the response.
+    let state = ServerState::new(OmpSessionId::default_session());
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(1)),
@@ -69,9 +82,6 @@ fn push_and_pull_recent_round_trip_via_handle() {
     let envelope = serde_json::to_string(&resp).unwrap();
     let parsed = deserialize_response(&envelope);
 
-    // The structuredContent path carries the actual segments; the
-    // content[0].text path carries the JSON-encoded copy for clients
-    // that don't grok structuredContent.
     let structured = parsed
         .result
         .as_ref()
@@ -80,9 +90,17 @@ fn push_and_pull_recent_round_trip_via_handle() {
         .and_then(|v| v.as_array())
         .expect("structuredContent.segments must be a JSON array");
 
+    restore("HOME", prev_home);
     assert_eq!(structured.len(), 50);
     for (i, seg) in structured.iter().enumerate() {
         assert_eq!(seg["text"], format!("segment-{i}"));
+    }
+}
+
+fn restore(key: &str, prev: Option<String>) {
+    match prev {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
     }
 }
 
@@ -117,17 +135,34 @@ fn push_segment_returns_increasing_indices() {
         );
         let pre = seen.lock().len();
         seen.lock().push(i as u64);
-        assert_eq!(pre, i);
-    }
+    assert_eq!(pre, i);
 }
 
 #[test]
+#[serial_test::serial]
+
 fn pull_recent_respects_limit_and_keeps_order() {
-    let state = ServerState::new(OmpSessionId::default_session());
+    let prev_home = std::env::var("HOME").ok();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", dir.path());
+    let slot: u8 = 1;
+    voice_bird_cli::omp::live::truncate_slot(slot).unwrap();
     for i in 0..20 {
-        let _ = state.push(fake_segment(&format!("e{i}"), i * 100));
+        voice_bird_cli::omp::live::append(
+            slot,
+            &voice_bird_cli::omp::live::LiveSegment {
+                segment_index: i,
+                t_start_ms: i * 100,
+                t_end_ms: i * 100 + 50,
+                text: format!("e{i}"),
+                tokens: vec![],
+                session_id: "test".into(),
+            },
+        )
+        .unwrap();
     }
 
+    let state = ServerState::new(OmpSessionId::default_session());
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(200)),
@@ -142,12 +177,17 @@ fn pull_recent_respects_limit_and_keeps_order() {
         .as_array()
         .unwrap()
         .clone();
+    restore("HOME", prev_home);
 
-    // The buffer is bounded at BUFFER_CAP and oldest-first; pull_recent
-    // returns the last `limit` segments in arrival order.
+    // pull_recent returns the last `limit` segments in arrival order.
     assert_eq!(segments.len(), 5);
     assert_eq!(segments[0]["text"], "e15");
     assert_eq!(segments[4]["text"], "e19");
+    assert_eq!(segments[2]["text"], "e17");
+}
+
+
+
 }
 
 #[test]

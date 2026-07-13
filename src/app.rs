@@ -1308,7 +1308,27 @@ impl App {
         // rest of the recording pipeline (engine pick, language
         // shadowing, etc.) doesn't have to learn about `Omp` yet —
         // the Omp target piggybacks on local inference today.
+
         settings.cloud_on = matches!(target, Target::Cloud);
+
+        // Truncate the per-slot live tail when starting an Omp session.
+        // The TUI writes every committed segment there; the MCP server
+        // process spawned by omp tails this file. Starting fresh
+        // prevents a new recording from inheriting segments left by
+        // a previous session on the same slot.
+        if matches!(target, Target::Omp { .. }) {
+            let slot_u8 = match slot {
+                SlotId(1) => 1u8,
+                SlotId(2) => 2u8,
+                SlotId(3) => 3u8,
+                _ => 0u8,
+            };
+            if slot_u8 > 0 {
+                if let Err(e) = voice_bird_cli::omp::live::truncate_slot(slot_u8) {
+                    log::warn!("omp live truncate: {e}");
+                }
+            }
+        }
 
         let now = chrono::Utc::now();
         // Local-first persistence: when broadcasting, the recording lives
@@ -1665,6 +1685,7 @@ impl App {
         // buffer when the user picked `Target::Omp`.
         let target_for_consumer = target.clone();
         let omp_state_for_consumer = self.omp_state.clone();
+        let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
                 match voice_bird_cli::session::writer::SegmentWriter::open(p) {
@@ -1700,11 +1721,45 @@ impl App {
                             text: seg.text.clone(),
                         });
                         tentative_for_consumer.lock().clear();
+
+                        // Build the on-disk live record FIRST, before
+                        // any code path moves `seg` into the in-memory
+                        // buffer. The mirror write to `~/.voice-bird/live/`
+                        // runs after, but it just reads `&seg` again —
+                        // which is fine since we already extracted the
+                        // fields we need into `live_seg`.
+                        let idx = omp_state_for_consumer.snapshot_next_index();
+                        let session = match &target_for_consumer {
+                            Target::Omp { session_id } => {
+                                voice_bird_cli::omp::OmpSessionId(session_id.clone())
+                            }
+                            _ => voice_bird_cli::omp::OmpSessionId::default_session(),
+                        };
+                        let live_seg = if matches!(target_for_consumer, Target::Omp { .. }) {
+                            Some(voice_bird_cli::omp::live::LiveSegment::from_engine(
+                                &seg, idx, &session,
+                            ))
+                        } else {
+                            None
+                        };
                         // Route into the omp buffer when the slot's
                         // target is `Target::Omp`. Best-effort.
                         if matches!(target_for_consumer, Target::Omp { .. }) {
                             omp_state_for_consumer.push(seg);
                         }
+                        // Mirror to the on-disk live tail so the MCP
+                        // server process spawned by omp sees the same
+                        // segments. The TUI's in-memory buffer is
+                        // local to this process; the live file is the
+                        // cross-process source of truth for `pull_recent`.
+                        if let Some(live) = live_seg {
+                            let slot_u8 = slot_for_consumer.0 as u8;
+                            if let Err(e) = voice_bird_cli::omp::live::append(slot_u8, &live) {
+                                log::warn!("omp live append: {e}");
+                            }
+                        }
+
+
                     }
                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
@@ -1713,9 +1768,10 @@ impl App {
                         }
                         break;
                     }
-                }
-            }
-        });
+                 }
+             }
+         });
+
 
         // --- 6b. Refinement consumer task (separate writer, separate JSONL) -
         let refinement_join = if let Some(h) = refinement_handle {

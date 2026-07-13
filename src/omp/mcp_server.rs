@@ -72,6 +72,10 @@ impl ServerState {
         self.session_id.lock().clone()
     }
 
+    pub fn snapshot_next_index(&self) -> u64 {
+        *self.next_index.lock()
+    }
+
     pub fn push(&self, seg: Segment) -> u64 {
         // Assign the next index first, then drop the guard so the
         // buffer lock below can take the buffer without overlapping
@@ -282,7 +286,21 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> Option<JsonRpcRespon
                         .and_then(|v| v.as_u64())
                         .unwrap_or(50)
                         .min(1024) as usize;
-                    let segments = state.pull(limit);
+                    let slot_id = args
+                        .get("slot_id")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u8;
+                    // Read from the cross-process live tail. The TUI
+                    // (separate process when omp spawns this binary)
+                    // appends each committed segment there in real time;
+                    // we just read the last `limit` lines on demand.
+                    let segments = match super::live::pull_recent(slot_id, limit) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("mcp_server: live pull_recent failed: {e}");
+                            Vec::new()
+                        }
+                    };
                     JsonRpcResponse::ok(
                         id.clone(),
                         serde_json::json!({
@@ -396,11 +414,32 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn handle_tools_call_pull_recent_returns_segments_in_order() {
-        let state = ServerState::new(OmpSessionId::default_session());
-        for i in 0..5 {
-            let _ = state.push(seg(&format!("s{i}"), i * 1000));
+        // pull_recent now reads from the on-disk live tail, not from
+        // the in-memory buffer — the MCP server process is separate
+        // from the TUI that writes segments. Point HOME at a tempdir
+        // so the test exercises the real on-disk path.
+        let prev_home = std::env::var("HOME").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
+        let slot: u8 = 1;
+        crate::omp::live::truncate_slot(slot).unwrap();
+        for i in 0..5u64 {
+            crate::omp::live::append(
+                slot,
+                &crate::omp::live::LiveSegment {
+                    segment_index: i,
+                    t_start_ms: i * 1000,
+                    t_end_ms: i * 1000 + 500,
+                    text: format!("s{i}"),
+                    tokens: vec![],
+                    session_id: "test".into(),
+                },
+            )
+            .unwrap();
         }
+        let state = ServerState::new(OmpSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -415,9 +454,17 @@ mod tests {
         );
         let v = resp.unwrap().result.unwrap();
         let arr = v["structuredContent"]["segments"].as_array().unwrap();
+        restore("HOME", prev_home);
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["text"], "s2");
         assert_eq!(arr[2]["text"], "s4");
+    }
+
+    fn restore(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
