@@ -19,7 +19,6 @@
 
 use std::io::{self, BufRead, Write};
 
-use parking_lot::Mutex;
 
 use crate::transcription::Segment;
 
@@ -40,20 +39,37 @@ const BUFFER_CAP: usize = 10_000;
 /// Shared buffer + book-keeping for one MCP server. Cloned into the
 /// mediator task and (later) into the `OmpTarget` impl that lives
 /// on `App`.
+///
+/// `session_id` is mutable: when the server probes the client for
+/// `roots/list` after `initialize`, the response updates the id
+/// in place. We hide it behind a Mutex so the `OmpTarget::session_id`
+/// accessor can take a snapshot without blocking writers.
 #[derive(Clone)]
 pub struct ServerState {
-    pub session_id: OmpSessionId,
-    pub buffer: std::sync::Arc<Mutex<Vec<Segment>>>,
-    pub next_index: std::sync::Arc<Mutex<u64>>,
+    pub session_id: std::sync::Arc<parking_lot::Mutex<OmpSessionId>>,
+    pub buffer: std::sync::Arc<parking_lot::Mutex<Vec<Segment>>>,
+    pub next_index: std::sync::Arc<parking_lot::Mutex<u64>>,
 }
 
 impl ServerState {
     pub fn new(session_id: OmpSessionId) -> Self {
         Self {
-            session_id,
-            buffer: std::sync::Arc::new(Mutex::new(Vec::new())),
-            next_index: std::sync::Arc::new(Mutex::new(0)),
+            session_id: std::sync::Arc::new(parking_lot::Mutex::new(session_id)),
+            buffer: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            next_index: std::sync::Arc::new(parking_lot::Mutex::new(0)),
         }
+    }
+
+    /// Replace the session id. Used by the roots probe after the
+    /// client responds. Idempotent.
+    pub fn set_session_id(&self, id: OmpSessionId) {
+        *self.session_id.lock() = id;
+    }
+
+    /// Snapshot of the current session id. Cheap: just a Mutex lock
+    /// and a clone.
+    pub fn snapshot_session_id(&self) -> OmpSessionId {
+        self.session_id.lock().clone()
     }
 
     pub fn push(&self, seg: Segment) -> u64 {
@@ -95,8 +111,8 @@ impl StdoutMcpTarget {
 }
 
 impl OmpTarget for StdoutMcpTarget {
-    fn session_id(&self) -> &OmpSessionId {
-        &self.state.session_id
+    fn session_id(&self) -> OmpSessionId {
+        self.state.snapshot_session_id()
     }
     fn push_segment(&self, seg: &Segment) -> anyhow::Result<()> {
         self.state.push(seg.clone());
@@ -133,14 +149,18 @@ pub fn run_on_stdio(state: ServerState) -> anyhow::Result<()> {
             }
         };
         drop(line_json);
-        let resp = handle(&state, &req);
+        // Notifications have no id; `handle` returns None and we
+        // skip the write.
+        let Some(resp) = handle(&state, &req) else {
+            continue;
+        };
         let line = serde_json::to_string(&resp).unwrap_or_else(|_| {
-            serde_json::to_string(&JsonRpcResponse::err(
-                req.id,
-                -32603,
-                "internal error serializing response",
-            ))
-            .unwrap_or_default()
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32603, "message": "internal error serializing response"}
+            })
+            .to_string()
         });
         output.write_all(line.as_bytes())?;
         output.write_all(b"\n")?;
@@ -150,10 +170,15 @@ pub fn run_on_stdio(state: ServerState) -> anyhow::Result<()> {
 
 /// Dispatch one parsed request to the appropriate handler. Pure
 /// function on `ServerState` — easy to unit-test.
-pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> JsonRpcResponse {
-    match req.method.as_str() {
+///
+/// Returns `None` for JSON-RPC notifications (no `id` field) since
+/// the spec forbids replying. Returns `Some(response)` for
+/// requests; the caller writes the response line and flushes.
+pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    let id = req.id.clone()?;
+    let resp = match req.method.as_str() {
         "initialize" => JsonRpcResponse::ok(
-            req.id,
+            id.clone(),
             serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": false}},
@@ -161,11 +186,11 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "name": "voice-bird",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "session_id": state.session_id.as_str(),
+                "session_id": state.snapshot_session_id().as_str(),
             }),
         ),
         "tools/list" => JsonRpcResponse::ok(
-            req.id,
+            id.clone(),
             serde_json::json!({
                 "tools": [
                     tool_def(
@@ -215,7 +240,7 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 TOOL_PUSH_SEGMENT => {
                     let received = parse_segment_index(&args);
                     JsonRpcResponse::ok(
-                        req.id,
+                        id.clone(),
                         serde_json::json!({
                             "content": [{"type": "text", "text": format!("received {received}")}],
                             "isError": false,
@@ -230,7 +255,7 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> JsonRpcResponse {
                         .min(1024) as usize;
                     let segments = state.pull(limit);
                     JsonRpcResponse::ok(
-                        req.id,
+                        id.clone(),
                         serde_json::json!({
                             "content": [{"type": "text", "text": serde_json::to_string(&segments).unwrap_or_default()}],
                             "structuredContent": {"segments": segments, "count": segments.len()},
@@ -238,20 +263,12 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> JsonRpcResponse {
                         }),
                     )
                 }
-                other => JsonRpcResponse::err(req.id, -32602, format!("unknown tool: {other}")),
+                other => JsonRpcResponse::err(id.clone(), -32602, format!("unknown tool: {other}")),
             }
         }
-        other => JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("method not found: {other}"),
-                data: None,
-            }),
-        },
-    }
+        other => JsonRpcResponse::err(id, -32601, format!("method not found: {other}")),
+    };
+    Some(resp)
 }
 
 fn tool_def(name: &str, description: &str, schema: serde_json::Value) -> serde_json::Value {
@@ -288,12 +305,12 @@ mod tests {
             &state,
             &JsonRpcRequest {
                 jsonrpc: "2.0".into(),
-                id: 1,
+                id: Some(serde_json::json!(1)),
                 method: "initialize".into(),
                 params: None,
             },
         );
-        let v = resp.result.unwrap();
+        let v = resp.unwrap().result.unwrap();
         assert_eq!(v["protocolVersion"], "2024-11-05");
         assert_eq!(v["serverInfo"]["name"], "voice-bird");
     }
@@ -305,12 +322,12 @@ mod tests {
             &state,
             &JsonRpcRequest {
                 jsonrpc: "2.0".into(),
-                id: 2,
+                id: Some(serde_json::json!(2)),
                 method: "tools/list".into(),
                 params: None,
             },
         );
-        let v = resp.result.unwrap();
+        let v = resp.unwrap().result.unwrap();
         let names: Vec<&str> = v["tools"]
             .as_array()
             .unwrap()
@@ -329,7 +346,7 @@ mod tests {
             &state,
             &JsonRpcRequest {
                 jsonrpc: "2.0".into(),
-                id: 3,
+                id: Some(serde_json::json!(3)),
                 method: "tools/call".into(),
                 params: Some(serde_json::json!({
                     "name": TOOL_PUSH_SEGMENT,
@@ -343,7 +360,7 @@ mod tests {
                 })),
             },
         );
-        let v = resp.result.unwrap();
+        let v = resp.unwrap().result.unwrap();
         assert_eq!(v["isError"], false);
         assert_eq!(state.pull(10).len(), 1);
     }
@@ -358,7 +375,7 @@ mod tests {
             &state,
             &JsonRpcRequest {
                 jsonrpc: "2.0".into(),
-                id: 4,
+                id: Some(serde_json::json!(4)),
                 method: "tools/call".into(),
                 params: Some(serde_json::json!({
                     "name": TOOL_PULL_RECENT,
@@ -366,7 +383,7 @@ mod tests {
                 })),
             },
         );
-        let v = resp.result.unwrap();
+        let v = resp.unwrap().result.unwrap();
         let arr = v["structuredContent"]["segments"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["text"], "s2");
@@ -380,14 +397,38 @@ mod tests {
             &state,
             &JsonRpcRequest {
                 jsonrpc: "2.0".into(),
-                id: 5,
+                id: Some(serde_json::json!(5)),
                 method: "nope".into(),
                 params: None,
             },
         );
-        assert_eq!(resp.error.unwrap().code, -32601);
+        assert_eq!(resp.unwrap().error.unwrap().code, -32601);
     }
 
+    #[test]
+    fn handle_notification_returns_none() {
+        // notifications/initialized has no id; handle() must return
+        // None so the caller doesn't write a reply (spec-forbidden).
+        let state = ServerState::new(OmpSessionId::default_session());
+        let resp = handle(
+            &state,
+            &JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: None,
+                method: "notifications/initialized".into(),
+                params: None,
+            },
+        );
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn snapshot_session_id_updates_after_set() {
+        let state = ServerState::new(OmpSessionId("initial".into()));
+        assert_eq!(state.snapshot_session_id().as_str(), "initial");
+        state.set_session_id(OmpSessionId("from-probe".into()));
+        assert_eq!(state.snapshot_session_id().as_str(), "from-probe");
+    }
     #[test]
     fn server_state_buffer_drops_oldest_when_full() {
         let state = ServerState::new(OmpSessionId::default_session());

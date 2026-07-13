@@ -53,8 +53,13 @@ pub enum OmpStatus {
 /// spawn / drop). Implementations own their own threading and
 /// serialisation.
 pub trait OmpTarget: Send {
-    /// `omp` session this target is attached to.
-    fn session_id(&self) -> &OmpSessionId;
+    /// `omp` session this target is attached to. Returns an owned
+    /// value because the id may mutate at runtime (the stdio MCP
+    /// server updates it after the roots probe); the alternative
+    /// `&OmpSessionId` would force a thread-local cache and lose
+    /// the snapshot semantics. Callers that need a stable id
+    /// should clone the returned value.
+    fn session_id(&self) -> OmpSessionId;
 
     /// Push a committed segment to the omp session. Returns
     /// `Ok(())` once the segment has been handed to the transport

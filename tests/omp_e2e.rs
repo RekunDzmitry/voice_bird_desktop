@@ -58,14 +58,14 @@ fn push_and_pull_recent_round_trip_via_handle() {
     // exact JSON envelope the mediator writes on stdout.
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
-        id: 1,
+        id: Some(serde_json::json!(1)),
         method: "tools/call".into(),
         params: Some(serde_json::json!({
             "name": TOOL_PULL_RECENT,
             "arguments": {"slot_id": 1, "limit": 50},
         })),
     };
-    let resp = handle(&state, &req);
+    let resp = handle(&state, &req).unwrap();
     let envelope = serde_json::to_string(&resp).unwrap();
     let parsed = deserialize_response(&envelope);
 
@@ -97,7 +97,7 @@ fn push_segment_returns_increasing_indices() {
         // and comparing to the index the request would carry.
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: 100 + i as u64,
+            id: Some(serde_json::json!(100 + i as u64)),
             method: "tools/call".into(),
             params: Some(serde_json::json!({
                 "name": TOOL_PUSH_SEGMENT,
@@ -110,7 +110,7 @@ fn push_segment_returns_increasing_indices() {
                 },
             })),
         };
-        let resp = handle(&state, &req);
+        let resp = handle(&state, &req).unwrap();
         assert_eq!(
             resp.result.as_ref().unwrap()["isError"],
             serde_json::Value::Bool(false)
@@ -130,14 +130,14 @@ fn pull_recent_respects_limit_and_keeps_order() {
 
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
-        id: 200,
+        id: Some(serde_json::json!(200)),
         method: "tools/call".into(),
         params: Some(serde_json::json!({
             "name": TOOL_PULL_RECENT,
             "arguments": {"slot_id": 1, "limit": 5},
         })),
     };
-    let parsed = handle(&state, &req);
+    let parsed = handle(&state, &req).unwrap();
     let segments = parsed.result.unwrap()["structuredContent"]["segments"]
         .as_array()
         .unwrap()
@@ -157,11 +157,12 @@ fn initialize_response_carries_session_id_and_protocol_version() {
         &state,
         &JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: 300,
+            id: Some(serde_json::json!(300)),
             method: "initialize".into(),
             params: None,
         },
-    );
+    )
+    .unwrap();
     let v = parsed.result.unwrap();
     assert_eq!(v["protocolVersion"], "2024-11-05");
     assert_eq!(v["serverInfo"]["name"], "voice-bird");
