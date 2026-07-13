@@ -661,6 +661,20 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('p') if app.active_section_count() == 0 => {
             app.open_path_modal();
         }
+        // Cycle the focused slot's pending target. Three key bindings
+        // are all wired to the same cycle so the user can pick whichever
+        // they remember: `O` (oh-my-pi), `S` (switch), or `A` (agent).
+        // Pressing any of them with a slot focused rotates the target
+        // through Stdout → Cloud → Omp → Stdout. The change is queued
+        // in `pending_target_overrides` and applied at next start.
+        KeyCode::Char('O') | KeyCode::Char('S') | KeyCode::Char('A') => {
+            let next = app.cycle_focused_target();
+            app.banner = Some(format!(
+                "Slot [{}] target → {} (applies on next start)",
+                app.focused_slot.0,
+                next,
+            ));
+        }
         _ => {}
     }
 }

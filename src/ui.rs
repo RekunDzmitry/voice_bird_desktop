@@ -608,27 +608,9 @@ fn render_targets_pane(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_target_chip(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
-    use voice_bird_cli::session::target::Target;
-
     let is_focused = slot.id == app.focused_slot;
-    let (label, style) = match slot.target() {
-        Some(Target::Stdout) => (
-            "▸ Stdout",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Some(Target::Cloud) => (
-            "▸ Cloud",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        None => (
-            "—",
-            Style::default().fg(Color::DarkGray),
-        ),
-    };
+    let is_omp_available = matches!(app.omp, voice_bird_cli::omp::OmpStatus::Ready { .. });
+    let (label, style) = chip_label_style(slot.target(), is_omp_available);
     let border_style = if is_focused {
         Style::default()
             .fg(Color::Yellow)
@@ -645,6 +627,38 @@ fn render_target_chip(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
     let p = Paragraph::new(Line::from(Span::styled(label, style)))
         .alignment(Alignment::Center);
     f.render_widget(p, inner);
+}
+
+/// Pure helper: chip text + style for a given `Target`. Extracted so
+/// unit tests can verify the `Omp` arm without spinning up a full
+/// `Section` (which would need a real audio engine + CaptureKeepAlive).
+fn chip_label_style(
+    target: Option<voice_bird_cli::session::target::Target>,
+    is_omp_available: bool,
+) -> (String, Style) {
+    use voice_bird_cli::session::target::Target;
+    match target {
+        Some(Target::Stdout) => (
+            "▸ Stdout".into(),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Some(Target::Cloud) => (
+            "▸ Cloud".into(),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+        Some(Target::Omp { .. }) => {
+            // Cyan when the omp binary is on disk; dim gray when it
+            // isn't (the chip is still informative as a tag for the
+            // user's routing choice, but obviously inert).
+            let style = if is_omp_available {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ("▸ Omp".into(), style)
+        }
+        None => ("—".into(), Style::default().fg(Color::DarkGray)),
+    }
 }
 
 
@@ -1311,6 +1325,29 @@ mod tests {
             out.contains("—"),
             "em-dash placeholder missing from chips:\n{out}"
         );
+    }
+
+    /// The chip helper returns cyan-bold `▸ Omp` when the user has
+    /// picked `Target::Omp` and the omp binary is on disk; the same
+    /// chip is dim gray when omp is missing (still informative as a
+    /// tag for the user's routing choice).
+    #[test]
+    fn chip_label_style_omp_is_cyan_when_omp_available() {
+        use voice_bird_cli::session::target::Target;
+        let t = Target::Omp { session_id: "x".into() };
+        let (label, style) = chip_label_style(Some(t), true);
+        assert_eq!(label, "▸ Omp");
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn chip_label_style_omp_is_dim_when_omp_missing() {
+        use voice_bird_cli::session::target::Target;
+        let t = Target::Omp { session_id: "x".into() };
+        let (label, style) = chip_label_style(Some(t), false);
+        assert_eq!(label, "▸ Omp");
+        assert_eq!(style.fg, Some(Color::DarkGray));
     }
 
     /// Idle key sidebar shows the new Tab/cfg keys.

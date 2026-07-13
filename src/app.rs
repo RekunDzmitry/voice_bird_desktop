@@ -225,8 +225,8 @@ impl Slot {
     pub fn target(&self) -> Option<Target> {
         match &self.kind {
             SlotKind::Empty => None,
-            SlotKind::Recording { section } => Some(section.target),
-            SlotKind::Saved { saved } => Some(saved.target),
+            SlotKind::Recording { section } => Some(section.target.clone()),
+            SlotKind::Saved { saved } => Some(saved.target.clone()),
         }
     }
 }
@@ -369,6 +369,14 @@ pub struct App {
     /// Which detection source produced `omp` (env / PATH / bun install).
     /// `None` iff detection failed. Surfaced in the status bar.
     pub omp_detection_source: Option<voice_bird_cli::omp::OmpDetectionSource>,
+
+    /// Per-slot pending target override. When the user presses `O` to
+    /// cycle the focused slot's target, we set this to the new target
+    /// (e.g. `Target::Omp`); the next `start_section` consults it and
+    /// applies it instead of the default `cloud_on` heuristic. The
+    /// value is consumed (set back to `None`) by start_section so it
+    /// only affects the very next start.
+    pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
 }
 
 impl App {
@@ -472,6 +480,7 @@ impl App {
             empty_tentative: Arc::new(PlMutex::new(String::new())),
             omp: voice_bird_cli::omp::OmpStatus::NotFound,
             omp_detection_source: None,
+            pending_target_overrides: std::collections::BTreeMap::new(),
         };
         // user must provide before recording.
         #[cfg(windows)]
@@ -606,6 +615,35 @@ impl App {
     /// Targets pane.
     pub fn focused_target(&self) -> Option<Target> {
         self.slot_by_id(self.focused_slot).and_then(|s| s.target())
+    }
+    /// Cycle the focused slot's *pending* target through
+    /// `Stdout → Cloud → Omp → Stdout`. The new target is stored on
+    /// `pending_target_overrides` and applied by the next
+    /// `start_section`. The current chip label keeps reflecting the
+    /// previous pick until the next start so the user has a chance
+    /// to back out (but we also surface a banner so they see the
+    /// pending change immediately).
+    ///
+    /// Returns the target that was just queued. The caller can use
+    /// this for the status bar hint.
+    pub fn cycle_focused_target(&mut self) -> Target {
+        use voice_bird_cli::omp::OmpSessionId;
+        let slot = self.focused_slot;
+        let current = self
+            .pending_target_overrides
+            .get(&slot)
+            .cloned()
+            .or_else(|| self.slot_by_id(slot).and_then(|s| s.target()))
+            .unwrap_or(Target::Stdout);
+        let next = match current {
+            Target::Stdout => Target::Cloud,
+            Target::Cloud => Target::Omp {
+                session_id: OmpSessionId::default_session().0,
+            },
+            Target::Omp { .. } => Target::Stdout,
+        };
+        self.pending_target_overrides.insert(slot, next.clone());
+        next
     }
 
     /// Committed-transcript Arc for the focused section, or saved
@@ -1213,14 +1251,27 @@ impl App {
             "en".to_string()
         };
 
-        // Where this section is heading. `cloud_on == true` → Cloud,
-        // else local Stdout. Computed once so the Section + the
-        // Targets pane agree without an extra accessor hop.
-        let target = if settings.cloud_on {
-            Target::Cloud
-        } else {
-            Target::Stdout
-        };
+        // Where this section is heading. The user can pre-pick a
+        // target via the `O`/`S`/`A` cycle key (PR 2 of the omp
+        // rollout); that overrides the cloud_on heuristic so `Omp`
+        // works alongside the existing Cloud / Stdout switch. The
+        // override is consumed at start so it only affects this one
+        // start.
+        let target = self
+            .pending_target_overrides
+            .remove(&slot)
+            .unwrap_or_else(|| {
+                if settings.cloud_on {
+                    Target::Cloud
+                } else {
+                    Target::Stdout
+                }
+            });
+        // Keep `cloud_on` in sync with the picked target so the
+        // rest of the recording pipeline (engine pick, language
+        // shadowing, etc.) doesn't have to learn about `Omp` yet —
+        // the Omp target piggybacks on local inference today.
+        settings.cloud_on = matches!(target, Target::Cloud);
 
         let now = chrono::Utc::now();
         // Local-first persistence: when broadcasting, the recording lives
@@ -2110,6 +2161,26 @@ mod tests {
         assert!(looks_like_auth_error("forbidden"));
         assert!(!looks_like_auth_error("connection reset by peer"));
         assert!(!looks_like_auth_error("audio format unsupported"));
+    }
+    /// The cycle key (O / S / A) walks the focused slot through
+    /// Stdout → Cloud → Omp → Stdout. The new target lands in
+    /// `pending_target_overrides` so start_section picks it up.
+    #[test]
+    fn cycle_focused_target_walks_stdout_cloud_omp_stdout() {
+        let mut app = App::new();
+        // Slot 1 starts as Empty → first cycle yields Cloud.
+        assert_eq!(app.cycle_focused_target(), Target::Cloud);
+        assert_eq!(
+            app.pending_target_overrides.get(&SlotId(1)).cloned(),
+            Some(Target::Cloud)
+        );
+        // Cloud → Omp.
+        let omp = app.cycle_focused_target();
+        assert!(matches!(omp, Target::Omp { .. }));
+        // Omp → Stdout.
+        assert_eq!(app.cycle_focused_target(), Target::Stdout);
+        // Stdout → Cloud again, full loop.
+        assert_eq!(app.cycle_focused_target(), Target::Cloud);
     }
 
     #[test]

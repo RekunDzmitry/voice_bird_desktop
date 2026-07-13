@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
     /// Local Whisper inference — transcript is written to disk and
     /// stays on the user's machine.
@@ -21,6 +21,11 @@ pub enum Target {
     /// `transcript.*` files; the API key in `config.toml` is used for
     /// authentication.
     Cloud,
+    /// Transcript segments are pushed into the user's oh-my-pi (omp)
+    /// session via MCP stdio JSON-RPC. The session id is opaque
+    /// today (`OmpSessionId::default_session()` for the single App
+    /// process); multi-session support is left for Phase B.
+    Omp { session_id: String },
 }
 
 impl Default for Target {
@@ -34,6 +39,7 @@ impl std::fmt::Display for Target {
         match self {
             Target::Stdout => f.write_str("Stdout"),
             Target::Cloud => f.write_str("Cloud"),
+            Target::Omp { .. } => f.write_str("Omp"),
         }
     }
 }
@@ -51,6 +57,10 @@ mod tests {
     fn display_is_user_readable() {
         assert_eq!(Target::Stdout.to_string(), "Stdout");
         assert_eq!(Target::Cloud.to_string(), "Cloud");
+        assert_eq!(
+            Target::Omp { session_id: "x".into() }.to_string(),
+            "Omp"
+        );
     }
 
     #[test]
@@ -58,5 +68,15 @@ mod tests {
         let json = serde_json::to_string(&Target::Cloud).unwrap();
         let back: Target = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Target::Cloud);
+    }
+
+    #[test]
+    fn target_round_trips_omp_session_id() {
+        let original = Target::Omp {
+            session_id: "abc".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Target = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
     }
 }
