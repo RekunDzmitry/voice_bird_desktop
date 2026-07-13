@@ -357,6 +357,18 @@ pub struct App {
     empty_committed: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_refined: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
+
+    /// Detected state of the user's `omp` install (oh-my-pi).
+    /// `None` only on a configuration error during `App::new`;
+    /// the user-visible states are `OmpStatus::Ready` (path + version)
+    /// or `OmpStatus::NotFound`. Used by the Targets pane to decide
+    /// whether the Omp chip is enabled, and by `App::new` to wire the
+    /// status-bar hint.
+    pub omp: voice_bird_cli::omp::OmpStatus,
+
+    /// Which detection source produced `omp` (env / PATH / bun install).
+    /// `None` iff detection failed. Surfaced in the status bar.
+    pub omp_detection_source: Option<voice_bird_cli::omp::OmpDetectionSource>,
 }
 
 impl App {
@@ -458,11 +470,33 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
+            omp: voice_bird_cli::omp::OmpStatus::NotFound,
+            omp_detection_source: None,
         };
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
             app.open_api_key_modal();
+        }
+
+        // Probe for a local `omp` install so the status bar can surface
+        // "Omp found at <path> v<version>" (or "Omp not found" when the
+        // user hasn't installed oh-my-pi yet). Detection is intentionally
+        // best-effort and zero-cost on failure — we just enumerate three
+        // candidate locations.
+        match voice_bird_cli::omp::detect() {
+            Ok(det) => {
+                log::info!("omp detected: {} v{}", det.path.display(), det.version);
+                app.omp = voice_bird_cli::omp::OmpStatus::Ready {
+                    path: det.path,
+                    version: det.version,
+                };
+                app.omp_detection_source = Some(det.source);
+            }
+            Err(status) => {
+                app.omp = status;
+                app.omp_detection_source = None;
+            }
         }
 
         app
