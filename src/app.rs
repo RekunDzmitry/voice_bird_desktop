@@ -1633,6 +1633,11 @@ impl App {
         });
 
         // --- 6. Consumer task: engine events → live state + JSONL ---------
+        // Capture the section's target + the shared omp buffer so
+        // the consumer can fan a Committed segment into the MCP-server
+        // buffer when the user picked `Target::Omp`.
+        let target_for_consumer = target.clone();
+        let omp_state_for_consumer = self.omp_state.clone();
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
                 match voice_bird_cli::session::writer::SegmentWriter::open(p) {
@@ -1665,9 +1670,14 @@ impl App {
                         committed_for_consumer.lock().push(CommittedLine {
                             t_start_ms: elapsed_ms,
                             t_end_ms: elapsed_ms,
-                            text: seg.text,
+                            text: seg.text.clone(),
                         });
                         tentative_for_consumer.lock().clear();
+                        // Route into the omp buffer when the slot's
+                        // target is `Target::Omp`. Best-effort.
+                        if matches!(target_for_consumer, Target::Omp { .. }) {
+                            omp_state_for_consumer.push(seg);
+                        }
                     }
                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
