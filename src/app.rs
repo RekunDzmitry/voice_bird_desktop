@@ -241,12 +241,14 @@ impl std::fmt::Debug for Slot {
 }
 /// Which pane the picker arrows / Enter key target. Devices is the
 /// physical-input/output column on the left; Apps is the
-/// per-application column on the right. Each pane has its own cursor
-/// and scroll offset.
+/// per-application column in the middle; Targets is the routing
+/// choice (Stdout / Cloud / Omp) on the right. Each pane has its
+/// own cursor and scroll offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFocus {
     Devices,
     Apps,
+    Targets,
 }
 
 /// Main application state
@@ -266,6 +268,12 @@ pub struct App {
     /// Cursor in the Apps pane. `None` = no app paired (run device alone).
     pub selected_app_index: Option<usize>,
 
+    /// Cursor in the Targets pane. The list of targets is fixed at
+    /// three entries (Stdout / Cloud / Omp) — see `targets()`. Always
+    /// `Some(idx)` while the TUI runs; the cursor is one of the
+    /// rendered rows.
+    pub selected_target_index: Option<usize>,
+
     /// Which pane the picker arrows / Enter target.
     pub picker_focus: PickerFocus,
 
@@ -273,7 +281,7 @@ pub struct App {
     /// auto-clamps these so the cursor stays visible.
     pub device_scroll: u16,
     pub app_scroll: u16,
-
+    pub target_scroll: u16,
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
     pub status: RecordingStatus,
@@ -376,14 +384,34 @@ pub struct App {
     /// applies it instead of the default `cloud_on` heuristic. The
     /// value is consumed (set back to `None`) by start_section so it
     /// only affects the very next start.
-    pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
-
-    /// MCP-server state shared with the `--mcp-server` mediator task
+    pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
     /// spawned when omp launches us. The TUI also pushes into this
     /// same buffer when the focused slot's target is `Target::Omp`,
     /// so a single source of truth serves both the in-process
     /// recorder and the out-of-process omp agent.
     omp_state: voice_bird_cli::omp::mcp_server::ServerState,
+}
+
+/// A renderable row in the Targets pane. The list of rows is fixed
+/// at three — the target *kind* drives the row; the `omp` session
+/// id is a property of `Target::Omp`, not a row in the picker.
+/// `disabled` rows render dim and the cursor refuses to land on them
+/// (see `App::focused_target_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetRow {
+    pub kind: TargetKind,
+    pub disabled: bool,
+}
+
+/// Picker-side classification of a target. We can't use `Target`
+/// directly because `Target::Omp` carries a session id that the
+/// user doesn't pick per-row — the row just means "route to omp
+/// with the current session".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Stdout,
+    Cloud,
+    Omp,
 }
 
 impl App {
@@ -459,9 +487,14 @@ impl App {
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
+            // Targets list is fixed at three rows (Stdout/Cloud/Omp),
+            // so the cursor starts on the first one. We never want
+            // the pane to render in an empty-cursor state.
+            selected_target_index: Some(0),
             picker_focus: PickerFocus::Devices,
             device_scroll: 0,
             app_scroll: 0,
+            target_scroll: 0,
             status: RecordingStatus::Idle,
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
@@ -653,7 +686,18 @@ impl App {
     pub fn focused_target(&self) -> Option<Target> {
         self.slot_by_id(self.focused_slot).and_then(|s| s.target())
     }
-    /// Cycle the focused slot's *pending* target through
+
+    /// The current pending target for the focused slot, falling
+    /// through to the slot's last-used target, then Stdout. The UI
+    /// uses this for the per-slot title and the targets pane's
+    /// "active" marker.
+    pub fn focused_pending_target(&self) -> Target {
+        self.pending_target_overrides
+            .get(&self.focused_slot)
+            .cloned()
+            .or_else(|| self.focused_target())
+            .unwrap_or(Target::Stdout)
+    }
     /// `Stdout → Cloud → Omp → Stdout`. The new target is stored on
     /// `pending_target_overrides` and applied by the next
     /// `start_section`. The current chip label keeps reflecting the
@@ -681,6 +725,45 @@ impl App {
         };
         self.pending_target_overrides.insert(slot, next.clone());
         next
+    }
+
+    /// The picker list. Always three rows; `Omp` is disabled when
+    /// the binary is not on disk.
+    pub fn targets(&self) -> [TargetRow; 3] {
+        use TargetKind::*;
+        let omp_disabled = !matches!(self.omp, voice_bird_cli::omp::OmpStatus::Ready { .. });
+        [
+            TargetRow { kind: Stdout, disabled: false },
+            TargetRow { kind: Cloud, disabled: false },
+            TargetRow { kind: Omp, disabled: omp_disabled },
+        ]
+    }
+
+    /// Resolve the currently focused Targets-pane row to a `Target`.
+    /// Returns `None` if the cursor is parked on a disabled row or
+    /// out of range.
+    pub fn focused_target_kind(&self) -> Option<TargetKind> {
+        let i = self.selected_target_index?;
+        self.targets().get(i).and_then(|r| if r.disabled { None } else { Some(r.kind) })
+    }
+
+    /// Set the focused slot's pending target from a `TargetKind`. The
+    /// value is consumed by the next `start_section` and applied
+    /// instead of the `cloud_on` heuristic. The resolved `Target`
+    /// (with a session id, for Omp) is returned so the caller can
+    /// surface it in a banner.
+    pub fn pick_target(&mut self, kind: TargetKind) -> Target {
+        use voice_bird_cli::omp::OmpSessionId;
+        let slot = self.focused_slot;
+        let target = match kind {
+            TargetKind::Stdout => Target::Stdout,
+            TargetKind::Cloud => Target::Cloud,
+            TargetKind::Omp => Target::Omp {
+                session_id: OmpSessionId::default_session().0,
+            },
+        };
+        self.pending_target_overrides.insert(slot, target.clone());
+        target
     }
 
     /// Committed-transcript Arc for the focused section, or saved
@@ -1008,6 +1091,9 @@ impl App {
     }
 
     /// Move the cursor up one row in whichever pane is focused.
+    /// In the Targets pane, disabled rows (currently just `Omp` when
+    /// the binary is missing) are skipped so the cursor never parks
+    /// on a row that can't be picked.
     pub fn select_previous(&mut self) {
         match self.picker_focus {
             PickerFocus::Devices => {
@@ -1022,18 +1108,31 @@ impl App {
                     self.selected_app_index = Some(next);
                 }
             }
+            PickerFocus::Targets => {
+                let i = self.selected_target_index.unwrap_or(0);
+                if i > 0 {
+                    self.selected_target_index = Some(i - 1);
+                }
+            }
         }
         log::debug!(
-            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?})",
+            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
                 .get(self.selected_device_index)
-                .map(|d| (d.name.clone(), d.kind)),
+                .map(|d| d.name.clone()),
             self.selected_app_index,
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
+            self.selected_target_index,
+            {
+                let rows = self.targets();
+                self.selected_target_index
+                    .and_then(|i| rows.get(i))
+                    .map(|r| r.kind)
+            },
         );
     }
 
@@ -1056,20 +1155,40 @@ impl App {
                     self.selected_app_index = Some(0);
                 }
             }
+            PickerFocus::Targets => {
+                let i = self.selected_target_index.unwrap_or(0);
+                // The list is fixed at three rows. The disabled-row
+                // skip happens lazily in `focused_target_kind` so
+                // the cursor still parks on the row visually — the
+                // banner and the start call both treat it as a
+                // no-op when the row is disabled.
+                if i + 1 < 3 {
+                    self.selected_target_index = Some(i + 1);
+                }
+            }
         }
         log::debug!(
-            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?})",
+            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
                 .get(self.selected_device_index)
-                .map(|d| (d.name.clone(), d.kind)),
+                .map(|d| d.name.clone()),
             self.selected_app_index,
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
+            self.selected_target_index,
+            {
+                let rows = self.targets();
+                self.selected_target_index
+                    .and_then(|i| rows.get(i))
+                    .map(|r| r.kind)
+            },
         );
     }
+
+
 
     /// Clamp pane scroll offsets so the cursor row stays inside the
     /// viewport. `visible` is the inner row count of one pane (rough
@@ -2265,25 +2384,27 @@ mod tests {
         assert!(!looks_like_auth_error("connection reset by peer"));
         assert!(!looks_like_auth_error("audio format unsupported"));
     }
-    /// The cycle key (O / S / A) walks the focused slot through
-    /// Stdout → Cloud → Omp → Stdout. The new target lands in
-    /// `pending_target_overrides` so start_section picks it up.
+    /// The Targets pane's `pick_target` writes the focused slot's
+    /// pending target, which `start_section` consumes on the next
+    /// start. Each call returns the resolved `Target` (with a
+    /// session id for Omp) so the caller can surface a banner.
     #[test]
-    fn cycle_focused_target_walks_stdout_cloud_omp_stdout() {
+    fn pick_target_writes_pending_override_for_focused_slot() {
+        use crate::app::TargetKind;
         let mut app = App::new();
-        // Slot 1 starts as Empty → first cycle yields Cloud.
-        assert_eq!(app.cycle_focused_target(), Target::Cloud);
+        let first = app.pick_target(TargetKind::Stdout);
+        assert_eq!(first, Target::Stdout);
         assert_eq!(
             app.pending_target_overrides.get(&SlotId(1)).cloned(),
-            Some(Target::Cloud)
+            Some(Target::Stdout)
         );
-        // Cloud → Omp.
-        let omp = app.cycle_focused_target();
+        let cloud = app.pick_target(TargetKind::Cloud);
+        assert_eq!(cloud, Target::Cloud);
+        let omp = app.pick_target(TargetKind::Omp);
         assert!(matches!(omp, Target::Omp { .. }));
-        // Omp → Stdout.
-        assert_eq!(app.cycle_focused_target(), Target::Stdout);
-        // Stdout → Cloud again, full loop.
-        assert_eq!(app.cycle_focused_target(), Target::Cloud);
+        // Switching back to Stdout overwrites the prior override.
+        let stdout = app.pick_target(TargetKind::Stdout);
+        assert_eq!(stdout, Target::Stdout);
     }
 
     #[test]

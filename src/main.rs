@@ -433,16 +433,29 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // ↑/↓/k/j navigate within the focused picker pane.
         KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-        // ←/→ switch picker pane focus. `h` / `l` are deliberately not
-        // bound here: `l` already cycles cloud language. `h` is free
-        // and aliased to `←` for vim-style users.
+        // ←/→ cycle picker pane focus. `h` is aliased to `←` for
+        // vim-style users. `l` is deliberately not bound: it cycles
+        // cloud language already, and we don't want the picker
+        // focus to drift while the user is in cloud mode.
         KeyCode::Left | KeyCode::Char('h') => {
-            app.picker_focus = crate::app::PickerFocus::Devices;
-            log::info!("keys: Left → picker_focus = Devices");
+            use crate::app::PickerFocus::*;
+            let next = match app.picker_focus {
+                Devices => Devices,
+                Apps => Devices,
+                Targets => Apps,
+            };
+            app.picker_focus = next;
+            log::info!("keys: Left → picker_focus = {:?}", next);
         }
         KeyCode::Right => {
-            app.picker_focus = crate::app::PickerFocus::Apps;
-            log::info!("keys: Right → picker_focus = Apps");
+            use crate::app::PickerFocus::*;
+            let next = match app.picker_focus {
+                Devices => Apps,
+                Apps => Targets,
+                Targets => Targets,
+            };
+            app.picker_focus = next;
+            log::info!("keys: Right → picker_focus = {:?}", next);
         }
         // Space clears the Apps cursor → starts the section with the
         // device alone. Only meaningful with the Apps pane focused; in
@@ -454,6 +467,28 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Enter => {
+            // When the Targets pane is focused, Enter first applies
+            // the picked target to the focused slot's
+            // pending_target_overrides (so start_section consumes
+            // it). The picked target may be disabled (e.g. Omp when
+            // the binary is missing) — in that case we surface a
+            // banner and abort; the user can press Down to land on
+            // a pickable row.
+            if app.picker_focus == crate::app::PickerFocus::Targets {
+                if let Some(kind) = app.focused_target_kind() {
+                    let target = app.pick_target(kind);
+                    log::info!(
+                        "keys: Enter in Targets pane → picked {target:?} for slot {}",
+                        app.focused_slot.0
+                    );
+                } else {
+                    let i = app.selected_target_index.unwrap_or(0);
+                    app.banner = Some(format!(
+                        "Target row {i} is disabled (binary missing?) — pick a different row"
+                    ));
+                    return;
+                }
+            }
             // Pick the next free slot (or refuse if all are full).
             let Some(slot) = app.next_free_slot() else {
                 log::info!("keys: Enter → refused (all 3 sections full)");
@@ -695,20 +730,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('p') if app.active_section_count() == 0 => {
             app.open_path_modal();
         }
-        // Cycle the focused slot's pending target. Three key bindings
-        // are all wired to the same cycle so the user can pick whichever
-        // they remember: `O` (oh-my-pi), `S` (switch), or `A` (agent).
-        // Pressing any of them with a slot focused rotates the target
-        // through Stdout → Cloud → Omp → Stdout. The change is queued
-        // in `pending_target_overrides` and applied at next start.
-        KeyCode::Char('O') | KeyCode::Char('S') | KeyCode::Char('A') => {
-            let next = app.cycle_focused_target();
-            app.banner = Some(format!(
-                "Slot [{}] target → {} (applies on next start)",
-                app.focused_slot.0,
-                next,
-            ));
-        }
+        // The O / S / A target-cycle keys have been replaced by the
+        // Targets picker pane — the user picks a target with the
+        // same arrow / Enter pattern as Devices and Apps. The change
+        // is queued in `pending_target_overrides` by the Enter
+        // handler when the Targets pane is focused.
         _ => {}
     }
 }
