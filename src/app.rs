@@ -26,8 +26,11 @@ pub enum AppMode {
 /// is hidden and the engine call is forced to "en".
 pub const CLOUD_LANGUAGES: &[&str] = &["en", "es", "fr", "de", "it", "pt", "ja", "zh", "ru", "pl"];
 
-/// Maximum number of parallel recording sections.
-pub const MAX_SECTIONS: usize = 3;
+/// Hard upper bound on parallel recording slots. Slots start at 1 and
+/// grow on user demand (`+`); they never shrink below 1. The cap is
+/// here to defend against a runaway key auto-repeat building a Vec
+/// that overruns the screen — practical UI tops out around 4.
+pub const MAX_SECTIONS: usize = 8;
 
 /// Recording status
 #[derive(Debug, Clone)]
@@ -315,13 +318,20 @@ pub struct App {
 
     /// Parallel recording slots. Each entry owns its own id, kind
     /// (`Empty` / `Recording` / `Saved`), and — for the non-empty
-    /// variants — the per-section state. The Vec is fixed at
-    /// `MAX_SECTIONS` for Phase A; Phase B will grow it via `n`.
+    /// variants — the per-section state. The Vec starts at 1 slot;
+    /// `+` appends new slots (allocating fresh ids via
+    /// `next_slot_id`), `-` removes the focused one.
     pub slots: Vec<Slot>,
 
     /// Slot the c/l/m/Tab keys currently target. Stable across the
     /// slot's lifetime — never a positional index.
     pub focused_slot: SlotId,
+
+    /// Monotonic counter for new slot ids. Starts at 2 because slot
+    /// 1 is always present at startup. Bumped every time `add_slot`
+    /// appends a new entry; never reuses freed ids so any handle a
+    /// caller is holding stays valid even after a `-`.
+    pub next_slot_id: u32,
 
     /// First-run model picker state; `Some` while in `AppMode::ModelPicker`.
     pub picker: Option<PickerState>,
@@ -507,6 +517,9 @@ impl App {
             rt,
             slots: Self::fresh_slots(),
             focused_slot: SlotId(1),
+            // Slot 1 was created by `fresh_slots()`. The next id we
+            // hand out is 2.
+            next_slot_id: 2,
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
@@ -584,14 +597,13 @@ impl App {
 
     // -- Slot helpers -------------------------------------------------------
 
-    /// Build the initial three empty slots. IDs start at 1 so the
-    /// visible `[1] [2] [3]` labels (one-based) match `SlotId.0`
-    /// directly. Stable for the app's lifetime — `n` (Phase B) will
-    /// append new slots without renumbering.
+    /// Build the initial slot Vec. The TUI starts with a single empty
+    /// slot (id 1) — the user expands the workspace with `+`. The
+    /// id is stable across the app's lifetime: appended slots get
+    /// fresh ids from `next_slot_id`, never renumbering the existing
+    /// ones, so any handle a caller is holding stays valid.
     fn fresh_slots() -> Vec<Slot> {
-        (1..=MAX_SECTIONS as u32)
-            .map(|i| Slot::empty(SlotId(i)))
-            .collect()
+        vec![Slot::empty(SlotId(1))]
     }
 
     /// Look up a slot's current Vec index from its stable id. Returns
@@ -1041,12 +1053,60 @@ impl App {
         }
     }
 
-    /// Pick the lowest-id free slot, or `None` if all are running.
+    /// Pick the first Empty slot, or `None` if every existing slot
+    /// is busy. Callers that need to grow past `len()` should call
+    /// `add_slot` instead — this stays narrow on purpose.
     pub fn next_free_slot(&self) -> Option<SlotId> {
         self.slots
             .iter()
             .find(|s| matches!(s.kind, SlotKind::Empty))
             .map(|s| s.id)
+    }
+
+    /// Append a new empty slot to the workspace and focus it.
+    /// Returns the new slot's id. Refuses (and returns `None`) when
+    /// the slot count is already at `MAX_SECTIONS` — the cap exists
+    /// to keep the screen readable, not as a feature limitation.
+    pub fn add_slot(&mut self) -> Option<SlotId> {
+        if self.slots.len() >= MAX_SECTIONS {
+            return None;
+        }
+        let id = SlotId(self.next_slot_id);
+        self.next_slot_id += 1;
+        self.slots.push(Slot::empty(id));
+        self.focused_slot = id;
+        Some(id)
+    }
+
+    /// Remove the focused slot. Refuses (returns `false`) when the
+    /// focused slot is currently recording — the user must `s`top
+    /// the section first to avoid orphaning a tokio task. Also
+    /// refuses when only one slot is left (the TUI always shows
+    /// at least one slot).
+    pub fn remove_focused_slot(&mut self) -> bool {
+        if self.slots.len() <= 1 {
+            return false;
+        }
+        let id = self.focused_slot;
+        let pos = match self.slot_index(id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
+            return false;
+        }
+        self.slots.remove(pos);
+        // If the focused slot also had a pending target override,
+        // drop it — the slot id is gone from the Vec and we don't
+        // want the override to silently re-apply to a future slot.
+        self.pending_target_overrides.remove(&id);
+        // Land focus on the nearest remaining slot. Prefer the slot
+        // to the left of the removed one, else the new rightmost.
+        let new_idx = if pos > 0 { pos - 1 } else { 0 };
+        if let Some(s) = self.slots.get(new_idx) {
+            self.focused_slot = s.id;
+        }
+        true
     }
 
     /// Refresh both panes' inventory. Preserves cursors by name when the
@@ -1231,6 +1291,82 @@ impl App {
     /// the user has cleared the selection or no apps are available.
     pub fn focused_app(&self) -> Option<&AppSession> {
         self.selected_app_index.and_then(|i| self.apps.get(i))
+    }
+
+    /// Row index of the device currently picked for the focused slot.
+    /// The picker is always pinned to the slot that's recording (or
+    /// about to record), so this matches what `start_section` will
+    /// consume. Falls back to the last-saved device from config when
+    /// the slot has never been started — that's still "picked" from
+    /// the user's perspective.
+    pub fn picked_device_idx(&self) -> Option<usize> {
+        // First preference: the live cursor.
+        if let Some(d) = self.focused_device() {
+            // Re-resolve by name+kind so the row survives a `r`efresh
+            // that reordered the inventory.
+            if let Some(saved) = self.config.input_device.as_deref() {
+                if d.name == saved
+                    && Some(d.kind) == self.config.input_device_kind
+                {
+                    return Some(self.selected_device_index);
+                }
+            }
+            return Some(self.selected_device_index);
+        }
+        // Fallback: the saved device from config.
+        if let Some(name) = self.config.input_device.clone() {
+            let kind = self.config.input_device_kind;
+            if let Some(i) = self
+                .devices
+                .iter()
+                .position(|d| d.name == name && Some(d.kind) == kind)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Picked-app row index in the rendered Apps list. Accounts for
+    /// the synthetic "(no app — device only)" row that sits at
+    /// visible row 0 of the pane — the apps Vec itself starts at 0
+    /// but the first rendered row is the synthesis. So:
+    /// `None` → no opinion yet (no app saved, none focused),
+    /// `Some(0)` → (no app) is picked,
+    /// `Some(k+1)` → app[k] is picked.
+    pub fn picked_app_idx(&self) -> Option<usize> {
+        if let Some(i) = self.selected_app_index {
+            // +1 to skip the synthetic "no app" row at the top of
+            // the pane.
+            return Some(i + 1);
+        }
+        if let Some(id) = self.config.last_app_id.as_deref() {
+            if let Some(i) = self.apps.iter().position(|a| a.id == id) {
+                return Some(i + 1);
+            }
+        }
+        // (no app) is the default — surface it as row 0.
+        if !self.apps.is_empty() {
+            return Some(0);
+        }
+        None
+    }
+
+    /// Picked-target kind for the focused slot. Falls through to
+    /// the last-saved target if no pending override is queued. The
+    /// Targets pane uses this to mark the active row.
+    pub fn picked_target_kind(&self) -> Option<TargetKind> {
+        let t = self
+            .pending_target_overrides
+            .get(&self.focused_slot)
+            .cloned()
+            .or_else(|| self.focused_target())
+            .unwrap_or(Target::Stdout);
+        Some(match t {
+            Target::Stdout => TargetKind::Stdout,
+            Target::Cloud => TargetKind::Cloud,
+            Target::Omp { .. } => TargetKind::Omp,
+        })
     }
 
     /// Get current audio level

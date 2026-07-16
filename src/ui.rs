@@ -121,9 +121,30 @@ pub fn render(f: &mut Frame, app: &App) {
 /// render path already iterates the Vec directly.
 fn render_sections(f: &mut Frame, area: Rect, app: &App) {
     let n = app.slots.len();
+    // Weight the layout so the focused slot gets 2 horizontal parts
+    // and every other slot gets 1. With 1 slot this is moot; with 2
+    // the focused pane claims ~65% of the row, with 3 it's ~50%;
+    // all of those keep the dynamic "[N] <device> + <app> → <tgt>"
+    // title from ellipsizing on the slot the user is editing.
+    // Equal split is reserved for slot counts above the focused
+    // weight so unfocused slots stay readable.
+    let constraints: Vec<Constraint> = if n <= 1 {
+        vec![Constraint::Ratio(1, 1)]
+    } else {
+        app.slots
+            .iter()
+            .map(|s| {
+                if s.id == app.focused_slot {
+                    Constraint::Ratio(2, 1)
+                } else {
+                    Constraint::Ratio(1, 1)
+                }
+            })
+            .collect()
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, n as u32); n])
+        .constraints(constraints)
         .split(area);
     for (i, slot) in app.slots.iter().enumerate() {
         render_section_column(f, cols[i], app, slot);
@@ -700,6 +721,11 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
 
     let focused = app.picker_focus == PickerFocus::Targets;
     let rows = app.targets();
+    // The row that's actually wired to the focused slot's
+    // pending-or-last target. Highlights survive the pane's focus
+    // state — even when Targets isn't focused, the user can see
+    // which row is the live choice.
+    let picked = app.picked_target_kind();
 
     let title = if focused {
         " Targets ▸ [↑/↓] pick  [←] apps  [Enter] start "
@@ -718,28 +744,35 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, row)| {
             let is_cursor = i == app.selected_target_index.unwrap_or(0) && focused;
+            let is_picked = picked == Some(row.kind) && !row.disabled;
             let marker = if is_cursor { "▶ " } else { "  " };
             let (label, style, hint) = target_row_style(row.kind, row.disabled);
-            // When the row is the focused slot's *current* target
-            // (last start, no pending override) we tag it as the
-            // active pick with a small "[active]" suffix. The pending
-            // override is shown via the top banner, not here — keeps
-            // the row itself stable.
-            let active = app
-                .focused_target()
-                .map(|t| match (t, row.kind) {
-                    (voice_bird_cli::session::target::Target::Stdout, TargetKind::Stdout) => true,
-                    (voice_bird_cli::session::target::Target::Cloud, TargetKind::Cloud) => true,
-                    (voice_bird_cli::session::target::Target::Omp { .. }, TargetKind::Omp) => true,
-                    _ => false,
-                })
-                .unwrap_or(false);
-            let active_tag = if active { "  (active)" } else { "" };
+            // The picked row gets its base color bumped to Yellow
+            // (the rest of the picker uses Green / Magenta / Cyan
+            // per target kind) plus the BOLD modifier. Cursor row
+            // wins on the invert to stay readable.
+            let label_style = if is_cursor {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            let picked_tag = if is_picked {
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("")
+            };
             Line::from(vec![
                 Span::raw(marker),
-                Span::styled(label, style),
+                Span::styled(label, label_style),
                 Span::styled(hint, Style::default().fg(Color::DarkGray)),
-                Span::styled(active_tag, Style::default().fg(Color::DarkGray)),
+                picked_tag,
             ])
         })
         .collect();
@@ -797,8 +830,7 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
     use crate::platform::AudioSessionKind;
 
     let focused = app.picker_focus == PickerFocus::Devices;
-    let saved = app.config.input_device.as_deref();
-    let saved_kind = app.config.input_device_kind;
+    let picked = app.picked_device_idx();
 
     let title = if focused {
         " Devices ▸ [↑/↓] select  [→] apps  [Enter] start "
@@ -827,31 +859,51 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, d)| {
             let is_cursor = i == app.selected_device_index && focused;
+            let is_picked = picked == Some(i);
             let marker = if is_cursor { "▶ " } else { "  " };
             let kind_tag = match d.kind {
                 AudioSessionKind::Input => {
                     Span::styled(" [input] ", Style::default().fg(Color::Cyan))
                 }
                 AudioSessionKind::Output => {
-                    Span::styled(" [output/loopback] ", Style::default().fg(Color::Magenta))
+                    Span::styled(
+                        " [output/loopback] ",
+                        Style::default().fg(Color::Magenta),
+                    )
                 }
                 AudioSessionKind::App => Span::styled(" [app] ", Style::default().fg(Color::Green)),
             };
-            let is_saved = Some(d.name.as_str()) == saved && saved_kind == Some(d.kind);
-            let saved_tag = if is_saved { "  (saved)" } else { "" };
+            // Picked rows glow yellow regardless of focus state —
+            // they're the rows the focused slot is actually routed
+            // to. The cursor row uses a white-on-black invert for
+            // contrast; non-cursor picked rows just get the color
+            // bump so it doesn't fight the focus invert.
             let name_style = if is_cursor {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if is_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
+            };
+            // "●" pin appears only on the row that's pinned to the
+            // slot. It survives the focus state of this pane —
+            // users looking at Apps or Targets can still see what
+            // the device choice is.
+            let picked_tag = if is_picked {
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("")
             };
             Line::from(vec![
                 Span::raw(marker),
                 Span::styled(d.name.clone(), name_style),
                 kind_tag,
-                Span::styled(saved_tag, Style::default().fg(Color::DarkGray)),
+                picked_tag,
             ])
         })
         .collect();
@@ -869,6 +921,7 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.picker_focus == PickerFocus::Apps;
+    let picked = app.picked_app_idx();
 
     let title = if focused {
         " Apps ▸ [↑/↓] pick  [Space] none  [←] devices  [→] targets "
@@ -897,36 +950,61 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // First row is the synthetic "(no app — device only)" entry. It's
-    // rendered visually but isn't selectable via the apps cursor — Space
-    // is the way to land on it.
+    // First row is the synthetic "(no app — device only)" entry at
+    // visible row 0. The apps Vec itself starts at 0 but the
+    // rendered pane front-loads this row, so cursor/picked indices
+    // shift by +1 throughout.
     let mut items: Vec<Line> = Vec::with_capacity(app.apps.len() + 1);
+    let none_picked = picked == Some(0);
     let none_active = app.selected_app_index.is_none() && focused;
     let none_marker = if none_active { "▶ " } else { "  " };
+    let none_picked_tag = if none_picked {
+        Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
     items.push(Line::from(vec![
         Span::raw(none_marker),
         Span::styled(
             "(no app — device only)",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            if none_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::ITALIC | Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            },
         ),
+        none_picked_tag,
     ]));
 
     for (i, a) in app.apps.iter().enumerate() {
         let is_cursor = Some(i) == app.selected_app_index && focused;
+        let is_picked = picked == Some(i + 1);
         let marker = if is_cursor { "▶ " } else { "  " };
         let name_style = if is_cursor {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD)
+        } else if is_picked {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
+        };
+        let picked_tag = if is_picked {
+            Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("")
         };
         items.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(a.name.clone(), name_style),
+            picked_tag,
         ]));
     }
 
@@ -1121,6 +1199,8 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[Space]", "no app"),
                 hotkey_line("[Enter]", "start"),
                 hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[+]", "add slot"),
+                hotkey_line("[-]", "remove slot"),
                 hotkey_line("[r]", "refresh"),
                 hotkey_line("[c]", cloud_key_label),
                 hotkey_line("[l]", "language"),
@@ -1148,6 +1228,8 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[←/→]", "pane"),
                 hotkey_line("[Enter]", "add"),
                 hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[+]", "add slot"),
+                hotkey_line("[-]", "remove slot"),
                 hotkey_line("[s]", "stop"),
                 hotkey_line("[S]", "stop all"),
                 hotkey_line("[c]", cloud_key_label),
@@ -1426,12 +1508,18 @@ mod tests {
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
 
-    /// Three section columns render side-by-side with empty placeholders
-    /// when no sections are running. Each column shows its slot number
-    /// in the title.
+    /// The workspace starts at 1 slot. Expanding with `+` adds
+    /// additional slots; each column carries its slot number in
+    /// the title. The empty-slot placeholder still shows when
+    /// nothing is recording.
     #[test]
     fn three_section_columns_show_empty_placeholders() {
-        let app = App::new();
+        let mut app = App::new();
+        // App::new() ships one slot; the user opts in to more
+        // with `+`. Verifying that *three* columns render means
+        // expanding twice first.
+        app.add_slot();
+        app.add_slot();
         let out = render_to_string(&app, 180, 40);
         assert!(out.contains("[1]"), "slot 1 title missing:\n{out}");
         assert!(out.contains("[2]"), "slot 2 title missing:\n{out}");
@@ -1511,39 +1599,81 @@ mod tests {
 
     #[test]
     fn key_sidebar_shows_all_idle_hotkeys_at_normal_height() {
+        // Wide-enough to render the full idle sidebar: the static
+        // list now includes the +/- workspace controls plus the
+        // local-only m/e/p lines plus the optional /mcp hint. We
+        // give the pane 26 rows of inner space.
         let app = App::new();
-        // 36 rows is enough for all idle hotkeys including the omp
-        // hint at normal heights. The exact height matters less
-        // than that the keys the user always reaches for (Tab,
-        // Enter, c, l, m, q, ?) are present.
-        let out = render_to_string(&app, 160, 36);
+        let out = render_to_string(&app, 160, 50);
+        // The hotkey sidebar guarantees the keys the user reaches
+        // for are present. The set is wide enough to catch
+        // regressions in the static list (e.g. a dropped `[Tab]`
+        // The idle branch must list every key the user can press
+        // when no section is recording. Recording-only keys
+        // ([s]top, [x]clear, …) live on the `(true, _)` branch.
         for key in [
             "[↑/↓]",
             "[←/→]",
             "[Space]",
             "[Enter]",
             "[Tab]",
+            // The +/- workspace controls are always rendered —
+            // short-circuit the test when the static list drops
+            // them.
+            "[+]",
+            "[-]",
             "[r]",
             "[c]",
             "[l]",
-            // The omp hotkeys only render when the binary is on
-            // disk. App::new() ran detect() at construction.
-            // Removed: "[O]" cycle key (replaced by the Targets pane
-            // — see `targets_pane_lists_stdout_cloud_omp_in_order`).
             "/mcp",
-            "[x]",
         ] {
+            assert!(out.contains(key), "idle key {key} missing from sidebar:\n{out}");
         }
     }
-    /// targeted assertions above already cover behaviour; this is a
-    /// plain `cargo test` snapshot to keep manual review cheap.
+    /// Expanding the workspace shows the new slot number in the
+    /// title once the column renders. Useful to prevent regressions
+    /// in `fresh_slots` / `next_slot_id` — the title `[2]` only
+    /// appears if the second slot's id is 2.
+    #[test]
+    fn add_slot_creates_distinct_numbered_columns() {
+        let mut app = App::new();
+        let id_a = app.add_slot();
+        let id_b = app.add_slot();
+        assert!(matches!(id_a, Some(crate::app::SlotId(2))));
+        assert!(matches!(id_b, Some(crate::app::SlotId(3))));
+        let out = render_to_string(&app, 180, 40);
+        assert!(out.contains("[1]"), "slot 1 missing:\n{out}");
+        assert!(out.contains("[2]"), "slot 2 missing:\n{out}");
+        assert!(out.contains("[3]"), "slot 3 missing:\n{out}");
+    }
+    /// End-to-end visual smoke: drive a realistic state, write the
+    /// rendered layout to `target/snapshot-idle.txt`. Powers the
+    /// `snapshot_idle_layout_for_visual_review` workflow — useful
+    /// to catch layout regressions in the picker shape, the slot
+    /// row, the sidebar, and the picked-pin highlights at a
+    /// glance.
     #[test]
     fn snapshot_idle_layout_for_visual_review() {
         let mut app = App::new();
         app.devices = vec![
             input("MacBook Pro Microphone"),
-            input("BlackHole 2ch"),
+            output("Mac mini Speakers"),
+            output("EPOS PC 8 USB"),
+            input("HD Pro Webcam C920"),
         ];
+        app.apps = vec![
+            fake_app("chrome", "Google Chrome"),
+            fake_app("zoom", "Zoom"),
+            fake_app("terminal", "Terminal"),
+        ];
+        // Cursor lands on a non-trivial row; cursor + picked are
+        // intentionally different so the test exercises both
+        // branches.
+        app.selected_device_index = 2;
+        app.selected_app_index = Some(1);
+        app.selected_target_index = Some(1); // Cloud
+        // Pretend a previous start installed an Omp session id, so
+        // the Omp row stays pickable but isn't the picked one.
         let out = render_to_string(&app, 180, 40);
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")

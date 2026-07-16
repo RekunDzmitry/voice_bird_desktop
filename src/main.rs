@@ -466,6 +466,54 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 log::info!("keys: Space → cleared app selection");
             }
         }
+        // `+` / `-` grow or shrink the slot workspace. `+` is
+        // disabled when at `MAX_SECTIONS` slots (workspace cap);
+        // `-` is disabled on a single-slot workspace or when the
+        // focused slot is recording (the user must `s`top it
+        // first — keeps the runtime cleanly disposed).
+        KeyCode::Char('+') | KeyCode::Char('=') => match app.add_slot() {
+            Some(id) => {
+                log::info!("keys: + → added slot {id}");
+            }
+            None => {
+                app.banner = Some(format!(
+                    "Already at the max of {} slots — remove one with [-] first",
+                    crate::app::MAX_SECTIONS
+                ));
+                log::info!(
+                    "keys: + → refused (at MAX_SECTIONS = {})",
+                    crate::app::MAX_SECTIONS
+                );
+            }
+        },
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if app.remove_focused_slot() {
+                log::info!(
+                    "keys: - → removed focused slot; now {} slot(s)",
+                    app.slots.len()
+                );
+            } else {
+                // Either only one slot left, or the focused one is
+                // recording. Surface a banner so the user knows
+                // which (and what to do).
+                let recording = app
+                    .slot_index(app.focused_slot)
+                    .map(|i| {
+                        matches!(
+                            app.slots[i].kind,
+                            crate::app::SlotKind::Recording { .. }
+                        )
+                    })
+                    .unwrap_or(false);
+                let msg = if recording {
+                    "Stop the recording with [s] before removing the slot".into()
+                } else {
+                    "At least one slot must remain — no slot to remove".into()
+                };
+                app.banner = Some(msg);
+                log::info!("keys: - → refused ({})", app.banner.as_deref().unwrap_or("?"));
+            }
+        }
         KeyCode::Enter => {
             // When the Targets pane is focused, Enter first applies
             // the picked target to the focused slot's
