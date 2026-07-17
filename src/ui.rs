@@ -808,12 +808,12 @@ fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, St
             "  (not installed)".into(),
         )
     } else {
+        // Omp is rendered the same as Stdout / Cloud — no
+        // trailing hint, same row geometry. The disabled
+        // case (above) carries the "(not installed)" hint
+        // since the row exists but can't be picked.
         let s = Style::default().fg(base_color).add_modifier(Modifier::BOLD);
-        let hint = match kind {
-            TargetKind::Omp => "  → local segments",
-            _ => "",
-        };
-        (label.into(), s, hint.into())
+        (label.into(), s, String::new())
     }
 }
 
@@ -1577,13 +1577,32 @@ mod tests {
         assert_eq!(style.fg, Some(Color::DarkGray));
         assert!(hint.contains("not installed"));
     }
+    /// When Omp is enabled, the row is rendered with the same
+    /// shape as Stdout / Cloud — no trailing hint text, so the
+    /// three rows share identical geometry and the pin glyph
+    /// ends up in the same column.
     #[test]
     fn target_row_style_omp_is_cyan_when_enabled() {
         use crate::app::TargetKind;
-        let (label, style, _hint) = target_row_style(TargetKind::Omp, false);
+        let (label, style, hint) = target_row_style(TargetKind::Omp, false);
         assert_eq!(label, "Omp");
         assert_eq!(style.fg, Some(Color::Cyan));
         assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            hint, "",
+            "enabled Omp must not carry a trailing hint"
+        );
+    }
+    /// Enabled Stdout / Cloud also carry no hint — pinning
+    /// the invariant that all three picker rows share a
+    /// single shape so the pin column lands identically.
+    #[test]
+    fn target_row_style_stdout_cloud_have_no_hint() {
+        use crate::app::TargetKind;
+        for k in [TargetKind::Stdout, TargetKind::Cloud] {
+            let (_label, _style, hint) = target_row_style(k, false);
+            assert_eq!(hint, "", "enabled {:?} must not carry a trailing hint", k);
+        }
     }
     /// Idle key sidebar shows the new Tab/cfg keys.
     #[test]
