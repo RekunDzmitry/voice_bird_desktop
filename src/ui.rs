@@ -1794,31 +1794,22 @@ mod tests {
             out.contains(&pinned_text)
         };
         // ---- Step 1: + adds a second slot ----
+        // focus_next / focus_prev cycle through every slot
+        // including Empty — the user can press Tab or
+        // Shift-Tab between slots regardless of whether a
+        // recording has started there yet.
         let added = app.add_slot();
         assert_eq!(added, Some(crate::app::SlotId(2)));
         assert_eq!(app.slots.len(), 2);
         // `add_slot` advances focused_slot to the new slot.
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        // Promote slot 2 to a Saved recording on Stdout so
-        // the Tab / Shift-Tab navigation in steps 2 and 3
-        // actually crosses slots — focus_next / focus_prev
-        // skip Empty slots, so the user's "move back and
-        // forth" only works once both slots hold something.
-        // The reproduce mirrors the state they would have
-        // after pressing Enter on each slot's picker.
-        app.slots[1] = crate::app::Slot {
-            id: crate::app::SlotId(2),
-            kind: SlotKind::Saved {
-                saved: SavedTranscript {
-                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    label: "EPOS PC 8 USB + Chrome -> Stdout".into(),
-                    target: Target::Stdout,
-                },
-            },
-        };
-        // Per-slot targets: slot 1 → Cloud, slot 2 → Stdout.
-        // Device + App cursors are global.
+        // Empty slot 2 picks fall back to the global
+        // cursor positions (Device, App) and the
+        // per-slot Stdout default (Target). Device +
+        // App keep their previous state because the
+        // user hasn't interacted with those panes;
+        // Target falls back to Stdout because slot 2
+        // has no recording and no pending override.
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1));
         assert_eq!(

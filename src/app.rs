@@ -1018,38 +1018,28 @@ impl App {
         }
     }
 
-    /// Cycle the focused section forward (Tab). Wraps from slot 2 → 0.
-    /// Cycle the focused section forward (Tab). Skips Empty slots so
-    /// focus lands on the first slot with a section (Recording or
-    /// Saved). When the focused slot is empty, jumps to the first
-    /// populated one. Wraps around the end of the slot list.
+    /// Cycle the focused slot forward (Tab). Pure positional
+    /// cycling — every slot, including Empty, is reachable.
+    /// Empty slots land the picker on a focused but unstarted
+    /// slot so the user can press Enter to start a recording
+    /// or `pick_target` to queue a routing override without
+    /// having to click into the column first.
+    /// Wraps from the last slot back to the first.
     pub fn focus_next(&mut self) {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
-            for off in 1..=n {
-                let next_idx = (idx + off) % n;
-                let next_id = self.slots[next_idx].id;
-                if !matches!(self.slots[next_idx].kind, SlotKind::Empty) || off == n {
-                    self.focused_slot = next_id;
-                    return;
-                    }
-            }
+            let next_idx = (idx + 1) % n;
+            self.focused_slot = self.slots[next_idx].id;
         }
     }
 
-    /// Cycle the focused section backward (Shift-Tab). Same skip-empty
-    /// behaviour as [`focus_next`].
+    /// Cycle the focused slot backward (Shift-Tab). Mirrors
+    /// [`focus_next`] — every slot, no skipping.
     pub fn focus_prev(&mut self) {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
-            for off in 1..=n {
-                let prev_idx = (idx + n - off) % n;
-                let prev_id = self.slots[prev_idx].id;
-                if !matches!(self.slots[prev_idx].kind, SlotKind::Empty) || off == n {
-                    self.focused_slot = prev_id;
-                    return;
-                    }
-            }
+            let prev_idx = (idx + n - 1) % n;
+            self.focused_slot = self.slots[prev_idx].id;
         }
     }
 
