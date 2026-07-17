@@ -1681,4 +1681,230 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &out).unwrap();
     }
+    /// Multi-slot round-trip — drove directly from a reported
+    /// scenario: user starts a recording on slot 1, adds a second
+    /// slot with `+`, navigates back to slot 1 with Shift-Tab,
+    /// navigates forward to slot 2 with Tab. Each focus step must
+    /// (a) succeed without surprising state, (b) keep the device,
+    /// app, and target picked-row pins in the picker pointing at
+    /// the *focused* slot's pick.
+    #[test]
+    fn multi_slot_round_trip_keeps_picked_pins_on_focused_slot() {
+        use crate::app::{RecordingStatus, SavedTranscript, SlotKind};
+        use crate::platform::{AudioDevice, AudioSessionKind};
+        use std::sync::Arc;
+        use voice_bird_cli::session::target::Target;
+
+        let mut app = App::new();
+        // Cloud is always pickable (doesn't depend on the user's
+        // local `omp` install). Pick that as the per-slot
+        // target so the test stays portable across machines.
+        // Seed the picker state so each pane is non-trivial —
+        // otherwise the picked pin would land on a single
+        // vacant row and the test wouldn't catch ordering bugs.
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "Mac mini Speakers".into(),
+                kind: AudioSessionKind::Output,
+            },
+            AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: AudioSessionKind::Output,
+            },
+        ];
+        app.apps = vec![
+            fake_app("chrome", "Google Chrome"),
+            fake_app("zoom", "Zoom"),
+            fake_app("terminal", "Terminal"),
+        ];
+        app.selected_device_index = 2; // EPOS PC 8 USB
+        app.selected_app_index = Some(0); // Chrome
+        app.selected_target_index = Some(1); // Cloud (cursor)
+        // slot 1 starts as the only slot (id 1). Mark it as a
+        // saved recording on Cloud so the device + target pick
+        // are non-default. Bypassing `start_section` keeps the
+        // test free of audio / cpal / tokio runtime needs.
+        let saved_target = Target::Cloud;
+        app.slots[0] = crate::app::Slot {
+            id: crate::app::SlotId(1),
+            kind: SlotKind::Saved {
+                saved: SavedTranscript {
+                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    label: "EPOS PC 8 USB + Chrome -> Cloud".into(),
+                    target: saved_target.clone(),
+                },
+            },
+        };
+        // Move focus explicitly to slot 1 (already is, by
+        // construction).
+        app.focused_slot = crate::app::SlotId(1);
+        app.status = RecordingStatus::Idle;
+
+        // ---- Step 0: focus on slot 1 ----
+        // Confirm we start on slot 1 and the picks resolve to
+        // the right rows in every pane.
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1)); // Chrome at apps[0] + synthetic offset 1
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud)
+        );
+        let out0 = render_to_string(&app, 180, 40);
+        // The picked Device row ('EPOS PC 8 USB' at index 2)
+        // must glow yellow + carry the '●' pin. Each
+        // non-cursor device row appears once in the rendered
+        // buffer — counting '●' against the picker tells us
+        // if more than one row picked up the pin.
+        assert!(
+            out0.lines().any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
+            "slot-1 step 0: device row missing '●' pin:\n{out0}"
+        );
+        assert!(
+            out0.lines().any(|l| l.contains("Chrome") && l.contains('●')),
+            "slot-1 step 0: app row missing '●' pin:\n{out0}"
+        );
+        // Helper: locate a Targets-pane row by its label and
+        // report whether the row carries the trailing '●' pin.
+        // Anchors on the row's coordinate markers
+        // ('││  ' header, '│' footer, no '→' arrow) so the
+        // top border / slot title / side-panel cells don't
+        // sneak in.
+        // Helper: locate a Targets-pane row by its label and
+        // report whether the row carries the trailing '●' pin.
+        // The TestBackend pads every line to the column width
+        // with spaces, so a row filter should anchor on the
+        // column-start marker '││  ' and the row's label, not
+        // on '│' (the right border, which is followed by
+        // trailing spaces). Trim trailing whitespace after the
+        // Each rendered row in the Targets pane reads as
+        // "Label [hint] [●]" with one trailing pin. The
+        // TestBackend flattens every pane into one 180-wide
+        // line, so a pin search is the most reliable
+        // verification — substring "Label ●" matches the
+        // exact row we care about without dragging in
+        // neighbour panes.
+        let target_pin_present = |out: &str, label: &str| -> bool {
+            let pinned_text = format!("{label} \u{25CF}");
+            out.contains(&pinned_text)
+        };
+        // ---- Step 1: + adds a second slot ----
+        let added = app.add_slot();
+        assert_eq!(added, Some(crate::app::SlotId(2)));
+        assert_eq!(app.slots.len(), 2);
+        // `add_slot` advances focused_slot to the new slot.
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        // Promote slot 2 to a Saved recording on Stdout so
+        // the Tab / Shift-Tab navigation in steps 2 and 3
+        // actually crosses slots — focus_next / focus_prev
+        // skip Empty slots, so the user's "move back and
+        // forth" only works once both slots hold something.
+        // The reproduce mirrors the state they would have
+        // after pressing Enter on each slot's picker.
+        app.slots[1] = crate::app::Slot {
+            id: crate::app::SlotId(2),
+            kind: SlotKind::Saved {
+                saved: SavedTranscript {
+                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    label: "EPOS PC 8 USB + Chrome -> Stdout".into(),
+                    target: Target::Stdout,
+                },
+            },
+        };
+        // Per-slot targets: slot 1 → Cloud, slot 2 → Stdout.
+        // Device + App cursors are global.
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Stdout)
+        );
+        let out1 = render_to_string(&app, 180, 40);
+        assert!(
+            target_pin_present(&out1, "Stdout"),
+            "step 1: Stdout must be pinned on slot 2:\n{out1}"
+        );
+        assert!(
+            !target_pin_present(&out1, "Cloud"),
+            "step 1: Cloud must NOT leak from slot 1 to slot 2:\n{out1}"
+        );
+        assert!(out1.contains("[1]"), "slot 1 title missing:\n{out1}");
+        assert!(out1.contains("[2]"), "slot 2 title missing:\n{out1}");
+
+        // ---- Step 2: focus_prev takes us back to slot 1 ----
+        app.focus_prev();
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "back on slot 1: picked target should be Cloud again"
+        );
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1));
+        let out2 = render_to_string(&app, 180, 40);
+        // Returning to slot 1 must re-pin Cloud on Targets
+        // — and must NOT leave Stdout pinned.
+        assert!(
+            target_pin_present(&out2, "Cloud"),
+            "back on slot 1: Cloud must be pinned:\n{out2}"
+        );
+        assert!(
+            !target_pin_present(&out2, "Stdout"),
+            "back on slot 1: Stdout must not be pinned:\n{out2}"
+        );
+
+        // ---- Step 3: focus_next takes us back to slot 2 ----
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        // Empty slot 2 falls back to defaults again — the
+        // pending override from Step 0 hasn't been touched yet.
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Stdout),
+            "forward on slot 2: picked target should be Stdout fallback"
+        );
+        let out3 = render_to_string(&app, 180, 40);
+        assert!(
+            target_pin_present(&out3, "Stdout"),
+            "back on slot 2: Stdout must be pinned:\n{out3}"
+        );
+        assert!(
+            !target_pin_present(&out3, "Cloud"),
+            "back on slot 2: Cloud must not be pinned:\n{out3}"
+        );
+
+        // ---- Bonus: queue a pending Cloud pick on slot 2
+        // and verify the override is per-slot. ----
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            Target::Cloud,
+        );
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "after queueing Cloud on slot 2, target picks Cloud"
+        );
+        app.focus_prev();
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        // Slot 1's pick is independent of slot 2's pending
+        // override: still Cloud (last saved).
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "slot 1 must keep its own target pick across slot 2's override"
+        );
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "slot 2 picks Cloud back after forward navigation"
+        );
+    }
 }
