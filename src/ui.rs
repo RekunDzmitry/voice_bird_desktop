@@ -764,7 +764,7 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
                 style
             };
             let picked_tag = if is_picked {
-                Span::styled(" ▶", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
                 Span::raw("")
             };
@@ -895,7 +895,7 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
             // users looking at Apps or Targets can still see what
             // the device choice is.
             let picked_tag = if is_picked {
-                Span::styled(" ▶", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
                 Span::raw("")
             };
@@ -959,7 +959,7 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
     let none_active = app.selected_app_index.is_none() && focused;
     let none_marker = if none_active { "▶ " } else { "  " };
     let none_picked_tag = if none_picked {
-        Span::styled(" ▶", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
         Span::raw("")
     };
@@ -997,7 +997,7 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let picked_tag = if is_picked {
-            Span::styled(" ▶", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         } else {
             Span::raw("")
         };
@@ -1052,7 +1052,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let timer = app.format_duration();
     let status = match &app.status {
         RecordingStatus::Idle => "idle",
-        RecordingStatus::Recording => "▶ REC",
+        RecordingStatus::Recording => "● REC",
         RecordingStatus::Error(_) => "ERROR",
     };
     let device_label = app
@@ -1762,12 +1762,12 @@ mod tests {
         // buffer — counting '●' against the picker tells us
         // if more than one row picked up the pin.
         assert!(
-            out0.lines().any(|l| l.contains("EPOS PC 8 USB") && l.contains('\u{25B6}')),
-            "slot-1 step 0: device row missing '▶' pin:\n{out0}"
+            out0.lines().any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
+            "slot-1 step 0: device row missing '●' pin:\n{out0}"
         );
         assert!(
-            out0.lines().any(|l| l.contains("Chrome") && l.contains('\u{25B6}')),
-            "slot-1 step 0: app row missing '▶' pin:\n{out0}"
+            out0.lines().any(|l| l.contains("Chrome") && l.contains('●')),
+            "slot-1 step 0: app row missing '●' pin:\n{out0}"
         );
         // Helper: locate a Targets-pane row by its label and
         // report whether the row carries the trailing '●' pin.
@@ -1790,7 +1790,7 @@ mod tests {
         // exact row we care about without dragging in
         // neighbour panes.
         let target_pin_present = |out: &str, label: &str| -> bool {
-            let pinned_text = format!("{label} \u{25B6}");
+            let pinned_text = format!("{label} \u{25CF}");
             out.contains(&pinned_text)
         };
         // ---- Step 1: + adds a second slot ----
