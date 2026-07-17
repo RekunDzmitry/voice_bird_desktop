@@ -63,13 +63,13 @@ logs/
 dist/
 debug.log
 errors.log
+dbg.log
 screenshots/
 
 # Personal agent/editor state
 .claude/
 .obsidian/
-
-# Generated schemas
+.serena/
 /gen/
 
 # macOS code-signing resources for the packaged CLI app
