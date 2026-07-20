@@ -21,11 +21,15 @@ pub enum Target {
     /// `transcript.*` files; the API key in `config.toml` is used for
     /// authentication.
     Cloud,
-    /// Transcript segments are pushed into the user's oh-my-pi (omp)
-    /// session via MCP stdio JSON-RPC. The session id is opaque
-    /// today (`OmpSessionId::default_session()` for the single App
+    /// Transcript segments are pushed into the user's agent
+    /// session (today: oh-my-pi / omp) via MCP stdio JSON-RPC.
+    /// The session id is opaque today
+    /// (`AgentSessionId::default_session()` for the single App
     /// process); multi-session support is left for Phase B.
-    Omp { session_id: String },
+    /// The user-facing label is "Agent" so the picker reads
+    /// as a generic routing choice rather than tying itself
+    /// to the current MCP-backed runtime.
+    Agent { session_id: String },
 }
 
 impl Default for Target {
@@ -37,9 +41,9 @@ impl Default for Target {
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Target::Agent { .. } => f.write_str("Agent"),
             Target::Stdout => f.write_str("Stdout"),
             Target::Cloud => f.write_str("Cloud"),
-            Target::Omp { .. } => f.write_str("Omp"),
         }
     }
 }
@@ -58,8 +62,8 @@ mod tests {
         assert_eq!(Target::Stdout.to_string(), "Stdout");
         assert_eq!(Target::Cloud.to_string(), "Cloud");
         assert_eq!(
-            Target::Omp { session_id: "x".into() }.to_string(),
-            "Omp"
+            Target::Agent { session_id: "x".into() }.to_string(),
+            "Agent"
         );
     }
 
@@ -72,7 +76,7 @@ mod tests {
 
     #[test]
     fn target_round_trips_omp_session_id() {
-        let original = Target::Omp {
+        let original = Target::Agent {
             session_id: "abc".into(),
         };
         let json = serde_json::to_string(&original).unwrap();

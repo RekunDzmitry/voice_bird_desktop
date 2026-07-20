@@ -1,14 +1,15 @@
 //! Add / remove the voice-bird entry in `~/.omp/agent/mcp.json`.
 //!
-//! omp 16.3.11 reads this file at startup and spawns each `command`
-//! under `mcpServers` as a stdio MCP server. We register one server
-//! per voice-bird App under the name `voice-bird`; omp then surfaces
-//! our tools as `mcp__voice-bird__push_segment` etc. in the agent's
-//! tool list.
+//! Today's runtime is `oh-my-pi` (omp) 16.3.11, which reads this
+//! file at startup and spawns each `command` under `mcpServers`
+//! as a stdio MCP server. We register one server per voice-bird
+//! App under the name `voice-bird`; omp then surfaces our tools
+//! as `mcp__voice-bird__push_segment` etc. in the agent's tool
+//! list.
 //!
 //! On drop we remove the entry so a dead voice-bird doesn't leave a
-//! stale registration that causes omp to fail to start the server.
-
+//! stale registration that causes the agent runtime to fail to
+//! start the server.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -42,8 +43,9 @@ fn mcp_path(home_dir: &Path) -> PathBuf {
     home_dir.join(MCP_FILE)
 }
 
-/// Resolve `~/.omp/` (the directory omp reads `agent/mcp.json` from).
-/// We honour `$OMP_HOME` for tests / sandboxing; default is `$HOME/.omp`.
+/// Resolve `~/.omp/` (the directory the agent runtime reads
+/// `agent/mcp.json` from). We honour `$OMP_HOME` for tests /
+/// sandboxing; default is `$HOME/.omp`.
 pub fn register_home() -> PathBuf {
     if let Ok(p) = std::env::var("OMP_HOME") {
         return PathBuf::from(p);
@@ -55,9 +57,9 @@ fn read_file(path: &Path) -> anyhow::Result<McpFile> {
     if !path.exists() {
         return Ok(McpFile::default());
     }
+    // Tolerate a missing `mcpServers` field — newer agent
+    // configs may carry other top-level keys.
     let raw = std::fs::read_to_string(path)?;
-    // Tolerate a missing `mcpServers` field — newer omp configs may
-    // carry other top-level keys.
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
@@ -159,10 +161,9 @@ mod tests {
     }
     #[test]
     fn register_overwrites_with_later_path() {
-        // Regression: App::new() used to register the omp binary path
-        // (passed via OmpDetection.path) instead of voice-bird's own
-        // current_exe(). The fix is at the call site in app.rs; this
-        // test pins the contract that whoever passes the binary path
+        // Regression: App::new() used to register the agent
+        // runtime's binary path (passed via AgentDetection.path)
+        // instead of voice-bird's own current_exe(). The fix is
         // owns the resulting `command` field — re-registering with a
         // different path must overwrite.
         let dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,5 @@
-//! Locate the `omp` binary on the user's machine and report its version.
+//! Locate the user's agent runtime (today: `oh-my-pi` / omp) and
+//! report its version.
 //!
 //! Search order (first hit wins):
 //!   1. `OMP_BIN` environment variable (CI / scripted overrides).
@@ -6,42 +7,41 @@
 //!   3. `~/.bun/bin/omp` (the most common install location for the
 //!      official oh-my-pi bootstrap).
 //!
-//! Version is parsed from `<omp> --version` output. The reference
+//! Version is parsed from `omp --version` output. The reference
 //! install reports `"omp/<x.y.z>"` so we strip the leading `omp/`
 //! before storing.
-
 use std::path::{Path, PathBuf};
 
-use super::OmpStatus;
+use super::AgentStatus;
 
-/// How the omp binary was found. Surfaced in the status bar so the
-/// user can sanity-check the detection source.
+/// How the agent runtime was found. Surfaced in the status bar
+/// so the user can sanity-check the detection source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OmpDetectionSource {
+pub enum AgentDetectionSource {
     Env,
     Path,
     Bun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OmpDetection {
+pub struct AgentDetection {
     pub path: PathBuf,
     pub version: String,
-    pub source: OmpDetectionSource,
+    pub source: AgentDetectionSource,
 }
 
-/// Locate `omp` and parse its version. Pure function — the caller
-/// decides what to do with the result (storing it in `App::omp`,
-/// surfacing it in the status bar, etc.).
-pub fn detect() -> Result<OmpDetection, OmpStatus> {
+/// Locate the agent runtime and parse its version. Pure function
+/// — the caller decides what to do with the result (storing it
+/// in `App::agent`, surfacing it in the status bar, etc.).
+pub fn detect() -> Result<AgentDetection, AgentStatus> {
     // 1. Explicit override.
     if let Some(p) = std::env::var_os("OMP_BIN") {
         let path = PathBuf::from(p);
         if let Ok(det) = check_executable(&path) {
-            return Ok(OmpDetection {
+            return Ok(AgentDetection {
                 path,
                 version: det,
-                source: OmpDetectionSource::Env,
+                source: AgentDetectionSource::Env,
             });
         }
     }
@@ -52,10 +52,10 @@ pub fn detect() -> Result<OmpDetection, OmpStatus> {
     //    Phase C.
     if let Some(path) = find_on_path("omp") {
         if let Ok(version) = check_executable(&path) {
-            return Ok(OmpDetection {
+            return Ok(AgentDetection {
                 path,
                 version,
-                source: OmpDetectionSource::Path,
+                source: AgentDetectionSource::Path,
             });
         }
     }
@@ -65,15 +65,15 @@ pub fn detect() -> Result<OmpDetection, OmpStatus> {
     if let Some(home) = dirs::home_dir() {
         let candidate = home.join(".bun").join("bin").join("omp");
         if let Ok(version) = check_executable(&candidate) {
-            return Ok(OmpDetection {
+            return Ok(AgentDetection {
                 path: candidate,
                 version,
-                source: OmpDetectionSource::Bun,
+                source: AgentDetectionSource::Bun,
             });
         }
     }
 
-    Err(OmpStatus::NotFound)
+    Err(AgentStatus::NotFound)
 }
 
 fn find_on_path(binary: &str) -> Option<PathBuf> {
@@ -198,11 +198,11 @@ mod tests {
         unsafe { std::env::remove_var("OMP_BIN"); }
         assert_eq!(det.path, bin);
         assert_eq!(det.version, "9.9.9");
-        assert_eq!(det.source, OmpDetectionSource::Env);
+        assert_eq!(det.source, AgentDetectionSource::Env);
     }
 
     /// With no env override and an empty PATH, detection returns
-    /// `OmpStatus::NotFound` instead of panicking.
+    /// `AgentStatus::NotFound` instead of panicking.
     #[test]
     fn detect_returns_not_found_when_no_candidates_exist() {
         let empty = tempfile::tempdir().unwrap();
@@ -213,6 +213,6 @@ mod tests {
             std::env::set_var("HOME", empty.path());
         }
         let result = detect();
-        assert!(matches!(result, Err(OmpStatus::NotFound)));
+        assert!(matches!(result, Err(AgentStatus::NotFound)));
     }
 }

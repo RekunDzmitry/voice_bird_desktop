@@ -1,7 +1,7 @@
 //! Cross-process segment bridge for the omp MCP integration.
 //!
 //! The TUI and the MCP server (spawned by omp as a separate process) do
-//! not share memory. When the user picks `Target::Omp`, the TUI appends
+//! not share memory. When the user picks `Target::Agent`, the TUI appends
 //! every committed segment to `~/.voice-bird/live/<slot_id>.jsonl`;
 //! the MCP server tails the same file when an agent calls
 //! `voice_bird__pull_recent`.
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::session::OmpSessionId;
+use super::session::AgentSessionId;
 use crate::transcription::Segment;
 
 /// Subdirectory under `$HOME/.voice-bird/` that holds the live tails.
@@ -57,7 +57,7 @@ pub struct LiveSegment {
 impl LiveSegment {
     /// Build a live record from the engine's `Segment` plus the
     /// slot's monotonic counter and the active session id.
-    pub fn from_engine(seg: &Segment, segment_index: u64, session: &OmpSessionId) -> Self {
+    pub fn from_engine(seg: &Segment, segment_index: u64, session: &AgentSessionId) -> Self {
         Self {
             segment_index,
             t_start_ms: seg.t_start.as_millis() as u64,

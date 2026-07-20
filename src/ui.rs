@@ -309,7 +309,7 @@ fn build_slot_title(
     let target_color = match target {
         Target::Stdout => Color::Green,
         Target::Cloud => Color::Magenta,
-        Target::Omp { .. } => Color::Cyan,
+        Target::Agent { .. } => Color::Cyan,
     };
     if prefix.chars().count() <= inner_w {
         vec![Line::from(Span::styled(
@@ -685,7 +685,7 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
 
 /// Top-row picker. Three panes side by side: Devices (physical I/O),
 /// Apps (per-application capture), and Targets (routing — Stdout /
-/// Cloud / Omp). Each pane is a self-contained `Block` with its own
+/// Cloud / Agent). Each pane is a self-contained `Block` with its own
 /// border + title + cursor; the picker wires them through a single
 /// outer layout so they all share the same row height.
 ///
@@ -707,13 +707,13 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
     render_targets_list_pane(f, cols[2], app);
 }
 /// Third picker column. Lists the three routing options (Stdout /
-/// Cloud / Omp) and lets the user pick one with the same arrow
+/// Cloud / Agent) and lets the user pick one with the same arrow
 /// navigation + Enter pattern as Devices and Apps. Picking here
 /// writes to `pending_target_overrides` on the focused slot; the
 /// next start_section consumes it.
 ///
-/// The Omp row is rendered dim and the cursor refuses to land on it
-/// when the `omp` binary is not on disk (see
+/// The Agent row is rendered dim and the cursor refuses to land on it
+/// when the agent runtime binary is not on disk (see
 /// `App::focused_target_kind`). This keeps the visible state and
 /// the pickable state in agreement.
 fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
@@ -794,12 +794,12 @@ fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, St
     let base_color = match kind {
         TargetKind::Stdout => Color::Green,
         TargetKind::Cloud => Color::Magenta,
-        TargetKind::Omp => Color::Cyan,
+        TargetKind::Agent => Color::Cyan,
     };
     let label = match kind {
         TargetKind::Stdout => "Stdout",
         TargetKind::Cloud => "Cloud",
-        TargetKind::Omp => "Omp",
+        TargetKind::Agent => "Agent",
     };
     if disabled {
         (
@@ -808,7 +808,7 @@ fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, St
             "  (not installed)".into(),
         )
     } else {
-        // Omp is rendered the same as Stdout / Cloud — no
+        // Agent is rendered the same as Stdout / Cloud — no
         // trailing hint, same row geometry. The disabled
         // case (above) carries the "(not installed)" hint
         // since the row exists but can't be picked.
@@ -1211,15 +1211,11 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 lines.push(hotkey_line("[p]", "path"));
             }
             // The O/S/A target-cycle key is gone — the Targets
-            // picker pane is now the way to pick a route. We still
-            // surface `/mcp` so the user knows where the omp
-            // session lives.
-            if matches!(
-                app.omp,
-                voice_bird_cli::omp::OmpStatus::Ready { .. }
-            ) {
-                lines.push(hotkey_line("/mcp", "in omp"));
-            }
+            // picker pane is the way to pick a route. The
+            // routing route is just `pick_target(kind)` then
+            // `start_section`; there's no separate user-facing
+            // key to advertise for the agent target because
+            // the picker pane *is* the surface.
             lines
         }
         (true, _) => {
@@ -1528,7 +1524,7 @@ mod tests {
     }
     /// Targets pane renders as the third picker column. The header is
     /// " Targets " (focused variant carries the action hint), the
-    /// three rows are Stdout / Cloud / Omp, and the active pick is
+    /// three rows are Stdout / Cloud / Agent, and the active pick is
     /// tagged with "(active)" next to the focused slot's current
     /// target.
     #[test]
@@ -1538,12 +1534,12 @@ mod tests {
         // Pane header (focused variant — Devices is the default focus,
         // so the targets pane shows the unfocused title).
         assert!(out.contains("Targets"), "targets pane missing:\n{out}");
-        // Three rows in the fixed order: Stdout first, Omp last.
+        // Three rows in the fixed order: Stdout first, Agent last.
         let stdout_pos = out.find("Stdout").expect("Stdout row missing");
         let cloud_pos = out.find("Cloud").expect("Cloud row missing");
-        let omp_pos = out.find("Omp").expect("Omp row missing");
+        let agent_pos = out.find("Agent").expect("Agent row missing");
         assert!(stdout_pos < cloud_pos, "Stdout must come before Cloud");
-        assert!(cloud_pos < omp_pos, "Cloud must come before Omp");
+        assert!(cloud_pos < agent_pos, "Cloud must come before Agent");
     }
 
     /// When the focused slot has been used before, the row matching
@@ -1566,31 +1562,30 @@ mod tests {
     }
 
     /// `target_row_style` (the helper behind the Targets pane rows)
-    /// returns the Omp row in dark gray and tagged as
-    /// "not installed" when the binary is missing. The base helper
-    /// is pure — no real omp detection required.
+    /// returns the Agent row in dark gray and tagged as
+    /// "not installed" when the runtime binary is missing. The
+    /// base helper is pure — no real agent-runtime detection
+    /// required.
     #[test]
-    fn target_row_style_omp_is_dim_when_disabled() {
+    fn target_row_style_agent_is_dim_when_disabled() {
         use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(TargetKind::Omp, true);
-        assert_eq!(label, "Omp");
+        let (label, style, hint) = target_row_style(TargetKind::Agent, true);
+        assert_eq!(label, "Agent");
         assert_eq!(style.fg, Some(Color::DarkGray));
         assert!(hint.contains("not installed"));
     }
-    /// When Omp is enabled, the row is rendered with the same
+    /// When Agent is enabled, the row is rendered with the same
     /// shape as Stdout / Cloud — no trailing hint text, so the
     /// three rows share identical geometry and the pin glyph
-    /// ends up in the same column.
     #[test]
-    fn target_row_style_omp_is_cyan_when_enabled() {
+    fn target_row_style_agent_is_cyan_when_enabled() {
         use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(TargetKind::Omp, false);
-        assert_eq!(label, "Omp");
+        let (label, style, hint) = target_row_style(TargetKind::Agent, false);
         assert_eq!(style.fg, Some(Color::Cyan));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             hint, "",
-            "enabled Omp must not carry a trailing hint"
+            "enabled Agent must not carry a trailing hint"
         );
     }
     /// Enabled Stdout / Cloud also carry no hint — pinning
@@ -1630,6 +1625,8 @@ mod tests {
         // The idle branch must list every key the user can press
         // when no section is recording. Recording-only keys
         // ([s]top, [x]clear, …) live on the `(true, _)` branch.
+        // No `/mcp` line — the Agent target lives in the
+        // Targets picker pane rather than a separate hotkey.
         for key in [
             "[↑/↓]",
             "[←/→]",
@@ -1644,7 +1641,6 @@ mod tests {
             "[r]",
             "[c]",
             "[l]",
-            "/mcp",
         ] {
             assert!(out.contains(key), "idle key {key} missing from sidebar:\n{out}");
         }
@@ -1691,8 +1687,8 @@ mod tests {
         app.selected_device_index = 2;
         app.selected_app_index = Some(1);
         app.selected_target_index = Some(1); // Cloud
-        // Pretend a previous start installed an Omp session id, so
-        // the Omp row stays pickable but isn't the picked one.
+        // Pretend a previous start installed an Agent session id, so
+        // the Agent row stays pickable but isn't the picked one.
         let out = render_to_string(&app, 180, 40);
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -1715,9 +1711,10 @@ mod tests {
         use voice_bird_cli::session::target::Target;
 
         let mut app = App::new();
-        // Cloud is always pickable (doesn't depend on the user's
-        // local `omp` install). Pick that as the per-slot
-        // target so the test stays portable across machines.
+        // Cloud is always pickable (doesn't depend on the user
+        // having an agent runtime installed). Pick that as
+        // the per-slot target so the test stays portable
+        // across machines.
         // Seed the picker state so each pane is non-trivial —
         // otherwise the picked pin would land on a single
         // vacant row and the test wouldn't catch ordering bugs.

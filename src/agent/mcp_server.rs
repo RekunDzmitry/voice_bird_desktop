@@ -1,29 +1,29 @@
-//! MCP-server task: bridges voice-bird's in-memory segment buffer to
-//! its own stdin/stdout when invoked with `--mcp-server`.
+//! MCP-server task: bridges voice-bird's in-memory segment buffer
+//! to its own stdin/stdout when invoked with `--mcp-server`.
 //!
-//! Under the `oh-my-pi` integration model voice-bird plays the MCP
-//! *server* role. omp 16.3.11 reads `~/.omp/agent/mcp.json`, spawns
-//! each entry's `command` as a stdio MCP server, and writes JSON-RPC
-//! requests on its stdin. We don't need to spawn omp ourselves —
-//! omp spawns us.
+//! Today's agent runtime is `oh-my-pi` (omp). Under the omp
+//! integration model voice-bird plays the MCP *server* role:
+//! omp 16.3.11 reads `~/.omp/agent/mcp.json`, spawns each
+//! entry's `command` as a stdio MCP server, and writes JSON-RPC
+//! requests on its stdin. We don't need to spawn omp — omp
+//! spawns us.
 //!
 //! Today the only consumer is `voice_bird__push_segment` (called by
 //! voice-bird itself right after a committed segment lands in
-//! `CommittedLine`) and `voice_bird__pull_recent` (called by an omp
+//! `CommittedLine`) and `voice_bird__pull_recent` (called by an
 //! agent that just started mid-session and wants to catch up).
 //!
 //! The server is single-threaded and async — one task per running
 //! voice-bird process is fine for Phase A. The TUI never shares a
 //! process with this server: when `--mcp-server` is set, we skip
 //! the TUI entirely and run the mediator loop instead.
-
 use std::io::{self, BufRead, Write};
 
 
 use crate::transcription::Segment;
 
 use super::rpc::{JsonRpcRequest, JsonRpcResponse};
-use super::session::{OmpSessionId, OmpTarget};
+use super::session::{AgentSessionId, AgentTarget};
 
 /// Names of the MCP tools we publish. Kept as constants so the
 /// `mcp.json` registration in `register.rs` and the runtime handler
@@ -37,22 +37,22 @@ pub const TOOL_PULL_RECENT: &str = "voice_bird__pull_recent";
 const BUFFER_CAP: usize = 10_000;
 
 /// Shared buffer + book-keeping for one MCP server. Cloned into the
-/// mediator task and (later) into the `OmpTarget` impl that lives
+/// mediator task and (later) into the `AgentTarget` impl that lives
 /// on `App`.
 ///
 /// `session_id` is mutable: when the server probes the client for
 /// `roots/list` after `initialize`, the response updates the id
-/// in place. We hide it behind a Mutex so the `OmpTarget::session_id`
+/// in place. We hide it behind a Mutex so the `AgentTarget::session_id`
 /// accessor can take a snapshot without blocking writers.
 #[derive(Clone)]
 pub struct ServerState {
-    pub session_id: std::sync::Arc<parking_lot::Mutex<OmpSessionId>>,
+    pub session_id: std::sync::Arc<parking_lot::Mutex<AgentSessionId>>,
     pub buffer: std::sync::Arc<parking_lot::Mutex<Vec<Segment>>>,
     pub next_index: std::sync::Arc<parking_lot::Mutex<u64>>,
 }
 
 impl ServerState {
-    pub fn new(session_id: OmpSessionId) -> Self {
+    pub fn new(session_id: AgentSessionId) -> Self {
         Self {
             session_id: std::sync::Arc::new(parking_lot::Mutex::new(session_id)),
             buffer: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -62,13 +62,13 @@ impl ServerState {
 
     /// Replace the session id. Used by the roots probe after the
     /// client responds. Idempotent.
-    pub fn set_session_id(&self, id: OmpSessionId) {
+    pub fn set_session_id(&self, id: AgentSessionId) {
         *self.session_id.lock() = id;
     }
 
     /// Snapshot of the current session id. Cheap: just a Mutex lock
     /// and a clone.
-    pub fn snapshot_session_id(&self) -> OmpSessionId {
+    pub fn snapshot_session_id(&self) -> AgentSessionId {
         self.session_id.lock().clone()
     }
 
@@ -101,7 +101,7 @@ impl ServerState {
     }
 }
 
-/// OmpTarget impl backed by the shared `ServerState`. The TUI uses
+/// AgentTarget impl backed by the shared `ServerState`. The TUI uses
 /// this directly — it never talks to a child process, it just
 /// appends to the same buffer the mediator serves.
 pub struct StdoutMcpTarget {
@@ -114,8 +114,8 @@ impl StdoutMcpTarget {
     }
 }
 
-impl OmpTarget for StdoutMcpTarget {
-    fn session_id(&self) -> OmpSessionId {
+impl AgentTarget for StdoutMcpTarget {
+    fn session_id(&self) -> AgentSessionId {
         self.state.snapshot_session_id()
     }
     fn push_segment(&self, seg: &Segment) -> anyhow::Result<()> {
@@ -137,7 +137,7 @@ pub fn run_on_stdio(state: ServerState) -> anyhow::Result<()> {
         buf.clear();
         let n = input.read_line(&mut buf)?;
         if n == 0 {
-            // omp closed the pipe; exit cleanly.
+            // The agent runtime closed the pipe; exit cleanly.
             return Ok(());
         }
         let trimmed = buf.trim();
@@ -175,30 +175,31 @@ pub fn run_on_stdio(state: ServerState) -> anyhow::Result<()> {
 /// Resolve the initial session id. Precedence (highest first):
 ///   1. `--session-id <id>` CLI arg.
 ///   2. `VOICE_BIRD_SESSION_ID` env var.
-///   3. The basename of `std::env::current_dir()` — omp spawns MCP
-///      servers with `cwd = getProjectDir()`, so this matches the
-///      project the user has open in omp (functionally equivalent
-///      to a `roots/list` probe without the async refactor).
-///   4. `OmpSessionId::default_session()` (i.e. "default").
-pub fn resolve_initial_session_id(args: &[String]) -> OmpSessionId {
+///   3. The basename of `std::env::current_dir()` — the agent
+///      runtime spawns MCP servers with `cwd = getProjectDir()`,
+///      so this matches the project the user has open (functionally
+///      equivalent to a `roots/list` probe without the async
+///      refactor).
+///   4. `AgentSessionId::default_session()` (i.e. "default").
+pub fn resolve_initial_session_id(args: &[String]) -> AgentSessionId {
     if let Some(pos) = args.iter().position(|a| a == "--session-id") {
         if let Some(v) = args.get(pos + 1) {
-            return OmpSessionId(v.clone());
+            return AgentSessionId(v.clone());
         }
     }
     if let Ok(v) = std::env::var("VOICE_BIRD_SESSION_ID") {
         if !v.is_empty() {
-            return OmpSessionId(v);
+            return AgentSessionId(v);
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(name) = cwd.file_name().and_then(|s| s.to_str()) {
             if !name.is_empty() {
-                return OmpSessionId(name.to_string());
+                return AgentSessionId(name.to_string());
             }
         }
     }
-    OmpSessionId::default_session()
+    AgentSessionId::default_session()
 }
 
 /// Dispatch one parsed request to the appropriate handler. Pure
@@ -291,9 +292,10 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> Option<JsonRpcRespon
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1) as u8;
                     // Read from the cross-process live tail. The TUI
-                    // (separate process when omp spawns this binary)
-                    // appends each committed segment there in real time;
-                    // we just read the last `limit` lines on demand.
+                    // (separate process when the agent runtime
+                    // spawns this binary) appends each committed
+                    // segment there in real time; we just read the
+                    // last `limit` lines on demand.
                     let segments = match super::live::pull_recent(slot_id, limit) {
                         Ok(s) => s,
                         Err(e) => {
@@ -348,7 +350,7 @@ mod tests {
 
     #[test]
     fn handle_initialize_returns_protocol_version() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -365,7 +367,7 @@ mod tests {
 
     #[test]
     fn handle_tools_list_advertises_both_tools() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -388,7 +390,7 @@ mod tests {
 
     #[test]
     fn handle_tools_call_push_segment_records_into_buffer() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let _ = state.push(seg("hello world", 0));
         let resp = handle(
             &state,
@@ -424,11 +426,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
         let slot: u8 = 1;
-        crate::omp::live::truncate_slot(slot).unwrap();
+        crate::agent::live::truncate_slot(slot).unwrap();
         for i in 0..5u64 {
-            crate::omp::live::append(
+            crate::agent::live::append(
                 slot,
-                &crate::omp::live::LiveSegment {
+                &crate::agent::live::LiveSegment {
                     segment_index: i,
                     t_start_ms: i * 1000,
                     t_end_ms: i * 1000 + 500,
@@ -439,7 +441,7 @@ mod tests {
             )
             .unwrap();
         }
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -469,7 +471,7 @@ mod tests {
 
     #[test]
     fn handle_unknown_method_returns_method_not_found() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -486,7 +488,7 @@ mod tests {
     fn handle_notification_returns_none() {
         // notifications/initialized has no id; handle() must return
         // None so the caller doesn't write a reply (spec-forbidden).
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let resp = handle(
             &state,
             &JsonRpcRequest {
@@ -501,9 +503,9 @@ mod tests {
 
     #[test]
     fn snapshot_session_id_updates_after_set() {
-        let state = ServerState::new(OmpSessionId("initial".into()));
+        let state = ServerState::new(AgentSessionId("initial".into()));
         assert_eq!(state.snapshot_session_id().as_str(), "initial");
-        state.set_session_id(OmpSessionId("from-probe".into()));
+        state.set_session_id(AgentSessionId("from-probe".into()));
         assert_eq!(state.snapshot_session_id().as_str(), "from-probe");
     }
 
@@ -556,7 +558,7 @@ mod tests {
         }
     }
     fn server_state_buffer_drops_oldest_when_full() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         for i in 0..(BUFFER_CAP + 5) {
             let _ = state.push(seg(&format!("s{i}"), i as u64));
         }
@@ -567,7 +569,7 @@ mod tests {
 
     #[test]
     fn stdout_mcp_target_pushes_into_shared_buffer() {
-        let state = ServerState::new(OmpSessionId::default_session());
+        let state = ServerState::new(AgentSessionId::default_session());
         let target = StdoutMcpTarget::new(state.clone());
         target
             .push_segment(&seg("first", 0))

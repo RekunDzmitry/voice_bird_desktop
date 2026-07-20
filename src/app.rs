@@ -245,7 +245,7 @@ impl std::fmt::Debug for Slot {
 /// Which pane the picker arrows / Enter key target. Devices is the
 /// physical-input/output column on the left; Apps is the
 /// per-application column in the middle; Targets is the routing
-/// choice (Stdout / Cloud / Omp) on the right. Each pane has its
+/// choice (Stdout / Cloud / Agent) on the right. Each pane has its
 /// own cursor and scroll offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFocus {
@@ -272,7 +272,7 @@ pub struct App {
     pub selected_app_index: Option<usize>,
 
     /// Cursor in the Targets pane. The list of targets is fixed at
-    /// three entries (Stdout / Cloud / Omp) — see `targets()`. Always
+    /// three entries (Stdout / Cloud / Agent) — see `targets()`. Always
     /// `Some(idx)` while the TUI runs; the cursor is one of the
     /// rendered rows.
     pub selected_target_index: Option<usize>,
@@ -376,52 +376,52 @@ pub struct App {
     empty_refined: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
 
-    /// Detected state of the user's `omp` install (oh-my-pi).
-    /// `None` only on a configuration error during `App::new`;
-    /// the user-visible states are `OmpStatus::Ready` (path + version)
-    /// or `OmpStatus::NotFound`. Used by the Targets pane to decide
-    /// whether the Omp chip is enabled, and by `App::new` to wire the
-    /// status-bar hint.
-    pub omp: voice_bird_cli::omp::OmpStatus,
-
-    /// Which detection source produced `omp` (env / PATH / bun install).
-    /// `None` iff detection failed. Surfaced in the status bar.
-    pub omp_detection_source: Option<voice_bird_cli::omp::OmpDetectionSource>,
-
-    /// Per-slot pending target override. When the user presses `O` to
-    /// cycle the focused slot's target, we set this to the new target
-    /// (e.g. `Target::Omp`); the next `start_section` consults it and
-    /// applies it instead of the default `cloud_on` heuristic. The
-    /// value is consumed (set back to `None`) by start_section so it
-    /// only affects the very next start.
+    /// Detected state of the user's agent runtime (today: oh-my-pi
+    /// / omp). `None` only on a configuration error during
+    /// `App::new`; the user-visible states are
+    /// `AgentStatus::Ready` (path + version) or
+    /// `AgentStatus::NotFound`. Used by the Targets pane to decide
+    /// whether the Agent chip is enabled, and by `App::new` to
+    /// wire the status-bar hint.
+    pub agent: voice_bird_cli::agent::AgentStatus,
+    /// Which detection source produced the agent runtime (env /
+    /// PATH / bun install). `None` iff detection failed.
+    /// Surfaced in the status bar.
+    pub agent_detection_source: Option<voice_bird_cli::agent::AgentDetectionSource>,
+    /// Per-slot pending target override. The Targets picker writes
+    /// to this when the user picks a row; the next `start_section`
+    /// consults it and applies it instead of the default
+    /// `cloud_on` heuristic. The value is consumed (set back to
+    /// `None`) by start_section so it only affects the very next
+    /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
-    /// spawned when omp launches us. The TUI also pushes into this
-    /// same buffer when the focused slot's target is `Target::Omp`,
-    /// so a single source of truth serves both the in-process
-    /// recorder and the out-of-process omp agent.
-    omp_state: voice_bird_cli::omp::mcp_server::ServerState,
+    /// spawned when the agent runtime launches us. The TUI also
+    /// pushes into this same buffer when the focused slot's
+    /// target is `Target::Agent`, so a single source of truth
+    /// serves both the in-process recorder and the
+    /// out-of-process agent.
+    agent_state: voice_bird_cli::agent::mcp_server::ServerState,
 }
 
-/// A renderable row in the Targets pane. The list of rows is fixed
-/// at three — the target *kind* drives the row; the `omp` session
-/// id is a property of `Target::Omp`, not a row in the picker.
-/// `disabled` rows render dim and the cursor refuses to land on them
-/// (see `App::focused_target_kind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A renderable row in the Targets pane. The list of rows is
+/// fixed at three — the target *kind* drives the row; the agent
+/// session id is a property of `Target::Agent`, not a row in
+/// the picker. `disabled` rows render dim and the cursor
+/// refuses to land on them (see `App::focused_target_kind`).
 pub struct TargetRow {
     pub kind: TargetKind,
     pub disabled: bool,
 }
 
 /// Picker-side classification of a target. We can't use `Target`
-/// directly because `Target::Omp` carries a session id that the
-/// user doesn't pick per-row — the row just means "route to omp
-/// with the current session".
+/// directly because `Target::Agent` carries a session id that
+/// the user doesn't pick per-row — the row just means "route
+/// to the agent runtime with the current session".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
     Cloud,
-    Omp,
+    Agent,
 }
 
 impl App {
@@ -497,7 +497,7 @@ impl App {
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
-            // Targets list is fixed at three rows (Stdout/Cloud/Omp),
+            // Targets list is fixed at three rows (Stdout/Cloud/Agent),
             // so the cursor starts on the first one. We never want
             // the pane to render in an empty-cursor state.
             selected_target_index: Some(0),
@@ -531,11 +531,11 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
-            omp: voice_bird_cli::omp::OmpStatus::NotFound,
-            omp_detection_source: None,
+            agent: voice_bird_cli::agent::AgentStatus::NotFound,
+            agent_detection_source: None,
             pending_target_overrides: std::collections::BTreeMap::new(),
-            omp_state: voice_bird_cli::omp::mcp_server::ServerState::new(
-                voice_bird_cli::omp::OmpSessionId::default_session(),
+            agent_state: voice_bird_cli::agent::mcp_server::ServerState::new(
+                voice_bird_cli::agent::AgentSessionId::default_session(),
             ),
         };
         // user must provide before recording.
@@ -544,36 +544,37 @@ impl App {
             app.open_api_key_modal();
         }
 
-        // Probe for a local `omp` install so the status bar can surface
-        // "Omp found at <path> v<version>" (or "Omp not found" when the
-        // user hasn't installed oh-my-pi yet). Detection is intentionally
-        // best-effort and zero-cost on failure — we just enumerate three
-        // candidate locations.
-        match voice_bird_cli::omp::detect() {
+        // Probe for the local agent runtime (today: oh-my-pi /
+        // omp) so the status bar can surface "Agent found at
+        // <path> v<version>" (or "Agent not found" when the
+        // user hasn't installed an agent yet). Detection is
+        // intentionally best-effort and zero-cost on failure —
+        // we just enumerate three candidate locations.
+        match voice_bird_cli::agent::detect() {
             Ok(det) => {
-                log::info!("omp detected: {} v{}", det.path.display(), det.version);
+                log::info!("agent detected: {} v{}", det.path.display(), det.version);
                 let det_path = det.path.clone();
                 let det_source = det.source.clone();
-                app.omp = voice_bird_cli::omp::OmpStatus::Ready {
+                app.agent = voice_bird_cli::agent::AgentStatus::Ready {
                     path: det.path,
                     version: det.version,
                 };
-                app.omp_detection_source = Some(det.source);
+                app.agent_detection_source = Some(det.source);
                 // Auto-register this binary as an MCP server in
-                // ~/.omp/agent/mcp.json so the user's `omp` picks
-                // voice-bird up on next launch. Best-effort: any
-                // error here just means the user has to run
-                // `voice-bird-cli --register` manually. Idempotent —
-                // repeated launches overwrite only the `voice-bird`
-                // key and leave other entries intact.
-                // Register THIS binary (voice-bird-cli), not the omp
-                // path we just detected. `det.path` is where omp lives;
-                // what omp needs in `command` is the absolute path of
-                // the stdio MCP server it'll spawn — i.e., us.
-                let home = voice_bird_cli::omp::register::register_home();
+                // ~/.omp/agent/mcp.json so the user's agent
+                // runtime picks voice-bird up on next launch.
+                // Best-effort: any error here just means the
+                // user has to run `voice-bird-cli --register`
+                // manually. Idempotent — repeated launches
+                // overwrite only the `voice-bird` key and leave
+                // other entries intact.
+                // Register THIS binary (voice-bird-cli), not the
+                // agent runtime's path. `det.path` is where the
+                // agent runtime lives; what the runtime needs
+                let home = voice_bird_cli::agent::register::register_home();
                 let binary = std::env::current_exe()
                     .unwrap_or_else(|_| det_path.clone());
-                match voice_bird_cli::omp::register::register(&binary, &home) {
+                match voice_bird_cli::agent::register::register(&binary, &home) {
                     Ok(()) => log::info!(
                         "registered MCP server in {}/agent/mcp.json (source: {:?})",
                         home.display(),
@@ -586,8 +587,8 @@ impl App {
                 }
             }
             Err(status) => {
-                app.omp = status;
-                app.omp_detection_source = None;
+                app.agent = status;
+                app.agent_detection_source = None;
             }
         }
 
@@ -710,7 +711,7 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// `Stdout → Cloud → Omp → Stdout`. The new target is stored on
+    /// `Stdout → Cloud → Agent → Stdout`. The new target is stored on
     /// `pending_target_overrides` and applied by the next
     /// `start_section`. The current chip label keeps reflecting the
     /// previous pick until the next start so the user has a chance
@@ -720,7 +721,7 @@ impl App {
     /// Returns the target that was just queued. The caller can use
     /// this for the status bar hint.
     pub fn cycle_focused_target(&mut self) -> Target {
-        use voice_bird_cli::omp::OmpSessionId;
+        use voice_bird_cli::agent::AgentSessionId;
         let slot = self.focused_slot;
         let current = self
             .pending_target_overrides
@@ -730,24 +731,24 @@ impl App {
             .unwrap_or(Target::Stdout);
         let next = match current {
             Target::Stdout => Target::Cloud,
-            Target::Cloud => Target::Omp {
-                session_id: OmpSessionId::default_session().0,
+            Target::Cloud => Target::Agent {
+                session_id: AgentSessionId::default_session().0,
             },
-            Target::Omp { .. } => Target::Stdout,
+            Target::Agent { .. } => Target::Stdout,
         };
         self.pending_target_overrides.insert(slot, next.clone());
         next
     }
 
-    /// The picker list. Always three rows; `Omp` is disabled when
+    /// The picker list. Always three rows; `Agent` is disabled when
     /// the binary is not on disk.
     pub fn targets(&self) -> [TargetRow; 3] {
         use TargetKind::*;
-        let omp_disabled = !matches!(self.omp, voice_bird_cli::omp::OmpStatus::Ready { .. });
+        let agent_disabled = !matches!(self.agent, voice_bird_cli::agent::AgentStatus::Ready { .. });
         [
             TargetRow { kind: Stdout, disabled: false },
             TargetRow { kind: Cloud, disabled: false },
-            TargetRow { kind: Omp, disabled: omp_disabled },
+            TargetRow { kind: Agent, disabled: agent_disabled },
         ]
     }
 
@@ -762,16 +763,16 @@ impl App {
     /// Set the focused slot's pending target from a `TargetKind`. The
     /// value is consumed by the next `start_section` and applied
     /// instead of the `cloud_on` heuristic. The resolved `Target`
-    /// (with a session id, for Omp) is returned so the caller can
+    /// (with a session id, for Agent) is returned so the caller can
     /// surface it in a banner.
     pub fn pick_target(&mut self, kind: TargetKind) -> Target {
-        use voice_bird_cli::omp::OmpSessionId;
+        use voice_bird_cli::agent::AgentSessionId;
         let slot = self.focused_slot;
         let target = match kind {
             TargetKind::Stdout => Target::Stdout,
             TargetKind::Cloud => Target::Cloud,
-            TargetKind::Omp => Target::Omp {
-                session_id: OmpSessionId::default_session().0,
+            TargetKind::Agent => Target::Agent {
+                session_id: AgentSessionId::default_session().0,
             },
         };
         self.pending_target_overrides.insert(slot, target.clone());
@@ -1141,7 +1142,7 @@ impl App {
     }
 
     /// Move the cursor up one row in whichever pane is focused.
-    /// In the Targets pane, disabled rows (currently just `Omp` when
+    /// In the Targets pane, disabled rows (currently just `Agent` when
     /// the binary is missing) are skipped so the cursor never parks
     /// on a row that can't be picked.
     pub fn select_previous(&mut self) {
@@ -1355,7 +1356,7 @@ impl App {
         Some(match t {
             Target::Stdout => TargetKind::Stdout,
             Target::Cloud => TargetKind::Cloud,
-            Target::Omp { .. } => TargetKind::Omp,
+            Target::Agent { .. } => TargetKind::Agent,
         })
     }
 
@@ -1533,12 +1534,12 @@ impl App {
             "en".to_string()
         };
 
-        // Where this section is heading. The user can pre-pick a
-        // target via the `O`/`S`/`A` cycle key (PR 2 of the omp
-        // rollout); that overrides the cloud_on heuristic so `Omp`
-        // works alongside the existing Cloud / Stdout switch. The
-        // override is consumed at start so it only affects this one
-        // start.
+        // Where this section is heading. The Targets picker
+        // writes a per-slot override when the user picks a
+        // row; that overrides the cloud_on heuristic so the
+        // agent target works alongside the existing Cloud /
+        // Stdout switch. The override is consumed at start so
+        // it only affects this one start.
         let target = self
             .pending_target_overrides
             .remove(&slot)
@@ -1551,17 +1552,18 @@ impl App {
             });
         // Keep `cloud_on` in sync with the picked target so the
         // rest of the recording pipeline (engine pick, language
-        // shadowing, etc.) doesn't have to learn about `Omp` yet —
-        // the Omp target piggybacks on local inference today.
+        // shadowing, etc.) doesn't have to learn about `Agent` yet —
+        // the Agent target piggybacks on local inference today.
 
         settings.cloud_on = matches!(target, Target::Cloud);
 
-        // Truncate the per-slot live tail when starting an Omp session.
-        // The TUI writes every committed segment there; the MCP server
-        // process spawned by omp tails this file. Starting fresh
-        // prevents a new recording from inheriting segments left by
-        // a previous session on the same slot.
-        if matches!(target, Target::Omp { .. }) {
+        // Truncate the per-slot live tail when starting an
+        // Agent session. The TUI writes every committed segment
+        // there; the MCP server process spawned by the agent
+        // runtime tails this file. Starting fresh prevents a new
+        // recording from inheriting segments left by a previous
+        // session on the same slot.
+        if matches!(target, Target::Agent { .. }) {
             let slot_u8 = match slot {
                 SlotId(1) => 1u8,
                 SlotId(2) => 2u8,
@@ -1569,8 +1571,8 @@ impl App {
                 _ => 0u8,
             };
             if slot_u8 > 0 {
-                if let Err(e) = voice_bird_cli::omp::live::truncate_slot(slot_u8) {
-                    log::warn!("omp live truncate: {e}");
+                if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot_u8) {
+                    log::warn!("agent live truncate: {e}");
                 }
             }
         }
@@ -1924,12 +1926,12 @@ impl App {
             }
         });
 
-        // --- 6. Consumer task: engine events → live state + JSONL ---------
-        // Capture the section's target + the shared omp buffer so
-        // the consumer can fan a Committed segment into the MCP-server
-        // buffer when the user picked `Target::Omp`.
+        // --- 6. Consumer task: engine events → live state + JSONL ---
+        // Capture the section's target + the shared agent buffer
+        // so the consumer can fan a Committed segment into the
+        // MCP-server buffer when the user picked `Target::Agent`.
         let target_for_consumer = target.clone();
-        let omp_state_for_consumer = self.omp_state.clone();
+        let agent_state_for_consumer = self.agent_state.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
@@ -1973,37 +1975,38 @@ impl App {
                         // runs after, but it just reads `&seg` again —
                         // which is fine since we already extracted the
                         // fields we need into `live_seg`.
-                        let idx = omp_state_for_consumer.snapshot_next_index();
+                        let idx = agent_state_for_consumer.snapshot_next_index();
                         let session = match &target_for_consumer {
-                            Target::Omp { session_id } => {
-                                voice_bird_cli::omp::OmpSessionId(session_id.clone())
+                            Target::Agent { session_id } => {
+                                voice_bird_cli::agent::AgentSessionId(session_id.clone())
                             }
-                            _ => voice_bird_cli::omp::OmpSessionId::default_session(),
+                            _ => voice_bird_cli::agent::AgentSessionId::default_session(),
                         };
-                        let live_seg = if matches!(target_for_consumer, Target::Omp { .. }) {
-                            Some(voice_bird_cli::omp::live::LiveSegment::from_engine(
+                        let live_seg = if matches!(target_for_consumer, Target::Agent { .. }) {
+                            Some(voice_bird_cli::agent::live::LiveSegment::from_engine(
                                 &seg, idx, &session,
                             ))
                         } else {
                             None
                         };
-                        // Route into the omp buffer when the slot's
-                        // target is `Target::Omp`. Best-effort.
-                        if matches!(target_for_consumer, Target::Omp { .. }) {
-                            omp_state_for_consumer.push(seg);
+                        // Route into the agent buffer when the
+                        // slot's target is `Target::Agent`.
+                        // Best-effort.
+                        if matches!(target_for_consumer, Target::Agent { .. }) {
+                            agent_state_for_consumer.push(seg);
                         }
-                        // Mirror to the on-disk live tail so the MCP
-                        // server process spawned by omp sees the same
-                        // segments. The TUI's in-memory buffer is
-                        // local to this process; the live file is the
-                        // cross-process source of truth for `pull_recent`.
+                        // Mirror to the on-disk live tail so the
+                        // MCP server process spawned by the agent
+                        // runtime sees the same segments. The
+                        // TUI's in-memory buffer is local to this
+                        // process; the live file is the
+                        // `pull_recent`.
                         if let Some(live) = live_seg {
                             let slot_u8 = slot_for_consumer.0 as u8;
-                            if let Err(e) = voice_bird_cli::omp::live::append(slot_u8, &live) {
-                                log::warn!("omp live append: {e}");
+                            if let Err(e) = voice_bird_cli::agent::live::append(slot_u8, &live) {
+                                log::warn!("agent live append: {e}");
                             }
                         }
-
 
                     }
                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
@@ -2513,7 +2516,7 @@ mod tests {
     /// The Targets pane's `pick_target` writes the focused slot's
     /// pending target, which `start_section` consumes on the next
     /// start. Each call returns the resolved `Target` (with a
-    /// session id for Omp) so the caller can surface a banner.
+    /// session id for Agent) so the caller can surface a banner.
     #[test]
     fn pick_target_writes_pending_override_for_focused_slot() {
         use crate::app::TargetKind;
@@ -2526,8 +2529,8 @@ mod tests {
         );
         let cloud = app.pick_target(TargetKind::Cloud);
         assert_eq!(cloud, Target::Cloud);
-        let omp = app.pick_target(TargetKind::Omp);
-        assert!(matches!(omp, Target::Omp { .. }));
+        let omp = app.pick_target(TargetKind::Agent);
+        assert!(matches!(omp, Target::Agent { .. }));
         // Switching back to Stdout overwrites the prior override.
         let stdout = app.pick_target(TargetKind::Stdout);
         assert_eq!(stdout, Target::Stdout);

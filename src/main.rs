@@ -113,20 +113,19 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
-    // `--mcp-server` runs voice-bird as a stdio MCP server for omp.
-    // Disables the TUI; blocks on stdin/stdout JSON-RPC. We
-    // intentionally check this before any TTY setup so the parent
-    // (omp) gets a clean pipe instead of a raw-mode terminal.
+    // `--mcp-server` runs voice-bird as a stdio MCP server for the
+    // agent runtime. Disables the TUI; blocks on stdin/stdout
+    // JSON-RPC. We intentionally check this before any TTY setup
+    // so the parent runtime gets a clean pipe instead of a
+    // raw-mode terminal.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--mcp-server") {
-        let session = voice_bird_cli::omp::mcp_server::resolve_initial_session_id(&args);
-        let state = voice_bird_cli::omp::mcp_server::ServerState::new(session);
-        return voice_bird_cli::omp::mcp_server::run_on_stdio(state);
+        let session = voice_bird_cli::agent::mcp_server::resolve_initial_session_id(&args);
+        let state = voice_bird_cli::agent::mcp_server::ServerState::new(session);
+        return voice_bird_cli::agent::mcp_server::run_on_stdio(state);
     }
-
     // Handle `--recover <dir>` before any TTY/terminal setup so it works
     // from non-TTY shells (e.g., piped or macOS `open` invocations).
-    let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--recover") {
         let dir = args
             .get(pos + 1)
@@ -136,22 +135,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `--register` writes this binary's path into ~/.omp/agent/mcp.json
-    // so the user's `omp` picks up voice-bird as an MCP server on next
-    // launch. Idempotent: re-running updates the entry in place. The
-    // binary path defaults to current_exe(); pass a different one as
-    // the first arg to register a different build (e.g., a release
-    // copy under ~/bin). Intended for users who never run the TUI
-    // (CI, sandboxed agent runs, or just to wire up MCP before
-    // launching the TUI for the first time).
-    let args: Vec<String> = std::env::args().collect();
+    // `--register` writes this binary's path into
+    // ~/.omp/agent/mcp.json so the user's agent runtime picks
+    // up voice-bird as an MCP server on next launch.
+    // Idempotent: re-running updates the entry in place. The
+    // binary path defaults to current_exe(); pass a different
+    // one as the first arg to register a different build (e.g.,
+    // a release copy under ~/bin). Intended for users who never
+    // run the TUI (CI, sandboxed agent runs, or just to wire up
+    // MCP before launching the TUI for the first time).
     if let Some(pos) = args.iter().position(|a| a == "--register") {
         let binary = match args.get(pos + 1) {
             Some(p) => std::path::PathBuf::from(p),
             None => std::env::current_exe()?,
         };
-        let home = voice_bird_cli::omp::register::register_home();
-        voice_bird_cli::omp::register::register(&binary, &home)?;
+        let home = voice_bird_cli::agent::register::register_home();
+        voice_bird_cli::agent::register::register(&binary, &home)?;
         println!(
             "registered {} in {}/agent/mcp.json",
             binary.display(),
@@ -518,7 +517,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // When the Targets pane is focused, Enter first applies
             // the picked target to the focused slot's
             // pending_target_overrides (so start_section consumes
-            // it). The picked target may be disabled (e.g. Omp when
+            // it). The picked target may be disabled (e.g. Agent when
             // the binary is missing) — in that case we surface a
             // banner and abort; the user can press Down to land on
             // a pickable row.

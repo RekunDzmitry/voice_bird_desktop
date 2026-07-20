@@ -1,30 +1,30 @@
-//! End-to-end test for the omp MCP mediator round trip.
+//! End-to-end test for the agent-runtime MCP mediator round trip.
 //!
-//! Drives the full JSON-RPC surface without spawning the real `omp`
-//! binary: a fake client process talks newline-delimited JSON-RPC
-//! to a voice-bird mediator instance, and we assert that
-//! `voice_bird__push_segment` segments land in `pull_recent` in
-//! arrival order.
+//! Drives the full JSON-RPC surface without spawning the real
+//! runtime binary: a fake client process talks
+//! newline-delimited JSON-RPC to a voice-bird mediator
+//! instance, and we assert that `voice_bird__push_segment`
+//! segments land in `pull_recent` in arrival order.
 //!
-//! Run with: `cargo test --test omp_e2e`
+//! Run with: `cargo test --test agent_e2e`
 //!
-//! What this exercises that the unit tests in `src/omp/mcp_server.rs`
-//! do not:
+//! What this exercises that the unit tests in
+//! `src/agent/mcp_server.rs` do not:
 //!   - End-to-end serde of the request/response envelope across an
 //!     actual line-buffered boundary.
 //!   - `segment_index` cursor semantics: every push returns a
 //!     monotonically increasing index, and `pull_recent` orders
-use voice_bird_cli::omp::OmpTarget as _;
+use voice_bird_cli::agent::AgentTarget as _;
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use voice_bird_cli::omp::mcp_server::{
+use voice_bird_cli::agent::mcp_server::{
     handle, ServerState, StdoutMcpTarget, TOOL_PULL_RECENT, TOOL_PUSH_SEGMENT,
 };
-use voice_bird_cli::omp::OmpSessionId;
-use voice_bird_cli::omp::rpc::{JsonRpcRequest, JsonRpcResponse};
+use voice_bird_cli::agent::AgentSessionId;
+use voice_bird_cli::agent::rpc::{JsonRpcRequest, JsonRpcResponse};
 use voice_bird_cli::transcription::Segment;
 
 fn fake_segment(text: &str, t_ms: u64) -> Segment {
@@ -43,18 +43,18 @@ fn deserialize_response(line: &str) -> JsonRpcResponse {
 #[serial_test::serial]
 fn push_and_pull_recent_round_trip_via_handle() {
     // Phase 1: the TUI pushes 50 segments into the live tail via
-    // crate::omp::live::append — same path the consumer task takes
+    // crate::agent::live::append — same path the consumer task takes
     // at runtime. Point HOME at a tempdir so the test exercises the
     // real on-disk path (the MCP server reads from there).
     let prev_home = std::env::var("HOME").ok();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", dir.path());
     let slot: u8 = 1;
-    voice_bird_cli::omp::live::truncate_slot(slot).unwrap();
+    voice_bird_cli::agent::live::truncate_slot(slot).unwrap();
     for i in 0..50 {
-        voice_bird_cli::omp::live::append(
+        voice_bird_cli::agent::live::append(
             slot,
-            &voice_bird_cli::omp::live::LiveSegment {
+            &voice_bird_cli::agent::live::LiveSegment {
                 segment_index: i,
                 t_start_ms: i * 1000,
                 t_end_ms: i * 1000 + 500,
@@ -66,9 +66,10 @@ fn push_and_pull_recent_round_trip_via_handle() {
         .unwrap();
     }
 
-    // Phase 2: a fake omp client calls voice_bird__pull_recent with
-    // limit=50 and reads the response.
-    let state = ServerState::new(OmpSessionId::default_session());
+    // Phase 2: a fake agent-runtime client calls
+    // voice_bird__pull_recent with the same session-id we
+    // crafted above.
+    let state = ServerState::new(AgentSessionId::default_session());
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(1)),
@@ -106,7 +107,7 @@ fn restore(key: &str, prev: Option<String>) {
 
 #[test]
 fn push_segment_returns_increasing_indices() {
-    let state = ServerState::new(OmpSessionId::default_session());
+    let state = ServerState::new(AgentSessionId::default_session());
     let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
     for i in 0..10 {
         // The mediator's tools/call for push returns no segment_index
@@ -146,11 +147,11 @@ fn pull_recent_respects_limit_and_keeps_order() {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", dir.path());
     let slot: u8 = 1;
-    voice_bird_cli::omp::live::truncate_slot(slot).unwrap();
+    voice_bird_cli::agent::live::truncate_slot(slot).unwrap();
     for i in 0..20 {
-        voice_bird_cli::omp::live::append(
+        voice_bird_cli::agent::live::append(
             slot,
-            &voice_bird_cli::omp::live::LiveSegment {
+            &voice_bird_cli::agent::live::LiveSegment {
                 segment_index: i,
                 t_start_ms: i * 100,
                 t_end_ms: i * 100 + 50,
@@ -162,7 +163,7 @@ fn pull_recent_respects_limit_and_keeps_order() {
         .unwrap();
     }
 
-    let state = ServerState::new(OmpSessionId::default_session());
+    let state = ServerState::new(AgentSessionId::default_session());
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(200)),
@@ -192,7 +193,7 @@ fn pull_recent_respects_limit_and_keeps_order() {
 
 #[test]
 fn initialize_response_carries_session_id_and_protocol_version() {
-    let state = ServerState::new(OmpSessionId("session-42".into()));
+    let state = ServerState::new(AgentSessionId("session-42".into()));
     let parsed = handle(
         &state,
         &JsonRpcRequest {
