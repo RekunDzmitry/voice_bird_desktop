@@ -136,9 +136,9 @@ fn push_segment_returns_increasing_indices() {
         );
         let pre = seen.lock().len();
         seen.lock().push(i as u64);
-    assert_eq!(pre, i);
+        assert_eq!(pre, i);
+    }
 }
-
 #[test]
 #[serial_test::serial]
 
@@ -187,9 +187,6 @@ fn pull_recent_respects_limit_and_keeps_order() {
     assert_eq!(segments[2]["text"], "e17");
 }
 
-
-
-}
 
 #[test]
 fn initialize_response_carries_session_id_and_protocol_version() {

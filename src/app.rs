@@ -1407,6 +1407,17 @@ impl App {
                 }
             }
         }
+        if let Some(msg) = drained {
+            let auth_failure = looks_like_auth_error(&msg);
+            self.banner = Some(msg.clone());
+            self.status = RecordingStatus::Error(msg);
+            // Server rejected the saved key — surface the paste modal
+            // immediately so the user can replace it without hunting
+            // for a key binding.
+            if auth_failure && self.config.cloud_broadcast_enabled {
+                self.open_api_key_modal();
+            }
+        }
     }
 
     /// Toggle help display
@@ -1564,16 +1575,15 @@ impl App {
         // recording from inheriting segments left by a previous
         // session on the same slot.
         if matches!(target, Target::Agent { .. }) {
-            let slot_u8 = match slot {
-                SlotId(1) => 1u8,
-                SlotId(2) => 2u8,
-                SlotId(3) => 3u8,
-                _ => 0u8,
-            };
-            if slot_u8 > 0 {
-                if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot_u8) {
-                    log::warn!("agent live truncate: {e}");
-                }
+            // Truncate the per-slot live tail so a fresh recording
+            // does not pick up segments left by a previous session
+            // on the same slot. Slot ids come from `next_slot_id`
+            // which monotonically grows up to `MAX_SECTIONS` (8) and
+            // is never reused, so the cast to `u8` is lossless and
+            // the live file path stays unique per slot.
+            let slot_u8 = slot.0 as u8;
+            if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot_u8) {
+                log::warn!("agent live truncate: {e}");
             }
         }
 
