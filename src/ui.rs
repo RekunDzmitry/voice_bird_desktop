@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -7,7 +7,8 @@ use ratatui::{
 };
 use std::time::Instant;
 
-use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, MAX_SECTIONS};
+use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotId, SlotKind};
+use voice_bird_cli::session::target::Target;
 use voice_bird_cli::session::layout::SessionSource;
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -27,14 +28,17 @@ pub fn render(f: &mut Frame, app: &App) {
         .focused_cloud_reminder_until()
         .map(|t| Instant::now() < t)
         .unwrap_or(false);
-    // Picker grows with the larger of devices/apps, capped to keep
-    // transcript space. The mode panel on the right shares this row and
-    // needs at least 5 rows (top border + Cloud + Language + Model +
-    // bottom border), so row 1 is floored at 8 to give the new two-pane
-    // picker room for a few rows + scroll. Cap at 14 so transcripts
-    // still get the bulk of the screen.
-    let max_pane_len = app.devices.len().max(app.apps.len()) as u16;
-    let devices_h = (max_pane_len + 2).clamp(8, 14);
+    // Picker grows with the larger of devices/apps/targets, capped to
+    // keep transcript space. The mode panel on the right shares this
+    // row and needs at least 5 rows, so the picker is floored at 8 to
+    // give a 3-column layout room for a few rows + scroll. Cap at 16
+    // so the slot row still gets the bulk of the screen.
+    let max_pane_len = app
+        .devices
+        .len()
+        .max(app.apps.len() + 1)
+        .max(3) as u16;
+    let devices_h = (max_pane_len + 2).clamp(8, 16);
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(3), // [0] header
         Constraint::Min(6),    // [1] main content + sidebar
@@ -64,11 +68,19 @@ pub fn render(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(72), Constraint::Length(36)])
         .split(root[1]);
 
+    // Three rows stacked: a 3-pane picker (Devices / Apps / Targets)
+    // and the slot row. The Targets pane replaces the per-slot chip
+    // strip and makes picking a target as discoverable as picking a
+    // device or app. Heights are weighted so the picker keeps its
+    // room while the slot row keeps the bulk of the screen.
     let workspace = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(devices_h), Constraint::Min(6)])
+        .constraints([
+            Constraint::Length(devices_h),
+            Constraint::Min(6),
+        ])
         .split(main[0]);
-    render_devices(f, workspace[0], app);
+    render_picker(f, workspace[0], app);
     render_sections(f, workspace[1], app);
 
     render_sidebar(f, main[1], app);
@@ -101,34 +113,60 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
-/// Render the 3-column section row. Each slot draws as its own block
-/// with a per-section Mode header in the title and the transcript +
-/// tentative line stacked inside. Empty slots show a placeholder. The
-/// focused slot's border is highlighted.
+/// Render the slot row. Each slot draws as its own block with a
+/// per-slot Mode header in the title and the transcript + tentative
+/// line stacked inside. Empty slots show a placeholder. The focused
+/// slot's border is highlighted. Slot count grows with the Vec —
+/// Phase A is hard-coded to three (the initial layout) but the
+/// render path already iterates the Vec directly.
 fn render_sections(f: &mut Frame, area: Rect, app: &App) {
+    let n = app.slots.len();
+    // Weight the layout so the focused slot gets 2 horizontal parts
+    // and every other slot gets 1. With 1 slot this is moot; with 2
+    // the focused pane claims ~65% of the row, with 3 it's ~50%;
+    // all of those keep the dynamic "[N] <device> + <app> → <tgt>"
+    // title from ellipsizing on the slot the user is editing.
+    // Equal split is reserved for slot counts above the focused
+    // weight so unfocused slots stay readable.
+    let constraints: Vec<Constraint> = if n <= 1 {
+        vec![Constraint::Ratio(1, 1)]
+    } else {
+        app.slots
+            .iter()
+            .map(|s| {
+                if s.id == app.focused_slot {
+                    Constraint::Ratio(2, 1)
+                } else {
+                    Constraint::Ratio(1, 1)
+                }
+            })
+            .collect()
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, MAX_SECTIONS as u32); MAX_SECTIONS])
+        .constraints(constraints)
         .split(area);
-    for slot in 0..MAX_SECTIONS {
-        render_section_column(f, cols[slot], app, slot);
+    for (i, slot) in app.slots.iter().enumerate() {
+        render_section_column(f, cols[i], app, slot);
     }
 }
 
-fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
-    let is_focused = slot == app.focused_section;
-    let section = app.sections.get(slot).and_then(|s| s.as_ref());
-
-    // Title: per-slot Mode header (compact: cloud/lang/model summary).
-    // Falls back to the saved label when a section was stopped but its
-    // transcript is still preserved.
-    let title_text = if let Some(s) = section {
-        section_column_title(slot, Some(s))
-    } else if let Some(saved) = &app.transcript_saved[slot] {
-        saved.label.clone()
-    } else {
-        section_column_title(slot, None)
+fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
+    let slot_id = slot.id;
+    let is_focused = slot_id == app.focused_slot;
+    let section = slot.as_section();
+    let saved = match &slot.kind {
+        SlotKind::Saved { saved } => Some(saved),
+        _ => None,
     };
+
+    // Title: dynamic, picker-aware, wraps to a second line when the
+    // composed string would exceed the column width. The two
+    // components are "[N] <device> + <app> → <target>" line 1, and
+    // a small status indicator (cloud ON/OFF, language, model) on
+    // line 2 when the slot is recording. Otherwise just one line.
+    let inner_w = area.width.saturating_sub(2) as usize; // borders
+    let title_lines = build_slot_title(app, slot, section, saved, inner_w);
     let border_style = if is_focused {
         Style::default()
             .fg(Color::Yellow)
@@ -138,17 +176,21 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let block = Block::default()
+    // Each Line in the title vector becomes its own `block.title()`
+    // call. ratatui stacks them top-to-bottom, giving us the
+    // two-line wrap for free.
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title_text);
-
+        .border_style(border_style);
+    for line in title_lines {
+        block = block.title(line);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let Some(section) = section else {
         // Check for preserved (saved) transcript from a prior stop.
-        if let Some(saved) = &app.transcript_saved[slot] {
+        if let Some(saved) = saved {
             let committed = saved.committed.lock();
             let refined = saved.refined.lock();
             let mut lines: Vec<Line> = Vec::with_capacity(refined.len() + committed.len());
@@ -228,38 +270,116 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: usize) {
     render_section_tentative(f, cells[1], section);
 }
 
-/// Title shown in the column's border. Includes the slot number, the
-/// source label (or "(empty)" / "(paused)"), and a compact `Cloud:[ON] pl base.en`
-/// summary so the user can read settings at a glance per column.
-fn section_column_title(slot: usize, section: Option<&Section>) -> String {
-    let n = slot + 1;
-    match section {
-        None => format!(" [{n}] (empty) "),
-        Some(s) => {
-            let label = source_label(&s.source);
-            let cloud = if s.settings.cloud_on { "ON" } else { "OFF" };
-            let lang = if s.settings.cloud_on {
-                s.settings.language.as_str()
-            } else {
-                "en"
-            };
-            // Cloud-only Windows has no local model to report
-            // (compile-time constant branch).
-            if cfg!(windows) {
-                format!(" [{n}] {label} · cloud:{cloud} · {lang} ")
-            } else {
-                format!(
-                    " [{n}] {label} · cloud:{cloud} · {lang} · {model} ",
-                    model = s.settings.model
-                )
-            }
-        }
+/// line (when the title fits) or two lines (the picker prefix on
+/// line 1, the routing target in colour on line 2). The caller
+/// applies each line as a separate `block.title()` call. Each
+/// component stays inside `inner_w` columns; if the picker prefix
+/// alone exceeds that, the device name is ellipsized to make room.
+fn build_slot_title(
+    app: &App,
+    slot: &Slot,
+    section: Option<&Section>,
+    saved: Option<&crate::app::SavedTranscript>,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let n = slot.id.0;
+
+    if section.is_none() && saved.is_none() && !slot_has_picker_pick(app) {
+        return vec![Line::from(format!(" [{n}] (empty) "))];
+    }
+
+    let device = app
+        .focused_device()
+        .map(|d| d.name.clone())
+        .or_else(|| app.config.input_device.clone());
+    let app_pick = app
+        .focused_app()
+        .map(|a| a.name.clone());
+    let target = if let Some(s) = section {
+        s.target.clone()
+    } else {
+        app.focused_pending_target()
+    };
+    let device_label = device.as_deref().unwrap_or("(no device)");
+    let app_str = app_pick
+        .as_deref()
+        .map(|a| format!(" + {a}"))
+        .unwrap_or_default();
+    let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
+    let target_color = match target {
+        Target::Stdout => Color::Green,
+        Target::Cloud => Color::Magenta,
+        Target::Agent { .. } => Color::Cyan,
+    };
+    if prefix.chars().count() <= inner_w {
+        vec![Line::from(Span::styled(
+            prefix,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))]
+    } else {
+        let prefix_short = truncate_for_two_line(&prefix, inner_w);
+        vec![
+            Line::from(Span::styled(
+                prefix_short,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(" → {target} "),
+                Style::default().fg(target_color).add_modifier(Modifier::BOLD),
+            )),
+        ]
     }
 }
 
-/// Short user-readable label for a section's source. Devices use the
-/// saved input_device name from config when available; SessionSource
-/// alone doesn't carry the device name post-Enter.
+/// A slot counts as "picker-picked" when the user has at least one
+/// A slot counts as "picker-picked" when the user has at least one
+/// picker selection that hasn't been turned into a recording yet —
+/// i.e. a device name in config OR a non-None focused app OR a
+/// pending target override for this slot.
+fn slot_has_picker_pick(app: &App) -> bool {
+    app.config.input_device.is_some()
+        || app.focused_app().is_some()
+        || app
+            .pending_target_overrides
+            .contains_key(&app.focused_slot)
+}
+
+/// slot they're on and which target was picked.
+fn truncate_for_two_line(prefix: &str, inner_w: usize) -> String {
+    // The target suffix is appended as a separate line in the
+    // caller, so we only need to make the prefix (everything up to
+    // " → ") fit. The arrow + target is always its own second line.
+    if let Some(idx) = prefix.rfind(" → ") {
+        let head = &prefix[..idx + 1];
+        if head.chars().count() <= inner_w {
+            return prefix.to_string();
+        }
+        if let Some(bracket_end) = head.find("] ") {
+            let start = &head[..bracket_end + 2];
+            let rest = &head[bracket_end + 2..head.len() - 1];
+            let avail = inner_w.saturating_sub(start.chars().count() + 1);
+            if avail >= 3 {
+                let trimmed = truncate_with_ellipsis(rest, avail);
+                return format!("{start}{trimmed}…");
+            }
+        }
+    }
+    prefix.to_string()
+}
+
+/// Truncate `s` to `max` columns, appending "…" if anything was
+/// dropped. `max` must be ≥ 1.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        let mut out: String = s.chars().take(keep).collect();
+        out.push('…');
+        out
+    }
+}
 fn source_label(source: &SessionSource) -> String {
     match source {
         SessionSource::Microphone => "mic".into(),
@@ -563,13 +683,138 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, popup);
 }
 
-fn render_devices(f: &mut Frame, area: Rect, app: &App) {
+/// Top-row picker. Three panes side by side: Devices (physical I/O),
+/// Apps (per-application capture), and Targets (routing — Stdout /
+/// Cloud / Agent). Each pane is a self-contained `Block` with its own
+/// border + title + cursor; the picker wires them through a single
+/// outer layout so they all share the same row height.
+///
+/// Width split is percentage-based and intentionally biased toward
+/// Devices: device names are the longest strings we render, and
+/// dropping Devices below ~40% starts clipping them. Apps and
+/// Targets are short lists so they can survive narrower columns.
+fn render_picker(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(33),
+            Constraint::Percentage(22),
+        ])
         .split(area);
     render_devices_pane(f, cols[0], app);
     render_apps_pane(f, cols[1], app);
+    render_targets_list_pane(f, cols[2], app);
+}
+/// Third picker column. Lists the three routing options (Stdout /
+/// Cloud / Agent) and lets the user pick one with the same arrow
+/// navigation + Enter pattern as Devices and Apps. Picking here
+/// writes to `pending_target_overrides` on the focused slot; the
+/// next start_section consumes it.
+///
+/// The Agent row is rendered dim and the cursor refuses to land on it
+/// when the agent runtime binary is not on disk (see
+/// `App::focused_target_kind`). This keeps the visible state and
+/// the pickable state in agreement.
+fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::TargetKind;
+
+    let focused = app.picker_focus == PickerFocus::Targets;
+    let rows = app.targets();
+    // The row that's actually wired to the focused slot's
+    // pending-or-last target. Highlights survive the pane's focus
+    // state — even when Targets isn't focused, the user can see
+    // which row is the live choice.
+    let picked = app.picked_target_kind();
+
+    let title = if focused {
+        " Targets ▸ [↑/↓] pick  [←] apps  [Enter] start "
+    } else {
+        " Targets  ([→] focus) "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border_style(focused))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let items: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_cursor = i == app.selected_target_index.unwrap_or(0) && focused;
+            let is_picked = picked == Some(row.kind) && !row.disabled;
+            let marker = if is_cursor { "▶ " } else { "  " };
+            let (label, style, hint) = target_row_style(row.kind, row.disabled);
+            // The picked row gets its base color bumped to Yellow
+            // (the rest of the picker uses Green / Magenta / Cyan
+            // per target kind) plus the BOLD modifier. Cursor row
+            // wins on the invert to stay readable.
+            let label_style = if is_cursor {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            let picked_tag = if is_picked {
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("")
+            };
+            Line::from(vec![
+                Span::raw(marker),
+                Span::styled(label, label_style),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+                picked_tag,
+            ])
+        })
+        .collect();
+
+    let cursor_row = app.selected_target_index.unwrap_or(0) as u16;
+    let scroll = clamp_scroll_for_render(cursor_row, app.target_scroll, items.len() as u16, inner.height);
+    let p = Paragraph::new(items).scroll((scroll, 0));
+    f.render_widget(p, inner);
+}
+
+/// (label, style) for a single target row. `disabled=true` dims the
+/// label and appends a hint so the user knows the row exists but
+/// can't be picked.
+/// (label, style, hint) for a single target row. `disabled=true`
+/// dims the label and appends a hint so the user knows the row
+/// exists but can't be picked.
+fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, Style, String) {
+    use crate::app::TargetKind;
+    let base_color = match kind {
+        TargetKind::Stdout => Color::Green,
+        TargetKind::Cloud => Color::Magenta,
+        TargetKind::Agent => Color::Cyan,
+    };
+    let label = match kind {
+        TargetKind::Stdout => "Stdout",
+        TargetKind::Cloud => "Cloud",
+        TargetKind::Agent => "Agent",
+    };
+    if disabled {
+        (
+            label.into(),
+            Style::default().fg(Color::DarkGray),
+            "  (not installed)".into(),
+        )
+    } else {
+        // Agent is rendered the same as Stdout / Cloud — no
+        // trailing hint, same row geometry. The disabled
+        // case (above) carries the "(not installed)" hint
+        // since the row exists but can't be picked.
+        let s = Style::default().fg(base_color).add_modifier(Modifier::BOLD);
+        (label.into(), s, String::new())
+    }
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -581,18 +826,16 @@ fn pane_border_style(focused: bool) -> Style {
         Style::default().fg(Color::Gray)
     }
 }
-
 fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
     use crate::platform::AudioSessionKind;
 
     let focused = app.picker_focus == PickerFocus::Devices;
-    let saved = app.config.input_device.as_deref();
-    let saved_kind = app.config.input_device_kind;
+    let picked = app.picked_device_idx();
 
     let title = if focused {
         " Devices ▸ [↑/↓] select  [→] apps  [Enter] start "
     } else {
-        " Devices  ([←] focus) "
+        " Devices  ([←] apps  [Tab] slot) "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -616,31 +859,51 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, d)| {
             let is_cursor = i == app.selected_device_index && focused;
+            let is_picked = picked == Some(i);
             let marker = if is_cursor { "▶ " } else { "  " };
             let kind_tag = match d.kind {
                 AudioSessionKind::Input => {
                     Span::styled(" [input] ", Style::default().fg(Color::Cyan))
                 }
                 AudioSessionKind::Output => {
-                    Span::styled(" [output/loopback] ", Style::default().fg(Color::Magenta))
+                    Span::styled(
+                        " [output/loopback] ",
+                        Style::default().fg(Color::Magenta),
+                    )
                 }
                 AudioSessionKind::App => Span::styled(" [app] ", Style::default().fg(Color::Green)),
             };
-            let is_saved = Some(d.name.as_str()) == saved && saved_kind == Some(d.kind);
-            let saved_tag = if is_saved { "  (saved)" } else { "" };
+            // Picked rows glow yellow regardless of focus state —
+            // they're the rows the focused slot is actually routed
+            // to. The cursor row uses a white-on-black invert for
+            // contrast; non-cursor picked rows just get the color
+            // bump so it doesn't fight the focus invert.
             let name_style = if is_cursor {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if is_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
+            };
+            // "●" pin appears only on the row that's pinned to the
+            // slot. It survives the focus state of this pane —
+            // users looking at Apps or Targets can still see what
+            // the device choice is.
+            let picked_tag = if is_picked {
+                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("")
             };
             Line::from(vec![
                 Span::raw(marker),
                 Span::styled(d.name.clone(), name_style),
                 kind_tag,
-                Span::styled(saved_tag, Style::default().fg(Color::DarkGray)),
+                picked_tag,
             ])
         })
         .collect();
@@ -658,9 +921,10 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.picker_focus == PickerFocus::Apps;
+    let picked = app.picked_app_idx();
 
     let title = if focused {
-        " Apps ▸ [↑/↓] pick  [Space] none  [←] devices "
+        " Apps ▸ [↑/↓] pick  [Space] none  [←] devices  [→] targets "
     } else {
         " Apps  ([→] focus) "
     };
@@ -686,36 +950,61 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // First row is the synthetic "(no app — device only)" entry. It's
-    // rendered visually but isn't selectable via the apps cursor — Space
-    // is the way to land on it.
+    // First row is the synthetic "(no app — device only)" entry at
+    // visible row 0. The apps Vec itself starts at 0 but the
+    // rendered pane front-loads this row, so cursor/picked indices
+    // shift by +1 throughout.
     let mut items: Vec<Line> = Vec::with_capacity(app.apps.len() + 1);
+    let none_picked = picked == Some(0);
     let none_active = app.selected_app_index.is_none() && focused;
     let none_marker = if none_active { "▶ " } else { "  " };
+    let none_picked_tag = if none_picked {
+        Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("")
+    };
     items.push(Line::from(vec![
         Span::raw(none_marker),
         Span::styled(
             "(no app — device only)",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            if none_picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::ITALIC | Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            },
         ),
+        none_picked_tag,
     ]));
 
     for (i, a) in app.apps.iter().enumerate() {
         let is_cursor = Some(i) == app.selected_app_index && focused;
+        let is_picked = picked == Some(i + 1);
         let marker = if is_cursor { "▶ " } else { "  " };
         let name_style = if is_cursor {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD)
+        } else if is_picked {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
+        };
+        let picked_tag = if is_picked {
+            Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("")
         };
         items.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(a.name.clone(), name_style),
+            picked_tag,
         ]));
     }
 
@@ -910,6 +1199,8 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[Space]", "no app"),
                 hotkey_line("[Enter]", "start"),
                 hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[+]", "add slot"),
+                hotkey_line("[-]", "remove slot"),
                 hotkey_line("[r]", "refresh"),
                 hotkey_line("[c]", cloud_key_label),
                 hotkey_line("[l]", "language"),
@@ -919,9 +1210,12 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 lines.push(hotkey_line("[e]", "export"));
                 lines.push(hotkey_line("[p]", "path"));
             }
-            lines.push(hotkey_line("[x]", "clear"));
-            lines.push(hotkey_line("[q]", "quit"));
-            lines.push(hotkey_line("[?]", "help"));
+            // The O/S/A target-cycle key is gone — the Targets
+            // picker pane is the way to pick a route. The
+            // routing route is just `pick_target(kind)` then
+            // `start_section`; there's no separate user-facing
+            // key to advertise for the agent target because
+            // the picker pane *is* the surface.
             lines
         }
         (true, _) => {
@@ -930,6 +1224,8 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[←/→]", "pane"),
                 hotkey_line("[Enter]", "add"),
                 hotkey_line("[Tab]", "focus slot"),
+                hotkey_line("[+]", "add slot"),
+                hotkey_line("[-]", "remove slot"),
                 hotkey_line("[s]", "stop"),
                 hotkey_line("[S]", "stop all"),
                 hotkey_line("[c]", cloud_key_label),
@@ -1111,7 +1407,7 @@ mod tests {
         );
         // Devices pane shows the unfocused hint.
         assert!(
-            out.contains("[←] focus"),
+            out.contains("[←] apps"),
             "devices unfocused hint missing:\n{out}"
         );
     }
@@ -1208,19 +1504,101 @@ mod tests {
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
 
-    /// Three section columns render side-by-side with empty placeholders
-    /// when no sections are running. Each column shows its slot number
-    /// in the title.
+    /// The workspace starts at 1 slot. Expanding with `+` adds
+    /// additional slots; each column carries its slot number in
+    /// the title. The empty-slot placeholder still shows when
+    /// nothing is recording.
     #[test]
     fn three_section_columns_show_empty_placeholders() {
-        let app = App::new();
+        let mut app = App::new();
+        // App::new() ships one slot; the user opts in to more
+        // with `+`. Verifying that *three* columns render means
+        // expanding twice first.
+        app.add_slot();
+        app.add_slot();
         let out = render_to_string(&app, 180, 40);
         assert!(out.contains("[1]"), "slot 1 title missing:\n{out}");
         assert!(out.contains("[2]"), "slot 2 title missing:\n{out}");
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
+    /// Targets pane renders as the third picker column. The header is
+    /// " Targets " (focused variant carries the action hint), the
+    /// three rows are Stdout / Cloud / Agent, and the active pick is
+    /// tagged with "(active)" next to the focused slot's current
+    /// target.
+    #[test]
+    fn targets_pane_lists_stdout_cloud_omp_in_order() {
+        let app = App::new();
+        let out = render_to_string(&app, 180, 40);
+        // Pane header (focused variant — Devices is the default focus,
+        // so the targets pane shows the unfocused title).
+        assert!(out.contains("Targets"), "targets pane missing:\n{out}");
+        // Three rows in the fixed order: Stdout first, Agent last.
+        let stdout_pos = out.find("Stdout").expect("Stdout row missing");
+        let cloud_pos = out.find("Cloud").expect("Cloud row missing");
+        let agent_pos = out.find("Agent").expect("Agent row missing");
+        assert!(stdout_pos < cloud_pos, "Stdout must come before Cloud");
+        assert!(cloud_pos < agent_pos, "Cloud must come before Agent");
+    }
 
+    /// When the focused slot has been used before, the row matching
+    /// the current target gets a "(active)" tag — without it the user
+    /// has no way to tell at a glance which row is the active pick
+    /// across multiple slots.
+    #[test]
+    fn targets_pane_marks_active_target_with_active_tag() {
+        let app = App::new();
+        let out = render_to_string(&app, 180, 40);
+        // No sections have started yet — so the active tag is absent
+        // for every row. This is the lazy invariant; the helper that
+        // writes the tag only fires when `focused_target()` returns
+        // `Some(_)` (i.e. a section has run on the focused slot).
+        // The assertion is the absence of the tag in the idle case.
+        assert!(
+            !out.contains("(active)"),
+            "no section has started yet — active tag should be absent:\n{out}"
+        );
+    }
+
+    /// `target_row_style` (the helper behind the Targets pane rows)
+    /// returns the Agent row in dark gray and tagged as
+    /// "not installed" when the runtime binary is missing. The
+    /// base helper is pure — no real agent-runtime detection
+    /// required.
+    #[test]
+    fn target_row_style_agent_is_dim_when_disabled() {
+        use crate::app::TargetKind;
+        let (label, style, hint) = target_row_style(TargetKind::Agent, true);
+        assert_eq!(label, "Agent");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+        assert!(hint.contains("not installed"));
+    }
+    /// When Agent is enabled, the row is rendered with the same
+    /// shape as Stdout / Cloud — no trailing hint text, so the
+    /// three rows share identical geometry and the pin glyph
+    #[test]
+    fn target_row_style_agent_is_cyan_when_enabled() {
+        use crate::app::TargetKind;
+        let (label, style, hint) = target_row_style(TargetKind::Agent, false);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            hint, "",
+            "enabled Agent must not carry a trailing hint"
+        );
+    }
+    /// Enabled Stdout / Cloud also carry no hint — pinning
+    /// the invariant that all three picker rows share a
+    /// single shape so the pin column lands identically.
+    #[test]
+    fn target_row_style_stdout_cloud_have_no_hint() {
+        use crate::app::TargetKind;
+        for k in [TargetKind::Stdout, TargetKind::Cloud] {
+            let (_label, _style, hint) = target_row_style(k, false);
+            assert_eq!(hint, "", "enabled {:?} must not carry a trailing hint", k);
+        }
+    }
     /// Idle key sidebar shows the new Tab/cfg keys.
     #[test]
     fn key_sidebar_shows_tab_and_cfg_hints_when_idle() {
@@ -1235,25 +1613,305 @@ mod tests {
 
     #[test]
     fn key_sidebar_shows_all_idle_hotkeys_at_normal_height() {
+        // Wide-enough to render the full idle sidebar: the static
+        // list now includes the +/- workspace controls plus the
+        // local-only m/e/p lines plus the optional /mcp hint. We
+        // give the pane 26 rows of inner space.
         let app = App::new();
-        let out = render_to_string(&app, 160, 30);
+        let out = render_to_string(&app, 160, 50);
+        // The hotkey sidebar guarantees the keys the user reaches
+        // for are present. The set is wide enough to catch
+        // regressions in the static list (e.g. a dropped `[Tab]`
+        // The idle branch must list every key the user can press
+        // when no section is recording. Recording-only keys
+        // ([s]top, [x]clear, …) live on the `(true, _)` branch.
+        // No `/mcp` line — the Agent target lives in the
+        // Targets picker pane rather than a separate hotkey.
         for key in [
             "[↑/↓]",
             "[←/→]",
             "[Space]",
             "[Enter]",
             "[Tab]",
+            // The +/- workspace controls are always rendered —
+            // short-circuit the test when the static list drops
+            // them.
+            "[+]",
+            "[-]",
             "[r]",
             "[c]",
             "[l]",
-            "[m]",
-            "[e]",
-            "[p]",
-            "[x]",
-            "[q]",
-            "[?]",
         ] {
-            assert!(out.contains(key), "hotkey {key} missing:\n{out}");
+            assert!(out.contains(key), "idle key {key} missing from sidebar:\n{out}");
         }
+    }
+    /// Expanding the workspace shows the new slot number in the
+    /// title once the column renders. Useful to prevent regressions
+    /// in `fresh_slots` / `next_slot_id` — the title `[2]` only
+    /// appears if the second slot's id is 2.
+    #[test]
+    fn add_slot_creates_distinct_numbered_columns() {
+        let mut app = App::new();
+        let id_a = app.add_slot();
+        let id_b = app.add_slot();
+        assert!(matches!(id_a, Some(crate::app::SlotId(2))));
+        assert!(matches!(id_b, Some(crate::app::SlotId(3))));
+        let out = render_to_string(&app, 180, 40);
+        assert!(out.contains("[1]"), "slot 1 missing:\n{out}");
+        assert!(out.contains("[2]"), "slot 2 missing:\n{out}");
+        assert!(out.contains("[3]"), "slot 3 missing:\n{out}");
+    }
+    /// End-to-end visual smoke: drive a realistic state, write the
+    /// rendered layout to `target/snapshot-idle.txt`. Powers the
+    /// `snapshot_idle_layout_for_visual_review` workflow — useful
+    /// to catch layout regressions in the picker shape, the slot
+    /// row, the sidebar, and the picked-pin highlights at a
+    /// glance.
+    #[test]
+    fn snapshot_idle_layout_for_visual_review() {
+        let mut app = App::new();
+        app.devices = vec![
+            input("MacBook Pro Microphone"),
+            output("Mac mini Speakers"),
+            output("EPOS PC 8 USB"),
+            input("HD Pro Webcam C920"),
+        ];
+        app.apps = vec![
+            fake_app("chrome", "Google Chrome"),
+            fake_app("zoom", "Zoom"),
+            fake_app("terminal", "Terminal"),
+        ];
+        // Cursor lands on a non-trivial row; cursor + picked are
+        // intentionally different so the test exercises both
+        // branches.
+        app.selected_device_index = 2;
+        app.selected_app_index = Some(1);
+        app.selected_target_index = Some(1); // Cloud
+        // Pretend a previous start installed an Agent session id, so
+        // the Agent row stays pickable but isn't the picked one.
+        let out = render_to_string(&app, 180, 40);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("snapshot-idle.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &out).unwrap();
+    }
+    /// Multi-slot round-trip — drove directly from a reported
+    /// scenario: user starts a recording on slot 1, adds a second
+    /// slot with `+`, navigates back to slot 1 with Shift-Tab,
+    /// navigates forward to slot 2 with Tab. Each focus step must
+    /// (a) succeed without surprising state, (b) keep the device,
+    /// app, and target picked-row pins in the picker pointing at
+    /// the *focused* slot's pick.
+    #[test]
+    fn multi_slot_round_trip_keeps_picked_pins_on_focused_slot() {
+        use crate::app::{RecordingStatus, SavedTranscript, SlotKind};
+        use crate::platform::{AudioDevice, AudioSessionKind};
+        use std::sync::Arc;
+        use voice_bird_cli::session::target::Target;
+
+        let mut app = App::new();
+        // Cloud is always pickable (doesn't depend on the user
+        // having an agent runtime installed). Pick that as
+        // the per-slot target so the test stays portable
+        // across machines.
+        // Seed the picker state so each pane is non-trivial —
+        // otherwise the picked pin would land on a single
+        // vacant row and the test wouldn't catch ordering bugs.
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "Mac mini Speakers".into(),
+                kind: AudioSessionKind::Output,
+            },
+            AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: AudioSessionKind::Output,
+            },
+        ];
+        app.apps = vec![
+            fake_app("chrome", "Google Chrome"),
+            fake_app("zoom", "Zoom"),
+            fake_app("terminal", "Terminal"),
+        ];
+        app.selected_device_index = 2; // EPOS PC 8 USB
+        app.selected_app_index = Some(0); // Chrome
+        app.selected_target_index = Some(1); // Cloud (cursor)
+        // slot 1 starts as the only slot (id 1). Mark it as a
+        // saved recording on Cloud so the device + target pick
+        // are non-default. Bypassing `start_section` keeps the
+        // test free of audio / cpal / tokio runtime needs.
+        let saved_target = Target::Cloud;
+        app.slots[0] = crate::app::Slot {
+            id: crate::app::SlotId(1),
+            kind: SlotKind::Saved {
+                saved: SavedTranscript {
+                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    label: "EPOS PC 8 USB + Chrome -> Cloud".into(),
+                    target: saved_target.clone(),
+                },
+            },
+        };
+        // Move focus explicitly to slot 1 (already is, by
+        // construction).
+        app.focused_slot = crate::app::SlotId(1);
+        app.status = RecordingStatus::Idle;
+
+        // ---- Step 0: focus on slot 1 ----
+        // Confirm we start on slot 1 and the picks resolve to
+        // the right rows in every pane.
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1)); // Chrome at apps[0] + synthetic offset 1
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud)
+        );
+        let out0 = render_to_string(&app, 180, 40);
+        // The picked Device row ('EPOS PC 8 USB' at index 2)
+        // must glow yellow + carry the '●' pin. Each
+        // non-cursor device row appears once in the rendered
+        // buffer — counting '●' against the picker tells us
+        // if more than one row picked up the pin.
+        assert!(
+            out0.lines().any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
+            "slot-1 step 0: device row missing '●' pin:\n{out0}"
+        );
+        assert!(
+            out0.lines().any(|l| l.contains("Chrome") && l.contains('●')),
+            "slot-1 step 0: app row missing '●' pin:\n{out0}"
+        );
+        // Helper: locate a Targets-pane row by its label and
+        // report whether the row carries the trailing '●' pin.
+        // Anchors on the row's coordinate markers
+        // ('││  ' header, '│' footer, no '→' arrow) so the
+        // top border / slot title / side-panel cells don't
+        // sneak in.
+        // Helper: locate a Targets-pane row by its label and
+        // report whether the row carries the trailing '●' pin.
+        // The TestBackend pads every line to the column width
+        // with spaces, so a row filter should anchor on the
+        // column-start marker '││  ' and the row's label, not
+        // on '│' (the right border, which is followed by
+        // trailing spaces). Trim trailing whitespace after the
+        // Each rendered row in the Targets pane reads as
+        // "Label [hint] [●]" with one trailing pin. The
+        // TestBackend flattens every pane into one 180-wide
+        // line, so a pin search is the most reliable
+        // verification — substring "Label ●" matches the
+        // exact row we care about without dragging in
+        // neighbour panes.
+        let target_pin_present = |out: &str, label: &str| -> bool {
+            let pinned_text = format!("{label} \u{25CF}");
+            out.contains(&pinned_text)
+        };
+        // ---- Step 1: + adds a second slot ----
+        // focus_next / focus_prev cycle through every slot
+        // including Empty — the user can press Tab or
+        // Shift-Tab between slots regardless of whether a
+        // recording has started there yet.
+        let added = app.add_slot();
+        assert_eq!(added, Some(crate::app::SlotId(2)));
+        assert_eq!(app.slots.len(), 2);
+        // `add_slot` advances focused_slot to the new slot.
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        // Empty slot 2 picks fall back to the global
+        // cursor positions (Device, App) and the
+        // per-slot Stdout default (Target). Device +
+        // App keep their previous state because the
+        // user hasn't interacted with those panes;
+        // Target falls back to Stdout because slot 2
+        // has no recording and no pending override.
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Stdout)
+        );
+        let out1 = render_to_string(&app, 180, 40);
+        assert!(
+            target_pin_present(&out1, "Stdout"),
+            "step 1: Stdout must be pinned on slot 2:\n{out1}"
+        );
+        assert!(
+            !target_pin_present(&out1, "Cloud"),
+            "step 1: Cloud must NOT leak from slot 1 to slot 2:\n{out1}"
+        );
+        assert!(out1.contains("[1]"), "slot 1 title missing:\n{out1}");
+        assert!(out1.contains("[2]"), "slot 2 title missing:\n{out1}");
+
+        // ---- Step 2: focus_prev takes us back to slot 1 ----
+        app.focus_prev();
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "back on slot 1: picked target should be Cloud again"
+        );
+        assert_eq!(app.picked_device_idx(), Some(2));
+        assert_eq!(app.picked_app_idx(), Some(1));
+        let out2 = render_to_string(&app, 180, 40);
+        // Returning to slot 1 must re-pin Cloud on Targets
+        // — and must NOT leave Stdout pinned.
+        assert!(
+            target_pin_present(&out2, "Cloud"),
+            "back on slot 1: Cloud must be pinned:\n{out2}"
+        );
+        assert!(
+            !target_pin_present(&out2, "Stdout"),
+            "back on slot 1: Stdout must not be pinned:\n{out2}"
+        );
+
+        // ---- Step 3: focus_next takes us back to slot 2 ----
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        // Empty slot 2 falls back to defaults again — the
+        // pending override from Step 0 hasn't been touched yet.
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Stdout),
+            "forward on slot 2: picked target should be Stdout fallback"
+        );
+        let out3 = render_to_string(&app, 180, 40);
+        assert!(
+            target_pin_present(&out3, "Stdout"),
+            "back on slot 2: Stdout must be pinned:\n{out3}"
+        );
+        assert!(
+            !target_pin_present(&out3, "Cloud"),
+            "back on slot 2: Cloud must not be pinned:\n{out3}"
+        );
+
+        // ---- Bonus: queue a pending Cloud pick on slot 2
+        // and verify the override is per-slot. ----
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            Target::Cloud,
+        );
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "after queueing Cloud on slot 2, target picks Cloud"
+        );
+        app.focus_prev();
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        // Slot 1's pick is independent of slot 2's pending
+        // override: still Cloud (last saved).
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "slot 1 must keep its own target pick across slot 2's override"
+        );
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        assert_eq!(
+            app.picked_target_kind(),
+            Some(crate::app::TargetKind::Cloud),
+            "slot 2 picks Cloud back after forward navigation"
+        );
     }
 }

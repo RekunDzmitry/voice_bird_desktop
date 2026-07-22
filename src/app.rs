@@ -6,7 +6,7 @@ use parking_lot::Mutex as PlMutex;
 use crate::platform::{AppSession, AudioDevice};
 use voice_bird_cli::config::AppConfig;
 use voice_bird_cli::session::layout::SessionSource;
-
+use voice_bird_cli::session::target::Target;
 /// Application running mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -26,8 +26,11 @@ pub enum AppMode {
 /// is hidden and the engine call is forced to "en".
 pub const CLOUD_LANGUAGES: &[&str] = &["en", "es", "fr", "de", "it", "pt", "ja", "zh", "ru", "pl"];
 
-/// Maximum number of parallel recording sections.
-pub const MAX_SECTIONS: usize = 3;
+/// Hard upper bound on parallel recording slots. Slots start at 1 and
+/// grow on user demand (`+`); they never shrink below 1. The cap is
+/// here to defend against a runaway key auto-repeat building a Vec
+/// that overruns the screen — practical UI tops out around 4.
+pub const MAX_SECTIONS: usize = 8;
 
 /// Recording status
 #[derive(Debug, Clone)]
@@ -70,9 +73,10 @@ pub struct SavedTranscript {
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Column-title label from the stopped section (e.g. "mic · cloud:OFF").
     pub label: String,
+    /// Target the stopped section was using. Keeps the Targets pane
+    /// honest about what the saved text was being routed to.
+    pub target: Target,
 }
-
-/// Handles to a running recording pipeline.
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
     /// Producer task: pulls cpal frames, resamples, tees to WAV + engine.
@@ -148,16 +152,106 @@ pub struct Section {
     /// to show the latest content. Set false on manual scroll, restored
     /// by End.
     pub transcript_follow: bool,
+    /// Where this section is sending its transcript. Derived from
+    /// `settings.cloud_on` at start time and kept in sync on the
+    /// `Target` axis so the Targets pane can show it without poking
+    /// into the per-section settings.
+    pub target: Target,
 }
 
+/// Stable identifier for a `Slot`. Allocated once when the slot is
+/// created and reused for the slot's lifetime. The id stays valid even
+/// if the slot's `kind` cycles between `Empty`, `Recording`, and
+/// `Saved` — render code and key handlers can hold a `SlotId` and trust
+/// it to keep addressing the same physical pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlotId(pub u32);
+
+impl std::fmt::Display for SlotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// The state of a single transcript slot. `Empty` is the rest state
+/// the user starts in; `Recording` is an actively-running section;
+/// `Saved` is a stopped section whose transcript is kept visible in
+/// the UI until cleared with `x` or overwritten by a fresh start.
+pub enum SlotKind {
+    Empty,
+    Recording { section: Section },
+    Saved { saved: SavedTranscript },
+}
+
+impl std::fmt::Debug for SlotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotKind::Empty => f.write_str("Empty"),
+            SlotKind::Recording { section } => f
+                .debug_struct("Recording")
+                .field("source", &section.source)
+                .field("target", &section.target)
+                .field("cloud_on", &section.settings.cloud_on)
+                .finish(),
+            SlotKind::Saved { saved } => f
+                .debug_struct("Saved")
+                .field("label", &saved.label)
+                .field("target", &saved.target)
+                .finish(),
+        }
+    }
+}
+
+/// One TUI pane and its current state. The pane's `id` is stable; the
+/// position in `App::slots` is incidental.
+pub struct Slot {
+    pub id: SlotId,
+    pub kind: SlotKind,
+}
+
+impl Slot {
+    pub fn empty(id: SlotId) -> Self {
+        Self { id, kind: SlotKind::Empty }
+    }
+
+    /// Read-only view of the running section, if any. Used by the
+    /// accessors that answer "what's in the focused slot".
+    pub fn as_section(&self) -> Option<&Section> {
+        match &self.kind {
+            SlotKind::Recording { section } => Some(section),
+            _ => None,
+        }
+    }
+
+    /// The target this slot is currently (or was last) routing to.
+    /// `None` only when the slot has never been used.
+    pub fn target(&self) -> Option<Target> {
+        match &self.kind {
+            SlotKind::Empty => None,
+            SlotKind::Recording { section } => Some(section.target.clone()),
+            SlotKind::Saved { saved } => Some(saved.target.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
 /// Which pane the picker arrows / Enter key target. Devices is the
 /// physical-input/output column on the left; Apps is the
-/// per-application column on the right. Each pane has its own cursor
-/// and scroll offset.
+/// per-application column in the middle; Targets is the routing
+/// choice (Stdout / Cloud / Agent) on the right. Each pane has its
+/// own cursor and scroll offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFocus {
     Devices,
     Apps,
+    Targets,
 }
 
 /// Main application state
@@ -177,6 +271,12 @@ pub struct App {
     /// Cursor in the Apps pane. `None` = no app paired (run device alone).
     pub selected_app_index: Option<usize>,
 
+    /// Cursor in the Targets pane. The list of targets is fixed at
+    /// three entries (Stdout / Cloud / Agent) — see `targets()`. Always
+    /// `Some(idx)` while the TUI runs; the cursor is one of the
+    /// rendered rows.
+    pub selected_target_index: Option<usize>,
+
     /// Which pane the picker arrows / Enter target.
     pub picker_focus: PickerFocus,
 
@@ -184,7 +284,7 @@ pub struct App {
     /// auto-clamps these so the cursor stays visible.
     pub device_scroll: u16,
     pub app_scroll: u16,
-
+    pub target_scroll: u16,
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
     pub status: RecordingStatus,
@@ -216,12 +316,22 @@ pub struct App {
     /// Always-running tokio runtime for the recording pipeline.
     pub rt: tokio::runtime::Runtime,
 
-    /// Parallel recording slots. `Some` slots are actively recording.
-    pub sections: [Option<Section>; MAX_SECTIONS],
+    /// Parallel recording slots. Each entry owns its own id, kind
+    /// (`Empty` / `Recording` / `Saved`), and — for the non-empty
+    /// variants — the per-section state. The Vec starts at 1 slot;
+    /// `+` appends new slots (allocating fresh ids via
+    /// `next_slot_id`), `-` removes the focused one.
+    pub slots: Vec<Slot>,
 
-    /// Slot the c/l/m/Tab keys currently target. Stage 3 will wire
-    /// Tab-cycling; Stage 1 keeps this pinned to 0.
-    pub focused_section: usize,
+    /// Slot the c/l/m/Tab keys currently target. Stable across the
+    /// slot's lifetime — never a positional index.
+    pub focused_slot: SlotId,
+
+    /// Monotonic counter for new slot ids. Starts at 2 because slot
+    /// 1 is always present at startup. Bumped every time `add_slot`
+    /// appends a new entry; never reuses freed ids so any handle a
+    /// caller is holding stays valid even after a `-`.
+    pub next_slot_id: u32,
 
     /// First-run model picker state; `Some` while in `AppMode::ModelPicker`.
     pub picker: Option<PickerState>,
@@ -259,18 +369,59 @@ pub struct App {
     /// End re-enables it.
     pub transcript_follow: bool,
 
-    /// Per-slot transcript state preserved across section stop/start.
-    /// When a section stops, its committed/refined Arcs move here so
-    /// the text stays visible. Starting a new section in the same slot
-    /// reattaches them — new segments append to existing content.
-    pub transcript_saved: [Option<SavedTranscript>; MAX_SECTIONS],
-
     /// Empty fallback Arcs returned by `focused_*` accessors when no
     /// section is active — keeps the UI render path Arc-shaped without
     /// special-casing the empty state at every read site.
     empty_committed: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_refined: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
+
+    /// Detected state of the user's agent runtime (today: oh-my-pi
+    /// / omp). `None` only on a configuration error during
+    /// `App::new`; the user-visible states are
+    /// `AgentStatus::Ready` (path + version) or
+    /// `AgentStatus::NotFound`. Used by the Targets pane to decide
+    /// whether the Agent chip is enabled, and by `App::new` to
+    /// wire the status-bar hint.
+    pub agent: voice_bird_cli::agent::AgentStatus,
+    /// Which detection source produced the agent runtime (env /
+    /// PATH / bun install). `None` iff detection failed.
+    /// Surfaced in the status bar.
+    pub agent_detection_source: Option<voice_bird_cli::agent::AgentDetectionSource>,
+    /// Per-slot pending target override. The Targets picker writes
+    /// to this when the user picks a row; the next `start_section`
+    /// consults it and applies it instead of the default
+    /// `cloud_on` heuristic. The value is consumed (set back to
+    /// `None`) by start_section so it only affects the very next
+    /// start.
+    pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
+    /// spawned when the agent runtime launches us. The TUI also
+    /// pushes into this same buffer when the focused slot's
+    /// target is `Target::Agent`, so a single source of truth
+    /// serves both the in-process recorder and the
+    /// out-of-process agent.
+    agent_state: voice_bird_cli::agent::mcp_server::ServerState,
+}
+
+/// A renderable row in the Targets pane. The list of rows is
+/// fixed at three — the target *kind* drives the row; the agent
+/// session id is a property of `Target::Agent`, not a row in
+/// the picker. `disabled` rows render dim and the cursor
+/// refuses to land on them (see `App::focused_target_kind`).
+pub struct TargetRow {
+    pub kind: TargetKind,
+    pub disabled: bool,
+}
+
+/// Picker-side classification of a target. We can't use `Target`
+/// directly because `Target::Agent` carries a session id that
+/// the user doesn't pick per-row — the row just means "route
+/// to the agent runtime with the current session".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Stdout,
+    Cloud,
+    Agent,
 }
 
 impl App {
@@ -346,9 +497,14 @@ impl App {
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
+            // Targets list is fixed at three rows (Stdout/Cloud/Agent),
+            // so the cursor starts on the first one. We never want
+            // the pane to render in an empty-cursor state.
+            selected_target_index: Some(0),
             picker_focus: PickerFocus::Devices,
             device_scroll: 0,
             app_scroll: 0,
+            target_scroll: 0,
             status: RecordingStatus::Idle,
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
@@ -359,8 +515,11 @@ impl App {
             error_channel: Arc::new(Mutex::new(None)),
             log_path: None,
             rt,
-            sections: [None, None, None],
-            focused_section: 0,
+            slots: Self::fresh_slots(),
+            focused_slot: SlotId(1),
+            // Slot 1 was created by `fresh_slots()`. The next id we
+            // hand out is 2.
+            next_slot_id: 2,
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
@@ -369,21 +528,101 @@ impl App {
             banner: banner_on_launch,
             transcript_scroll: 0,
             transcript_follow: true,
-            transcript_saved: [None, None, None],
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
+            agent: voice_bird_cli::agent::AgentStatus::NotFound,
+            agent_detection_source: None,
+            pending_target_overrides: std::collections::BTreeMap::new(),
+            agent_state: voice_bird_cli::agent::mcp_server::ServerState::new(
+                voice_bird_cli::agent::AgentSessionId::default_session(),
+            ),
         };
-
-        // Windows first run (or missing key): land directly in the API-key
-        // modal — cloud is the only mode, so the key is the only thing the
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
             app.open_api_key_modal();
         }
 
+        // Probe for the local agent runtime (today: oh-my-pi /
+        // omp) so the status bar can surface "Agent found at
+        // <path> v<version>" (or "Agent not found" when the
+        // user hasn't installed an agent yet). Detection is
+        // intentionally best-effort and zero-cost on failure —
+        // we just enumerate three candidate locations.
+        match voice_bird_cli::agent::detect() {
+            Ok(det) => {
+                log::info!("agent detected: {} v{}", det.path.display(), det.version);
+                let det_path = det.path.clone();
+                let det_source = det.source.clone();
+                app.agent = voice_bird_cli::agent::AgentStatus::Ready {
+                    path: det.path,
+                    version: det.version,
+                };
+                app.agent_detection_source = Some(det.source);
+                // Auto-register this binary as an MCP server in
+                // ~/.omp/agent/mcp.json so the user's agent
+                // runtime picks voice-bird up on next launch.
+                // Best-effort: any error here just means the
+                // user has to run `voice-bird-cli --register`
+                // manually. Idempotent — repeated launches
+                // overwrite only the `voice-bird` key and leave
+                // other entries intact.
+                // Register THIS binary (voice-bird-cli), not the
+                // agent runtime's path. `det.path` is where the
+                // agent runtime lives; what the runtime needs
+                let home = voice_bird_cli::agent::register::register_home();
+                let binary = std::env::current_exe()
+                    .unwrap_or_else(|_| det_path.clone());
+                match voice_bird_cli::agent::register::register(&binary, &home) {
+                    Ok(()) => log::info!(
+                        "registered MCP server in {}/agent/mcp.json (source: {:?})",
+                        home.display(),
+                        det_source,
+                    ),
+                    Err(e) => log::warn!(
+                        "could not register MCP server: {e} (source: {:?})",
+                        det_source,
+                    ),
+                }
+            }
+            Err(status) => {
+                app.agent = status;
+                app.agent_detection_source = None;
+            }
+        }
+
         app
+    }
+
+
+    // -- Slot helpers -------------------------------------------------------
+
+    /// Build the initial slot Vec. The TUI starts with a single empty
+    /// slot (id 1) — the user expands the workspace with `+`. The
+    /// id is stable across the app's lifetime: appended slots get
+    /// fresh ids from `next_slot_id`, never renumbering the existing
+    /// ones, so any handle a caller is holding stays valid.
+    fn fresh_slots() -> Vec<Slot> {
+        vec![Slot::empty(SlotId(1))]
+    }
+
+    /// Look up a slot's current Vec index from its stable id. Returns
+    /// `None` if the id was never allocated (e.g. freed by a Phase B
+    /// shrink). The Vec is the source of truth — ids are a stable
+    /// handle for outside callers.
+    pub fn slot_index(&self, id: SlotId) -> Option<usize> {
+        self.slots.iter().position(|s| s.id == id)
+    }
+
+    /// Read-only access to a slot by id.
+    fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
+        self.slots.iter().find(|s| s.id == id)
+    }
+
+    /// Mutable access to a slot by id.
+    fn slot_by_id_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.id == id)
     }
 
     // -- Section accessors --------------------------------------------------
@@ -391,21 +630,28 @@ impl App {
     /// Currently focused section (the one `c`/`l`/`m`/`s` operate on),
     /// or `None` if no section is running in that slot.
     pub fn focused(&self) -> Option<&Section> {
-        self.sections
-            .get(self.focused_section)
-            .and_then(|s| s.as_ref())
+        self.slot_by_id(self.focused_slot)
+            .and_then(|s| s.as_section())
     }
 
     /// Mutable variant of [`focused`].
     pub fn focused_mut(&mut self) -> Option<&mut Section> {
-        self.sections
-            .get_mut(self.focused_section)
-            .and_then(|s| s.as_mut())
+        let id = self.focused_slot;
+        self.slots
+            .iter_mut()
+            .find(|s| s.id == id)
+            .and_then(|s| match &mut s.kind {
+                SlotKind::Recording { section } => Some(section),
+                _ => None,
+            })
     }
 
     /// Number of slots currently recording.
     pub fn active_section_count(&self) -> usize {
-        self.sections.iter().filter(|s| s.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|s| matches!(s.kind, SlotKind::Recording { .. }))
+            .count()
     }
 
     /// Engine kind label for the focused section. Empty string when idle.
@@ -447,15 +693,102 @@ impl App {
             .unwrap_or_else(|| self.config.default_model.clone())
     }
 
+    /// The focused slot's current target (Stdout / Cloud), or `None`
+    /// when the slot has never been used. UI uses this to drive the
+    /// Targets pane.
+    pub fn focused_target(&self) -> Option<Target> {
+        self.slot_by_id(self.focused_slot).and_then(|s| s.target())
+    }
+
+    /// The current pending target for the focused slot, falling
+    /// through to the slot's last-used target, then Stdout. The UI
+    /// uses this for the per-slot title and the targets pane's
+    /// "active" marker.
+    pub fn focused_pending_target(&self) -> Target {
+        self.pending_target_overrides
+            .get(&self.focused_slot)
+            .cloned()
+            .or_else(|| self.focused_target())
+            .unwrap_or(Target::Stdout)
+    }
+    /// `Stdout → Cloud → Agent → Stdout`. The new target is stored on
+    /// `pending_target_overrides` and applied by the next
+    /// `start_section`. The current chip label keeps reflecting the
+    /// previous pick until the next start so the user has a chance
+    /// to back out (but we also surface a banner so they see the
+    /// pending change immediately).
+    ///
+    /// Returns the target that was just queued. The caller can use
+    /// this for the status bar hint.
+    pub fn cycle_focused_target(&mut self) -> Target {
+        use voice_bird_cli::agent::AgentSessionId;
+        let slot = self.focused_slot;
+        let current = self
+            .pending_target_overrides
+            .get(&slot)
+            .cloned()
+            .or_else(|| self.slot_by_id(slot).and_then(|s| s.target()))
+            .unwrap_or(Target::Stdout);
+        let next = match current {
+            Target::Stdout => Target::Cloud,
+            Target::Cloud => Target::Agent {
+                session_id: AgentSessionId::default_session().0,
+            },
+            Target::Agent { .. } => Target::Stdout,
+        };
+        self.pending_target_overrides.insert(slot, next.clone());
+        next
+    }
+
+    /// The picker list. Always three rows; `Agent` is disabled when
+    /// the binary is not on disk.
+    pub fn targets(&self) -> [TargetRow; 3] {
+        use TargetKind::*;
+        let agent_disabled = !matches!(self.agent, voice_bird_cli::agent::AgentStatus::Ready { .. });
+        [
+            TargetRow { kind: Stdout, disabled: false },
+            TargetRow { kind: Cloud, disabled: false },
+            TargetRow { kind: Agent, disabled: agent_disabled },
+        ]
+    }
+
+    /// Resolve the currently focused Targets-pane row to a `Target`.
+    /// Returns `None` if the cursor is parked on a disabled row or
+    /// out of range.
+    pub fn focused_target_kind(&self) -> Option<TargetKind> {
+        let i = self.selected_target_index?;
+        self.targets().get(i).and_then(|r| if r.disabled { None } else { Some(r.kind) })
+    }
+
+    /// Set the focused slot's pending target from a `TargetKind`. The
+    /// value is consumed by the next `start_section` and applied
+    /// instead of the `cloud_on` heuristic. The resolved `Target`
+    /// (with a session id, for Agent) is returned so the caller can
+    /// surface it in a banner.
+    pub fn pick_target(&mut self, kind: TargetKind) -> Target {
+        use voice_bird_cli::agent::AgentSessionId;
+        let slot = self.focused_slot;
+        let target = match kind {
+            TargetKind::Stdout => Target::Stdout,
+            TargetKind::Cloud => Target::Cloud,
+            TargetKind::Agent => Target::Agent {
+                session_id: AgentSessionId::default_session().0,
+            },
+        };
+        self.pending_target_overrides.insert(slot, target.clone());
+        target
+    }
+
     /// Committed-transcript Arc for the focused section, or saved
     /// transcript, or an empty fallback when nothing is available.
     pub fn focused_committed(&self) -> Arc<PlMutex<Vec<CommittedLine>>> {
         self.focused()
             .map(|s| s.committed.clone())
             .or_else(|| {
-                self.transcript_saved
-                    .get(self.focused_section)
-                    .and_then(|t| t.as_ref().map(|t| t.committed.clone()))
+                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
+                    SlotKind::Saved { saved } => Some(saved.committed.clone()),
+                    _ => None,
+                })
             })
             .unwrap_or_else(|| self.empty_committed.clone())
     }
@@ -464,9 +797,10 @@ impl App {
         self.focused()
             .map(|s| s.refined.clone())
             .or_else(|| {
-                self.transcript_saved
-                    .get(self.focused_section)
-                    .and_then(|t| t.as_ref().map(|t| t.refined.clone()))
+                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
+                    SlotKind::Saved { saved } => Some(saved.refined.clone()),
+                    _ => None,
+                })
             })
             .unwrap_or_else(|| self.empty_refined.clone())
     }
@@ -476,6 +810,7 @@ impl App {
             .map(|s| s.tentative.clone())
             .unwrap_or_else(|| self.empty_tentative.clone())
     }
+    // -- Section accessors --------------------------------------------------
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
@@ -684,19 +1019,85 @@ impl App {
         }
     }
 
-    /// Cycle the focused section forward (Tab). Wraps from slot 2 → 0.
+    /// Cycle the focused slot forward (Tab). Pure positional
+    /// cycling — every slot, including Empty, is reachable.
+    /// Empty slots land the picker on a focused but unstarted
+    /// slot so the user can press Enter to start a recording
+    /// or `pick_target` to queue a routing override without
+    /// having to click into the column first.
+    /// Wraps from the last slot back to the first.
     pub fn focus_next(&mut self) {
-        self.focused_section = (self.focused_section + 1) % MAX_SECTIONS;
+        if let Some(idx) = self.slot_index(self.focused_slot) {
+            let n = self.slots.len();
+            let next_idx = (idx + 1) % n;
+            self.focused_slot = self.slots[next_idx].id;
+        }
     }
 
-    /// Cycle the focused section backward (Shift-Tab).
+    /// Cycle the focused slot backward (Shift-Tab). Mirrors
+    /// [`focus_next`] — every slot, no skipping.
     pub fn focus_prev(&mut self) {
-        self.focused_section = (self.focused_section + MAX_SECTIONS - 1) % MAX_SECTIONS;
+        if let Some(idx) = self.slot_index(self.focused_slot) {
+            let n = self.slots.len();
+            let prev_idx = (idx + n - 1) % n;
+            self.focused_slot = self.slots[prev_idx].id;
+        }
     }
 
-    /// Pick the lowest-numbered free slot, or `None` if all are running.
-    pub fn next_free_slot(&self) -> Option<usize> {
-        self.sections.iter().position(|s| s.is_none())
+    /// Pick the first Empty slot, or `None` if every existing slot
+    /// is busy. Callers that need to grow past `len()` should call
+    /// `add_slot` instead — this stays narrow on purpose.
+    pub fn next_free_slot(&self) -> Option<SlotId> {
+        self.slots
+            .iter()
+            .find(|s| matches!(s.kind, SlotKind::Empty))
+            .map(|s| s.id)
+    }
+
+    /// Append a new empty slot to the workspace and focus it.
+    /// Returns the new slot's id. Refuses (and returns `None`) when
+    /// the slot count is already at `MAX_SECTIONS` — the cap exists
+    /// to keep the screen readable, not as a feature limitation.
+    pub fn add_slot(&mut self) -> Option<SlotId> {
+        if self.slots.len() >= MAX_SECTIONS {
+            return None;
+        }
+        let id = SlotId(self.next_slot_id);
+        self.next_slot_id += 1;
+        self.slots.push(Slot::empty(id));
+        self.focused_slot = id;
+        Some(id)
+    }
+
+    /// Remove the focused slot. Refuses (returns `false`) when the
+    /// focused slot is currently recording — the user must `s`top
+    /// the section first to avoid orphaning a tokio task. Also
+    /// refuses when only one slot is left (the TUI always shows
+    /// at least one slot).
+    pub fn remove_focused_slot(&mut self) -> bool {
+        if self.slots.len() <= 1 {
+            return false;
+        }
+        let id = self.focused_slot;
+        let pos = match self.slot_index(id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
+            return false;
+        }
+        self.slots.remove(pos);
+        // If the focused slot also had a pending target override,
+        // drop it — the slot id is gone from the Vec and we don't
+        // want the override to silently re-apply to a future slot.
+        self.pending_target_overrides.remove(&id);
+        // Land focus on the nearest remaining slot. Prefer the slot
+        // to the left of the removed one, else the new rightmost.
+        let new_idx = if pos > 0 { pos - 1 } else { 0 };
+        if let Some(s) = self.slots.get(new_idx) {
+            self.focused_slot = s.id;
+        }
+        true
     }
 
     /// Refresh both panes' inventory. Preserves cursors by name when the
@@ -741,6 +1142,9 @@ impl App {
     }
 
     /// Move the cursor up one row in whichever pane is focused.
+    /// In the Targets pane, disabled rows (currently just `Agent` when
+    /// the binary is missing) are skipped so the cursor never parks
+    /// on a row that can't be picked.
     pub fn select_previous(&mut self) {
         match self.picker_focus {
             PickerFocus::Devices => {
@@ -755,18 +1159,31 @@ impl App {
                     self.selected_app_index = Some(next);
                 }
             }
+            PickerFocus::Targets => {
+                let i = self.selected_target_index.unwrap_or(0);
+                if i > 0 {
+                    self.selected_target_index = Some(i - 1);
+                }
+            }
         }
         log::debug!(
-            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?})",
+            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
                 .get(self.selected_device_index)
-                .map(|d| (d.name.clone(), d.kind)),
+                .map(|d| d.name.clone()),
             self.selected_app_index,
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
+            self.selected_target_index,
+            {
+                let rows = self.targets();
+                self.selected_target_index
+                    .and_then(|i| rows.get(i))
+                    .map(|r| r.kind)
+            },
         );
     }
 
@@ -789,20 +1206,40 @@ impl App {
                     self.selected_app_index = Some(0);
                 }
             }
+            PickerFocus::Targets => {
+                let i = self.selected_target_index.unwrap_or(0);
+                // The list is fixed at three rows. The disabled-row
+                // skip happens lazily in `focused_target_kind` so
+                // the cursor still parks on the row visually — the
+                // banner and the start call both treat it as a
+                // no-op when the row is disabled.
+                if i + 1 < 3 {
+                    self.selected_target_index = Some(i + 1);
+                }
+            }
         }
         log::debug!(
-            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?})",
+            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
                 .get(self.selected_device_index)
-                .map(|d| (d.name.clone(), d.kind)),
+                .map(|d| d.name.clone()),
             self.selected_app_index,
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
+            self.selected_target_index,
+            {
+                let rows = self.targets();
+                self.selected_target_index
+                    .and_then(|i| rows.get(i))
+                    .map(|r| r.kind)
+            },
         );
     }
+
+
 
     /// Clamp pane scroll offsets so the cursor row stays inside the
     /// viewport. `visible` is the inner row count of one pane (rough
@@ -847,6 +1284,82 @@ impl App {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
+    /// Row index of the device currently picked for the focused slot.
+    /// The picker is always pinned to the slot that's recording (or
+    /// about to record), so this matches what `start_section` will
+    /// consume. Falls back to the last-saved device from config when
+    /// the slot has never been started — that's still "picked" from
+    /// the user's perspective.
+    pub fn picked_device_idx(&self) -> Option<usize> {
+        // First preference: the live cursor.
+        if let Some(d) = self.focused_device() {
+            // Re-resolve by name+kind so the row survives a `r`efresh
+            // that reordered the inventory.
+            if let Some(saved) = self.config.input_device.as_deref() {
+                if d.name == saved
+                    && Some(d.kind) == self.config.input_device_kind
+                {
+                    return Some(self.selected_device_index);
+                }
+            }
+            return Some(self.selected_device_index);
+        }
+        // Fallback: the saved device from config.
+        if let Some(name) = self.config.input_device.clone() {
+            let kind = self.config.input_device_kind;
+            if let Some(i) = self
+                .devices
+                .iter()
+                .position(|d| d.name == name && Some(d.kind) == kind)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Picked-app row index in the rendered Apps list. Accounts for
+    /// the synthetic "(no app — device only)" row that sits at
+    /// visible row 0 of the pane — the apps Vec itself starts at 0
+    /// but the first rendered row is the synthesis. So:
+    /// `None` → no opinion yet (no app saved, none focused),
+    /// `Some(0)` → (no app) is picked,
+    /// `Some(k+1)` → app[k] is picked.
+    pub fn picked_app_idx(&self) -> Option<usize> {
+        if let Some(i) = self.selected_app_index {
+            // +1 to skip the synthetic "no app" row at the top of
+            // the pane.
+            return Some(i + 1);
+        }
+        if let Some(id) = self.config.last_app_id.as_deref() {
+            if let Some(i) = self.apps.iter().position(|a| a.id == id) {
+                return Some(i + 1);
+            }
+        }
+        // (no app) is the default — surface it as row 0.
+        if !self.apps.is_empty() {
+            return Some(0);
+        }
+        None
+    }
+
+    /// Picked-target kind for the focused slot. Falls through to
+    /// the last-saved target if no pending override is queued. The
+    /// Targets pane uses this to mark the active row.
+    pub fn picked_target_kind(&self) -> Option<TargetKind> {
+        let t = self
+            .pending_target_overrides
+            .get(&self.focused_slot)
+            .cloned()
+            .or_else(|| self.focused_target())
+            .unwrap_or(Target::Stdout);
+        Some(match t {
+            Target::Stdout => TargetKind::Stdout,
+            Target::Cloud => TargetKind::Cloud,
+            Target::Agent { .. } => TargetKind::Agent,
+        })
+    }
+
     /// Get current audio level
     pub fn get_audio_level(&self) -> f32 {
         self.audio_level.lock().map(|l| *l).unwrap_or(0.0)
@@ -885,8 +1398,8 @@ impl App {
         // Drain all sections, but only one banner — the most recent error
         // wins (last write of multiple in the same tick survives).
         let mut drained: Option<String> = None;
-        for slot in self.sections.iter() {
-            if let Some(section) = slot.as_ref() {
+        for slot in self.slots.iter() {
+            if let SlotKind::Recording { section } = &slot.kind {
                 if let Ok(mut err) = section.engine_error_channel.lock() {
                     if let Some(msg) = err.take() {
                         drained = Some(msg);
@@ -922,7 +1435,7 @@ impl App {
     /// in `banner` + `status` so the UI can surface them.
     pub fn start_recording(&mut self, source: SessionSource) {
         let settings = self.effective_settings_for(&source);
-        let slot = self.focused_section;
+        let slot = self.focused_slot;
         if let Err(msg) = self.start_section(slot, source, settings) {
             self.banner = Some(msg.clone());
             self.status = RecordingStatus::Error(msg);
@@ -1000,16 +1513,18 @@ impl App {
     /// avoid clobbering the modal with a banner.
     pub fn start_section(
         &mut self,
-        slot: usize,
+        slot: SlotId,
         source: SessionSource,
         mut settings: SectionSettings,
     ) -> Result<(), String> {
         clamp_section_settings_for_platform(&mut settings);
 
-        if slot >= MAX_SECTIONS {
-            return Err(format!("invalid section slot: {slot}"));
-        }
-        if self.sections[slot].is_some() {
+        // Look up the slot up front. An invalid id is the caller's
+        // bug — usually a freed Phase B id — so we refuse cleanly.
+        let pos = self
+            .slot_index(slot)
+            .ok_or_else(|| format!("invalid section slot: {slot}"))?;
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("section slot {slot} already running"));
         }
 
@@ -1030,6 +1545,48 @@ impl App {
             "en".to_string()
         };
 
+        // Where this section is heading. The Targets picker
+        // writes a per-slot override when the user picks a
+        // row; that overrides the cloud_on heuristic so the
+        // agent target works alongside the existing Cloud /
+        // Stdout switch. The override is consumed at start so
+        // it only affects this one start.
+        let target = self
+            .pending_target_overrides
+            .remove(&slot)
+            .unwrap_or_else(|| {
+                if settings.cloud_on {
+                    Target::Cloud
+                } else {
+                    Target::Stdout
+                }
+            });
+        // Keep `cloud_on` in sync with the picked target so the
+        // rest of the recording pipeline (engine pick, language
+        // shadowing, etc.) doesn't have to learn about `Agent` yet —
+        // the Agent target piggybacks on local inference today.
+
+        settings.cloud_on = matches!(target, Target::Cloud);
+
+        // Truncate the per-slot live tail when starting an
+        // Agent session. The TUI writes every committed segment
+        // there; the MCP server process spawned by the agent
+        // runtime tails this file. Starting fresh prevents a new
+        // recording from inheriting segments left by a previous
+        // session on the same slot.
+        if matches!(target, Target::Agent { .. }) {
+            // Truncate the per-slot live tail so a fresh recording
+            // does not pick up segments left by a previous session
+            // on the same slot. Slot ids come from `next_slot_id`
+            // which monotonically grows up to `MAX_SECTIONS` (8) and
+            // is never reused, so the cast to `u8` is lossless and
+            // the live file path stays unique per slot.
+            let slot_u8 = slot.0 as u8;
+            if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot_u8) {
+                log::warn!("agent live truncate: {e}");
+            }
+        }
+
         let now = chrono::Utc::now();
         // Local-first persistence: when broadcasting, the recording lives
         // entirely on voicebird.app and we skip creating a local session
@@ -1049,20 +1606,21 @@ impl App {
         };
 
         // Per-section live state. Reattach preserved transcript if the
-        // slot had one from a prior stop; otherwise start fresh.
-        let (committed, refined) = if let Some(saved) = self.transcript_saved[slot].take() {
-            (saved.committed, saved.refined)
-        } else {
-            (
+        // slot had a Saved variant; otherwise start fresh.
+        let (committed, refined) = match &self.slots[pos].kind {
+            SlotKind::Saved { saved } => {
+                (saved.committed.clone(), saved.refined.clone())
+            }
+            _ => (
                 Arc::new(PlMutex::new(Vec::new())),
                 Arc::new(PlMutex::new(Vec::new())),
-            )
+            ),
         };
         let tentative: Arc<PlMutex<String>> = Arc::new(PlMutex::new(String::new()));
         let engine_error_channel: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Reset focused-section transcript scroll when the focused slot starts.
-        if slot == self.focused_section {
+        if slot == self.focused_slot {
             self.transcript_scroll = 0;
             self.transcript_follow = true;
         }
@@ -1378,7 +1936,13 @@ impl App {
             }
         });
 
-        // --- 6. Consumer task: engine events → live state + JSONL ---------
+        // --- 6. Consumer task: engine events → live state + JSONL ---
+        // Capture the section's target + the shared agent buffer
+        // so the consumer can fan a Committed segment into the
+        // MCP-server buffer when the user picked `Target::Agent`.
+        let target_for_consumer = target.clone();
+        let agent_state_for_consumer = self.agent_state.clone();
+        let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
                 match voice_bird_cli::session::writer::SegmentWriter::open(p) {
@@ -1411,9 +1975,49 @@ impl App {
                         committed_for_consumer.lock().push(CommittedLine {
                             t_start_ms: elapsed_ms,
                             t_end_ms: elapsed_ms,
-                            text: seg.text,
+                            text: seg.text.clone(),
                         });
                         tentative_for_consumer.lock().clear();
+
+                        // Build the on-disk live record FIRST, before
+                        // any code path moves `seg` into the in-memory
+                        // buffer. The mirror write to `~/.voice-bird/live/`
+                        // runs after, but it just reads `&seg` again —
+                        // which is fine since we already extracted the
+                        // fields we need into `live_seg`.
+                        let idx = agent_state_for_consumer.snapshot_next_index();
+                        let session = match &target_for_consumer {
+                            Target::Agent { session_id } => {
+                                voice_bird_cli::agent::AgentSessionId(session_id.clone())
+                            }
+                            _ => voice_bird_cli::agent::AgentSessionId::default_session(),
+                        };
+                        let live_seg = if matches!(target_for_consumer, Target::Agent { .. }) {
+                            Some(voice_bird_cli::agent::live::LiveSegment::from_engine(
+                                &seg, idx, &session,
+                            ))
+                        } else {
+                            None
+                        };
+                        // Route into the agent buffer when the
+                        // slot's target is `Target::Agent`.
+                        // Best-effort.
+                        if matches!(target_for_consumer, Target::Agent { .. }) {
+                            agent_state_for_consumer.push(seg);
+                        }
+                        // Mirror to the on-disk live tail so the
+                        // MCP server process spawned by the agent
+                        // runtime sees the same segments. The
+                        // TUI's in-memory buffer is local to this
+                        // process; the live file is the
+                        // `pull_recent`.
+                        if let Some(live) = live_seg {
+                            let slot_u8 = slot_for_consumer.0 as u8;
+                            if let Err(e) = voice_bird_cli::agent::live::append(slot_u8, &live) {
+                                log::warn!("agent live append: {e}");
+                            }
+                        }
+
                     }
                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
@@ -1422,9 +2026,10 @@ impl App {
                         }
                         break;
                     }
-                }
-            }
-        });
+                 }
+             }
+         });
+
 
         // --- 6b. Refinement consumer task (separate writer, separate JSONL) -
         let refinement_join = if let Some(h) = refinement_handle {
@@ -1504,12 +2109,14 @@ impl App {
             cloud_reminder_until,
             transcript_scroll: 0,
             transcript_follow: true,
+            target,
         };
-        self.sections[slot] = Some(section);
-
-        // Aggregate App-level recording state. With multiple sections,
-        // start_time tracks the EARLIEST active section's start.
-        self.status = RecordingStatus::Recording;
+        // Park the running section in the slot. `pos` was validated at
+        // the top of the function, so a successful match here is the
+        // only way the Recording variant can land.
+        if let Some(slot_ref) = self.slots.get_mut(pos) {
+            slot_ref.kind = SlotKind::Recording { section };
+        }
         let now_inst = std::time::Instant::now();
         self.start_time = Some(match self.start_time {
             Some(prev) if prev < now_inst => prev,
@@ -1520,27 +2127,39 @@ impl App {
 
     /// Stop the active recording in `slot` and finalize its session files.
     /// No-op if the slot is empty.
-    pub fn stop_section(&mut self, slot: usize) {
+    pub fn stop_section(&mut self, slot: SlotId) {
         log::info!("stop_section[{slot}]: entered");
-        if slot >= MAX_SECTIONS {
-            log::warn!("stop_section[{slot}]: invalid slot, refusing");
-            return;
-        }
-        // Preserve the transcript before taking the section so the text
-        // stays visible in the UI after stop.
-        if let Some(section) = self.sections[slot].as_ref() {
-            let label = section_column_label(slot, Some(section));
-            self.transcript_saved[slot] = Some(SavedTranscript {
-                committed: section.committed.clone(),
-                refined: section.refined.clone(),
-                label,
-            });
-        }
-
-        let Some(section) = self.sections[slot].take() else {
-            log::info!("stop_section[{slot}]: slot was empty (no-op)");
-            return;
+        let pos = match self.slot_index(slot) {
+            Some(p) => p,
+            None => {
+                log::warn!("stop_section[{slot}]: invalid slot, refusing");
+                return;
+            }
         };
+
+        // Take the section out so we can finalize its session files.
+        // We replace the slot with a Saved variant carrying the same
+        // transcripts so the UI keeps showing the text after stop.
+        let section = match std::mem::replace(&mut self.slots[pos].kind, SlotKind::Empty) {
+            SlotKind::Recording { section } => section,
+            other => {
+                // Empty or already Saved: nothing to stop, put the
+                // slot back exactly as it was.
+                self.slots[pos].kind = other;
+                log::info!("stop_section[{slot}]: slot was empty (no-op)");
+                return;
+            }
+        };
+        let label = section_column_label(slot, Some(&section));
+        let target = section.target;
+        let saved = SavedTranscript {
+            committed: section.committed.clone(),
+            refined: section.refined.clone(),
+            label,
+            target,
+        };
+        self.slots[pos].kind = SlotKind::Saved { saved };
+
         log::info!(
             "stop_section[{slot}]: stopping source = {:?}",
             section.source
@@ -1606,28 +2225,42 @@ impl App {
 
     /// Clear the transcript for the given slot — both any live section's
     /// committed/refined data and the saved (preserved) transcript.
-    pub fn clear_slot_transcript(&mut self, slot: usize) {
-        self.transcript_saved[slot] = None;
-        if let Some(section) = self.sections[slot].as_ref() {
-            section.committed.lock().clear();
-            section.refined.lock().clear();
-            section.tentative.lock().clear();
+    pub fn clear_slot_transcript(&mut self, slot: SlotId) {
+        let Some(pos) = self.slot_index(slot) else {
+            return;
+        };
+        match &mut self.slots[pos].kind {
+            SlotKind::Recording { section } => {
+                section.committed.lock().clear();
+                section.refined.lock().clear();
+                section.tentative.lock().clear();
+            }
+            SlotKind::Saved { .. } => {
+                self.slots[pos].kind = SlotKind::Empty;
+            }
+            SlotKind::Empty => {}
         }
     }
 
     /// Stop the focused section. Backwards-compatible shim for callers
     /// that haven't been updated to the per-section API yet.
     pub fn stop_recording(&mut self) {
-        let slot = self.focused_section;
+        let slot = self.focused_slot;
         self.stop_section(slot);
     }
 
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
-        for slot in 0..MAX_SECTIONS {
-            if self.sections[slot].is_some() {
-                self.stop_section(slot);
-            }
+        // Collect ids first so we don't hold a borrow on `self.slots`
+        // while mutating each one through `stop_section`.
+        let recording_ids: Vec<SlotId> = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.kind, SlotKind::Recording { .. }))
+            .map(|s| s.id)
+            .collect();
+        for slot in recording_ids {
+            self.stop_section(slot);
         }
     }
 
@@ -1739,8 +2372,8 @@ impl App {
 /// placeholders). Mirrors `section_column_title` in ui.rs so the saved-
 /// transcript path can reconstruct the label without depending on the ui
 /// module.
-pub fn section_column_label(slot: usize, section: Option<&Section>) -> String {
-    let n = slot + 1;
+pub fn section_column_label(slot: SlotId, section: Option<&Section>) -> String {
+    let n = slot.0;
     match section {
         None => format!(" [{n}] (empty) "),
         Some(s) => {
@@ -1889,6 +2522,28 @@ mod tests {
         assert!(looks_like_auth_error("forbidden"));
         assert!(!looks_like_auth_error("connection reset by peer"));
         assert!(!looks_like_auth_error("audio format unsupported"));
+    }
+    /// The Targets pane's `pick_target` writes the focused slot's
+    /// pending target, which `start_section` consumes on the next
+    /// start. Each call returns the resolved `Target` (with a
+    /// session id for Agent) so the caller can surface a banner.
+    #[test]
+    fn pick_target_writes_pending_override_for_focused_slot() {
+        use crate::app::TargetKind;
+        let mut app = App::new();
+        let first = app.pick_target(TargetKind::Stdout);
+        assert_eq!(first, Target::Stdout);
+        assert_eq!(
+            app.pending_target_overrides.get(&SlotId(1)).cloned(),
+            Some(Target::Stdout)
+        );
+        let cloud = app.pick_target(TargetKind::Cloud);
+        assert_eq!(cloud, Target::Cloud);
+        let omp = app.pick_target(TargetKind::Agent);
+        assert!(matches!(omp, Target::Agent { .. }));
+        // Switching back to Stdout overwrites the prior override.
+        let stdout = app.pick_target(TargetKind::Stdout);
+        assert_eq!(stdout, Target::Stdout);
     }
 
     #[test]

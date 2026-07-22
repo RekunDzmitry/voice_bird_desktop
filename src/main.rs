@@ -113,9 +113,19 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
+    // `--mcp-server` runs voice-bird as a stdio MCP server for the
+    // agent runtime. Disables the TUI; blocks on stdin/stdout
+    // JSON-RPC. We intentionally check this before any TTY setup
+    // so the parent runtime gets a clean pipe instead of a
+    // raw-mode terminal.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp-server") {
+        let session = voice_bird_cli::agent::mcp_server::resolve_initial_session_id(&args);
+        let state = voice_bird_cli::agent::mcp_server::ServerState::new(session);
+        return voice_bird_cli::agent::mcp_server::run_on_stdio(state);
+    }
     // Handle `--recover <dir>` before any TTY/terminal setup so it works
     // from non-TTY shells (e.g., piped or macOS `open` invocations).
-    let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--recover") {
         let dir = args
             .get(pos + 1)
@@ -125,6 +135,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--register` writes this binary's path into
+    // ~/.omp/agent/mcp.json so the user's agent runtime picks
+    // up voice-bird as an MCP server on next launch.
+    // Idempotent: re-running updates the entry in place. The
+    // binary path defaults to current_exe(); pass a different
+    // one as the first arg to register a different build (e.g.,
+    // a release copy under ~/bin). Intended for users who never
+    // run the TUI (CI, sandboxed agent runs, or just to wire up
+    // MCP before launching the TUI for the first time).
+    if let Some(pos) = args.iter().position(|a| a == "--register") {
+        let binary = match args.get(pos + 1) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::env::current_exe()?,
+        };
+        let home = voice_bird_cli::agent::register::register_home();
+        voice_bird_cli::agent::register::register(&binary, &home)?;
+        println!(
+            "registered {} in {}/agent/mcp.json",
+            binary.display(),
+            home.display(),
+        );
+        return Ok(());
+    }
     // `--debug-state-snapshot <path>` opts into a JSONL file where every
     // key press appends a serialized App-state snapshot. Used by the
     // e2e_human test harness to drive the TUI without relying on
@@ -383,32 +416,45 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Tab => {
             app.focus_next();
             log::info!(
-                "keys: Tab → focused_section = {} (sections active = {})",
-                app.focused_section,
+                "keys: Tab → focused_slot = {} (sections active = {})",
+                app.focused_slot,
                 app.active_section_count()
             );
         }
         KeyCode::BackTab => {
             app.focus_prev();
             log::info!(
-                "keys: BackTab → focused_section = {} (sections active = {})",
-                app.focused_section,
+                "keys: BackTab → focused_slot = {} (sections active = {})",
+                app.focused_slot,
                 app.active_section_count()
             );
         }
         // ↑/↓/k/j navigate within the focused picker pane.
         KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-        // ←/→ switch picker pane focus. `h` / `l` are deliberately not
-        // bound here: `l` already cycles cloud language. `h` is free
-        // and aliased to `←` for vim-style users.
+        // ←/→ cycle picker pane focus. `h` is aliased to `←` for
+        // vim-style users. `l` is deliberately not bound: it cycles
+        // cloud language already, and we don't want the picker
+        // focus to drift while the user is in cloud mode.
         KeyCode::Left | KeyCode::Char('h') => {
-            app.picker_focus = crate::app::PickerFocus::Devices;
-            log::info!("keys: Left → picker_focus = Devices");
+            use crate::app::PickerFocus::*;
+            let next = match app.picker_focus {
+                Devices => Devices,
+                Apps => Devices,
+                Targets => Apps,
+            };
+            app.picker_focus = next;
+            log::info!("keys: Left → picker_focus = {:?}", next);
         }
         KeyCode::Right => {
-            app.picker_focus = crate::app::PickerFocus::Apps;
-            log::info!("keys: Right → picker_focus = Apps");
+            use crate::app::PickerFocus::*;
+            let next = match app.picker_focus {
+                Devices => Apps,
+                Apps => Targets,
+                Targets => Targets,
+            };
+            app.picker_focus = next;
+            log::info!("keys: Right → picker_focus = {:?}", next);
         }
         // Space clears the Apps cursor → starts the section with the
         // device alone. Only meaningful with the Apps pane focused; in
@@ -419,7 +465,77 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 log::info!("keys: Space → cleared app selection");
             }
         }
+        // `+` / `-` grow or shrink the slot workspace. `+` is
+        // disabled when at `MAX_SECTIONS` slots (workspace cap);
+        // `-` is disabled on a single-slot workspace or when the
+        // focused slot is recording (the user must `s`top it
+        // first — keeps the runtime cleanly disposed).
+        KeyCode::Char('+') | KeyCode::Char('=') => match app.add_slot() {
+            Some(id) => {
+                log::info!("keys: + → added slot {id}");
+            }
+            None => {
+                app.banner = Some(format!(
+                    "Already at the max of {} slots — remove one with [-] first",
+                    crate::app::MAX_SECTIONS
+                ));
+                log::info!(
+                    "keys: + → refused (at MAX_SECTIONS = {})",
+                    crate::app::MAX_SECTIONS
+                );
+            }
+        },
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if app.remove_focused_slot() {
+                log::info!(
+                    "keys: - → removed focused slot; now {} slot(s)",
+                    app.slots.len()
+                );
+            } else {
+                // Either only one slot left, or the focused one is
+                // recording. Surface a banner so the user knows
+                // which (and what to do).
+                let recording = app
+                    .slot_index(app.focused_slot)
+                    .map(|i| {
+                        matches!(
+                            app.slots[i].kind,
+                            crate::app::SlotKind::Recording { .. }
+                        )
+                    })
+                    .unwrap_or(false);
+                let msg = if recording {
+                    "Stop the recording with [s] before removing the slot".into()
+                } else {
+                    "At least one slot must remain — no slot to remove".into()
+                };
+                app.banner = Some(msg);
+                log::info!("keys: - → refused ({})", app.banner.as_deref().unwrap_or("?"));
+            }
+        }
         KeyCode::Enter => {
+            // When the Targets pane is focused, Enter first applies
+            // the picked target to the focused slot's
+            // pending_target_overrides (so start_section consumes
+            // it). The picked target may be disabled (e.g. Agent when
+            // the binary is missing) — in that case we surface a
+            // banner and abort; the user can press Down to land on
+            // a pickable row.
+            if app.picker_focus == crate::app::PickerFocus::Targets {
+                if let Some(kind) = app.focused_target_kind() {
+                    let target = app.pick_target(kind);
+                    log::info!(
+                        "keys: Enter in Targets pane → picked {target:?} for slot {}",
+                        app.focused_slot.0
+                    );
+                } else {
+                    let i = app.selected_target_index.unwrap_or(0);
+                    app.banner = Some(format!(
+                        "Target row {i} is disabled (binary missing?) — pick a different row"
+                    ));
+                    return;
+                }
+            }
             // Pick the next free slot (or refuse if all are full).
             let Some(slot) = app.next_free_slot() else {
                 log::info!("keys: Enter → refused (all 3 sections full)");
@@ -439,9 +555,9 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             };
             let app_pick = app.focused_app().cloned();
             log::info!(
-                "keys: Enter → slot={} focused_section_before={} dev=({:?}, {:?}) app={:?}",
+                "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
                 slot,
-                app.focused_section,
+                app.focused_slot,
                 dev.name,
                 dev.kind,
                 app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
@@ -490,7 +606,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // Start in the chosen slot; route through the per-section API
             // so settings come from `effective_settings_for(source)`.
             let settings = app.effective_settings_for(&source);
-            app.focused_section = slot;
+            app.focused_slot = slot;
             log::info!(
                 "keys: Enter → resolved source={:?}; calling start_section[{}]",
                 source,
@@ -526,30 +642,35 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         }
         // 's' stops the focused section (no-op if its slot is empty).
         KeyCode::Char('s') => {
-            let slot = app.focused_section;
-            if app.sections[slot].is_some() {
+            let slot = app.focused_slot;
+            let pos = app.slot_index(slot);
+            let is_recording = pos
+                .and_then(|i| app.slots.get(i))
+                .map(|s| matches!(s.kind, crate::app::SlotKind::Recording { .. }))
+                .unwrap_or(false);
+            if is_recording {
                 log::info!("keys: s → stop_section[{}]", slot);
                 app.stop_section(slot);
             } else {
-                log::info!("keys: s → no-op (slot {} empty)", slot);
+                log::info!("keys: s → no-op (slot {slot} empty)");
             }
         }
         // 'x' clears the transcript for the focused slot (both live and
         // saved/preserved).
         KeyCode::Char('x') => {
-            let slot = app.focused_section;
-            let had_text =
-                app.focused_committed().lock().len() > 0 || app.transcript_saved[slot].is_some();
+            let slot = app.focused_slot;
+            let had_text = app.focused_committed().lock().len() > 0
+                || app
+                    .slot_index(slot)
+                    .and_then(|i| app.slots.get(i))
+                    .map(|s| matches!(s.kind, crate::app::SlotKind::Saved { .. }))
+                    .unwrap_or(false);
             app.clear_slot_transcript(slot);
             if had_text {
                 log::info!("keys: x → cleared transcript for slot {slot}");
             }
         }
-        // Shift-S stops every active section in one go.
-        KeyCode::Char('S') => {
-            app.stop_all_sections();
-        }
-        #[cfg(not(windows))]
+
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the
@@ -656,6 +777,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('p') if app.active_section_count() == 0 => {
             app.open_path_modal();
         }
+        // The O / S / A target-cycle keys have been replaced by the
+        // Targets picker pane — the user picks a target with the
+        // same arrow / Enter pattern as Devices and Apps. The change
+        // is queued in `pending_target_overrides` by the Enter
+        // handler when the Targets pane is focused.
         _ => {}
     }
 }
