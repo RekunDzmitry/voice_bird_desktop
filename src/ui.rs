@@ -111,6 +111,12 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::PathModal {
         render_path_modal(f, f.area(), app);
     }
+    if app.mode == AppMode::AgentFunnel {
+        render_agent_funnel(f, f.area(), app);
+    }
+    if let AppMode::ConfirmDeleteAgentTarget { id } = &app.mode {
+        render_confirm_delete(f, f.area(), id);
+    }
 }
 
 /// Render the slot row. Each slot draws as its own block with a
@@ -683,6 +689,195 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, popup);
 }
 
+/// Centered overlay for the multi-step "Add / Edit Agent target"
+/// funnel. Renders the current step's question + the live
+/// form values + a footer with the keys for the step.
+/// Verify and Save show their respective status lines
+/// instead of a question.
+fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
+
+    let Some(funnel) = app.funnel.as_ref() else { return };
+    let popup = centered(72, 14, area);
+    f.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let step_label = match funnel.step {
+        AgentFunnelStep::PickConnectionKind => "1/7 — Connection",
+        AgentFunnelStep::Name => "2/7 — Name",
+        AgentFunnelStep::Endpoint => "3/7 — Broker endpoint",
+        AgentFunnelStep::Topic => "4/7 — Topic",
+        AgentFunnelStep::Acks => "5/7 — Acknowledgement level",
+        AgentFunnelStep::Verify => "6/7 — Verify",
+        AgentFunnelStep::Save => "7/7 — Save",
+    };
+    lines.push(Line::from(Span::styled(
+        format!(" {step_label} "),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    match funnel.step {
+        AgentFunnelStep::PickConnectionKind => {
+            lines.push(Line::from("Which connection?"));
+            for (i, k) in voice_bird_cli::agent_funnel::AgentFunnelConnectionKind::ALL
+                .iter()
+                .enumerate()
+            {
+                lines.push(Line::from(Span::styled(
+                    format!("  [{}] {}", i + 1, k.label()),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        AgentFunnelStep::Name => {
+            lines.push(Line::from("Target name (e.g. prod-events):"));
+            lines.push(input_line(&funnel.name));
+        }
+        AgentFunnelStep::Endpoint => {
+            lines.push(Line::from("Broker endpoint (host:port, comma-separated):"));
+            lines.push(input_line(&funnel.endpoint));
+        }
+        AgentFunnelStep::Topic => {
+            lines.push(Line::from("Topic name:"));
+            lines.push(input_line(&funnel.topic));
+        }
+        AgentFunnelStep::Acks => {
+            lines.push(Line::from("Acknowledgement level:"));
+            let opts = [
+                (voice_bird_cli::config::KafkaAcks::All, "[1] All (safe)"),
+                (voice_bird_cli::config::KafkaAcks::One, "[2] One (fast)"),
+                (
+                    voice_bird_cli::config::KafkaAcks::Zero,
+                    "[3] Zero (fire-and-forget)",
+                ),
+            ];
+            for (val, label) in opts {
+                let marker = if funnel.acks == val { "● " } else { "  " };
+                let color = if funnel.acks == val {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}{label}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        AgentFunnelStep::Verify => {
+            lines.push(Line::from(Span::styled(
+                "Press [Enter] to verify the connection",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+            match &funnel.verify {
+                VerifyOutcome::Pending => {
+                    lines.push(Line::from(Span::styled(
+                        "(not yet verified)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                VerifyOutcome::InProgress => {
+                    lines.push(Line::from(Span::styled(
+                        "Verifying…",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                VerifyOutcome::Ok { elapsed } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("OK — round trip in {elapsed:?}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                VerifyOutcome::Err { message } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("FAILED: {message}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+        }
+        AgentFunnelStep::Save => {
+            lines.push(Line::from(Span::styled(
+                "Save this Agent target?",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("name     : {}", funnel.name),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("endpoint : {}", funnel.endpoint),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("topic    : {}", funnel.topic),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("acks     : {}", funnel.acks.as_str()),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let footer = match funnel.step {
+        AgentFunnelStep::Verify => "[Enter] run verify  [Esc] cancel",
+        AgentFunnelStep::Save => "[Enter] save  [Esc] cancel",
+        _ => "[Enter] next  [Esc] cancel",
+    };
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Agent target ")
+        .style(Style::default().fg(Color::White));
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, popup);
+}
+
+/// Centered overlay for the "delete this Agent target?" confirm
+/// prompt. `y` confirms; any other key cancels. Implemented as
+/// a single-line modal so it doesn't pull focus away from the
+/// Targets pane for long.
+fn render_confirm_delete(f: &mut Frame, area: Rect, id: &str) {
+    let popup = centered(60, 3, area);
+    f.render_widget(Clear, popup);
+    let lines = vec![Line::from(Span::styled(
+        format!("Delete Agent target '{id}'? [y/N]"),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    ))];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Confirm delete ")
+        .style(Style::default().fg(Color::White));
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, popup);
+}
+
+/// Render a single text-input line with a yellow caret at the
+/// end. Used by the funnel's Name / Endpoint / Topic steps.
+fn input_line(value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            value.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "▏",
+            Style::default().fg(Color::Yellow),
+        ),
+    ])
+}
+
 /// Top-row picker. Three panes side by side: Devices (physical I/O),
 /// Apps (per-application capture), and Targets (routing — Stdout /
 /// Cloud / Agent). Each pane is a self-contained `Block` with its own
@@ -694,7 +889,7 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
 /// dropping Devices below ~40% starts clipping them. Apps and
 /// Targets are short lists so they can survive narrower columns.
 fn render_picker(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::default()
+     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(45),
@@ -744,9 +939,21 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, row)| {
             let is_cursor = i == app.selected_target_index.unwrap_or(0) && focused;
-            let is_picked = picked == Some(row.kind) && !row.disabled;
+            // The Targets pane is now dynamic — `Agent` rows
+            // can also be picked. Clone the kind so the borrow
+            // on `row` ends before the next iteration's call.
+            let is_picked = picked.as_ref() == Some(&row.kind) && !row.disabled;
             let marker = if is_cursor { "▶ " } else { "  " };
-            let (label, style, hint) = target_row_style(row.kind, row.disabled);
+            // Look up the agent target's name so the row label
+            // reads as "Agent: <name>" instead of a bare "Agent".
+            let name = match &row.kind {
+                crate::app::TargetKind::Agent { id } => app
+                    .config
+                    .agent_target_by_id(id)
+                    .map(|t| t.name.clone()),
+                _ => None,
+            };
+            let (label, style, hint) = target_row_style(row.kind.clone(), row.disabled, name.as_deref());
             // The picked row gets its base color bumped to Yellow
             // (the rest of the picker uses Green / Magenta / Cyan
             // per target kind) plus the BOLD modifier. Cursor row
@@ -782,28 +989,34 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
 }
-
 /// (label, style) for a single target row. `disabled=true` dims the
 /// label and appends a hint so the user knows the row exists but
 /// can't be picked.
 /// (label, style, hint) for a single target row. `disabled=true`
 /// dims the label and appends a hint so the user knows the row
 /// exists but can't be picked.
-fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, Style, String) {
+fn target_row_style(
+    kind: crate::app::TargetKind,
+    disabled: bool,
+    name: Option<&str>,
+) -> (String, Style, String) {
     use crate::app::TargetKind;
-    let base_color = match kind {
+    let base_color = match &kind {
         TargetKind::Stdout => Color::Green,
         TargetKind::Cloud => Color::Magenta,
-        TargetKind::Agent => Color::Cyan,
+        TargetKind::Agent { .. } => Color::Cyan,
     };
-    let label = match kind {
-        TargetKind::Stdout => "Stdout",
-        TargetKind::Cloud => "Cloud",
-        TargetKind::Agent => "Agent",
+    let label = match &kind {
+        TargetKind::Stdout => "Stdout".to_string(),
+        TargetKind::Cloud => "Cloud".to_string(),
+        TargetKind::Agent { .. } => match name {
+            Some(n) => format!("Agent: {n}"),
+            None => "Agent".to_string(),
+        },
     };
     if disabled {
         (
-            label.into(),
+            label,
             Style::default().fg(Color::DarkGray),
             "  (not installed)".into(),
         )
@@ -813,7 +1026,7 @@ fn target_row_style(kind: crate::app::TargetKind, disabled: bool) -> (String, St
         // case (above) carries the "(not installed)" hint
         // since the row exists but can't be picked.
         let s = Style::default().fg(base_color).add_modifier(Modifier::BOLD);
-        (label.into(), s, String::new())
+        (label, s, String::new())
     }
 }
 
@@ -1207,15 +1420,20 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             ];
             if local_keys {
                 lines.push(hotkey_line("[m]", "model"));
-                lines.push(hotkey_line("[e]", "export"));
                 lines.push(hotkey_line("[p]", "path"));
             }
-            // The O/S/A target-cycle key is gone — the Targets
-            // picker pane is the way to pick a route. The
-            // routing route is just `pick_target(kind)` then
-            // `start_section`; there's no separate user-facing
-            // key to advertise for the agent target because
-            // the picker pane *is* the surface.
+             // Agent CRUD keys live on the Targets pane only —
+            // they don't collide with the Devices/Apps `l`,
+            // `m`, `e` shortcuts. `e` is overloaded: in the
+            // Targets pane it opens the edit funnel; in any
+            // other pane (today: Devices) it exports.
+            if app.picker_focus == crate::app::PickerFocus::Targets {
+                lines.push(hotkey_line("[a]", "add agent"));
+                lines.push(hotkey_line("[e]", "edit agent"));
+                lines.push(hotkey_line("[d]", "delete agent"));
+            } else if local_keys {
+                lines.push(hotkey_line("[e]", "export"));
+            }
             lines
         }
         (true, _) => {
@@ -1528,8 +1746,23 @@ mod tests {
     /// tagged with "(active)" next to the focused slot's current
     /// target.
     #[test]
-    fn targets_pane_lists_stdout_cloud_omp_in_order() {
-        let app = App::new();
+    fn targets_pane_lists_stdout_cloud_agent_in_order() {
+        // The default Agent row is gone — the user has to add
+        // their own via the funnel. Plant one in the config so
+        // the row renders in the expected order.
+        let mut app = App::new();
+        app.upsert_agent_target(voice_bird_cli::config::AgentTargetConfig {
+            id: "test-uuid".into(),
+            name: "prod".into(),
+            connection: voice_bird_cli::config::AgentConnection::Kafka(
+                voice_bird_cli::config::KafkaAgentConnection {
+                    endpoint: "localhost:9092".into(),
+                    topic: "voice-bird".into(),
+                    client_id: None,
+                    acks: Default::default(),
+                },
+            ),
+        });
         let out = render_to_string(&app, 180, 40);
         // Pane header (focused variant — Devices is the default focus,
         // so the targets pane shows the unfocused title).
@@ -1537,7 +1770,7 @@ mod tests {
         // Three rows in the fixed order: Stdout first, Agent last.
         let stdout_pos = out.find("Stdout").expect("Stdout row missing");
         let cloud_pos = out.find("Cloud").expect("Cloud row missing");
-        let agent_pos = out.find("Agent").expect("Agent row missing");
+        let agent_pos = out.find("Agent:").expect("Agent row missing");
         assert!(stdout_pos < cloud_pos, "Stdout must come before Cloud");
         assert!(cloud_pos < agent_pos, "Cloud must come before Agent");
     }
@@ -1569,7 +1802,11 @@ mod tests {
     #[test]
     fn target_row_style_agent_is_dim_when_disabled() {
         use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(TargetKind::Agent, true);
+        let (label, style, hint) = target_row_style(
+            TargetKind::Agent { id: "any".into() },
+            true,
+            None,
+        );
         assert_eq!(label, "Agent");
         assert_eq!(style.fg, Some(Color::DarkGray));
         assert!(hint.contains("not installed"));
@@ -1580,7 +1817,12 @@ mod tests {
     #[test]
     fn target_row_style_agent_is_cyan_when_enabled() {
         use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(TargetKind::Agent, false);
+        let (label, style, hint) = target_row_style(
+            TargetKind::Agent { id: "any".into() },
+            false,
+            Some("prod-events"),
+        );
+        assert_eq!(label, "Agent: prod-events");
         assert_eq!(style.fg, Some(Color::Cyan));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
@@ -1595,7 +1837,7 @@ mod tests {
     fn target_row_style_stdout_cloud_have_no_hint() {
         use crate::app::TargetKind;
         for k in [TargetKind::Stdout, TargetKind::Cloud] {
-            let (_label, _style, hint) = target_row_style(k, false);
+            let (_label, _style, hint) = target_row_style(k.clone(), false, None);
             assert_eq!(hint, "", "enabled {:?} must not carry a trailing hint", k);
         }
     }

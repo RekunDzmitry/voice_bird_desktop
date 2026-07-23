@@ -336,12 +336,17 @@ fn run_app<B: Backend>(
                 consecutive_poll_errors = 0;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        match app.mode {
+                        match &app.mode {
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
                             AppMode::PathModal => handle_path_modal(app, key.code),
+                            AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
+                            AppMode::ConfirmDeleteAgentTarget { id } => {
+                                let id = id.clone();
+                                handle_confirm_delete_agent_target(app, key.code, &id)
+                            }
                         }
                         if let Some(path) = debug_snapshot_path {
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
@@ -513,7 +518,70 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 log::info!("keys: - → refused ({})", app.banner.as_deref().unwrap_or("?"));
             }
         }
-        KeyCode::Enter => {
+        // Agent CRUD keys — only meaningful in the Targets
+        // pane. `a` adds, `e` edits the focused Agent row,
+        // `d` confirms a delete. We no-op outside the pane
+        // so we don't shadow the export / language / model
+        // shortcuts in the other panes.
+        KeyCode::Char('a') | KeyCode::Char('A')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            app.open_add_agent_funnel();
+            log::info!("keys: a → opened add-agent funnel");
+        }
+        KeyCode::Char('e') | KeyCode::Char('E')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            // Edit the focused Agent row, or the first one
+            // if the cursor sits on Stdout / Cloud.
+            let id = app
+                .focused_target_kind()
+                .and_then(|kind| match kind {
+                    crate::app::TargetKind::Agent { id } => Some(id),
+                    _ => None,
+                })
+                .or_else(|| {
+                    app.config
+                        .agent_targets
+                        .first()
+                        .map(|t| t.id.clone())
+                });
+            match id {
+                Some(id) => {
+                    log::info!("keys: e → opened edit-agent funnel for {id}");
+                    app.open_edit_agent_funnel(&id);
+                }
+                None => {
+                    app.banner = Some("No Agent target to edit — press [a] to add one".into());
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            let id = app
+                .focused_target_kind()
+                .and_then(|kind| match kind {
+                    crate::app::TargetKind::Agent { id } => Some(id),
+                    _ => None,
+                })
+                .or_else(|| {
+                    app.config
+                        .agent_targets
+                        .first()
+                        .map(|t| t.id.clone())
+                });
+            match id {
+                Some(id) => {
+                    log::info!("keys: d → prompted delete for Agent {id}");
+                    app.mode = AppMode::ConfirmDeleteAgentTarget { id };
+                }
+                None => {
+                    app.banner = Some("No Agent target to delete".into());
+                }
+            }
+        }
+         KeyCode::Enter => {
             // When the Targets pane is focused, Enter first applies
             // the picked target to the focused slot's
             // pending_target_overrides (so start_section consumes
@@ -870,6 +938,110 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
             }
         }
         _ => {}
+    }
+}
+
+/// Key handler for the multi-step "Add / Edit Agent target"
+/// funnel. Steps share a `KeyCode::Enter` advance and
+/// `KeyCode::Esc` cancel; text-input steps also accept
+/// `KeyCode::Char` and `KeyCode::Backspace`. Verify is the
+/// one step that hits the network — every other step is
+/// pure form state.
+fn handle_agent_funnel(app: &mut App, key: KeyCode) {
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
+    use voice_bird_cli::agent::kafka::KafkaTarget;
+    let Some(funnel) = app.funnel.as_mut() else {
+        app.mode = AppMode::Normal;
+        return;
+    };
+    match key {
+        KeyCode::Esc => {
+            app.funnel = None;
+            app.mode = AppMode::Normal;
+            app.banner = Some("Add Agent: cancelled".into());
+        }
+        KeyCode::Backspace => funnel.backspace(),
+        KeyCode::Enter => match funnel.step {
+            AgentFunnelStep::Verify => {
+                funnel.verify = VerifyOutcome::InProgress;
+                let conn = funnel.kafka_connection();
+                let target = KafkaTarget::new(
+                    voice_bird_cli::agent::AgentSessionId::default_session(),
+                    conn.clone(),
+                );
+                // Drive verify on a dedicated thread with
+                // its own runtime. We're inside the TUI's
+                // tokio runtime, so `block_on` on
+                // `Handle::current()` would panic.
+                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build one-shot tokio runtime");
+                    let r = rt.block_on(target.verify());
+                    let _ = tx.send(r);
+                });
+                let started = std::time::Instant::now();
+                match rx.recv().expect("join verify thread") {
+                    Ok(elapsed) => {
+                        funnel.verify = VerifyOutcome::Ok { elapsed };
+                    }
+                    Err(e) => {
+                        funnel.verify = VerifyOutcome::Err {
+                            message: format!("{e}"),
+                        };
+                        log::warn!(
+                            "funnel: verify failed after {:?}: {e}",
+                            started.elapsed()
+                        );
+                    }
+                }
+            }
+            AgentFunnelStep::Save => {
+                let config = funnel.to_config();
+                let name = config.name.clone();
+                app.upsert_agent_target(config);
+                app.funnel = None;
+                app.mode = AppMode::Normal;
+                app.banner = Some(format!("Saved Agent target '{name}'"));
+            }
+            _ => {
+                if funnel.can_advance() {
+                    funnel.advance();
+                } else {
+                    app.banner = Some("Fill the form before advancing".into());
+                }
+            }
+        },
+        KeyCode::Char('1') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::All;
+        }
+        KeyCode::Char('2') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::One;
+        }
+        KeyCode::Char('3') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
+        }
+        KeyCode::Char(ch) => funnel.type_char(ch),
+        _ => {}
+    }
+}
+
+/// Confirm-prompt for deleting a user-configured Agent target.
+/// `y` confirms; anything else (incl. `n`, `Esc`, `Enter`)
+/// cancels.
+fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
+    match key {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.remove_agent_target(id);
+            app.mode = AppMode::Normal;
+            app.banner = Some(format!("Deleted Agent target '{id}'"));
+        }
+        _ => {
+            app.mode = AppMode::Normal;
+            app.banner = Some("Delete cancelled".into());
+        }
     }
 }
 

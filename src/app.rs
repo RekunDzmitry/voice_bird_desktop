@@ -17,8 +17,14 @@ pub enum AppMode {
     /// Opened when `c` toggles cloud on with an empty key, or when the
     /// engine reports an auth failure during recording.
     ApiKeyModal,
-    /// Centered overlay for editing the session output directory.
     PathModal,
+    /// Multi-step "Add / Edit Agent target" funnel. The funnel
+    /// state is on `App::funnel`; this variant just signals the
+    /// dispatcher to route keys to `handle_agent_funnel`.
+    AgentFunnel,
+    /// Confirm-prompt overlay. Used today for "delete the focused
+    /// Agent target? [y/N]".
+    ConfirmDeleteAgentTarget { id: String },
 }
 
 /// Languages offered in the cloud-mode language selector. Local mode
@@ -395,17 +401,29 @@ pub struct App {
     /// `None`) by start_section so it only affects the very next
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
-    /// spawned when the agent runtime launches us. The TUI also
     /// pushes into this same buffer when the focused slot's
     /// target is `Target::Agent`, so a single source of truth
     /// serves both the in-process recorder and the
     /// out-of-process agent.
     agent_state: voice_bird_cli::agent::mcp_server::ServerState,
-}
 
-/// A renderable row in the Targets pane. The list of rows is
-/// fixed at three — the target *kind* drives the row; the agent
-/// session id is a property of `Target::Agent`, not a row in
+    /// User-configured Agent targets, keyed by their
+    /// `AgentTargetId`. Populated from `config.agent_targets` at
+    /// `App::new` time and updated whenever the funnel saves a
+    /// new target. The consumer task looks up the right impl by
+    /// `Target::Agent` (with its session_id) so the segment
+    /// fan-out matches the picker pick.
+    pub agent_targets:
+        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
+
+    /// Active funnel state. `Some` while the user is in
+    /// `AppMode::AgentFunnel`; `None` otherwise. Mutated by
+    /// Active funnel state. `Some` while the user is in
+    /// `AppMode::AgentFunnel`; `None` otherwise. Mutated by
+    /// `main.rs`'s key dispatcher and read by `ui.rs`'s modal
+    /// renderer.
+    pub funnel: Option<voice_bird_cli::agent_funnel::AgentFunnel>,
+}
 /// the picker. `disabled` rows render dim and the cursor
 /// refuses to land on them (see `App::focused_target_kind`).
 pub struct TargetRow {
@@ -417,11 +435,19 @@ pub struct TargetRow {
 /// directly because `Target::Agent` carries a session id that
 /// the user doesn't pick per-row — the row just means "route
 /// to the agent runtime with the current session".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
     Cloud,
-    Agent,
+    /// One user-configured Agent target. The `id` is the stable
+    /// `AgentTargetId` from `AppConfig::agent_targets` and
+    /// resolves to a `KafkaTarget` (today) via
+    /// `App::agent_targets`. We don't reuse the old
+    /// unit-variant `Agent` form because picking the
+    /// "default" MCP-backed session is no longer surfaced in
+    /// the picker — the user adds their own targets via the
+    /// funnel instead.
+    Agent { id: String },
 }
 
 impl App {
@@ -537,7 +563,10 @@ impl App {
             agent_state: voice_bird_cli::agent::mcp_server::ServerState::new(
                 voice_bird_cli::agent::AgentSessionId::default_session(),
             ),
+            agent_targets: std::collections::HashMap::new(),
+            funnel: None,
         };
+        app.load_agent_targets_from_config();
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
@@ -711,17 +740,14 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// `Stdout → Cloud → Agent → Stdout`. The new target is stored on
-    /// `pending_target_overrides` and applied by the next
-    /// `start_section`. The current chip label keeps reflecting the
-    /// previous pick until the next start so the user has a chance
-    /// to back out (but we also surface a banner so they see the
-    /// pending change immediately).
-    ///
-    /// Returns the target that was just queued. The caller can use
-    /// this for the status bar hint.
     pub fn cycle_focused_target(&mut self) -> Target {
-        use voice_bird_cli::agent::AgentSessionId;
+        // The cycle is per-slot — pick the *next* target kind
+        // after the slot's current pending-or-last target, so a
+        // user that already picked a specific Agent target
+        // gets to cycle through other Agent targets in order
+        // before falling back to Stdout. The Targets pane
+        // handles full CRUD via `a`/`e`/`d`; this key just
+        // walks the list.
         let slot = self.focused_slot;
         let current = self
             .pending_target_overrides
@@ -729,27 +755,53 @@ impl App {
             .cloned()
             .or_else(|| self.slot_by_id(slot).and_then(|s| s.target()))
             .unwrap_or(Target::Stdout);
-        let next = match current {
+        let next = match &current {
             Target::Stdout => Target::Cloud,
-            Target::Cloud => Target::Agent {
-                session_id: AgentSessionId::default_session().0,
-            },
-            Target::Agent { .. } => Target::Stdout,
+            Target::Cloud => self
+                .config
+                .agent_targets
+                .first()
+                .map(|t| Target::Agent {
+                    session_id: t.id.clone(),
+                })
+                .unwrap_or(Target::Stdout),
+            Target::Agent { session_id } => self
+                .config
+                .agent_targets
+                .iter()
+                .position(|t| t.id == *session_id)
+                .and_then(|idx| {
+                    self.config.agent_targets.get(idx + 1).map(|t| Target::Agent {
+                        session_id: t.id.clone(),
+                    })
+                })
+                .unwrap_or(Target::Stdout),
         };
         self.pending_target_overrides.insert(slot, next.clone());
         next
     }
 
-    /// The picker list. Always three rows; `Agent` is disabled when
-    /// the binary is not on disk.
-    pub fn targets(&self) -> [TargetRow; 3] {
-        use TargetKind::*;
-        let agent_disabled = !matches!(self.agent, voice_bird_cli::agent::AgentStatus::Ready { .. });
-        [
-            TargetRow { kind: Stdout, disabled: false },
-            TargetRow { kind: Cloud, disabled: false },
-            TargetRow { kind: Agent, disabled: agent_disabled },
-        ]
+    /// The picker list. Rows 0-1 are fixed (`Stdout`, `Cloud`).
+    /// From row 2 onward, one row per user-configured Agent
+    /// target. Disabled flag is reserved for future use; today
+    /// every configured Agent target is pickable.
+    pub fn targets(&self) -> Vec<TargetRow> {
+        let mut rows = Vec::with_capacity(2 + self.config.agent_targets.len());
+        rows.push(TargetRow {
+            kind: TargetKind::Stdout,
+            disabled: false,
+        });
+        rows.push(TargetRow {
+            kind: TargetKind::Cloud,
+            disabled: false,
+        });
+        for t in &self.config.agent_targets {
+            rows.push(TargetRow {
+                kind: TargetKind::Agent { id: t.id.clone() },
+                disabled: false,
+            });
+        }
+        rows
     }
 
     /// Resolve the currently focused Targets-pane row to a `Target`.
@@ -757,7 +809,9 @@ impl App {
     /// out of range.
     pub fn focused_target_kind(&self) -> Option<TargetKind> {
         let i = self.selected_target_index?;
-        self.targets().get(i).and_then(|r| if r.disabled { None } else { Some(r.kind) })
+        self.targets()
+            .get(i)
+            .and_then(|r| if r.disabled { None } else { Some(r.kind.clone()) })
     }
 
     /// Set the focused slot's pending target from a `TargetKind`. The
@@ -766,14 +820,11 @@ impl App {
     /// (with a session id, for Agent) is returned so the caller can
     /// surface it in a banner.
     pub fn pick_target(&mut self, kind: TargetKind) -> Target {
-        use voice_bird_cli::agent::AgentSessionId;
         let slot = self.focused_slot;
         let target = match kind {
             TargetKind::Stdout => Target::Stdout,
             TargetKind::Cloud => Target::Cloud,
-            TargetKind::Agent => Target::Agent {
-                session_id: AgentSessionId::default_session().0,
-            },
+            TargetKind::Agent { id } => Target::Agent { session_id: id },
         };
         self.pending_target_overrides.insert(slot, target.clone());
         target
@@ -1182,7 +1233,7 @@ impl App {
                 let rows = self.targets();
                 self.selected_target_index
                     .and_then(|i| rows.get(i))
-                    .map(|r| r.kind)
+                .map(|r| r.kind.clone())
             },
         );
     }
@@ -1234,7 +1285,7 @@ impl App {
                 let rows = self.targets();
                 self.selected_target_index
                     .and_then(|i| rows.get(i))
-                    .map(|r| r.kind)
+                .map(|r| r.kind.clone())
             },
         );
     }
@@ -1356,7 +1407,7 @@ impl App {
         Some(match t {
             Target::Stdout => TargetKind::Stdout,
             Target::Cloud => TargetKind::Cloud,
-            Target::Agent { .. } => TargetKind::Agent,
+            Target::Agent { session_id } => TargetKind::Agent { id: session_id },
         })
     }
 
@@ -1942,6 +1993,10 @@ impl App {
         // MCP-server buffer when the user picked `Target::Agent`.
         let target_for_consumer = target.clone();
         let agent_state_for_consumer = self.agent_state.clone();
+        // Clone the per-session-id AgentTarget map so the
+        // consumer task can route a committed segment to
+        // the user-configured Kafka target the slot picked.
+        let agent_targets_for_consumer = self.agent_targets.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
@@ -2000,10 +2055,35 @@ impl App {
                             None
                         };
                         // Route into the agent buffer when the
-                        // slot's target is `Target::Agent`.
-                        // Best-effort.
-                        if matches!(target_for_consumer, Target::Agent { .. }) {
-                            agent_state_for_consumer.push(seg);
+                        // slot's target is `Target::Agent`. The
+                        // target's session_id picks the
+                        // `AgentTarget` impl to fan the segment
+                        // out to. The default MCP-backed target
+                        // (session_id == "default") still goes
+                        // through `agent_state` for backward
+                        // compatibility with the
+                        // `voice_bird__pull_recent` MCP tool.
+                        if let Target::Agent { session_id } = &target_for_consumer {
+                            if session_id == "default" {
+                                agent_state_for_consumer.push(seg.clone());
+                            } else if let Some(agent) =
+                                agent_targets_for_consumer.get(session_id)
+                            {
+                                if let Err(e) = agent.push_segment(&seg) {
+                                    log::warn!(
+                                        "agent target push_segment ({}): {e}",
+                                        session_id
+                                    );
+                                }
+                            } else {
+                                // Target was removed mid-recording.
+                                // Drop the segment — better than
+                                // silently routing to the
+                                // default MCP target.
+                                log::warn!(
+                                    "agent target {session_id} not found; segment dropped"
+                                );
+                            }
                         }
                         // Mirror to the on-disk live tail so the
                         // MCP server process spawned by the agent
@@ -2366,6 +2446,93 @@ impl App {
             self.config_was_loaded_from_disk = true;
         }
     }
+    /// Hydrate `agent_targets` from the on-disk config. Called
+    /// once at startup; subsequent funnel saves update both
+    /// the config and this map so a relaunch isn't needed.
+    pub fn load_agent_targets_from_config(&mut self) {
+        use voice_bird_cli::agent::AgentTarget;
+        use voice_bird_cli::config::AgentConnection;
+        self.agent_targets.clear();
+        for t in &self.config.agent_targets {
+            let session = voice_bird_cli::agent::AgentSessionId(t.id.clone());
+            let target: std::sync::Arc<dyn AgentTarget> = match &t.connection {
+                AgentConnection::Kafka(conn) => std::sync::Arc::new(
+                    voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
+                ),
+            };
+            self.agent_targets.insert(t.id.clone(), target);
+        }
+    }
+
+    /// Look up the Agent target by `Target::Agent`'s session id.
+    /// Returns `None` for the default MCP-backed target (which
+    /// lives on `agent_state`, not here) or for any id the user
+    /// removed while a recording was in flight.
+    pub fn lookup_agent_target(
+        &self,
+        session_id: &str,
+    ) -> Option<std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>> {
+        self.agent_targets.get(session_id).cloned()
+    }
+
+    /// Add or replace a user-configured Agent target. Updates
+    /// `agent_targets`, the on-disk config, and the target's
+    /// in-process buffer. Idempotent.
+    pub fn upsert_agent_target(&mut self, config_target: voice_bird_cli::config::AgentTargetConfig) {
+        use voice_bird_cli::agent::AgentTarget;
+        let id = config_target.id.clone();
+        let session = voice_bird_cli::agent::AgentSessionId(id.clone());
+        let target: std::sync::Arc<dyn AgentTarget> = match &config_target.connection {
+            voice_bird_cli::config::AgentConnection::Kafka(conn) => {
+                std::sync::Arc::new(
+                    voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
+                )
+            }
+        };
+        self.agent_targets.insert(id.clone(), target);
+        self.config.upsert_agent_target(config_target);
+        if let Err(e) = self.config.save() {
+            log::error!("config save (upsert agent target): {e}");
+            self.banner = Some(format!("Save failed: {e}"));
+        }
+    }
+
+    /// Remove a user-configured Agent target. Drops the in-process
+    /// handle, updates the on-disk config, and clears any
+    /// pending target overrides that pointed at it so the slot
+    /// doesn't carry a stale `Target::Agent` (with a now-removed
+    /// session_id) into the next recording start.
+    pub fn remove_agent_target(&mut self, id: &str) {
+        self.agent_targets.remove(id);
+        self.config.remove_agent_target(id);
+        if let Err(e) = self.config.save() {
+            log::error!("config save (remove agent target): {e}");
+            self.banner = Some(format!("Save failed: {e}"));
+        }
+        for (_, t) in self.pending_target_overrides.iter_mut() {
+            if let Target::Agent { session_id } = t {
+                if session_id == id {
+                    *t = Target::Stdout;
+                }
+            }
+        }
+    }
+
+    /// Open the funnel for adding a brand-new Agent target.
+    pub fn open_add_agent_funnel(&mut self) {
+        self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_add());
+        self.mode = AppMode::AgentFunnel;
+    }
+
+    /// Open the funnel pre-filled with an existing Agent target.
+    pub fn open_edit_agent_funnel(&mut self, id: &str) {
+        if let Some(t) = self.config.agent_target_by_id(id).cloned() {
+            self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_edit(&t));
+            self.mode = AppMode::AgentFunnel;
+        } else {
+            self.banner = Some(format!("Agent target {id} not found"));
+        }
+    }
 }
 
 /// Build the column-title label for a section (or "(empty)" / "(paused)"
@@ -2539,8 +2706,8 @@ mod tests {
         );
         let cloud = app.pick_target(TargetKind::Cloud);
         assert_eq!(cloud, Target::Cloud);
-        let omp = app.pick_target(TargetKind::Agent);
-        assert!(matches!(omp, Target::Agent { .. }));
+        let omp = app.pick_target(TargetKind::Agent { id: "session-x".into() });
+        assert!(matches!(omp, Target::Agent { session_id } if session_id == "session-x"));
         // Switching back to Stdout overwrites the prior override.
         let stdout = app.pick_target(TargetKind::Stdout);
         assert_eq!(stdout, Target::Stdout);
@@ -3135,5 +3302,5 @@ mod tests {
             Some("Exported \u{2713} \u{2014} newest")
         );
     }
-    }
+}
 }
