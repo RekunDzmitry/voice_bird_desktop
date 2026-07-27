@@ -84,3 +84,5 @@ npm/voice-bird-cli/.npm-install-tmp/
 *.whl
 *.egg-info/
 __pycache__/
+# Design-review packet - generated locally, uploaded as a release asset, not tracked.
+docs/review/
