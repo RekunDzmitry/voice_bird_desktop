@@ -327,6 +327,10 @@ fn run_app<B: Backend>(
         // return to Normal mode.
         app.poll_picker_download();
 
+        // Drain any completed verify probe. Non-blocking; the
+        // TUI keeps drawing frames while the probe runs, so Esc
+        // is reachable and "Verifying…" actually renders.
+        app.poll_funnel_verify();
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -502,12 +506,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 // which (and what to do).
                 let recording = app
                     .slot_index(app.focused_slot)
-                    .map(|i| {
-                        matches!(
-                            app.slots[i].kind,
-                            crate::app::SlotKind::Recording { .. }
-                        )
-                    })
+                    .map(|i| matches!(app.slots[i].kind, crate::app::SlotKind::Recording { .. }))
                     .unwrap_or(false);
                 let msg = if recording {
                     "Stop the recording with [s] before removing the slot".into()
@@ -515,7 +514,10 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "At least one slot must remain — no slot to remove".into()
                 };
                 app.banner = Some(msg);
-                log::info!("keys: - → refused ({})", app.banner.as_deref().unwrap_or("?"));
+                log::info!(
+                    "keys: - → refused ({})",
+                    app.banner.as_deref().unwrap_or("?")
+                );
             }
         }
         // Agent CRUD keys — only meaningful in the Targets
@@ -532,56 +534,43 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('e') | KeyCode::Char('E')
             if app.picker_focus == crate::app::PickerFocus::Targets =>
         {
-            // Edit the focused Agent row, or the first one
-            // if the cursor sits on Stdout / Cloud.
-            let id = app
-                .focused_target_kind()
-                .and_then(|kind| match kind {
-                    crate::app::TargetKind::Agent { id } => Some(id),
-                    _ => None,
-                })
-                .or_else(|| {
-                    app.config
-                        .agent_targets
-                        .first()
-                        .map(|t| t.id.clone())
-                });
-            match id {
-                Some(id) => {
+            // Edit the focused Agent row only. The cursor must
+            // be on an Agent row — if it's on Stdout / Cloud,
+            // the user hasn't actually selected a target, so
+            // don't fall back to "edit some random Agent
+            // target the user isn't pointing at" (the
+            // previous fallback made the wrong target easy to
+            // delete/mutate).
+            match app.focused_target_kind() {
+                Some(crate::app::TargetKind::Agent { id }) => {
                     log::info!("keys: e → opened edit-agent funnel for {id}");
                     app.open_edit_agent_funnel(&id);
                 }
-                None => {
-                    app.banner = Some("No Agent target to edit — press [a] to add one".into());
+                _ => {
+                    app.banner = Some("No Agent target selected — press [a] to add one".into());
                 }
             }
         }
         KeyCode::Char('d') | KeyCode::Char('D')
             if app.picker_focus == crate::app::PickerFocus::Targets =>
         {
-            let id = app
-                .focused_target_kind()
-                .and_then(|kind| match kind {
-                    crate::app::TargetKind::Agent { id } => Some(id),
-                    _ => None,
-                })
-                .or_else(|| {
-                    app.config
-                        .agent_targets
-                        .first()
-                        .map(|t| t.id.clone())
-                });
-            match id {
-                Some(id) => {
+            // Delete the focused Agent row only. The cursor must
+            // be on an Agent row — falling back to "the first
+            // Agent target in the list" when the cursor is on
+            // Stdout / Cloud let users nuke a target they
+            // weren't pointing at. Same risk as the `e` arm
+            // above.
+            match app.focused_target_kind() {
+                Some(crate::app::TargetKind::Agent { id }) => {
                     log::info!("keys: d → prompted delete for Agent {id}");
                     app.mode = AppMode::ConfirmDeleteAgentTarget { id };
                 }
-                None => {
-                    app.banner = Some("No Agent target to delete".into());
+                _ => {
+                    app.banner = Some("No Agent target selected".into());
                 }
             }
         }
-         KeyCode::Enter => {
+        KeyCode::Enter => {
             // When the Targets pane is focused, Enter first applies
             // the picked target to the focused slot's
             // pending_target_overrides (so start_section consumes
@@ -948,8 +937,8 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
 /// one step that hits the network — every other step is
 /// pure form state.
 fn handle_agent_funnel(app: &mut App, key: KeyCode) {
-    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
     use voice_bird_cli::agent::kafka::KafkaTarget;
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
     let Some(funnel) = app.funnel.as_mut() else {
         app.mode = AppMode::Normal;
         return;
@@ -957,22 +946,30 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Esc => {
             app.funnel = None;
+            app.verify_rx = None;
+            app.verify_started = None;
             app.mode = AppMode::Normal;
             app.banner = Some("Add Agent: cancelled".into());
         }
         KeyCode::Backspace => funnel.backspace(),
         KeyCode::Enter => match funnel.step {
             AgentFunnelStep::Verify => {
+                // Re-run if the user just hit Enter again — the
+                // previous probe has already drained (or never
+                // started); always replace the in-flight
+                // channel and start a fresh probe. The TUI
+                // event loop polls `verify_rx` each tick, so
+                // we no longer block here.
                 funnel.verify = VerifyOutcome::InProgress;
                 let conn = funnel.kafka_connection();
                 let target = KafkaTarget::new(
                     voice_bird_cli::agent::AgentSessionId::default_session(),
                     conn.clone(),
                 );
-                // Drive verify on a dedicated thread with
-                // its own runtime. We're inside the TUI's
-                // tokio runtime, so `block_on` on
-                // `Handle::current()` would panic.
+                // Drive verify on a dedicated thread with its own
+                // runtime. The TUI runs inside its own tokio
+                // runtime, so `block_on` on `Handle::current()`
+                // would panic.
                 let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -982,29 +979,29 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
                     let r = rt.block_on(target.verify());
                     let _ = tx.send(r);
                 });
-                let started = std::time::Instant::now();
-                match rx.recv().expect("join verify thread") {
-                    Ok(elapsed) => {
-                        funnel.verify = VerifyOutcome::Ok { elapsed };
-                    }
-                    Err(e) => {
-                        funnel.verify = VerifyOutcome::Err {
-                            message: format!("{e}"),
-                        };
-                        log::warn!(
-                            "funnel: verify failed after {:?}: {e}",
-                            started.elapsed()
-                        );
-                    }
-                }
+                app.verify_rx = Some(rx);
+                app.verify_started = Some(std::time::Instant::now());
             }
             AgentFunnelStep::Save => {
                 let config = funnel.to_config();
                 let name = config.name.clone();
-                app.upsert_agent_target(config);
-                app.funnel = None;
-                app.mode = AppMode::Normal;
-                app.banner = Some(format!("Saved Agent target '{name}'"));
+                // Funnel mints a fresh UUID on Save, so a
+                // reserved-id rejection would indicate a bug
+                // in the id minter. Surface it instead of
+                // silently dropping the user's target.
+                match app.upsert_agent_target(config) {
+                    Ok(()) => {
+                        app.funnel = None;
+                        app.verify_rx = None;
+                        app.verify_started = None;
+                        app.mode = AppMode::Normal;
+                        app.banner = Some(format!("Saved Agent target '{name}'"));
+                    }
+                    Err(e) => {
+                        log::error!("funnel: save failed: {e}");
+                        app.banner = Some(format!("Save failed: {e}"));
+                    }
+                }
             }
             _ => {
                 if funnel.can_advance() {
@@ -1034,9 +1031,17 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
 fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
     match key {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Look up the name before the row goes away so the
+            // banner can refer to it by name (same rationale as
+            // the confirm modal: the user can't read a UUID).
+            let name = app
+                .config
+                .agent_target_by_id(id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| id.to_string());
             app.remove_agent_target(id);
             app.mode = AppMode::Normal;
-            app.banner = Some(format!("Deleted Agent target '{id}'"));
+            app.banner = Some(format!("Deleted Agent target '{name}'"));
         }
         _ => {
             app.mode = AppMode::Normal;

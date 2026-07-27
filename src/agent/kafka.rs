@@ -18,8 +18,6 @@
 //! `pub async fn push_segment_async` and a sync wrapper
 //! that spawns a fresh thread+runtime so the trait impl
 //! doesn't deadlock the caller's tokio runtime.
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -27,6 +25,9 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::session::{AgentSessionId, AgentTarget};
 use crate::config::KafkaAgentConnection;
@@ -64,18 +65,22 @@ struct KafkaTargetInner {
     /// `pull_recent` so multiple Kafka targets stay distinguishable
     /// in their consumer logs.
     session: AgentSessionId,
-    /// Connection the target was built from. Held so `verify` can
-    /// rebuild a temporary producer without the caller having to
-    /// plumb the config through again.
+    /// Connection the target was built from. Held so `verify`
+    /// can rebuild a temporary producer without the caller
+    /// having to plumb the config through again.
     connection: KafkaAgentConnection,
-    /// Lazy: `None` until the first `push_segment` (or
-    /// eagerly initialised in `verify`). Wrapped in a `Mutex<Option<_>>`
-    /// so the `verify` path can also drop a stale producer that
-    /// the user just changed the connection details on.
+    /// eagerly initialised in `verify`). Wrapped in a
+    /// `Mutex<Option<_>>` so the `verify` path can also drop
+    /// a stale producer that the user just changed the
+    /// connection details on.
     producer: Mutex<Option<FutureProducer>>,
-    /// Bounded buffer of segments pushed so far, oldest first.
-    /// `pull_recent` reads from the back; `push_segment` appends.
-    buffer: Mutex<Vec<Segment>>,
+    /// Bounded ring buffer of segments pushed so far, oldest at
+    /// the front. `pull_recent` reads the back; `push_segment`
+    /// appends and evicts the front when the cap is hit.
+    /// `VecDeque` so the eviction is O(1) instead of the
+    /// O(n) shift `Vec::remove(0)` would cost on a full
+    /// buffer.
+    buffer: Mutex<VecDeque<Segment>>,
 }
 
 impl KafkaTarget {
@@ -89,7 +94,7 @@ impl KafkaTarget {
                 session,
                 connection,
                 producer: Mutex::new(None),
-                buffer: Mutex::new(Vec::with_capacity(BUFFER_CAP)),
+                buffer: Mutex::new(VecDeque::with_capacity(BUFFER_CAP)),
             }),
         }
     }
@@ -109,7 +114,8 @@ impl KafkaTarget {
         if let Some(p) = slot.as_ref() {
             return Ok(p.clone());
         }
-        let producer = build_producer(&self.inner.connection, &self.inner.session)?;
+        let producer =
+            build_producer(&self.inner.connection, &self.inner.session, PRODUCE_TIMEOUT)?;
         *slot = Some(producer.clone());
         Ok(producer)
     }
@@ -124,7 +130,15 @@ impl KafkaTarget {
         // Drop any cached producer so we re-test the live config.
         *self.inner.producer.lock() = None;
         let started = Instant::now();
-        let producer = self.producer()?;
+        // Build a one-shot producer with `message.timeout.ms =
+        // VERIFY_TIMEOUT` so the probe can actually use the
+        // generous window the constant advertises (the cached
+        // producer uses PRODUCE_TIMEOUT = 5 s, which would cap
+        // delivery well before our 15 s deadline). The consumer
+        // half below also subscribes with `auto.offset.reset =
+        // latest` (see `build_consumer`) so we don't have to
+        // scan the whole topic.
+        let producer = build_producer(&self.inner.connection, &self.inner.session, VERIFY_TIMEOUT)?;
 
         // Probe id is a fresh UUID so two concurrent verifies (or
         // a verify + a real push) can't collide on the same key.
@@ -137,12 +151,25 @@ impl KafkaTarget {
         let probe_bytes = serde_json::to_vec(&payload)?;
         let key = probe_id.clone();
         let topic = self.inner.connection.topic.clone();
+        // Subscribe BEFORE producing so the consumer is
+        // registered with the broker and ready to receive
+        // the probe the moment it lands. `auto.offset.reset =
+        // latest` + the fresh UUID group id (below) means we
+        // start at the head and only see messages produced
+        // after this point.
+        let verify_group = format!("voice-bird-cli-verify-{}", uuid::Uuid::new_v4());
+        let consumer = build_consumer(
+            &self.inner.connection,
+            &self.inner.session,
+            &verify_group,
+            "latest",
+        )?;
+        consumer.subscribe(&[&topic])?;
 
-        // Produce the probe. `acks=all` (the default) means this
-        // future only resolves once the ISR has the record.
-        let record: FutureRecord<'_, String, Vec<u8>> = FutureRecord::to(&topic)
-            .key(&key)
-            .payload(&probe_bytes);
+        // Now produce the probe. `acks=all` (the default) means
+        // this future only resolves once the ISR has the record.
+        let record: FutureRecord<'_, String, Vec<u8>> =
+            FutureRecord::to(&topic).key(&key).payload(&probe_bytes);
         producer
             .send(record, Timeout::After(VERIFY_TIMEOUT))
             .await
@@ -152,8 +179,6 @@ impl KafkaTarget {
                     self.inner.connection.endpoint
                 )
             })?;
-        let consumer = build_consumer(&self.inner.connection, &self.inner.session)?;
-        consumer.subscribe(&[&topic])?;
 
         // Poll until we see the probe id or the timeout elapses.
         let deadline = Instant::now() + VERIFY_TIMEOUT;
@@ -195,10 +220,7 @@ impl KafkaTarget {
     /// sibling of [`AgentTarget::push_segment`] — the trait
     /// implementation calls this from a sync context via
     /// [`block_on_current`].
-    pub async fn push_segment_async(
-        &self,
-        segment: &Segment,
-    ) -> anyhow::Result<()> {
+    pub async fn push_segment_async(&self, segment: &Segment) -> anyhow::Result<()> {
         let producer = self.producer()?;
 
         // Stable partition key: the segment's start time so all
@@ -207,27 +229,26 @@ impl KafkaTarget {
         let key = segment.t_start.as_millis().to_string();
         let payload = serde_json::to_vec(segment)?;
         let topic = self.inner.connection.topic.clone();
-        let record: FutureRecord<'_, String, Vec<u8>> = FutureRecord::to(&topic)
-            .key(&key)
-            .payload(&payload);
+        let record: FutureRecord<'_, String, Vec<u8>> =
+            FutureRecord::to(&topic).key(&key).payload(&payload);
 
         producer
             .send(record, Timeout::After(PRODUCE_TIMEOUT))
             .await
             .map_err(|(e, _msg)| anyhow::anyhow!("kafka produce failed: {e}"))?;
 
-        // Mirror into the in-process buffer so a late-joining agent
-        // can `pull_recent` and catch up.
+        // Mirror into the in-process buffer so a late-joining
+        // agent can `pull_recent` and catch up. `VecDeque`
+        // makes the eviction O(1).
         let mut buf = self.inner.buffer.lock();
         if buf.len() == BUFFER_CAP {
-            buf.remove(0);
+            buf.pop_front();
         }
-        buf.push(segment.clone());
+        buf.push_back(segment.clone());
         Ok(())
     }
 }
 
-/// Drive a future to completion synchronously. When called from
 impl AgentTarget for KafkaTarget {
     fn session_id(&self) -> AgentSessionId {
         self.inner.session.clone()
@@ -256,19 +277,33 @@ impl AgentTarget for KafkaTarget {
             let r = rt.block_on(this.push_segment_async(&seg));
             let _ = tx.send(r);
         });
-        rx.recv().expect("join producer thread")
+        // Block until the worker sends its result. The only way
+        // `recv` returns Err here is if the worker thread
+        // panicked (which also drops the channel) or the OS
+        // killed the thread — either way the segment wasn't
+        // delivered. Surface that as a per-segment error so the
+        // consumer task logs and moves on; we deliberately do
+        // NOT panic the recorder for a single misbehaving
+        // segment, matching the trait's "best-effort, errors
+        // are non-fatal" contract.
+        rx.recv()
+            .map_err(|e| anyhow::anyhow!("producer worker join failed: {e}"))?
     }
 
     fn pull_recent(&self, limit: usize) -> Vec<Segment> {
         let buf = self.inner.buffer.lock();
+        // VecDeque has no slice-range indexing; iterate from
+        // the tail by hand to keep the same "most recent N"
+        // ordering as the previous `Vec` implementation.
         let start = buf.len().saturating_sub(limit);
-        buf[start..].to_vec()
+        buf.iter().skip(start).cloned().collect()
     }
 }
 
 fn build_producer(
     conn: &KafkaAgentConnection,
     session: &AgentSessionId,
+    message_timeout: Duration,
 ) -> Result<FutureProducer, KafkaError> {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &conn.endpoint)
@@ -281,9 +316,17 @@ fn build_producer(
         )
         // Connection-level timeouts. The 5 s request timeout pairs
         // with `PRODUCE_TIMEOUT` so a slow broker doesn't pin the
-        // recorder forever.
+        // recorder forever. `message.timeout.ms` is the total
+        // time librdkafka will keep retrying a single message
+        // before surfacing an error; for normal pushes we want
+        // it short, but the verify path passes VERIFY_TIMEOUT
+        // so a slow broker can actually use the generous window
+        // the constant promises.
         .set("request.timeout.ms", "5000")
-        .set("message.timeout.ms", "5000")
+        .set(
+            "message.timeout.ms",
+            message_timeout.as_millis().to_string(),
+        )
         .set("socket.timeout.ms", "5000")
         .set("enable.idempotence", "false");
     cfg.create()
@@ -292,14 +335,23 @@ fn build_producer(
 fn build_consumer(
     conn: &KafkaAgentConnection,
     session: &AgentSessionId,
+    group_id: &str,
+    auto_offset_reset: &str,
 ) -> Result<StreamConsumer, KafkaError> {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &conn.endpoint)
-        .set(
-            "group.id",
-            format!("voice-bird-cli-verify-{}", session.as_str()),
-        )
-        .set("auto.offset.reset", "earliest")
+        // The verify path passes a fresh UUID here so two
+        // concurrent verifies (or two app instances) don't
+        // join the same group, split partitions, and have
+        // one of them miss its own probe. Other callers can
+        // pass the session-derived stable id.
+        .set("group.id", group_id)
+        // `latest` skips the backlog and reads only messages
+        // produced after the consumer subscribed — paired
+        // with the subscribe-before-produce order in
+        // `verify` so the probe is the first thing the
+        // consumer can see.
+        .set("auto.offset.reset", auto_offset_reset)
         .set("enable.auto.commit", "false")
         .set("session.timeout.ms", "6000")
         .set(
@@ -310,4 +362,3 @@ fn build_consumer(
         );
     cfg.create()
 }
-

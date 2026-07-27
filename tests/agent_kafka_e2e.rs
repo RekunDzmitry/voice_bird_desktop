@@ -51,21 +51,18 @@ fn broker_or_skip() -> Option<(String, String)> {
     let broker = std::env::var("TEST_KAFKA_BROKER").ok()?;
     let topic = std::env::var("TEST_KAFKA_TOPIC").ok()?;
     if broker.is_empty() || topic.is_empty() {
-        eprintln!(
-            "agent_kafka_e2e: TEST_KAFKA_BROKER or TEST_KAFKA_TOPIC is empty; skipping"
-        );
+        eprintln!("agent_kafka_e2e: TEST_KAFKA_BROKER or TEST_KAFKA_TOPIC is empty; skipping");
         return None;
     }
     Some((broker, topic))
 }
 
-/// Drive a future synchronously by running it on a
-/// dedicated thread with its own current-thread
-/// runtime. We can't `block_on` from inside the
-/// cargo test harness because it already runs each
-/// test inside a tokio runtime; spinning a fresh
-/// thread keeps the two runtimes separate so the
-/// `FutureProducer`'s background tasks can run.
+/// Drive a future synchronously. Cargo test's plain
+/// `#[test]` runner is sync, so we can't `block_on`
+/// directly on the caller's thread; the
+/// `FutureProducer`'s background tasks need a real
+/// reactor, so the test spawns a thread + own
+/// current-thread runtime to drive the future.
 fn block_on<F>(fut: F) -> F::Output
 where
     F: Future + Send + 'static,
@@ -224,7 +221,9 @@ fn verify_only() {
             .expect("build one-shot tokio runtime");
         let _ = tx.send(rt.block_on(target.verify()));
     });
-    let elapsed = rx.recv().expect("join verify thread")
+    let elapsed = rx
+        .recv()
+        .expect("join verify thread")
         .expect("verify should succeed against a reachable broker");
     eprintln!("verify_only: OK in {elapsed:?}");
 }

@@ -54,13 +54,6 @@ impl AgentFunnelStep {
     }
 }
 
-impl std::str::FromStr for AgentFunnelStep {
-    type Err = ();
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Err(())
-    }
-}
-
 /// Result of the verify step. The renderer surfaces this on
 /// both the Verify screen and the Save screen so the user can
 /// revisit the outcome before committing.
@@ -71,24 +64,11 @@ pub enum VerifyOutcome {
     Ok { elapsed: Duration },
     Err { message: String },
 }
-
-/// What the user picked on the "Connection kind" step. Today
-/// only Kafka is wired; the enum is open so the funnel can
-/// grow without breaking saved-state handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentFunnelConnectionKind {
-    Kafka,
-}
-
-impl AgentFunnelConnectionKind {
-    pub const ALL: [Self; 1] = [Self::Kafka];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Kafka => "Kafka",
-        }
-    }
-}
+/// (no local kind enum — the funnel reuses
+/// `crate::config::AgentConnectionKind` so there's
+/// a single source of truth for the "what transport the user
+/// picked" concept. Kept as a comment to flag the removal
+/// for anyone who lands here from a search.)
 
 /// Funnel state. Lives on `App`; mutated by `main.rs`'s key
 /// dispatcher and read by `ui.rs`'s renderer.
@@ -102,8 +82,7 @@ pub struct AgentFunnel {
 
     /// Form values the user has filled in so far. The
     /// renderer shows the relevant field for the current
-    /// step; the others stay buffered here.
-    pub kind: AgentFunnelConnectionKind,
+    pub kind: crate::config::AgentConnectionKind,
     pub name: String,
     pub endpoint: String,
     pub topic: String,
@@ -120,7 +99,7 @@ impl AgentFunnel {
         Self {
             editing_id: None,
             step: AgentFunnelStep::PickConnectionKind,
-            kind: AgentFunnelConnectionKind::Kafka,
+            kind: crate::config::AgentConnectionKind::Kafka,
             name: String::new(),
             endpoint: String::new(),
             topic: String::new(),
@@ -139,7 +118,7 @@ impl AgentFunnel {
         Self {
             editing_id: Some(existing.id.clone()),
             step: AgentFunnelStep::PickConnectionKind,
-            kind: AgentFunnelConnectionKind::Kafka,
+            kind: crate::config::AgentConnectionKind::Kafka,
             name: existing.name.clone(),
             endpoint,
             topic,
@@ -273,7 +252,7 @@ mod tests {
         let f = AgentFunnel::new_add();
         assert_eq!(f.step, AgentFunnelStep::PickConnectionKind);
         assert!(f.editing_id.is_none());
-        assert_eq!(f.kind, AgentFunnelConnectionKind::Kafka);
+        assert_eq!(f.kind, crate::config::AgentConnectionKind::Kafka);
         assert!(f.name.is_empty());
         assert!(f.endpoint.is_empty());
         assert!(f.topic.is_empty());

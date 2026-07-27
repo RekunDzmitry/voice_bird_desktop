@@ -8,8 +8,8 @@ use ratatui::{
 use std::time::Instant;
 
 use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotId, SlotKind};
-use voice_bird_cli::session::target::Target;
 use voice_bird_cli::session::layout::SessionSource;
+use voice_bird_cli::session::target::Target;
 
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
@@ -33,11 +33,7 @@ pub fn render(f: &mut Frame, app: &App) {
     // row and needs at least 5 rows, so the picker is floored at 8 to
     // give a 3-column layout room for a few rows + scroll. Cap at 16
     // so the slot row still gets the bulk of the screen.
-    let max_pane_len = app
-        .devices
-        .len()
-        .max(app.apps.len() + 1)
-        .max(3) as u16;
+    let max_pane_len = app.devices.len().max(app.apps.len() + 1).max(3) as u16;
     let devices_h = (max_pane_len + 2).clamp(8, 16);
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(3), // [0] header
@@ -75,10 +71,7 @@ pub fn render(f: &mut Frame, app: &App) {
     // room while the slot row keeps the bulk of the screen.
     let workspace = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(devices_h),
-            Constraint::Min(6),
-        ])
+        .constraints([Constraint::Length(devices_h), Constraint::Min(6)])
         .split(main[0]);
     render_picker(f, workspace[0], app);
     render_sections(f, workspace[1], app);
@@ -115,7 +108,7 @@ pub fn render(f: &mut Frame, app: &App) {
         render_agent_funnel(f, f.area(), app);
     }
     if let AppMode::ConfirmDeleteAgentTarget { id } = &app.mode {
-        render_confirm_delete(f, f.area(), id);
+        render_confirm_delete(f, f.area(), app, id);
     }
 }
 
@@ -298,9 +291,7 @@ fn build_slot_title(
         .focused_device()
         .map(|d| d.name.clone())
         .or_else(|| app.config.input_device.clone());
-    let app_pick = app
-        .focused_app()
-        .map(|a| a.name.clone());
+    let app_pick = app.focused_app().map(|a| a.name.clone());
     let target = if let Some(s) = section {
         s.target.clone()
     } else {
@@ -331,7 +322,9 @@ fn build_slot_title(
             )),
             Line::from(Span::styled(
                 format!(" → {target} "),
-                Style::default().fg(target_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(target_color)
+                    .add_modifier(Modifier::BOLD),
             )),
         ]
     }
@@ -345,9 +338,7 @@ fn build_slot_title(
 fn slot_has_picker_pick(app: &App) -> bool {
     app.config.input_device.is_some()
         || app.focused_app().is_some()
-        || app
-            .pending_target_overrides
-            .contains_key(&app.focused_slot)
+        || app.pending_target_overrides.contains_key(&app.focused_slot)
 }
 
 /// slot they're on and which target was picked.
@@ -697,7 +688,9 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
 fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
     use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
 
-    let Some(funnel) = app.funnel.as_ref() else { return };
+    let Some(funnel) = app.funnel.as_ref() else {
+        return;
+    };
     let popup = centered(72, 14, area);
     f.render_widget(Clear, popup);
 
@@ -713,14 +706,16 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
     };
     lines.push(Line::from(Span::styled(
         format!(" {step_label} "),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
     match funnel.step {
         AgentFunnelStep::PickConnectionKind => {
             lines.push(Line::from("Which connection?"));
-            for (i, k) in voice_bird_cli::agent_funnel::AgentFunnelConnectionKind::ALL
+            for (i, k) in voice_bird_cli::config::AgentConnectionKind::ALL
                 .iter()
                 .enumerate()
             {
@@ -846,11 +841,20 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
 /// prompt. `y` confirms; any other key cancels. Implemented as
 /// a single-line modal so it doesn't pull focus away from the
 /// Targets pane for long.
-fn render_confirm_delete(f: &mut Frame, area: Rect, id: &str) {
+fn render_confirm_delete(f: &mut Frame, area: Rect, app: &App, id: &str) {
     let popup = centered(60, 3, area);
     f.render_widget(Clear, popup);
+    // Show the target's *name* (not its raw UUID) so the user
+    // can tell which row they're about to delete. Fall back
+    // to the id only if the config was edited out from under
+    // us between prompt-open and prompt-render.
+    let name = app
+        .config
+        .agent_target_by_id(id)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| id.to_string());
     let lines = vec![Line::from(Span::styled(
-        format!("Delete Agent target '{id}'? [y/N]"),
+        format!("Delete Agent target '{name}'? [y/N]"),
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     ))];
     let block = Block::default()
@@ -871,10 +875,7 @@ fn input_line(value: &str) -> Line<'static> {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "▏",
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled("▏", Style::default().fg(Color::Yellow)),
     ])
 }
 
@@ -889,7 +890,7 @@ fn input_line(value: &str) -> Line<'static> {
 /// dropping Devices below ~40% starts clipping them. Apps and
 /// Targets are short lists so they can survive narrower columns.
 fn render_picker(f: &mut Frame, area: Rect, app: &App) {
-     let cols = Layout::default()
+    let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(45),
@@ -947,13 +948,13 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
             // Look up the agent target's name so the row label
             // reads as "Agent: <name>" instead of a bare "Agent".
             let name = match &row.kind {
-                crate::app::TargetKind::Agent { id } => app
-                    .config
-                    .agent_target_by_id(id)
-                    .map(|t| t.name.clone()),
+                crate::app::TargetKind::Agent { id } => {
+                    app.config.agent_target_by_id(id).map(|t| t.name.clone())
+                }
                 _ => None,
             };
-            let (label, style, hint) = target_row_style(row.kind.clone(), row.disabled, name.as_deref());
+            let (label, style, hint) =
+                target_row_style(row.kind.clone(), row.disabled, name.as_deref());
             // The picked row gets its base color bumped to Yellow
             // (the rest of the picker uses Green / Magenta / Cyan
             // per target kind) plus the BOLD modifier. Cursor row
@@ -971,7 +972,12 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
                 style
             };
             let picked_tag = if is_picked {
-                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    " ●",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::raw("")
             };
@@ -985,7 +991,12 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let cursor_row = app.selected_target_index.unwrap_or(0) as u16;
-    let scroll = clamp_scroll_for_render(cursor_row, app.target_scroll, items.len() as u16, inner.height);
+    let scroll = clamp_scroll_for_render(
+        cursor_row,
+        app.target_scroll,
+        items.len() as u16,
+        inner.height,
+    );
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
 }
@@ -1079,10 +1090,7 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled(" [input] ", Style::default().fg(Color::Cyan))
                 }
                 AudioSessionKind::Output => {
-                    Span::styled(
-                        " [output/loopback] ",
-                        Style::default().fg(Color::Magenta),
-                    )
+                    Span::styled(" [output/loopback] ", Style::default().fg(Color::Magenta))
                 }
                 AudioSessionKind::App => Span::styled(" [app] ", Style::default().fg(Color::Green)),
             };
@@ -1108,7 +1116,12 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
             // users looking at Apps or Targets can still see what
             // the device choice is.
             let picked_tag = if is_picked {
-                Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    " ●",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::raw("")
             };
@@ -1172,7 +1185,12 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
     let none_active = app.selected_app_index.is_none() && focused;
     let none_marker = if none_active { "▶ " } else { "  " };
     let none_picked_tag = if none_picked {
-        Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " ●",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("")
     };
@@ -1210,7 +1228,12 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let picked_tag = if is_picked {
-            Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            Span::styled(
+                " ●",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::raw("")
         };
@@ -1422,7 +1445,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 lines.push(hotkey_line("[m]", "model"));
                 lines.push(hotkey_line("[p]", "path"));
             }
-             // Agent CRUD keys live on the Targets pane only —
+            // Agent CRUD keys live on the Targets pane only —
             // they don't collide with the Devices/Apps `l`,
             // `m`, `e` shortcuts. `e` is overloaded: in the
             // Targets pane it opens the edit funnel; in any
@@ -1751,7 +1774,7 @@ mod tests {
         // their own via the funnel. Plant one in the config so
         // the row renders in the expected order.
         let mut app = App::new();
-        app.upsert_agent_target(voice_bird_cli::config::AgentTargetConfig {
+        app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
             id: "test-uuid".into(),
             name: "prod".into(),
             connection: voice_bird_cli::config::AgentConnection::Kafka(
@@ -1802,11 +1825,8 @@ mod tests {
     #[test]
     fn target_row_style_agent_is_dim_when_disabled() {
         use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(
-            TargetKind::Agent { id: "any".into() },
-            true,
-            None,
-        );
+        let (label, style, hint) =
+            target_row_style(TargetKind::Agent { id: "any".into() }, true, None);
         assert_eq!(label, "Agent");
         assert_eq!(style.fg, Some(Color::DarkGray));
         assert!(hint.contains("not installed"));
@@ -1825,10 +1845,7 @@ mod tests {
         assert_eq!(label, "Agent: prod-events");
         assert_eq!(style.fg, Some(Color::Cyan));
         assert!(style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            hint, "",
-            "enabled Agent must not carry a trailing hint"
-        );
+        assert_eq!(hint, "", "enabled Agent must not carry a trailing hint");
     }
     /// Enabled Stdout / Cloud also carry no hint — pinning
     /// the invariant that all three picker rows share a
@@ -1884,7 +1901,10 @@ mod tests {
             "[c]",
             "[l]",
         ] {
-            assert!(out.contains(key), "idle key {key} missing from sidebar:\n{out}");
+            assert!(
+                out.contains(key),
+                "idle key {key} missing from sidebar:\n{out}"
+            );
         }
     }
     /// Expanding the workspace shows the new slot number in the
@@ -1929,8 +1949,8 @@ mod tests {
         app.selected_device_index = 2;
         app.selected_app_index = Some(1);
         app.selected_target_index = Some(1); // Cloud
-        // Pretend a previous start installed an Agent session id, so
-        // the Agent row stays pickable but isn't the picked one.
+                                             // Pretend a previous start installed an Agent session id, so
+                                             // the Agent row stays pickable but isn't the picked one.
         let out = render_to_string(&app, 180, 40);
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -1982,10 +2002,10 @@ mod tests {
         app.selected_device_index = 2; // EPOS PC 8 USB
         app.selected_app_index = Some(0); // Chrome
         app.selected_target_index = Some(1); // Cloud (cursor)
-        // slot 1 starts as the only slot (id 1). Mark it as a
-        // saved recording on Cloud so the device + target pick
-        // are non-default. Bypassing `start_section` keeps the
-        // test free of audio / cpal / tokio runtime needs.
+                                             // slot 1 starts as the only slot (id 1). Mark it as a
+                                             // saved recording on Cloud so the device + target pick
+                                             // are non-default. Bypassing `start_section` keeps the
+                                             // test free of audio / cpal / tokio runtime needs.
         let saved_target = Target::Cloud;
         app.slots[0] = crate::app::Slot {
             id: crate::app::SlotId(1),
@@ -2020,11 +2040,13 @@ mod tests {
         // buffer — counting '●' against the picker tells us
         // if more than one row picked up the pin.
         assert!(
-            out0.lines().any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
+            out0.lines()
+                .any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
             "slot-1 step 0: device row missing '●' pin:\n{out0}"
         );
         assert!(
-            out0.lines().any(|l| l.contains("Chrome") && l.contains('●')),
+            out0.lines()
+                .any(|l| l.contains("Chrome") && l.contains('●')),
             "slot-1 step 0: app row missing '●' pin:\n{out0}"
         );
         // Helper: locate a Targets-pane row by its label and
@@ -2130,10 +2152,8 @@ mod tests {
 
         // ---- Bonus: queue a pending Cloud pick on slot 2
         // and verify the override is per-slot. ----
-        app.pending_target_overrides.insert(
-            crate::app::SlotId(2),
-            Target::Cloud,
-        );
+        app.pending_target_overrides
+            .insert(crate::app::SlotId(2), Target::Cloud);
         assert_eq!(
             app.picked_target_kind(),
             Some(crate::app::TargetKind::Cloud),
