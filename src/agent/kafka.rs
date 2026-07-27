@@ -151,23 +151,72 @@ impl KafkaTarget {
         let probe_bytes = serde_json::to_vec(&payload)?;
         let key = probe_id.clone();
         let topic = self.inner.connection.topic.clone();
-        // Subscribe BEFORE producing so the consumer is
-        // registered with the broker and ready to receive
-        // the probe the moment it lands. `auto.offset.reset =
-        // latest` + the fresh UUID group id (below) means we
-        // start at the head and only see messages produced
-        // after this point.
-        let verify_group = format!("voice-bird-cli-verify-{}", uuid::Uuid::new_v4());
+        // Skip the consumer-group machinery entirely: a fresh
+        // group takes seconds to JoinGroup/SyncGroup
+        // (`group.initial.rebalance.delay.ms` defaults to 3 s on
+        // the broker) and `auto.offset.reset = latest` would
+        // resolve the "log end" at *assignment* time, so the
+        // probe we produce right after would already be behind
+        // us and the consumer would never see it. `assign()`
+        // with an explicit end-offset is a synchronous metadata
+        // round-trip — fast and race-free.
+        //
+        // Fetch topic metadata first to discover the
+        // partitions; then ask each partition for its
+        // end-offset (`watermark` with timeout = now); then
+        // `assign()` the consumer to those offsets; *then*
+        // produce. The consumer is now positioned exactly at
+        // the head with no delay between assign and produce.
         let consumer = build_consumer(
             &self.inner.connection,
             &self.inner.session,
-            &verify_group,
+            // Group id is required by librdkafka even when
+            // using `assign()` directly. Use a fresh UUID
+            // anyway so we never share offsets with another
+            // live consumer.
+            &format!("voice-bird-cli-verify-{}", uuid::Uuid::new_v4()),
+            // auto.offset.reset is irrelevant when we `assign()`
+            // explicit offsets, but pass `latest` as a
+            // belt-and-braces default in case the broker
+            // rewinds the assignment.
             "latest",
         )?;
-        consumer.subscribe(&[&topic])?;
+        let metadata = consumer
+            .fetch_metadata(Some(&topic), Duration::from_secs(5))
+            .map_err(|e| {
+                anyhow::anyhow!("verify metadata fetch failed: {e} (broker={})", self.inner.connection.endpoint)
+            })?;
+        let topic_meta = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .ok_or_else(|| anyhow::anyhow!("verify: topic '{}' not in metadata", topic))?;
+        if topic_meta.partitions().is_empty() {
+            return Err(anyhow::anyhow!(
+                "verify: topic '{}' has no partitions",
+                topic
+            ));
+ }
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        for p in topic_meta.partitions() {
+            let (_low, high) = consumer
+                .fetch_watermarks(&topic, p.id(), Duration::from_secs(5))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "verify watermark fetch failed (topic={}, partition={}): {e}",
+                        topic,
+                        p.id()
+                    )
+                })?;
+            // `high` is the offset of the next message that
+            // will be produced — i.e. the head. The consumer
+            tpl.add_partition_offset(&topic, p.id(), rdkafka::Offset::Offset(high))?;
+        }
+        consumer.assign(&tpl)?;
 
-        // Now produce the probe. `acks=all` (the default) means
-        // this future only resolves once the ISR has the record.
+        // Produce the probe. `acks=all` (the default) means
+        // this future only resolves once the ISR has the
+        // record.
         let record: FutureRecord<'_, String, Vec<u8>> =
             FutureRecord::to(&topic).key(&key).payload(&probe_bytes);
         producer

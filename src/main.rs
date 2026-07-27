@@ -952,6 +952,13 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
             app.banner = Some("Add Agent: cancelled".into());
         }
         KeyCode::Backspace => funnel.backspace(),
+        // Step the funnel back without losing form values —
+        // useful when the Verify step fails and the user
+        // wants to fix the broker endpoint, topic name, etc.
+        // Esc would throw away the whole form, so ← is the
+        // non-destructive alternative. Bound to Left (matches
+        // the help-overlay convention for "go back").
+        KeyCode::Left => funnel.back(),
         KeyCode::Enter => match funnel.step {
             AgentFunnelStep::Verify => {
                 // Re-run if the user just hit Enter again — the

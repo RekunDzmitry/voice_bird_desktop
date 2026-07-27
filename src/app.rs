@@ -2024,18 +2024,32 @@ impl App {
         // the user-configured Kafka target the slot picked.
         //
         // Snapshot semantics: the map is cloned at section
-        // start. Edits to a user-configured target via the
-        // funnel only take effect for the *next* section
-        // the user starts in this slot — the in-flight
-        // consumer keeps producing to the broker/topic it
-        // captured here. Only removal-mid-recording is
-        // observed live: the lookup in the dispatch
-        // branch hits `agent_targets_for_consumer` (the
-        // snapshot), not the live `self.agent_targets`,
-        // so a removed id just falls through to the
-        // "drop with a warning" branch instead of
-        // shadowing. Shared `Arc<RwLock<…>>` so edits
-        // apply live is filed as a follow-up.
+        // start. The clone owns its own `Arc<dyn AgentTarget>`
+        // values — `AgentTarget` itself is a cheap
+        // `Arc<KafkaTargetInner>` handle, so the broker
+        // connection + buffer are shared, but the dispatch
+        // map is independent of `self.agent_targets`.
+        //
+        // Concretely: both *edits* and *removals* made via
+        // the funnel (or via `App::remove_agent_target_*`)
+        // only take effect for the *next* section the user
+        // starts in this slot. The in-flight consumer keeps
+        // routing to the broker/topic it captured here, so
+        // removing a target mid-recording does NOT cut off
+        // production to that broker — the segment pipeline
+        // continues until the section ends. The
+        // "agent target not found; segment dropped" branch
+        // downstream is effectively unreachable from a
+        // mid-recording removal (the cloned map still has
+        // the entry); it can only fire if the target was
+        // never present in the first place.
+        //
+        // Sharing the live map via `Arc<RwLock<…>>` (so
+        // edits/removals apply mid-section) is filed as a
+        // follow-up — the current snapshot behaviour is
+        // correct for the 7-step funnel UX ("next section
+        // picks up the new target") but surprising if the
+        // user expects removal to take effect immediately.
         let agent_targets_for_consumer = self.agent_targets.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {

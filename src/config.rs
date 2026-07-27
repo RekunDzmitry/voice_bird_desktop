@@ -149,23 +149,23 @@ pub struct AppConfig {
 /// mints one when the user picks `a`dd; the value is a UUIDv4.
 pub type AgentTargetId = String;
 
-/// Ids that the segment dispatcher in `App::push_segment_to_agent`
-/// compares against as a special case (e.g. `"default"` routes
-/// to the legacy MCP-backed `ServerState`). Letting a
-/// user-configured target claim the same id would silently
-/// route its segments to the wrong destination, so we reject
-/// both hand-edited config rows and funnel-saved configs that
+/// Ids that the segment dispatcher in the consumer task
+/// inside `App::start_section` compares against as a
+/// special case (e.g. `"default"` routes to the legacy
+/// MCP-backed `ServerState`). Letting a user-configured
+/// target claim the same id would silently route its
+/// segments to the wrong destination, so we reject both
+/// hand-edited config rows and funnel-saved configs that
 /// use them.
 pub const RESERVED_AGENT_TARGET_IDS: &[&str] = &["default"];
 
-/// Return `true` if `id` is reserved for an internal Agent
-/// destination and must not be reused by a user-configured
-/// target.
 pub fn is_reserved_agent_target_id(id: &str) -> bool {
     RESERVED_AGENT_TARGET_IDS.contains(&id)
 }
 
-/// Today only Kafka is wired; the enum is open so the funnel
+/// Transport the user-configured Agent target uses to
+/// publish committed segments. Today only Kafka is wired;
+/// the enum is open so the funnel
 /// ("1. Kafka  2. ...  3. ...") keeps working when we add more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

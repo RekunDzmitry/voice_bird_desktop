@@ -64,11 +64,6 @@ pub enum VerifyOutcome {
     Ok { elapsed: Duration },
     Err { message: String },
 }
-/// (no local kind enum — the funnel reuses
-/// `crate::config::AgentConnectionKind` so there's
-/// a single source of truth for the "what transport the user
-/// picked" concept. Kept as a comment to flag the removal
-/// for anyone who lands here from a search.)
 
 /// Funnel state. Lives on `App`; mutated by `main.rs`'s key
 /// dispatcher and read by `ui.rs`'s renderer.
@@ -82,6 +77,7 @@ pub struct AgentFunnel {
 
     /// Form values the user has filled in so far. The
     /// renderer shows the relevant field for the current
+    /// step; the others stay buffered here.
     pub kind: crate::config::AgentConnectionKind,
     pub name: String,
     pub endpoint: String,
