@@ -2011,29 +2011,15 @@ impl App {
                             None
                         };
                         // Route into the agent buffer when the
-                        // slot's target is `Target::Agent`. The
-                        // target's session_id picks the
-                        // `AgentTarget` impl to fan the segment
-                        // out to. The default MCP-backed target
-                        // (session_id == "default") still goes
-                        // through `agent_state` for backward
-                        // compatibility with the
-                        // `voice_bird__pull_recent` MCP tool.
-                        if let Target::Agent { session_id } = &target_for_consumer {
-                            if session_id == "default" {
-                                agent_state_for_consumer.push(seg.clone());
-                            } else if let Some(agent) = agent_targets_for_consumer.get(session_id) {
-                                if let Err(e) = agent.push_segment(&seg) {
-                                    log::warn!("agent target push_segment ({}): {e}", session_id);
-                                }
-                            } else {
-                                // Target was removed mid-recording.
-                                // Drop the segment — better than
-                                // silently routing to the
-                                // default MCP target.
-                                log::warn!("agent target {session_id} not found; segment dropped");
-                            }
-                        }
+                        // slot's target is `Target::Agent`. See
+                        // `dispatch_segment_to_agent` for the
+                        // default / known-id / missing-id arms.
+                        dispatch_segment_to_agent(
+                            &target_for_consumer,
+                            &seg,
+                            &agent_state_for_consumer,
+                            &agent_targets_for_consumer,
+                        );
                         // Mirror to the on-disk live tail so the
                         // MCP server process spawned by the agent
                         // runtime sees the same segments. The
@@ -2594,6 +2580,64 @@ impl Default for App {
     }
 }
 
+// ── Agent segment dispatch ─────────────────────────────────────────────
+
+/// What [`dispatch_segment_to_agent`] did with a segment. Returned so
+/// tests (and future status surfaces) can assert routing without a
+/// live recording pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDispatch {
+    /// The slot's target is not `Target::Agent`; nothing was routed.
+    NotAgent,
+    /// Routed to the legacy MCP `agent_state` buffer (`"default"` id).
+    Default,
+    /// Pushed to the mapped user-configured `AgentTarget`.
+    Pushed,
+    /// The mapped target's `push_segment` failed; error logged.
+    PushFailed,
+    /// No target with that id (removed mid-recording); segment
+    /// dropped with a warning — NOT silently routed to default.
+    Dropped,
+}
+
+/// Route one committed segment to its Agent destination. The default
+/// MCP-backed target (`session_id == "default"`, see
+/// `voice_bird_cli::config::RESERVED_AGENT_TARGET_IDS`) goes through
+/// `agent_state` for backward compatibility with the
+/// `voice_bird__pull_recent` MCP tool; user-configured ids resolve
+/// through `agent_targets`. Called from the recording consumer task
+/// in `App::start_section`.
+fn dispatch_segment_to_agent(
+    target: &Target,
+    seg: &voice_bird_cli::transcription::Segment,
+    agent_state: &voice_bird_cli::agent::mcp_server::ServerState,
+    agent_targets: &std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
+    >,
+) -> AgentDispatch {
+    let Target::Agent { session_id } = target else {
+        return AgentDispatch::NotAgent;
+    };
+    if session_id == "default" {
+        agent_state.push(seg.clone());
+        AgentDispatch::Default
+    } else if let Some(agent) = agent_targets.get(session_id) {
+        match agent.push_segment(seg) {
+            Ok(()) => AgentDispatch::Pushed,
+            Err(e) => {
+                log::warn!("agent target push_segment ({session_id}): {e}");
+                AgentDispatch::PushFailed
+            }
+        }
+    } else {
+        // Target was removed mid-recording. Drop the segment —
+        // better than silently routing to the default MCP target.
+        log::warn!("agent target {session_id} not found; segment dropped");
+        AgentDispatch::Dropped
+    }
+}
+
 // ── Platform invariants ────────────────────────────────────────────────
 
 /// Windows is cloud-only: force cloud on in memory regardless of what the
@@ -2731,6 +2775,149 @@ mod tests {
         // Empty fallbacks for the focused-* Arcs.
         assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
+    }
+
+    // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
+
+    /// Spy `AgentTarget`: records every pushed segment's text, or
+    /// fails the push when `fail` is set.
+    struct SpyTarget {
+        pushed: Arc<PlMutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl voice_bird_cli::agent::AgentTarget for SpyTarget {
+        fn session_id(&self) -> voice_bird_cli::agent::AgentSessionId {
+            voice_bird_cli::agent::AgentSessionId("spy".into())
+        }
+        fn push_segment(
+            &self,
+            segment: &voice_bird_cli::transcription::Segment,
+        ) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("spy push_segment failure");
+            }
+            self.pushed.lock().push(segment.text.clone());
+            Ok(())
+        }
+        fn pull_recent(&self, _limit: usize) -> Vec<voice_bird_cli::transcription::Segment> {
+            Vec::new()
+        }
+    }
+
+    fn dispatch_seg(text: &str) -> voice_bird_cli::transcription::Segment {
+        voice_bird_cli::transcription::Segment {
+            t_start: std::time::Duration::from_millis(0),
+            t_end: std::time::Duration::from_millis(500),
+            text: text.into(),
+            tokens: Vec::new(),
+        }
+    }
+
+    fn dispatch_fixture(
+        fail: bool,
+    ) -> (
+        voice_bird_cli::agent::mcp_server::ServerState,
+        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
+        Arc<PlMutex<Vec<String>>>,
+    ) {
+        let state = voice_bird_cli::agent::mcp_server::ServerState::new(
+            voice_bird_cli::agent::AgentSessionId::default_session(),
+        );
+        let pushed = Arc::new(PlMutex::new(Vec::new()));
+        let mut targets: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
+        > = std::collections::HashMap::new();
+        targets.insert(
+            "known-id".into(),
+            std::sync::Arc::new(SpyTarget {
+                pushed: pushed.clone(),
+                fail,
+            }),
+        );
+        (state, targets, pushed)
+    }
+
+    #[test]
+    fn dispatch_default_id_routes_to_legacy_mcp_buffer() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "default".into(),
+            },
+            &dispatch_seg("hello"),
+            &state,
+            &targets,
+        );
+        assert_eq!(out, AgentDispatch::Default);
+        let buf = state.pull(10);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].text, "hello");
+        // The user-configured target must NOT see the segment.
+        assert!(pushed.lock().is_empty());
+    }
+
+    #[test]
+    fn dispatch_known_id_pushes_to_mapped_target() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "known-id".into(),
+            },
+            &dispatch_seg("routed"),
+            &state,
+            &targets,
+        );
+        assert_eq!(out, AgentDispatch::Pushed);
+        assert_eq!(*pushed.lock(), vec!["routed".to_string()]);
+        // The legacy MCP buffer must stay empty.
+        assert!(state.pull(10).is_empty());
+    }
+
+    #[test]
+    fn dispatch_missing_id_drops_segment_not_default() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "removed-mid-recording".into(),
+            },
+            &dispatch_seg("lost"),
+            &state,
+            &targets,
+        );
+        assert_eq!(out, AgentDispatch::Dropped);
+        // Dropped means dropped: neither the legacy buffer nor any
+        // configured target receives the segment.
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
+    }
+
+    #[test]
+    fn dispatch_push_failure_is_reported_not_rerouted() {
+        let (state, targets, pushed) = dispatch_fixture(true);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "known-id".into(),
+            },
+            &dispatch_seg("boom"),
+            &state,
+            &targets,
+        );
+        assert_eq!(out, AgentDispatch::PushFailed);
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
+    }
+
+    #[test]
+    fn dispatch_non_agent_targets_route_nothing() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        for target in [Target::Stdout, Target::Cloud] {
+            let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets);
+            assert_eq!(out, AgentDispatch::NotAgent);
+        }
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
     }
 
     // Runs on every platform: asserts the forcing on Windows and the
