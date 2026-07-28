@@ -327,6 +327,10 @@ fn run_app<B: Backend>(
         // return to Normal mode.
         app.poll_picker_download();
 
+        // Drain any completed verify probe. Non-blocking; the
+        // TUI keeps drawing frames while the probe runs, so Esc
+        // is reachable and "Verifying…" actually renders.
+        app.poll_funnel_verify();
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -336,12 +340,17 @@ fn run_app<B: Backend>(
                 consecutive_poll_errors = 0;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        match app.mode {
+                        match &app.mode {
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
                             AppMode::PathModal => handle_path_modal(app, key.code),
+                            AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
+                            AppMode::ConfirmDeleteAgentTarget { id } => {
+                                let id = id.clone();
+                                handle_confirm_delete_agent_target(app, key.code, &id)
+                            }
                         }
                         if let Some(path) = debug_snapshot_path {
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
@@ -497,12 +506,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 // which (and what to do).
                 let recording = app
                     .slot_index(app.focused_slot)
-                    .map(|i| {
-                        matches!(
-                            app.slots[i].kind,
-                            crate::app::SlotKind::Recording { .. }
-                        )
-                    })
+                    .map(|i| matches!(app.slots[i].kind, crate::app::SlotKind::Recording { .. }))
                     .unwrap_or(false);
                 let msg = if recording {
                     "Stop the recording with [s] before removing the slot".into()
@@ -510,7 +514,60 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "At least one slot must remain — no slot to remove".into()
                 };
                 app.banner = Some(msg);
-                log::info!("keys: - → refused ({})", app.banner.as_deref().unwrap_or("?"));
+                log::info!(
+                    "keys: - → refused ({})",
+                    app.banner.as_deref().unwrap_or("?")
+                );
+            }
+        }
+        // Agent CRUD keys — only meaningful in the Targets
+        // pane. `a` adds, `e` edits the focused Agent row,
+        // `d` confirms a delete. We no-op outside the pane
+        // so we don't shadow the export / language / model
+        // shortcuts in the other panes.
+        KeyCode::Char('a') | KeyCode::Char('A')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            app.open_add_agent_funnel();
+            log::info!("keys: a → opened add-agent funnel");
+        }
+        KeyCode::Char('e') | KeyCode::Char('E')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            // Edit the focused Agent row only. The cursor must
+            // be on an Agent row — if it's on Stdout / Cloud,
+            // the user hasn't actually selected a target, so
+            // don't fall back to "edit some random Agent
+            // target the user isn't pointing at" (the
+            // previous fallback made the wrong target easy to
+            // delete/mutate).
+            match app.focused_target_kind() {
+                Some(crate::app::TargetKind::Agent { id }) => {
+                    log::info!("keys: e → opened edit-agent funnel for {id}");
+                    app.open_edit_agent_funnel(&id);
+                }
+                _ => {
+                    app.banner = Some("No Agent target selected — press [a] to add one".into());
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if app.picker_focus == crate::app::PickerFocus::Targets =>
+        {
+            // Delete the focused Agent row only. The cursor must
+            // be on an Agent row — falling back to "the first
+            // Agent target in the list" when the cursor is on
+            // Stdout / Cloud let users nuke a target they
+            // weren't pointing at. Same risk as the `e` arm
+            // above.
+            match app.focused_target_kind() {
+                Some(crate::app::TargetKind::Agent { id }) => {
+                    log::info!("keys: d → prompted delete for Agent {id}");
+                    app.mode = AppMode::ConfirmDeleteAgentTarget { id };
+                }
+                _ => {
+                    app.banner = Some("No Agent target selected".into());
+                }
             }
         }
         KeyCode::Enter => {
@@ -873,6 +930,141 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
     }
 }
 
+/// Key handler for the multi-step "Add / Edit Agent target"
+/// funnel. Steps share a `KeyCode::Enter` advance and
+/// `KeyCode::Esc` cancel; text-input steps also accept
+/// `KeyCode::Char` and `KeyCode::Backspace`. Verify is the
+/// one step that hits the network — every other step is
+/// pure form state.
+fn handle_agent_funnel(app: &mut App, key: KeyCode) {
+    use voice_bird_cli::agent::kafka::KafkaTarget;
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
+    let Some(funnel) = app.funnel.as_mut() else {
+        app.mode = AppMode::Normal;
+        return;
+    };
+    match key {
+        KeyCode::Esc => {
+            app.funnel = None;
+            app.verify_rx = None;
+            app.verify_started = None;
+            app.mode = AppMode::Normal;
+            app.banner = Some("Add Agent: cancelled".into());
+        }
+        KeyCode::Backspace => funnel.backspace(),
+        // Step the funnel back without losing form values —
+        // useful when the Verify step fails and the user
+        // wants to fix the broker endpoint, topic name, etc.
+        // Esc would throw away the whole form, so ← is the
+        // non-destructive alternative. Bound to Left (matches
+        // the help-overlay convention for "go back").
+        KeyCode::Left => funnel.back(),
+        KeyCode::Enter => match funnel.step {
+            AgentFunnelStep::Verify => {
+                // Enter on a green probe advances to Save.
+                // Pending/InProgress/Err re-spawns the probe
+                // (the previous probe has already drained or
+                // never started; always replace the in-flight
+                // channel and start a fresh one). The TUI
+                // event loop polls `verify_rx` each tick, so
+                // we don't block here.
+                if matches!(funnel.verify, VerifyOutcome::Ok { .. }) {
+                    funnel.advance();
+                } else {
+                    funnel.verify = VerifyOutcome::InProgress;
+                    let conn = funnel.kafka_connection();
+                    let target = KafkaTarget::new(
+                        voice_bird_cli::agent::AgentSessionId::default_session(),
+                        conn.clone(),
+                    );
+                    // Drive verify on a dedicated thread with its own
+                    // runtime. The TUI runs inside its own tokio
+                    // runtime, so `block_on` on `Handle::current()`
+                    // would panic.
+                    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build one-shot tokio runtime");
+                        let r = rt.block_on(target.verify());
+                        let _ = tx.send(r);
+                    });
+                    app.verify_rx = Some(rx);
+                    app.verify_started = Some(std::time::Instant::now());
+                }
+            }
+            AgentFunnelStep::Save => {
+                let config = funnel.to_config();
+                let name = config.name.clone();
+                // Funnel mints a fresh UUID on Save, so a
+                // reserved-id rejection would indicate a bug
+                // in the id minter. Surface it instead of
+                // silently dropping the user's target.
+                match app.upsert_agent_target(config) {
+                    Ok(()) => {
+                        app.funnel = None;
+                        app.verify_rx = None;
+                        app.verify_started = None;
+                        app.mode = AppMode::Normal;
+                        app.banner = Some(format!("Saved Agent target '{name}'"));
+                    }
+                    Err(e) => {
+                        log::error!("funnel: save failed: {e}");
+                        app.banner = Some(format!("Save failed: {e}"));
+                    }
+                }
+            }
+            _ => {
+                if funnel.can_advance() {
+                    funnel.advance();
+                } else {
+                    app.banner = Some("Fill the form before advancing".into());
+                }
+            }
+        },
+        KeyCode::Char('1') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::All;
+            funnel.verify = VerifyOutcome::Pending;
+        }
+        KeyCode::Char('2') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::One;
+            funnel.verify = VerifyOutcome::Pending;
+        }
+        KeyCode::Char('3') if funnel.step == AgentFunnelStep::Acks => {
+            funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
+            funnel.verify = VerifyOutcome::Pending;
+        }
+        KeyCode::Char(ch) => funnel.type_char(ch),
+        _ => {}
+    }
+}
+
+/// Confirm-prompt for deleting a user-configured Agent target.
+/// `y` confirms; anything else (incl. `n`, `Esc`, `Enter`)
+/// cancels.
+fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
+    match key {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Look up the name before the row goes away so the
+            // banner can refer to it by name (same rationale as
+            // the confirm modal: the user can't read a UUID).
+            let name = app
+                .config
+                .agent_target_by_id(id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| id.to_string());
+            app.remove_agent_target(id);
+            app.mode = AppMode::Normal;
+            app.banner = Some(format!("Deleted Agent target '{name}'"));
+        }
+        _ => {
+            app.mode = AppMode::Normal;
+            app.banner = Some("Delete cancelled".into());
+        }
+    }
+}
+
 fn handle_picker_mode(app: &mut App, key: KeyCode) {
     // Ignore input while a download is in progress (no error yet).
     let download_in_flight = app
@@ -1013,5 +1205,72 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         .open(path)
     {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod funnel_dispatch_tests {
+    use super::*;
+    use crate::app::{App, AppMode};
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
+
+    fn type_str(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            handle_agent_funnel(app, KeyCode::Char(ch));
+        }
+    }
+
+    /// R4 (PR #31 round-3 review): after a green Verify, Enter must
+    /// advance to the Save step. Today the Verify arm of the Enter
+    /// handler unconditionally re-spawns the probe, the
+    /// `_ => can_advance/advance` arm excludes Verify, and nothing
+    /// else advances — so step 7/7 is unreachable and the funnel
+    /// can never save a target through the dispatcher, on both the
+    /// Add and Edit paths.
+    ///
+    /// The test walks the real key path (the funnel unit tests call
+    /// `advance()` directly, which is why they never caught this),
+    /// simulates the probe coming back green the same way
+    /// `App::poll_funnel_verify` would, then presses Enter once.
+    #[test]
+    fn enter_after_verify_ok_advances_to_save() {
+        let mut app = App::new();
+        app.open_add_agent_funnel();
+        assert_eq!(app.mode, AppMode::AgentFunnel);
+
+        // 1/7 connection kind (Kafka is preselected)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 2/7 name
+        type_str(&mut app, "prod");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 3/7 broker endpoint
+        type_str(&mut app, "localhost:19092");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 4/7 topic
+        type_str(&mut app, "voice-bird-events");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 5/7 acks (keep the default: All)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.funnel.as_ref().unwrap().step,
+            AgentFunnelStep::Verify,
+            "sanity: the form walk must land on the Verify step"
+        );
+
+        // Simulate the round-trip probe coming back green — this is
+        // exactly what poll_funnel_verify() writes on success.
+        app.funnel.as_mut().unwrap().verify = VerifyOutcome::Ok {
+            elapsed: std::time::Duration::from_millis(42),
+        };
+
+        // Enter after a green probe must move on to Save.
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.funnel.as_ref().unwrap().step,
+            AgentFunnelStep::Save,
+            "Enter after VerifyOutcome::Ok must advance to Save (R4); \
+             re-spawning the probe forever makes step 7/7 unreachable \
+             and the funnel can never save a target"
+        );
     }
 }

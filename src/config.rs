@@ -135,6 +135,131 @@ pub struct AppConfig {
     /// fields above.
     #[serde(default)]
     pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
+
+    /// User-configured Agent targets. Each entry carries the
+    /// `Connection` (e.g. Kafka broker + topic) the TUI uses when
+    /// pushing committed transcript segments. The built-in
+    /// oh-my-pi / MCP target lives on `App::agent` instead — these
+    /// are additively user-defined.
+    #[serde(default)]
+    pub agent_targets: Vec<AgentTargetConfig>,
+}
+
+/// Stable identifier for a user-configured Agent target. The TUI
+/// mints one when the user picks `a`dd; the value is a UUIDv4.
+pub type AgentTargetId = String;
+
+/// Ids that the segment dispatcher in the consumer task
+/// inside `App::start_section` compares against as a
+/// special case (e.g. `"default"` routes to the legacy
+/// MCP-backed `ServerState`). Letting a user-configured
+/// target claim the same id would silently route its
+/// segments to the wrong destination, so we reject both
+/// hand-edited config rows and funnel-saved configs that
+/// use them.
+pub const RESERVED_AGENT_TARGET_IDS: &[&str] = &["default"];
+
+pub fn is_reserved_agent_target_id(id: &str) -> bool {
+    RESERVED_AGENT_TARGET_IDS.contains(&id)
+}
+
+/// Transport the user-configured Agent target uses to
+/// publish committed segments. Today only Kafka is wired;
+/// the enum is open so the funnel
+/// ("1. Kafka  2. ...  3. ...") keeps working when we add more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentConnectionKind {
+    Kafka,
+}
+
+impl AgentConnectionKind {
+    /// Every variant of `AgentConnectionKind`. The funnel
+    /// iterates this to render the "Connection kind" picker
+    /// and to decide what transport a saved config row
+    /// referred to.
+    pub const ALL: [Self; 1] = [Self::Kafka];
+
+    /// Human-readable label rendered in the funnel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kafka => "Kafka",
+        }
+    }
+}
+/// `acks` mode passed to librdkafka. We default to `All` so a
+/// committed segment is durable before `push_segment` returns `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaAcks {
+    /// No broker ack (fire-and-forget). Fastest, but can lose
+    /// segments on broker failure. Not recommended for transcript.
+    Zero,
+    /// Leader-only ack. Survives leader re-election; loses
+    /// messages on leader crash before replication.
+    One,
+    /// Wait for all in-sync replicas. Default.
+    All,
+}
+
+impl Default for KafkaAcks {
+    fn default() -> Self {
+        KafkaAcks::All
+    }
+}
+
+impl KafkaAcks {
+    /// librdkafka string form (`"0"`, `"1"`, `"all"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KafkaAcks::Zero => "0",
+            KafkaAcks::One => "1",
+            KafkaAcks::All => "all",
+        }
+    }
+}
+
+/// Connection details for a Kafka-flavoured Agent target. Endpoint
+/// is a librdkafka bootstrap list (e.g. `"localhost:9092"` or
+/// `"broker-1:9092,broker-2:9092"`); topic is the destination
+/// partition key the segment JSON lines get published to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KafkaAgentConnection {
+    pub endpoint: String,
+    pub topic: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub acks: KafkaAcks,
+}
+
+/// One user-configured Agent target. `id` is the stable key
+/// referenced by the TUI's Targets list cursor and by
+/// `App::agent_targets`; `name` is the user-facing label rendered
+/// in the picker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTargetConfig {
+    pub id: AgentTargetId,
+    pub name: String,
+    #[serde(flatten)]
+    pub connection: AgentConnection,
+}
+
+/// Tagged union of every Agent transport. `#[serde(tag = "kind")]`
+/// so the TOML reads as
+/// `[[agent_targets]]` / `kind = "kafka"` / `endpoint = "..."`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AgentConnection {
+    Kafka(KafkaAgentConnection),
+}
+
+impl AgentConnection {
+    pub fn kind(&self) -> AgentConnectionKind {
+        match self {
+            AgentConnection::Kafka(_) => AgentConnectionKind::Kafka,
+        }
+    }
 }
 
 fn default_voicebird_server_url() -> String {
@@ -169,6 +294,7 @@ impl Default for AppConfig {
             voicebird_server_url: default_voicebird_server_url(),
             cloud_broadcast_enabled: false,
             source_overrides: BTreeMap::new(),
+            agent_targets: Vec::new(),
         }
     }
 }
@@ -195,7 +321,34 @@ impl AppConfig {
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&s)?)
+        let mut cfg: Self = toml::from_str(&s)?;
+        // Drop any agent_target rows whose id collides with
+        // an internal destination (e.g. `"default"`) — letting
+        // one through would silently route its segments to
+        // the legacy MCP buffer instead of the configured
+        // broker. Log a warning so the user can fix the TOML
+        // by hand.
+        let before = cfg.agent_targets.len();
+        cfg.agent_targets.retain(|t| {
+            let keep = !is_reserved_agent_target_id(&t.id);
+            if !keep {
+                log::warn!("config: dropping agent_target with reserved id {:?}", t.id);
+            }
+            keep
+        });
+        if cfg.agent_targets.len() != before {
+            // Persist the cleaned config so the user can see
+            // what was dropped. Best-effort: a save failure
+            // here is non-fatal — the in-memory cfg is still
+            // correct for this session.
+            if let Err(e) = cfg.save_to(path) {
+                log::warn!(
+                    "config: failed to persist cleaned config ({} agent_targets dropped): {e}",
+                    before - cfg.agent_targets.len(),
+                );
+            }
+        }
+        Ok(cfg)
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
@@ -247,6 +400,48 @@ impl AppConfig {
     /// Convenience: persist or update one source's override and save.
     pub fn upsert_source_override(&mut self, key: String, ov: SourceSettingsOverride) {
         self.source_overrides.insert(key, ov);
+    }
+
+    /// Look up an Agent target by its stable id. Returns `None` if
+    /// no target with that id has been configured (the user removed
+    /// it, or the config file was hand-edited and lost the row).
+    pub fn agent_target_by_id(&self, id: &str) -> Option<&AgentTargetConfig> {
+        self.agent_targets.iter().find(|t| t.id == id)
+    }
+
+    /// Mutable variant of [`Self::agent_target_by_id`].
+    pub fn agent_target_by_id_mut(&mut self, id: &str) -> Option<&mut AgentTargetConfig> {
+        self.agent_targets.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Insert-or-replace by id. Caller is responsible for minting
+    /// the id on the add path; this method just enforces uniqueness
+    /// so two targets can't share a session, and rejects reserved
+    /// ids (e.g. `"default"`) so a user-configured target can't
+    /// silently shadow the legacy MCP-backed session.
+    /// Returns `Err` on a reserved id; the caller is expected to
+    /// surface the failure to the user.
+    pub fn upsert_agent_target(&mut self, target: AgentTargetConfig) -> anyhow::Result<()> {
+        if is_reserved_agent_target_id(&target.id) {
+            return Err(anyhow::anyhow!(
+                "agent target id {:?} is reserved for an internal destination",
+                target.id
+            ));
+        }
+        if let Some(slot) = self.agent_targets.iter_mut().find(|t| t.id == target.id) {
+            *slot = target;
+        } else {
+            self.agent_targets.push(target);
+        }
+        Ok(())
+    }
+
+    /// Drop the target with the given id. Returns true if anything
+    /// was removed.
+    pub fn remove_agent_target(&mut self, id: &str) -> bool {
+        let before = self.agent_targets.len();
+        self.agent_targets.retain(|t| t.id != id);
+        self.agent_targets.len() != before
     }
 }
 
@@ -362,10 +557,168 @@ refinement_beam_size = 5
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
             cloud_broadcast_enabled: true,
             source_overrides: BTreeMap::new(),
+            agent_targets: Vec::new(),
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded, c);
+    }
+
+    /// `agent_targets` survives a save/load round trip.
+    /// The TOML form uses `[[agent_targets]]` with a
+    /// tagged `kind = "kafka"` field; the parser must
+    /// reconstruct the `AgentConnection::Kafka` variant
+    /// exactly, including the `acks` enum string.
+    #[test]
+    fn agent_targets_round_trip_through_toml() {
+        use crate::config::{AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.agent_targets.push(AgentTargetConfig {
+            id: "abc-123".into(),
+            name: "prod".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "broker-1:9092,broker-2:9092".into(),
+                topic: "voice-bird-events".into(),
+                client_id: Some("svc".into()),
+                acks: KafkaAcks::All,
+            }),
+        });
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.agent_targets, c.agent_targets);
+        // The `acks` string is the on-disk wire format —
+        // pin it so a future refactor that changes
+        // `KafkaAcks::as_str` doesn't silently break
+        // existing config.toml files.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("acks = \"all\""),
+            "acks wire format drift: {body}"
+        );
+    }
+
+    /// `upsert_agent_target` updates in place when the id
+    /// matches, and appends otherwise. Pin both branches.
+    #[test]
+    fn upsert_agent_target_replaces_by_id() {
+        use crate::config::{AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection};
+        let mut c = AppConfig::default();
+        let target = AgentTargetConfig {
+            id: "id-1".into(),
+            name: "first".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "b1:9092".into(),
+                topic: "t1".into(),
+                client_id: None,
+                acks: KafkaAcks::All,
+            }),
+        };
+        c.upsert_agent_target(target.clone()).unwrap();
+        assert_eq!(c.agent_targets.len(), 1);
+        // Mutate, then upsert with the same id; the row
+        // should be replaced, not appended.
+        let mut updated = target.clone();
+        updated.name = "renamed".into();
+        c.upsert_agent_target(updated).unwrap();
+        assert_eq!(c.agent_targets.len(), 1);
+        assert_eq!(c.agent_targets[0].name, "renamed");
+        // Removing by id should clear the slot.
+        assert!(c.remove_agent_target("id-1"));
+        assert!(c.agent_targets.is_empty());
+        // Removing a missing id is a no-op that returns false.
+        assert!(!c.remove_agent_target("missing"));
+    }
+
+    #[test]
+    fn upsert_agent_target_rejects_reserved_id() {
+        // The consumer-dispatch branch in
+        // `App::start_section_consumer_task` treats
+        // `session_id == "default"` as a special case
+        // (route to the legacy MCP buffer) and any other
+        // unknown id as "drop with a warning". Letting a
+        // user-configured target claim `"default"` would
+        // silently route its segments to the MCP buffer
+        // — so `upsert_agent_target` must reject it.
+        let mut c = AppConfig::default();
+        let bad = AgentTargetConfig {
+            id: "default".into(),
+            name: "evil".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "b1:9092".into(),
+                topic: "t1".into(),
+                client_id: None,
+                acks: KafkaAcks::All,
+            }),
+        };
+        assert!(c.upsert_agent_target(bad).is_err());
+        // And nothing was inserted.
+        assert!(c.agent_targets.is_empty());
+        // Non-reserved ids still go through.
+        let good = AgentTargetConfig {
+            id: "real-uuid".into(),
+            name: "ok".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "b1:9092".into(),
+                topic: "t1".into(),
+                client_id: None,
+                acks: KafkaAcks::All,
+            }),
+        };
+        assert!(c.upsert_agent_target(good).is_ok());
+        assert_eq!(c.agent_targets.len(), 1);
+    }
+
+    #[test]
+    fn load_from_drops_reserved_id_rows() {
+        // A hand-edited config with `id = "default"` would
+        // silently shadow the MCP-backed session if it
+        // loaded cleanly. `load_from` must filter it out
+        // and persist the cleaned config so the user can
+        // see what was dropped.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let body = "\
+default_model = \"distil-small.en\"\n\
+language = \"en\"\n\
+session_dir = \"~/voice-bird/sessions\"\n\
+hop_ms = 750\n\
+min_window_ms = 1000\n\
+engine_prefer = \"auto\"\n\
+audio_default_source = \"microphone\"\n\
+refinement_window_ms = 20000\n\
+refinement_beam_size = 5\n\
+voicebird_api_key = \"\"\n\
+voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
+cloud_broadcast_enabled = false\n\
+\n\
+[[agent_targets]]\n\
+id = \"default\"\n\
+name = \"evil\"\n\
+kind = \"kafka\"\n\
+endpoint = \"b1:9092\"\n\
+topic = \"t1\"\n\
+acks = \"all\"\n\
+\n\
+[[agent_targets]]\n\
+id = \"real-uuid\"\n\
+name = \"ok\"\n\
+kind = \"kafka\"\n\
+endpoint = \"b1:9092\"\n\
+topic = \"t1\"\n\
+acks = \"all\"\n\
+";
+        std::fs::write(&path, body).unwrap();
+        let c = AppConfig::load_from(&path).unwrap();
+        // The reserved row was dropped; the real one survived.
+        assert_eq!(c.agent_targets.len(), 1);
+        assert_eq!(c.agent_targets[0].id, "real-uuid");
+        // The on-disk config was rewritten without the
+        // reserved row.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("id = \"default\""));
+        assert!(on_disk.contains("id = \"real-uuid\""));
     }
 
     #[test]

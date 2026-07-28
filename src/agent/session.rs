@@ -53,7 +53,7 @@ pub enum AgentStatus {
 /// a few times per second — once per committed segment + occasional
 /// spawn / drop). Implementations own their own threading and
 /// serialisation.
-pub trait AgentTarget: Send {
+pub trait AgentTarget: Send + Sync {
     /// Agent session this target is attached to. Returns an owned
     /// value because the id may mutate at runtime (the stdio MCP
     /// server updates it after the roots probe); the alternative

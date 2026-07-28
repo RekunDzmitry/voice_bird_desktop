@@ -17,8 +17,18 @@ pub enum AppMode {
     /// Opened when `c` toggles cloud on with an empty key, or when the
     /// engine reports an auth failure during recording.
     ApiKeyModal,
-    /// Centered overlay for editing the session output directory.
+    /// Centered overlay prompting the user to pick a local
+    /// session output path. Opened with `p` from Normal mode.
     PathModal,
+    /// Multi-step "Add / Edit Agent target" funnel. The funnel
+    /// state is on `App::funnel`; this variant just signals the
+    /// dispatcher to route keys to `handle_agent_funnel`.
+    AgentFunnel,
+    /// Confirm-prompt overlay. Used today for "delete the focused
+    /// Agent target? [y/N]".
+    ConfirmDeleteAgentTarget {
+        id: String,
+    },
 }
 
 /// Languages offered in the cloud-mode language selector. Local mode
@@ -211,7 +221,10 @@ pub struct Slot {
 
 impl Slot {
     pub fn empty(id: SlotId) -> Self {
-        Self { id, kind: SlotKind::Empty }
+        Self {
+            id,
+            kind: SlotKind::Empty,
+        }
     }
 
     /// Read-only view of the running section, if any. Used by the
@@ -395,33 +408,69 @@ pub struct App {
     /// `None`) by start_section so it only affects the very next
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
-    /// spawned when the agent runtime launches us. The TUI also
+    /// Legacy MCP-backed segment buffer for the `"default"`
+    /// Agent target. The segment-fan-out task (in `App`)
     /// pushes into this same buffer when the focused slot's
-    /// target is `Target::Agent`, so a single source of truth
-    /// serves both the in-process recorder and the
-    /// out-of-process agent.
+    /// target is `Target::Agent` with `session_id == "default"`,
+    /// so a single source of truth serves both the
+    /// in-process recorder and the out-of-process agent.
     agent_state: voice_bird_cli::agent::mcp_server::ServerState,
-}
 
-/// A renderable row in the Targets pane. The list of rows is
-/// fixed at three — the target *kind* drives the row; the agent
-/// session id is a property of `Target::Agent`, not a row in
-/// the picker. `disabled` rows render dim and the cursor
-/// refuses to land on them (see `App::focused_target_kind`).
+    /// User-configured Agent targets, keyed by their
+    /// `AgentTargetId`. Populated from `config.agent_targets` at
+    /// `App::new` time and updated whenever the funnel saves a
+    /// new target. The consumer task looks up the right impl by
+    /// `Target::Agent` (with its session_id) so the segment
+    /// fan-out matches the picker pick.
+    pub agent_targets:
+        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
+    /// Active funnel state. `Some` while the user is in
+    /// `AppMode::AgentFunnel`; `None` otherwise. Mutated by
+    /// `main.rs`'s key dispatcher and read by `ui.rs`'s modal
+    /// renderer.
+    pub funnel: Option<voice_bird_cli::agent_funnel::AgentFunnel>,
+
+    /// In-flight verify probe. Set by the Verify-step key
+    /// handler when the user runs a probe; drained by
+    /// `App::poll_funnel_verify` from the main event loop so
+    /// the TUI keeps drawing frames (and Esc keeps working)
+    /// while the probe is in flight.
+    pub verify_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<std::time::Duration>>>,
+
+    /// Wall-clock start of the in-flight verify probe, for
+    /// logging. Set alongside `verify_rx`; read by the poll
+    /// helper on completion.
+    pub verify_started: Option<std::time::Instant>,
+}
+/// A single row in the Targets picker. The picker renders
+/// one row per known target; rows that point at a target
+/// the user can't actually use (e.g. Agent when the
+/// runtime binary is missing) are tagged `disabled = true`.
+/// `disabled` rows render dim and the cursor refuses to
+/// land on them (see `App::focused_target_kind`).
 pub struct TargetRow {
     pub kind: TargetKind,
     pub disabled: bool,
 }
-
 /// Picker-side classification of a target. We can't use `Target`
 /// directly because `Target::Agent` carries a session id that
 /// the user doesn't pick per-row — the row just means "route
 /// to the agent runtime with the current session".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
     Cloud,
-    Agent,
+    /// One user-configured Agent target. The `id` is the stable
+    /// `AgentTargetId` from `AppConfig::agent_targets` and
+    /// resolves to a `KafkaTarget` (today) via
+    /// `App::agent_targets`. We don't reuse the old
+    /// unit-variant `Agent` form because picking the
+    /// "default" MCP-backed session is no longer surfaced in
+    /// the picker — the user adds their own targets via the
+    /// funnel instead.
+    Agent {
+        id: String,
+    },
 }
 
 impl App {
@@ -537,7 +586,12 @@ impl App {
             agent_state: voice_bird_cli::agent::mcp_server::ServerState::new(
                 voice_bird_cli::agent::AgentSessionId::default_session(),
             ),
+            agent_targets: std::collections::HashMap::new(),
+            funnel: None,
+            verify_rx: None,
+            verify_started: None,
         };
+        app.load_agent_targets_from_config();
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
@@ -572,8 +626,7 @@ impl App {
                 // agent runtime's path. `det.path` is where the
                 // agent runtime lives; what the runtime needs
                 let home = voice_bird_cli::agent::register::register_home();
-                let binary = std::env::current_exe()
-                    .unwrap_or_else(|_| det_path.clone());
+                let binary = std::env::current_exe().unwrap_or_else(|_| det_path.clone());
                 match voice_bird_cli::agent::register::register(&binary, &home) {
                     Ok(()) => log::info!(
                         "registered MCP server in {}/agent/mcp.json (source: {:?})",
@@ -594,7 +647,6 @@ impl App {
 
         app
     }
-
 
     // -- Slot helpers -------------------------------------------------------
 
@@ -711,17 +763,14 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// `Stdout → Cloud → Agent → Stdout`. The new target is stored on
-    /// `pending_target_overrides` and applied by the next
-    /// `start_section`. The current chip label keeps reflecting the
-    /// previous pick until the next start so the user has a chance
-    /// to back out (but we also surface a banner so they see the
-    /// pending change immediately).
-    ///
-    /// Returns the target that was just queued. The caller can use
-    /// this for the status bar hint.
     pub fn cycle_focused_target(&mut self) -> Target {
-        use voice_bird_cli::agent::AgentSessionId;
+        // The cycle is per-slot — pick the *next* target kind
+        // after the slot's current pending-or-last target, so a
+        // user that already picked a specific Agent target
+        // gets to cycle through other Agent targets in order
+        // before falling back to Stdout. The Targets pane
+        // handles full CRUD via `a`/`e`/`d`; this key just
+        // walks the list.
         let slot = self.focused_slot;
         let current = self
             .pending_target_overrides
@@ -729,27 +778,56 @@ impl App {
             .cloned()
             .or_else(|| self.slot_by_id(slot).and_then(|s| s.target()))
             .unwrap_or(Target::Stdout);
-        let next = match current {
+        let next = match &current {
             Target::Stdout => Target::Cloud,
-            Target::Cloud => Target::Agent {
-                session_id: AgentSessionId::default_session().0,
-            },
-            Target::Agent { .. } => Target::Stdout,
+            Target::Cloud => self
+                .config
+                .agent_targets
+                .first()
+                .map(|t| Target::Agent {
+                    session_id: t.id.clone(),
+                })
+                .unwrap_or(Target::Stdout),
+            Target::Agent { session_id } => self
+                .config
+                .agent_targets
+                .iter()
+                .position(|t| t.id == *session_id)
+                .and_then(|idx| {
+                    self.config
+                        .agent_targets
+                        .get(idx + 1)
+                        .map(|t| Target::Agent {
+                            session_id: t.id.clone(),
+                        })
+                })
+                .unwrap_or(Target::Stdout),
         };
         self.pending_target_overrides.insert(slot, next.clone());
         next
     }
 
-    /// The picker list. Always three rows; `Agent` is disabled when
-    /// the binary is not on disk.
-    pub fn targets(&self) -> [TargetRow; 3] {
-        use TargetKind::*;
-        let agent_disabled = !matches!(self.agent, voice_bird_cli::agent::AgentStatus::Ready { .. });
-        [
-            TargetRow { kind: Stdout, disabled: false },
-            TargetRow { kind: Cloud, disabled: false },
-            TargetRow { kind: Agent, disabled: agent_disabled },
-        ]
+    /// The picker list. Rows 0-1 are fixed (`Stdout`, `Cloud`).
+    /// From row 2 onward, one row per user-configured Agent
+    /// target. Disabled flag is reserved for future use; today
+    /// every configured Agent target is pickable.
+    pub fn targets(&self) -> Vec<TargetRow> {
+        let mut rows = Vec::with_capacity(2 + self.config.agent_targets.len());
+        rows.push(TargetRow {
+            kind: TargetKind::Stdout,
+            disabled: false,
+        });
+        rows.push(TargetRow {
+            kind: TargetKind::Cloud,
+            disabled: false,
+        });
+        for t in &self.config.agent_targets {
+            rows.push(TargetRow {
+                kind: TargetKind::Agent { id: t.id.clone() },
+                disabled: false,
+            });
+        }
+        rows
     }
 
     /// Resolve the currently focused Targets-pane row to a `Target`.
@@ -757,7 +835,13 @@ impl App {
     /// out of range.
     pub fn focused_target_kind(&self) -> Option<TargetKind> {
         let i = self.selected_target_index?;
-        self.targets().get(i).and_then(|r| if r.disabled { None } else { Some(r.kind) })
+        self.targets().get(i).and_then(|r| {
+            if r.disabled {
+                None
+            } else {
+                Some(r.kind.clone())
+            }
+        })
     }
 
     /// Set the focused slot's pending target from a `TargetKind`. The
@@ -766,14 +850,11 @@ impl App {
     /// (with a session id, for Agent) is returned so the caller can
     /// surface it in a banner.
     pub fn pick_target(&mut self, kind: TargetKind) -> Target {
-        use voice_bird_cli::agent::AgentSessionId;
         let slot = self.focused_slot;
         let target = match kind {
             TargetKind::Stdout => Target::Stdout,
             TargetKind::Cloud => Target::Cloud,
-            TargetKind::Agent => Target::Agent {
-                session_id: AgentSessionId::default_session().0,
-            },
+            TargetKind::Agent { id } => Target::Agent { session_id: id },
         };
         self.pending_target_overrides.insert(slot, target.clone());
         target
@@ -785,10 +866,11 @@ impl App {
         self.focused()
             .map(|s| s.committed.clone())
             .or_else(|| {
-                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
-                    SlotKind::Saved { saved } => Some(saved.committed.clone()),
-                    _ => None,
-                })
+                self.slot_by_id(self.focused_slot)
+                    .and_then(|s| match &s.kind {
+                        SlotKind::Saved { saved } => Some(saved.committed.clone()),
+                        _ => None,
+                    })
             })
             .unwrap_or_else(|| self.empty_committed.clone())
     }
@@ -797,10 +879,11 @@ impl App {
         self.focused()
             .map(|s| s.refined.clone())
             .or_else(|| {
-                self.slot_by_id(self.focused_slot).and_then(|s| match &s.kind {
-                    SlotKind::Saved { saved } => Some(saved.refined.clone()),
-                    _ => None,
-                })
+                self.slot_by_id(self.focused_slot)
+                    .and_then(|s| match &s.kind {
+                        SlotKind::Saved { saved } => Some(saved.refined.clone()),
+                        _ => None,
+                    })
             })
             .unwrap_or_else(|| self.empty_refined.clone())
     }
@@ -1182,7 +1265,7 @@ impl App {
                 let rows = self.targets();
                 self.selected_target_index
                     .and_then(|i| rows.get(i))
-                    .map(|r| r.kind)
+                    .map(|r| r.kind.clone())
             },
         );
     }
@@ -1234,12 +1317,10 @@ impl App {
                 let rows = self.targets();
                 self.selected_target_index
                     .and_then(|i| rows.get(i))
-                    .map(|r| r.kind)
+                    .map(|r| r.kind.clone())
             },
         );
     }
-
-
 
     /// Clamp pane scroll offsets so the cursor row stays inside the
     /// viewport. `visible` is the inner row count of one pane (rough
@@ -1296,9 +1377,7 @@ impl App {
             // Re-resolve by name+kind so the row survives a `r`efresh
             // that reordered the inventory.
             if let Some(saved) = self.config.input_device.as_deref() {
-                if d.name == saved
-                    && Some(d.kind) == self.config.input_device_kind
-                {
+                if d.name == saved && Some(d.kind) == self.config.input_device_kind {
                     return Some(self.selected_device_index);
                 }
             }
@@ -1356,7 +1435,7 @@ impl App {
         Some(match t {
             Target::Stdout => TargetKind::Stdout,
             Target::Cloud => TargetKind::Cloud,
-            Target::Agent { .. } => TargetKind::Agent,
+            Target::Agent { session_id } => TargetKind::Agent { id: session_id },
         })
     }
 
@@ -1608,9 +1687,7 @@ impl App {
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
         let (committed, refined) = match &self.slots[pos].kind {
-            SlotKind::Saved { saved } => {
-                (saved.committed.clone(), saved.refined.clone())
-            }
+            SlotKind::Saved { saved } => (saved.committed.clone(), saved.refined.clone()),
             _ => (
                 Arc::new(PlMutex::new(Vec::new())),
                 Arc::new(PlMutex::new(Vec::new())),
@@ -1942,6 +2019,38 @@ impl App {
         // MCP-server buffer when the user picked `Target::Agent`.
         let target_for_consumer = target.clone();
         let agent_state_for_consumer = self.agent_state.clone();
+        // Clone the per-session-id AgentTarget map so the
+        // consumer task can route a committed segment to
+        // the user-configured Kafka target the slot picked.
+        //
+        // Snapshot semantics: the map is cloned at section
+        // start. The clone owns its own `Arc<dyn AgentTarget>`
+        // values — `AgentTarget` itself is a cheap
+        // `Arc<KafkaTargetInner>` handle, so the broker
+        // connection + buffer are shared, but the dispatch
+        // map is independent of `self.agent_targets`.
+        //
+        // Concretely: both *edits* and *removals* made via
+        // the funnel (or via `App::remove_agent_target_*`)
+        // only take effect for the *next* section the user
+        // starts in this slot. The in-flight consumer keeps
+        // routing to the broker/topic it captured here, so
+        // removing a target mid-recording does NOT cut off
+        // production to that broker — the segment pipeline
+        // continues until the section ends. The
+        // "agent target not found; segment dropped" branch
+        // downstream is effectively unreachable from a
+        // mid-recording removal (the cloned map still has
+        // the entry); it can only fire if the target was
+        // never present in the first place.
+        //
+        // Sharing the live map via `Arc<RwLock<…>>` (so
+        // edits/removals apply mid-section) is filed as a
+        // follow-up — the current snapshot behaviour is
+        // correct for the 7-step funnel UX ("next section
+        // picks up the new target") but surprising if the
+        // user expects removal to take effect immediately.
+        let agent_targets_for_consumer = self.agent_targets.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
@@ -2000,10 +2109,28 @@ impl App {
                             None
                         };
                         // Route into the agent buffer when the
-                        // slot's target is `Target::Agent`.
-                        // Best-effort.
-                        if matches!(target_for_consumer, Target::Agent { .. }) {
-                            agent_state_for_consumer.push(seg);
+                        // slot's target is `Target::Agent`. The
+                        // target's session_id picks the
+                        // `AgentTarget` impl to fan the segment
+                        // out to. The default MCP-backed target
+                        // (session_id == "default") still goes
+                        // through `agent_state` for backward
+                        // compatibility with the
+                        // `voice_bird__pull_recent` MCP tool.
+                        if let Target::Agent { session_id } = &target_for_consumer {
+                            if session_id == "default" {
+                                agent_state_for_consumer.push(seg.clone());
+                            } else if let Some(agent) = agent_targets_for_consumer.get(session_id) {
+                                if let Err(e) = agent.push_segment(&seg) {
+                                    log::warn!("agent target push_segment ({}): {e}", session_id);
+                                }
+                            } else {
+                                // Target was removed mid-recording.
+                                // Drop the segment — better than
+                                // silently routing to the
+                                // default MCP target.
+                                log::warn!("agent target {session_id} not found; segment dropped");
+                            }
                         }
                         // Mirror to the on-disk live tail so the
                         // MCP server process spawned by the agent
@@ -2017,7 +2144,6 @@ impl App {
                                 log::warn!("agent live append: {e}");
                             }
                         }
-
                     }
                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
@@ -2026,10 +2152,9 @@ impl App {
                         }
                         break;
                     }
-                 }
-             }
-         });
-
+                }
+            }
+        });
 
         // --- 6b. Refinement consumer task (separate writer, separate JSONL) -
         let refinement_join = if let Some(h) = refinement_handle {
@@ -2366,6 +2491,183 @@ impl App {
             self.config_was_loaded_from_disk = true;
         }
     }
+    /// Hydrate `agent_targets` from the on-disk config. Called
+    /// once at startup; subsequent funnel saves update both
+    /// the config and this map so a relaunch isn't needed.
+    pub fn load_agent_targets_from_config(&mut self) {
+        use voice_bird_cli::agent::AgentTarget;
+        use voice_bird_cli::config::AgentConnection;
+        self.agent_targets.clear();
+        for t in &self.config.agent_targets {
+            let session = voice_bird_cli::agent::AgentSessionId(t.id.clone());
+            let target: std::sync::Arc<dyn AgentTarget> = match &t.connection {
+                AgentConnection::Kafka(conn) => std::sync::Arc::new(
+                    voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
+                ),
+            };
+            self.agent_targets.insert(t.id.clone(), target);
+        }
+    }
+
+    /// Look up the Agent target by `Target::Agent`'s session id.
+    /// Returns `None` for the default MCP-backed target (which
+    /// lives on `agent_state`, not here) or for any id the user
+    /// removed while a recording was in flight.
+    pub fn lookup_agent_target(
+        &self,
+        session_id: &str,
+    ) -> Option<std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>> {
+        self.agent_targets.get(session_id).cloned()
+    }
+
+    /// Add or replace a user-configured Agent target in memory.
+    /// Updates `agent_targets` and the in-process config; does NOT
+    /// persist to disk. Use [`Self::upsert_agent_target`] for the
+    /// persisting variant, or call [`Self::persist_config`] after
+    /// the in-memory call when batching several mutations.
+    /// Idempotent on `id`. Returns `Err` (and leaves both maps
+    /// untouched) if `id` is reserved for an internal Agent
+    /// destination (see
+    /// `voice_bird_cli::config::RESERVED_AGENT_TARGET_IDS`).
+    pub fn upsert_agent_target_in_memory(
+        &mut self,
+        config_target: voice_bird_cli::config::AgentTargetConfig,
+    ) -> anyhow::Result<()> {
+        self.config.upsert_agent_target(config_target.clone())?;
+        use voice_bird_cli::agent::AgentTarget;
+        let id = config_target.id.clone();
+        let session = voice_bird_cli::agent::AgentSessionId(id.clone());
+        let target: std::sync::Arc<dyn AgentTarget> = match &config_target.connection {
+            voice_bird_cli::config::AgentConnection::Kafka(conn) => std::sync::Arc::new(
+                voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
+            ),
+        };
+        self.agent_targets.insert(id, target);
+        Ok(())
+    }
+
+    /// Add or replace a user-configured Agent target. Persists the
+    /// updated config to disk. Idempotent on `id`. Returns `Err`
+    /// (and does not persist) if `id` is reserved.
+    pub fn upsert_agent_target(
+        &mut self,
+        config_target: voice_bird_cli::config::AgentTargetConfig,
+    ) -> anyhow::Result<()> {
+        self.upsert_agent_target_in_memory(config_target)?;
+        self.config.save().map_err(|e| {
+            log::error!("config save (upsert agent target): {e}");
+            self.banner = Some(format!("Save failed: {e}"));
+            e
+        })
+    }
+
+    /// Remove a user-configured Agent target in memory. Drops the
+    /// in-process handle and clears any pending target overrides
+    /// that pointed at it so the slot doesn't carry a stale
+    /// `Target::Agent` (with a now-removed `session_id`) into the
+    /// next recording start. Does NOT persist to disk; call
+    /// [`Self::persist_config`] when the caller is ready to save.
+    pub fn remove_agent_target_in_memory(&mut self, id: &str) {
+        self.agent_targets.remove(id);
+        self.config.remove_agent_target(id);
+        for (_, t) in self.pending_target_overrides.iter_mut() {
+            if let Target::Agent { session_id } = t {
+                if session_id == id {
+                    *t = Target::Stdout;
+                }
+            }
+        }
+    }
+
+    /// Remove a user-configured Agent target. Persists the updated
+    /// config to disk.
+    pub fn remove_agent_target(&mut self, id: &str) {
+        self.remove_agent_target_in_memory(id);
+        if let Err(e) = self.config.save() {
+            log::error!("config save (remove agent target): {e}");
+            self.banner = Some(format!("Save failed: {e}"));
+        }
+    }
+
+    /// Persist the in-process config to disk and surface a banner
+    /// on failure. Used by callers that batch several in-memory
+    /// mutations through the `*_in_memory` variants before
+    /// committing them.
+    pub fn persist_config(&mut self) {
+        if let Err(e) = self.config.save() {
+            log::error!("config save (persist_config): {e}");
+            self.banner = Some(format!("Save failed: {e}"));
+        }
+    }
+
+    /// Drain the in-flight verify probe's result channel
+    /// (non-blocking) and update the active funnel's
+    /// `VerifyOutcome`. Called from the main event loop on
+    /// every tick so the TUI keeps drawing frames (and Esc
+    /// keeps working) while a probe runs in the background.
+    pub fn poll_funnel_verify(&mut self) {
+        let Some(rx) = self.verify_rx.as_ref() else {
+            return;
+        };
+        // Peek first: try_recv returns Err(Empty) until the
+        // worker thread sends its result. We only want to
+        // commit when the value has actually arrived.
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The worker thread panicked or the channel
+                // was otherwise torn down. Surface that as a
+                // verify error so the user isn't stuck on
+                // "Verifying…" forever.
+                self.verify_rx = None;
+                self.verify_started = None;
+                if let Some(f) = self.funnel.as_mut() {
+                    f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
+                        message: "verify worker disconnected unexpectedly".into(),
+                    };
+                }
+                return;
+            }
+        };
+        // Probe finished — record the outcome and drop the
+        // channel. The user can re-run verify by re-pressing
+        // Enter on the Verify step.
+        let started = self.verify_started.take();
+        self.verify_rx = None;
+        let Some(f) = self.funnel.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(elapsed) => {
+                f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed };
+            }
+            Err(e) => {
+                if let Some(started) = started {
+                    log::warn!("funnel: verify failed after {:?}: {e}", started.elapsed());
+                }
+                f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
+                    message: format!("{e}"),
+                };
+            }
+        }
+    }
+
+    /// Open the funnel for adding a brand-new Agent target.
+    pub fn open_add_agent_funnel(&mut self) {
+        self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_add());
+        self.mode = AppMode::AgentFunnel;
+    }
+
+    /// Open the funnel pre-filled with an existing Agent target.
+    pub fn open_edit_agent_funnel(&mut self, id: &str) {
+        if let Some(t) = self.config.agent_target_by_id(id).cloned() {
+            self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_edit(&t));
+            self.mode = AppMode::AgentFunnel;
+        } else {
+            self.banner = Some(format!("Agent target {id} not found"));
+        }
+    }
 }
 
 /// Build the column-title label for a section (or "(empty)" / "(paused)"
@@ -2539,8 +2841,10 @@ mod tests {
         );
         let cloud = app.pick_target(TargetKind::Cloud);
         assert_eq!(cloud, Target::Cloud);
-        let omp = app.pick_target(TargetKind::Agent);
-        assert!(matches!(omp, Target::Agent { .. }));
+        let omp = app.pick_target(TargetKind::Agent {
+            id: "session-x".into(),
+        });
+        assert!(matches!(omp, Target::Agent { session_id } if session_id == "session-x"));
         // Switching back to Stdout overwrites the prior override.
         let stdout = app.pick_target(TargetKind::Stdout);
         assert_eq!(stdout, Target::Stdout);
@@ -2591,549 +2895,549 @@ mod tests {
     // doesn't exist on cloud-only Windows.
     #[cfg(not(windows))]
     mod local_export {
-    use super::*;
+        use super::*;
 
-    // ── ws_url_to_http tests (phase 1) ────────────────────────────────
+        // ── ws_url_to_http tests (phase 1) ────────────────────────────────
 
-    #[test]
-    fn ws_url_wss_with_path() {
-        assert_eq!(
-            ws_url_to_http("wss://voicebird.app/api/audio/stream"),
-            "https://voicebird.app"
-        );
-    }
+        #[test]
+        fn ws_url_wss_with_path() {
+            assert_eq!(
+                ws_url_to_http("wss://voicebird.app/api/audio/stream"),
+                "https://voicebird.app"
+            );
+        }
 
-    #[test]
-    fn ws_url_ws_with_port_produces_http() {
-        assert_eq!(
-            ws_url_to_http("ws://127.0.0.1:3000"),
-            "http://127.0.0.1:3000"
-        );
-    }
+        #[test]
+        fn ws_url_ws_with_port_produces_http() {
+            assert_eq!(
+                ws_url_to_http("ws://127.0.0.1:3000"),
+                "http://127.0.0.1:3000"
+            );
+        }
 
-    #[test]
-    fn ws_url_ws_with_path_produces_http() {
-        assert_eq!(
-            ws_url_to_http("ws://localhost:9999/api/audio/stream"),
-            "http://localhost:9999"
-        );
-    }
+        #[test]
+        fn ws_url_ws_with_path_produces_http() {
+            assert_eq!(
+                ws_url_to_http("ws://localhost:9999/api/audio/stream"),
+                "http://localhost:9999"
+            );
+        }
 
-    #[test]
-    fn ws_url_no_scheme_falls_through_to_https() {
-        assert_eq!(ws_url_to_http("voicebird.app"), "https://voicebird.app");
-    }
+        #[test]
+        fn ws_url_no_scheme_falls_through_to_https() {
+            assert_eq!(ws_url_to_http("voicebird.app"), "https://voicebird.app");
+        }
 
-    #[test]
-    fn ws_url_preserves_port() {
-        assert_eq!(
-            ws_url_to_http("wss://voicebird.app:8080/path"),
-            "https://voicebird.app:8080"
-        );
-    }
+        #[test]
+        fn ws_url_preserves_port() {
+            assert_eq!(
+                ws_url_to_http("wss://voicebird.app:8080/path"),
+                "https://voicebird.app:8080"
+            );
+        }
 
-    #[test]
-    fn ws_url_bare_host() {
-        assert_eq!(
-            ws_url_to_http("wss://voicebird.app"),
-            "https://voicebird.app"
-        );
-    }
+        #[test]
+        fn ws_url_bare_host() {
+            assert_eq!(
+                ws_url_to_http("wss://voicebird.app"),
+                "https://voicebird.app"
+            );
+        }
 
-    // ── find_latest_session tests (phase 1) ───────────────────────
+        // ── find_latest_session tests (phase 1) ───────────────────────
 
-    #[test]
-    fn find_latest_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(find_latest_session(dir.path()).is_none());
-    }
+        #[test]
+        fn find_latest_empty_dir() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(find_latest_session(dir.path()).is_none());
+        }
 
-    #[test]
-    fn find_latest_dir_does_not_exist() {
-        let path = std::path::Path::new("/tmp/voice-bird-nonexistent-test-dir-xyzzy");
-        assert!(find_latest_session(path).is_none());
-    }
+        #[test]
+        fn find_latest_dir_does_not_exist() {
+            let path = std::path::Path::new("/tmp/voice-bird-nonexistent-test-dir-xyzzy");
+            assert!(find_latest_session(path).is_none());
+        }
 
-    #[test]
-    fn find_latest_one_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        std::fs::write(session.join("transcript.json"), "{}").unwrap();
-
-        let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(found, session);
-    }
-
-    #[test]
-    fn find_latest_picks_latest_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let older = dir.path().join("2026-05-13_09-00-00-mic");
-        let newer = dir.path().join("2026-05-13_12-00-00-mic");
-        std::fs::create_dir(&older).unwrap();
-        std::fs::create_dir(&newer).unwrap();
-        std::fs::write(older.join("transcript.json"), "{}").unwrap();
-        std::fs::write(newer.join("transcript.json"), "{}").unwrap();
-
-        let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(
-            found, newer,
-            "should pick lexicographically latest (= newest timestamp)"
-        );
-    }
-
-    #[test]
-    fn find_latest_includes_uploaded() {
-        let dir = tempfile::tempdir().unwrap();
-        let uploaded = dir.path().join("2026-05-13_12-00-00-mic");
-        let fresh = dir.path().join("2026-05-13_09-00-00-mic");
-        std::fs::create_dir(&uploaded).unwrap();
-        std::fs::create_dir(&fresh).unwrap();
-        std::fs::write(uploaded.join("transcript.json"), "{}").unwrap();
-        std::fs::write(uploaded.join(".uploaded"), "x").unwrap();
-        std::fs::write(fresh.join("transcript.json"), "{}").unwrap();
-
-        let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(
-            found, uploaded,
-            "should return the most recent session even if uploaded"
-        );
-    }
-
-    #[test]
-    fn find_latest_all_uploaded_returns_latest() {
-        let dir = tempfile::tempdir().unwrap();
-        for i in 0..3 {
-            let session = dir.path().join(format!("2026-05-13_1{i}-00-00-mic"));
+        #[test]
+        fn find_latest_one_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
             std::fs::create_dir(&session).unwrap();
             std::fs::write(session.join("transcript.json"), "{}").unwrap();
-            std::fs::write(session.join(".uploaded"), format!("id-{i}")).unwrap();
+
+            let found = find_latest_session(dir.path()).unwrap();
+            assert_eq!(found, session);
         }
-        // find_latest_session doesn't care about .uploaded — it returns
-        // the most recent session with transcript.json regardless.
-        let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(
-            found.file_name().unwrap().to_string_lossy(),
-            "2026-05-13_12-00-00-mic"
-        );
-    }
 
-    #[test]
-    fn find_latest_no_transcript_json_skips() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        // Only transcript.jsonl, no transcript.json
-        std::fs::write(session.join("transcript.jsonl"), "...").unwrap();
-        assert!(find_latest_session(dir.path()).is_none());
-    }
+        #[test]
+        fn find_latest_picks_latest_by_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let older = dir.path().join("2026-05-13_09-00-00-mic");
+            let newer = dir.path().join("2026-05-13_12-00-00-mic");
+            std::fs::create_dir(&older).unwrap();
+            std::fs::create_dir(&newer).unwrap();
+            std::fs::write(older.join("transcript.json"), "{}").unwrap();
+            std::fs::write(newer.join("transcript.json"), "{}").unwrap();
 
-    #[test]
-    fn find_latest_ignores_plain_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("README.txt"), "hello").unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        std::fs::write(session.join("transcript.json"), "{}").unwrap();
+            let found = find_latest_session(dir.path()).unwrap();
+            assert_eq!(
+                found, newer,
+                "should pick lexicographically latest (= newest timestamp)"
+            );
+        }
 
-        let found = find_latest_session(dir.path()).unwrap();
-        assert_eq!(found, session);
-    }
+        #[test]
+        fn find_latest_includes_uploaded() {
+            let dir = tempfile::tempdir().unwrap();
+            let uploaded = dir.path().join("2026-05-13_12-00-00-mic");
+            let fresh = dir.path().join("2026-05-13_09-00-00-mic");
+            std::fs::create_dir(&uploaded).unwrap();
+            std::fs::create_dir(&fresh).unwrap();
+            std::fs::write(uploaded.join("transcript.json"), "{}").unwrap();
+            std::fs::write(uploaded.join(".uploaded"), "x").unwrap();
+            std::fs::write(fresh.join("transcript.json"), "{}").unwrap();
 
-    // ── export_transcript banner-only tests (phase 1) ─────────────────
+            let found = find_latest_session(dir.path()).unwrap();
+            assert_eq!(
+                found, uploaded,
+                "should return the most recent session even if uploaded"
+            );
+        }
 
-    /// Helper: write a minimal valid transcript.json into `session_dir`.
-    fn write_minimal_transcript(session_dir: &std::path::Path) {
-        let meta = voice_bird_cli::session::finalize::SessionMeta {
-            version: "1.0".into(),
-            model: "whisper-large-v3".into(),
-            engine: "whisperkit".into(),
-            source: "mic".into(),
-            device: "MacBook Pro Microphone".into(),
-            started_at: "2026-05-13T10:00:00Z".into(),
-            ended_at: "2026-05-13T10:05:00Z".into(),
-            duration_ms: 300_000,
-        };
-        let segments: Vec<voice_bird_cli::session::writer::WrittenSegment> =
-            vec![voice_bird_cli::session::writer::WrittenSegment {
-                t_start_ms: 0,
-                t_end_ms: 2500,
-                text: "Hello world".into(),
-            }];
-        let json = serde_json::json!({
-            "segments": segments,
-            "meta": meta,
-        });
-        std::fs::write(session_dir.join("transcript.json"), json.to_string()).unwrap();
-    }
+        #[test]
+        fn find_latest_all_uploaded_returns_latest() {
+            let dir = tempfile::tempdir().unwrap();
+            for i in 0..3 {
+                let session = dir.path().join(format!("2026-05-13_1{i}-00-00-mic"));
+                std::fs::create_dir(&session).unwrap();
+                std::fs::write(session.join("transcript.json"), "{}").unwrap();
+                std::fs::write(session.join(".uploaded"), format!("id-{i}")).unwrap();
+            }
+            // find_latest_session doesn't care about .uploaded — it returns
+            // the most recent session with transcript.json regardless.
+            let found = find_latest_session(dir.path()).unwrap();
+            assert_eq!(
+                found.file_name().unwrap().to_string_lossy(),
+                "2026-05-13_12-00-00-mic"
+            );
+        }
 
-    #[test]
-    fn export_banner_no_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().to_string();
+        #[test]
+        fn find_latest_no_transcript_json_skips() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            // Only transcript.jsonl, no transcript.json
+            std::fs::write(session.join("transcript.jsonl"), "...").unwrap();
+            assert!(find_latest_session(dir.path()).is_none());
+        }
 
-        app.export_transcript();
+        #[test]
+        fn find_latest_ignores_plain_files() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("README.txt"), "hello").unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            std::fs::write(session.join("transcript.json"), "{}").unwrap();
 
-        assert!(app.export_banner.is_some());
-        assert!(
-            app.export_banner
-                .as_deref()
-                .unwrap()
-                .contains("No sessions"),
-            "got: {:?}",
-            app.export_banner
-        );
-    }
+            let found = find_latest_session(dir.path()).unwrap();
+            assert_eq!(found, session);
+        }
 
-    #[test]
-    fn export_banner_unreadable_transcript() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
+        // ── export_transcript banner-only tests (phase 1) ─────────────────
 
-        let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().to_string();
+        /// Helper: write a minimal valid transcript.json into `session_dir`.
+        fn write_minimal_transcript(session_dir: &std::path::Path) {
+            let meta = voice_bird_cli::session::finalize::SessionMeta {
+                version: "1.0".into(),
+                model: "whisper-large-v3".into(),
+                engine: "whisperkit".into(),
+                source: "mic".into(),
+                device: "MacBook Pro Microphone".into(),
+                started_at: "2026-05-13T10:00:00Z".into(),
+                ended_at: "2026-05-13T10:05:00Z".into(),
+                duration_ms: 300_000,
+            };
+            let segments: Vec<voice_bird_cli::session::writer::WrittenSegment> =
+                vec![voice_bird_cli::session::writer::WrittenSegment {
+                    t_start_ms: 0,
+                    t_end_ms: 2500,
+                    text: "Hello world".into(),
+                }];
+            let json = serde_json::json!({
+                "segments": segments,
+                "meta": meta,
+            });
+            std::fs::write(session_dir.join("transcript.json"), json.to_string()).unwrap();
+        }
 
-        app.export_transcript();
+        #[test]
+        fn export_banner_no_sessions() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
 
-        assert!(app.export_banner.is_some());
-        let msg = app.export_banner.as_deref().unwrap();
-        assert!(
-            msg.contains("Failed to parse"),
-            "expected parse failure, got: {msg:?}"
-        );
-    }
+            app.export_transcript();
 
-    // ── integration tests with mock HTTP (phases 3-4) ────────────────
+            assert!(app.export_banner.is_some());
+            assert!(
+                app.export_banner
+                    .as_deref()
+                    .unwrap()
+                    .contains("No sessions"),
+                "got: {:?}",
+                app.export_banner
+            );
+        }
 
-    /// Spawn a single-shot mock HTTP server on an OS-assigned port.
-    /// The handler thread accepts one connection, reads the request into
-    /// `captured`, and replies with the given status + JSON body.
-    struct MockHttp {
-        port: u16,
-        captured: Arc<Mutex<Option<String>>>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
+        #[test]
+        fn export_banner_unreadable_transcript() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
 
-    impl MockHttp {
-        fn start(status: u16, response_body: &'static str) -> Self {
-            let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-            let c = Arc::clone(&captured);
-            let body = response_body.to_string();
+            let mut app = App::new();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
 
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            listener.set_nonblocking(false).ok();
+            app.export_transcript();
 
-            let handle = std::thread::spawn(move || {
-                listener.set_nonblocking(true).ok();
+            assert!(app.export_banner.is_some());
+            let msg = app.export_banner.as_deref().unwrap();
+            assert!(
+                msg.contains("Failed to parse"),
+                "expected parse failure, got: {msg:?}"
+            );
+        }
 
-                // Busy-wait for a connection with 10ms polling;
-                // give up after ~2s to avoid hanging tests that
-                // short-circuit before any HTTP call.
-                let started = std::time::Instant::now();
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok(s) => break s.0,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            if started.elapsed() > std::time::Duration::from_secs(2) {
-                                return;
+        // ── integration tests with mock HTTP (phases 3-4) ────────────────
+
+        /// Spawn a single-shot mock HTTP server on an OS-assigned port.
+        /// The handler thread accepts one connection, reads the request into
+        /// `captured`, and replies with the given status + JSON body.
+        struct MockHttp {
+            port: u16,
+            captured: Arc<Mutex<Option<String>>>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl MockHttp {
+            fn start(status: u16, response_body: &'static str) -> Self {
+                let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                let c = Arc::clone(&captured);
+                let body = response_body.to_string();
+
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                listener.set_nonblocking(false).ok();
+
+                let handle = std::thread::spawn(move || {
+                    listener.set_nonblocking(true).ok();
+
+                    // Busy-wait for a connection with 10ms polling;
+                    // give up after ~2s to avoid hanging tests that
+                    // short-circuit before any HTTP call.
+                    let started = std::time::Instant::now();
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok(s) => break s.0,
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                if started.elapsed() > std::time::Duration::from_secs(2) {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    };
+
+                    // We have a connection. Switch back to blocking for r/w.
+                    stream.set_nonblocking(false).ok();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .ok();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                        .ok();
+
+                    let mut raw = String::new();
+                    let mut content_length: usize = 0;
+
+                    {
+                        let mut reader = BufReader::new(&stream);
+
+                        // request line
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok() {
+                            raw.push_str(&line);
+                        }
+
+                        // headers
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).is_err() {
+                                break;
+                            }
+                            if line == "\r\n" || line == "\n" {
+                                raw.push_str(&line);
+                                break;
+                            }
+                            let lower = line.to_lowercase();
+                            if lower.starts_with("content-length:") {
+                                content_length = line
+                                    .split(':')
+                                    .nth(1)
+                                    .unwrap_or("0")
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0);
+                            }
+                            raw.push_str(&line);
+                        }
+
+                        // body
+                        if content_length > 0 {
+                            let mut buf = vec![0u8; content_length];
+                            if reader.read_exact(&mut buf).is_ok() {
+                                raw.push_str(&String::from_utf8_lossy(&buf));
                             }
                         }
-                        Err(_) => return,
-                    }
-                };
+                    } // reader dropped — releases &borrow on stream
 
-                // We have a connection. Switch back to blocking for r/w.
-                stream.set_nonblocking(false).ok();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-                    .ok();
+                    *c.lock().unwrap() = Some(raw);
 
-                let mut raw = String::new();
-                let mut content_length: usize = 0;
-
-                {
-                    let mut reader = BufReader::new(&stream);
-
-                    // request line
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() {
-                        raw.push_str(&line);
-                    }
-
-                    // headers
-                    loop {
-                        line.clear();
-                        if reader.read_line(&mut line).is_err() {
-                            break;
-                        }
-                        if line == "\r\n" || line == "\n" {
-                            raw.push_str(&line);
-                            break;
-                        }
-                        let lower = line.to_lowercase();
-                        if lower.starts_with("content-length:") {
-                            content_length = line
-                                .split(':')
-                                .nth(1)
-                                .unwrap_or("0")
-                                .trim()
-                                .parse()
-                                .unwrap_or(0);
-                        }
-                        raw.push_str(&line);
-                    }
-
-                    // body
-                    if content_length > 0 {
-                        let mut buf = vec![0u8; content_length];
-                        if reader.read_exact(&mut buf).is_ok() {
-                            raw.push_str(&String::from_utf8_lossy(&buf));
-                        }
-                    }
-                } // reader dropped — releases &borrow on stream
-
-                *c.lock().unwrap() = Some(raw);
-
-                let resp = format!(
+                    let resp = format!(
                             "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
                             len = body.len()
                         );
-                let _ = stream.write_all(resp.as_bytes());
-            });
+                    let _ = stream.write_all(resp.as_bytes());
+                });
 
-            MockHttp {
-                port,
-                captured,
-                handle: Some(handle),
+                MockHttp {
+                    port,
+                    captured,
+                    handle: Some(handle),
+                }
+            }
+
+            fn captured_request(&self) -> Option<String> {
+                self.captured.lock().unwrap().clone()
             }
         }
 
-        fn captured_request(&self) -> Option<String> {
-            self.captured.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for MockHttp {
-        fn drop(&mut self) {
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
+        impl Drop for MockHttp {
+            fn drop(&mut self) {
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
             }
         }
-    }
 
-    fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
-        let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().to_string();
-        app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
-        app.config.voicebird_api_key = "test-key-abc123".into();
-        app
-    }
+        fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
+            let mut app = App::new();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
+            app.config.voicebird_api_key = "test-key-abc123".into();
+            app
+        }
 
-    /// Helper: assert the captured raw HTTP request contains all the
-    /// expected substrings.
-    fn assert_request_contains(raw: &Option<String>, expected: &[&str]) {
-        let raw = raw.as_deref().expect("mock server captured no request");
-        for s in expected {
+        /// Helper: assert the captured raw HTTP request contains all the
+        /// expected substrings.
+        fn assert_request_contains(raw: &Option<String>, expected: &[&str]) {
+            let raw = raw.as_deref().expect("mock server captured no request");
+            for s in expected {
+                assert!(
+                    raw.contains(s),
+                    "expected request to contain {s:?}\nfull request:\n{raw}"
+                );
+            }
+        }
+
+        #[test]
+        fn integration_happy_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            write_minimal_transcript(&session);
+
+            let mock = MockHttp::start(201, r#"{"success":true,"transcription_id":"abc-123"}"#);
+            let mut app = app_with_mock_server(&dir, mock.port);
+
+            app.export_transcript();
+
+            assert!(app.export_banner.is_some());
+            let msg = app.export_banner.as_deref().unwrap();
             assert!(
-                raw.contains(s),
-                "expected request to contain {s:?}\nfull request:\n{raw}"
+                msg.starts_with("Exported"),
+                "expected success banner, got: {msg:?}"
+            );
+            assert!(msg.contains("abc-123"), "banner should contain id: {msg}");
+
+            assert!(session.join(".uploaded").exists());
+            let marker_content = std::fs::read_to_string(session.join(".uploaded")).unwrap();
+            assert_eq!(marker_content, "abc-123");
+
+            let raw = mock.captured_request();
+            assert_request_contains(
+                &raw,
+                &[
+                    "POST /api/transcripts/upload HTTP/1.1",
+                    "Authorization: Bearer test-key-abc123",
+                    "Content-Type: application/json",
+                    "\"session_id\":\"2026-05-13_10-00-00-mic\"",
+                    "\"title\":\"mic \u{2014} 2026-05-13\"",
+                    "\"text\":\"Hello world\"",
+                ],
             );
         }
-    }
 
-    #[test]
-    fn integration_happy_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        write_minimal_transcript(&session);
+        #[test]
+        fn integration_client_side_idempotency() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            write_minimal_transcript(&session);
+            // Pre-create the .uploaded marker
+            std::fs::write(session.join(".uploaded"), "previous-export").unwrap();
 
-        let mock = MockHttp::start(201, r#"{"success":true,"transcription_id":"abc-123"}"#);
-        let mut app = app_with_mock_server(&dir, mock.port);
+            let mock = MockHttp::start(200, r#"{"ok":true}"#);
+            let mut app = app_with_mock_server(&dir, mock.port);
 
-        app.export_transcript();
+            app.export_transcript();
 
-        assert!(app.export_banner.is_some());
-        let msg = app.export_banner.as_deref().unwrap();
-        assert!(
-            msg.starts_with("Exported"),
-            "expected success banner, got: {msg:?}"
-        );
-        assert!(msg.contains("abc-123"), "banner should contain id: {msg}");
+            assert_eq!(
+                app.export_banner.as_deref(),
+                Some("Already exported \u{2713}")
+            );
+            assert!(
+                mock.captured_request().is_none(),
+                "no HTTP call expected when .uploaded marker exists"
+            );
+        }
 
-        assert!(session.join(".uploaded").exists());
-        let marker_content = std::fs::read_to_string(session.join(".uploaded")).unwrap();
-        assert_eq!(marker_content, "abc-123");
+        #[test]
+        fn integration_server_duplicate_response() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            write_minimal_transcript(&session);
 
-        let raw = mock.captured_request();
-        assert_request_contains(
-            &raw,
-            &[
-                "POST /api/transcripts/upload HTTP/1.1",
-                "Authorization: Bearer test-key-abc123",
-                "Content-Type: application/json",
-                "\"session_id\":\"2026-05-13_10-00-00-mic\"",
-                "\"title\":\"mic \u{2014} 2026-05-13\"",
-                "\"text\":\"Hello world\"",
-            ],
-        );
-    }
+            let mock = MockHttp::start(
+                200,
+                r#"{"success":true,"transcription_id":"dup-1","duplicate":true}"#,
+            );
+            let mut app = app_with_mock_server(&dir, mock.port);
 
-    #[test]
-    fn integration_client_side_idempotency() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        write_minimal_transcript(&session);
-        // Pre-create the .uploaded marker
-        std::fs::write(session.join(".uploaded"), "previous-export").unwrap();
+            app.export_transcript();
 
-        let mock = MockHttp::start(200, r#"{"ok":true}"#);
-        let mut app = app_with_mock_server(&dir, mock.port);
+            assert_eq!(
+                app.export_banner.as_deref(),
+                Some("Already exported \u{2713}")
+            );
+            assert!(session.join(".uploaded").exists());
+            assert_eq!(
+                std::fs::read_to_string(session.join(".uploaded")).unwrap(),
+                "dup-1"
+            );
+        }
 
-        app.export_transcript();
+        #[test]
+        fn integration_network_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            write_minimal_transcript(&session);
 
-        assert_eq!(
-            app.export_banner.as_deref(),
-            Some("Already exported \u{2713}")
-        );
-        assert!(
-            mock.captured_request().is_none(),
-            "no HTTP call expected when .uploaded marker exists"
-        );
-    }
+            let dead_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            let dead_port = dead_socket.local_addr().unwrap().port();
+            drop(dead_socket);
 
-    #[test]
-    fn integration_server_duplicate_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        write_minimal_transcript(&session);
+            let mut app = app_with_mock_server(&dir, dead_port);
 
-        let mock = MockHttp::start(
-            200,
-            r#"{"success":true,"transcription_id":"dup-1","duplicate":true}"#,
-        );
-        let mut app = app_with_mock_server(&dir, mock.port);
+            app.export_transcript();
 
-        app.export_transcript();
+            let msg = app.export_banner.as_deref().unwrap();
+            assert!(
+                msg.starts_with("Export failed"),
+                "expected error, got: {msg:?}"
+            );
+            assert!(!session.join(".uploaded").exists());
+        }
 
-        assert_eq!(
-            app.export_banner.as_deref(),
-            Some("Already exported \u{2713}")
-        );
-        assert!(session.join(".uploaded").exists());
-        assert_eq!(
-            std::fs::read_to_string(session.join(".uploaded")).unwrap(),
-            "dup-1"
-        );
-    }
+        #[test]
+        fn integration_mock_returns_401() {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir.path().join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir(&session).unwrap();
+            write_minimal_transcript(&session);
 
-    #[test]
-    fn integration_network_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        write_minimal_transcript(&session);
+            let mock = MockHttp::start(401, r#"{"error":"Invalid or revoked API key"}"#);
+            let mut app = app_with_mock_server(&dir, mock.port);
 
-        let dead_socket = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_port = dead_socket.local_addr().unwrap().port();
-        drop(dead_socket);
+            app.export_transcript();
 
-        let mut app = app_with_mock_server(&dir, dead_port);
+            let msg = app.export_banner.as_deref().unwrap();
+            assert!(
+                msg.contains("Invalid or revoked"),
+                "expected auth error, got: {msg:?}"
+            );
+            assert!(!session.join(".uploaded").exists());
+        }
 
-        app.export_transcript();
+        #[test]
+        fn integration_export_multiple_sessions_picks_latest() {
+            let dir = tempfile::tempdir().unwrap();
 
-        let msg = app.export_banner.as_deref().unwrap();
-        assert!(
-            msg.starts_with("Export failed"),
-            "expected error, got: {msg:?}"
-        );
-        assert!(!session.join(".uploaded").exists());
-    }
+            // Older session
+            let older = dir.path().join("2026-05-13_08-00-00-system");
+            std::fs::create_dir(&older).unwrap();
+            let meta_old = voice_bird_cli::session::finalize::SessionMeta {
+                started_at: "2026-05-13T08:00:00Z".into(),
+                source: "system".into(),
+                version: "1.0".into(),
+                model: "whisper-large-v3".into(),
+                engine: "whisperkit".into(),
+                device: "BlackHole".into(),
+                ended_at: "2026-05-13T08:05:00Z".into(),
+                duration_ms: 300_000,
+            };
+            let seg = voice_bird_cli::session::writer::WrittenSegment {
+                t_start_ms: 0,
+                t_end_ms: 1000,
+                text: "older".into(),
+            };
+            std::fs::write(
+                older.join("transcript.json"),
+                serde_json::json!({"segments":[seg],"meta":meta_old}).to_string(),
+            )
+            .unwrap();
 
-    #[test]
-    fn integration_mock_returns_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("2026-05-13_10-00-00-mic");
-        std::fs::create_dir(&session).unwrap();
-        write_minimal_transcript(&session);
+            let newer = dir.path().join("2026-05-13_12-00-00-mic");
+            std::fs::create_dir(&newer).unwrap();
+            write_minimal_transcript(&newer);
 
-        let mock = MockHttp::start(401, r#"{"error":"Invalid or revoked API key"}"#);
-        let mut app = app_with_mock_server(&dir, mock.port);
+            let mock = MockHttp::start(201, r#"{"success":true,"transcription_id":"newest"}"#);
+            let mut app = app_with_mock_server(&dir, mock.port);
 
-        app.export_transcript();
+            app.export_transcript();
 
-        let msg = app.export_banner.as_deref().unwrap();
-        assert!(
-            msg.contains("Invalid or revoked"),
-            "expected auth error, got: {msg:?}"
-        );
-        assert!(!session.join(".uploaded").exists());
-    }
-
-    #[test]
-    fn integration_export_multiple_sessions_picks_latest() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Older session
-        let older = dir.path().join("2026-05-13_08-00-00-system");
-        std::fs::create_dir(&older).unwrap();
-        let meta_old = voice_bird_cli::session::finalize::SessionMeta {
-            started_at: "2026-05-13T08:00:00Z".into(),
-            source: "system".into(),
-            version: "1.0".into(),
-            model: "whisper-large-v3".into(),
-            engine: "whisperkit".into(),
-            device: "BlackHole".into(),
-            ended_at: "2026-05-13T08:05:00Z".into(),
-            duration_ms: 300_000,
-        };
-        let seg = voice_bird_cli::session::writer::WrittenSegment {
-            t_start_ms: 0,
-            t_end_ms: 1000,
-            text: "older".into(),
-        };
-        std::fs::write(
-            older.join("transcript.json"),
-            serde_json::json!({"segments":[seg],"meta":meta_old}).to_string(),
-        )
-        .unwrap();
-
-        let newer = dir.path().join("2026-05-13_12-00-00-mic");
-        std::fs::create_dir(&newer).unwrap();
-        write_minimal_transcript(&newer);
-
-        let mock = MockHttp::start(201, r#"{"success":true,"transcription_id":"newest"}"#);
-        let mut app = app_with_mock_server(&dir, mock.port);
-
-        app.export_transcript();
-
-        let raw = mock.captured_request();
-        assert!(
-            raw.as_deref()
-                .unwrap_or("")
-                .contains("2026-05-13_12-00-00-mic"),
-            "should export the most recent session"
-        );
-        assert!(
-            !raw.as_deref()
-                .unwrap_or("")
-                .contains("2026-05-13_08-00-00-system"),
-            "should NOT export the older session"
-        );
-        assert_eq!(
-            app.export_banner.as_deref(),
-            Some("Exported \u{2713} \u{2014} newest")
-        );
-    }
+            let raw = mock.captured_request();
+            assert!(
+                raw.as_deref()
+                    .unwrap_or("")
+                    .contains("2026-05-13_12-00-00-mic"),
+                "should export the most recent session"
+            );
+            assert!(
+                !raw.as_deref()
+                    .unwrap_or("")
+                    .contains("2026-05-13_08-00-00-system"),
+                "should NOT export the older session"
+            );
+            assert_eq!(
+                app.export_banner.as_deref(),
+                Some("Exported \u{2713} \u{2014} newest")
+            );
+        }
     }
 }

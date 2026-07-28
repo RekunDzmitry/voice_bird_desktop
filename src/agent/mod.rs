@@ -14,6 +14,7 @@
 //! notes this module implements.
 
 pub mod install;
+pub mod kafka;
 pub mod live;
 pub mod mcp_server;
 pub mod register;
