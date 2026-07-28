@@ -1199,3 +1199,70 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         let _ = writeln!(f, "{line}");
     }
 }
+
+#[cfg(test)]
+mod funnel_dispatch_tests {
+    use super::*;
+    use crate::app::{App, AppMode};
+    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
+
+    fn type_str(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            handle_agent_funnel(app, KeyCode::Char(ch));
+        }
+    }
+
+    /// R4 (PR #31 round-3 review): after a green Verify, Enter must
+    /// advance to the Save step. Today the Verify arm of the Enter
+    /// handler unconditionally re-spawns the probe, the
+    /// `_ => can_advance/advance` arm excludes Verify, and nothing
+    /// else advances — so step 7/7 is unreachable and the funnel
+    /// can never save a target through the dispatcher, on both the
+    /// Add and Edit paths.
+    ///
+    /// The test walks the real key path (the funnel unit tests call
+    /// `advance()` directly, which is why they never caught this),
+    /// simulates the probe coming back green the same way
+    /// `App::poll_funnel_verify` would, then presses Enter once.
+    #[test]
+    fn enter_after_verify_ok_advances_to_save() {
+        let mut app = App::new();
+        app.open_add_agent_funnel();
+        assert_eq!(app.mode, AppMode::AgentFunnel);
+
+        // 1/7 connection kind (Kafka is preselected)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 2/7 name
+        type_str(&mut app, "prod");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 3/7 broker endpoint
+        type_str(&mut app, "localhost:19092");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 4/7 topic
+        type_str(&mut app, "voice-bird-events");
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 5/7 acks (keep the default: All)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.funnel.as_ref().unwrap().step,
+            AgentFunnelStep::Verify,
+            "sanity: the form walk must land on the Verify step"
+        );
+
+        // Simulate the round-trip probe coming back green — this is
+        // exactly what poll_funnel_verify() writes on success.
+        app.funnel.as_mut().unwrap().verify = VerifyOutcome::Ok {
+            elapsed: std::time::Duration::from_millis(42),
+        };
+
+        // Enter after a green probe must move on to Save.
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.funnel.as_ref().unwrap().step,
+            AgentFunnelStep::Save,
+            "Enter after VerifyOutcome::Ok must advance to Save (R4); \
+             re-spawning the probe forever makes step 7/7 unreachable \
+             and the funnel can never save a target"
+        );
+    }
+}

@@ -346,4 +346,36 @@ mod tests {
         };
         assert_eq!(endpoint, "broker:9092");
     }
+
+    /// R5 (PR #31 round-3 review): editing any form field must
+    /// reset a stale `VerifyOutcome`. Otherwise: verify OK →
+    /// [←] back → edit the endpoint → forward again shows a
+    /// green "OK" for a connection that was never probed, and
+    /// (once R4 lands) Enter reaches Save without re-verifying.
+    #[test]
+    fn editing_form_resets_verify_outcome() {
+        let mut f = AgentFunnel::new_add();
+        f.step = AgentFunnelStep::Endpoint;
+        f.endpoint = "old-broker:9092".into();
+
+        f.verify = VerifyOutcome::Ok {
+            elapsed: Duration::from_millis(5),
+        };
+        f.type_char('x');
+        assert!(
+            matches!(f.verify, VerifyOutcome::Pending),
+            "type_char must reset a stale verify outcome to Pending (R5), got {:?}",
+            f.verify
+        );
+
+        f.verify = VerifyOutcome::Ok {
+            elapsed: Duration::from_millis(5),
+        };
+        f.backspace();
+        assert!(
+            matches!(f.verify, VerifyOutcome::Pending),
+            "backspace must reset a stale verify outcome to Pending (R5), got {:?}",
+            f.verify
+        );
+    }
 }

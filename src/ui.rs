@@ -2176,4 +2176,25 @@ mod tests {
             "slot 2 picks Cloud back after forward navigation"
         );
     }
+
+    /// R7 (PR #31 round-3 review): the funnel footer must
+    /// advertise the [←] back key. main.rs binds KeyCode::Left
+    /// to AgentFunnel::back(), but every step footer still reads
+    /// "[Enter] …  [Esc] cancel" — the escape hatch from a failed
+    /// Verify is invisible exactly where it's needed.
+    #[test]
+    fn funnel_footer_advertises_back_key() {
+        let mut app = App::new();
+        app.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_add());
+        app.mode = crate::app::AppMode::AgentFunnel;
+        let out = render_to_string(&app, 120, 40);
+        let footers: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("[Enter]"))
+            .collect();
+        assert!(
+            out.contains("[←] back"),
+            "funnel footer must advertise the [←] back key (R7); rendered footer(s): {footers:?}"
+        );
+    }
 }

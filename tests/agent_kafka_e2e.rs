@@ -227,3 +227,38 @@ fn verify_only() {
         .expect("verify should succeed against a reachable broker");
     eprintln!("verify_only: OK in {elapsed:?}");
 }
+
+/// R6 (PR #31 round-3 review): verifying a BRAND-NEW topic must
+/// succeed on the first attempt against a broker with topic
+/// auto-creation enabled (the default single-node dev setup in
+/// this file's module docs). The assign()-at-watermarks rework
+/// fetches metadata *before* producing anything, and the first
+/// metadata request for a nonexistent topic returns no usable
+/// partitions (LEADER_NOT_AVAILABLE) — so the very first verify
+/// of a freshly typed topic name fails where the old
+/// produce-first flow auto-created the topic and passed.
+///
+/// Gated like the other tests here: set TEST_KAFKA_BROKER (and
+/// TEST_KAFKA_TOPIC, unused here but required by the shared
+/// skip helper) to run.
+#[test]
+fn verify_fresh_topic_first_attempt() {
+    let Some((broker, _existing_topic)) = broker_or_skip() else {
+        return;
+    };
+    let fresh_topic = format!("voice-bird-e2e-fresh-{}", uuid::Uuid::new_v4());
+    let conn = KafkaAgentConnection {
+        endpoint: broker,
+        topic: fresh_topic.clone(),
+        client_id: None,
+        acks: Default::default(),
+    };
+    let target = KafkaTarget::new(AgentSessionId("fresh-verify".into()), conn);
+    let result = block_on(async move { target.verify().await });
+    match result {
+        Ok(elapsed) => eprintln!("fresh-topic verify: OK in {elapsed:?}"),
+        Err(e) => panic!(
+            "first verify of brand-new topic '{fresh_topic}' must succeed (R6): {e}"
+        ),
+    }
+}
