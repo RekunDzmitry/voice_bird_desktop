@@ -65,13 +65,15 @@ chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "2.10", features = ["json"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
-# Kafka client for user-configured Agent targets. `dynamic-linking`
-# links against the system librdkafka (Homebrew `librdkafka` on macOS,
-# `librdkafka-dev` on Debian/Ubuntu, `librdkafka1` on RHEL). When
-# librdkafka isn't on the system, set the env var
-# `RDKAFKA_DYNAMIC_LINKING=0` and rebuild to fall back to
-# building from source via cmake.
-rdkafka = { version = "0.36", default-features = false, features = ["dynamic-linking", "tokio"] }
+# Kafka client for user-configured Agent targets. `cmake-build` compiles
+# librdkafka from the vendored source and links it STATICALLY, so the
+# distributed binary has no runtime dependency on a system/Homebrew
+# librdkafka (the previous `dynamic-linking` feature made the macOS
+# binary dlopen the Homebrew dylib path it was linked against, which
+# fails on end-user machines). Build-time cost: cmake + a C toolchain.
+# rdkafka-sys selects dynamic vs. source build via these cargo features
+# only — there is no RDKAFKA_DYNAMIC_LINKING env-var fallback.
+rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "tokio"] }
 
 # Model download + verification
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
