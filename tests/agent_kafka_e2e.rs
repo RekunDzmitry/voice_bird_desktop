@@ -139,6 +139,7 @@ fn funnel_to_kafka_round_trip() {
         };
         target
             .push_segment(&seg)
+            .await
             .map_err(|e| anyhow::anyhow!("push_segment failed: {e}"))?;
 
         // 4. Build a read-back consumer and `assign()` it from

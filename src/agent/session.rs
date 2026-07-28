@@ -8,6 +8,8 @@
 //! and slots into [`AgentStatus`] without touching the rest of
 //! the binary.
 
+use async_trait::async_trait;
+
 use crate::transcription::Segment;
 
 /// Stable identifier for an agent session. Today we only support
@@ -53,6 +55,7 @@ pub enum AgentStatus {
 /// a few times per second — once per committed segment + occasional
 /// spawn / drop). Implementations own their own threading and
 /// serialisation.
+#[async_trait]
 pub trait AgentTarget: Send + Sync {
     /// Agent session this target is attached to. Returns an owned
     /// value because the id may mutate at runtime (the stdio MCP
@@ -68,7 +71,12 @@ pub trait AgentTarget: Send + Sync {
     /// transport error is logged but not surfaced to the UI —
     /// losing one segment is recoverable; blocking the recording
     /// pipeline is not.
-    fn push_segment(&self, segment: &Segment) -> anyhow::Result<()>;
+    ///
+    /// Async since #32: the recorder's consumer task already runs
+    /// on a tokio runtime, so transports with async I/O (rdkafka)
+    /// return their future directly instead of bridging through a
+    /// dedicated thread + one-shot runtime per call.
+    async fn push_segment(&self, segment: &Segment) -> anyhow::Result<()>;
 
     /// Tentative text accumulated by the engine. Sent as a separate
     /// event so the agent runtime can see live progress without

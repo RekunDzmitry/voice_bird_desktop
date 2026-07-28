@@ -2095,7 +2095,8 @@ impl App {
                             &seg,
                             &agent_state_for_consumer,
                             &agent_targets_for_consumer,
-                        );
+                        )
+                        .await;
                         if let Target::Agent { session_id } = &target_for_consumer {
                             record_dispatch_event(&agent_events_for_consumer, outcome, session_id);
                         }
@@ -2697,8 +2698,10 @@ pub enum AgentDispatch {
 /// `agent_state` for backward compatibility with the
 /// `voice_bird__pull_recent` MCP tool; user-configured ids resolve
 /// through `agent_targets`. Called from the recording consumer task
-/// in `App::start_section`.
-fn dispatch_segment_to_agent(
+/// in `App::start_section`. Async since #32: the consumer task
+/// awaits the target's `push_segment` future directly on its own
+/// runtime instead of bridging through a per-call thread.
+async fn dispatch_segment_to_agent(
     target: &Target,
     seg: &voice_bird_cli::transcription::Segment,
     agent_state: &voice_bird_cli::agent::mcp_server::ServerState,
@@ -2714,7 +2717,7 @@ fn dispatch_segment_to_agent(
         agent_state.push(seg.clone());
         AgentDispatch::Default
     } else if let Some(agent) = agent_targets.get(session_id) {
-        match agent.push_segment(seg) {
+        match agent.push_segment(seg).await {
             Ok(()) => AgentDispatch::Pushed,
             Err(e) => {
                 log::warn!("agent target push_segment ({session_id}): {e}");
@@ -2877,11 +2880,12 @@ mod tests {
         fail: bool,
     }
 
+    #[async_trait::async_trait]
     impl voice_bird_cli::agent::AgentTarget for SpyTarget {
         fn session_id(&self) -> voice_bird_cli::agent::AgentSessionId {
             voice_bird_cli::agent::AgentSessionId("spy".into())
         }
-        fn push_segment(
+        async fn push_segment(
             &self,
             segment: &voice_bird_cli::transcription::Segment,
         ) -> anyhow::Result<()> {
@@ -2930,8 +2934,8 @@ mod tests {
         (state, targets, pushed)
     }
 
-    #[test]
-    fn dispatch_default_id_routes_to_legacy_mcp_buffer() {
+    #[tokio::test]
+    async fn dispatch_default_id_routes_to_legacy_mcp_buffer() {
         let (state, targets, pushed) = dispatch_fixture(false);
         let out = dispatch_segment_to_agent(
             &Target::Agent {
@@ -2940,7 +2944,7 @@ mod tests {
             &dispatch_seg("hello"),
             &state,
             &targets,
-        );
+        ).await;
         assert_eq!(out, AgentDispatch::Default);
         let buf = state.pull(10);
         assert_eq!(buf.len(), 1);
@@ -2949,8 +2953,8 @@ mod tests {
         assert!(pushed.lock().is_empty());
     }
 
-    #[test]
-    fn dispatch_known_id_pushes_to_mapped_target() {
+    #[tokio::test]
+    async fn dispatch_known_id_pushes_to_mapped_target() {
         let (state, targets, pushed) = dispatch_fixture(false);
         let out = dispatch_segment_to_agent(
             &Target::Agent {
@@ -2959,15 +2963,15 @@ mod tests {
             &dispatch_seg("routed"),
             &state,
             &targets,
-        );
+        ).await;
         assert_eq!(out, AgentDispatch::Pushed);
         assert_eq!(*pushed.lock(), vec!["routed".to_string()]);
         // The legacy MCP buffer must stay empty.
         assert!(state.pull(10).is_empty());
     }
 
-    #[test]
-    fn dispatch_missing_id_drops_segment_not_default() {
+    #[tokio::test]
+    async fn dispatch_missing_id_drops_segment_not_default() {
         let (state, targets, pushed) = dispatch_fixture(false);
         let out = dispatch_segment_to_agent(
             &Target::Agent {
@@ -2976,7 +2980,7 @@ mod tests {
             &dispatch_seg("lost"),
             &state,
             &targets,
-        );
+        ).await;
         assert_eq!(out, AgentDispatch::Dropped);
         // Dropped means dropped: neither the legacy buffer nor any
         // configured target receives the segment.
@@ -2984,8 +2988,8 @@ mod tests {
         assert!(pushed.lock().is_empty());
     }
 
-    #[test]
-    fn dispatch_push_failure_is_reported_not_rerouted() {
+    #[tokio::test]
+    async fn dispatch_push_failure_is_reported_not_rerouted() {
         let (state, targets, pushed) = dispatch_fixture(true);
         let out = dispatch_segment_to_agent(
             &Target::Agent {
@@ -2994,7 +2998,7 @@ mod tests {
             &dispatch_seg("boom"),
             &state,
             &targets,
-        );
+        ).await;
         assert_eq!(out, AgentDispatch::PushFailed);
         assert!(state.pull(10).is_empty());
         assert!(pushed.lock().is_empty());
@@ -3053,11 +3057,11 @@ mod tests {
         assert_eq!(app.mode, AppMode::Normal);
     }
 
-    #[test]
-    fn dispatch_non_agent_targets_route_nothing() {
+    #[tokio::test]
+    async fn dispatch_non_agent_targets_route_nothing() {
         let (state, targets, pushed) = dispatch_fixture(false);
         for target in [Target::Stdout, Target::Cloud] {
-            let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets);
+            let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets).await;
             assert_eq!(out, AgentDispatch::NotAgent);
         }
         assert!(state.pull(10).is_empty());
