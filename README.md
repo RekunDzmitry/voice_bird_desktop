@@ -124,6 +124,7 @@ The interface is split into source panes (microphones, system output, running ap
 | `e` | Export the latest local transcript |
 | `p` | Change local session path |
 | `x` | Clear stopped transcript slot |
+| `t` | Status overlay — recent agent events (target saved, verify results, broker errors, dropped segments) with timestamps |
 | `q` | Quit |
 | `?` | Help |
 
