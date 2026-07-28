@@ -674,21 +674,29 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
     let Some(funnel) = app.funnel.as_ref() else {
         return;
     };
-    let popup = centered(72, 14, area);
+    let popup = centered(72, 16, area);
     f.render_widget(Clear, popup);
 
     let mut lines: Vec<Line> = Vec::new();
-    let step_label = match funnel.step {
-        AgentFunnelStep::PickConnectionKind => "1/7 — Connection",
-        AgentFunnelStep::Name => "2/7 — Name",
-        AgentFunnelStep::Endpoint => "3/7 — Broker endpoint",
-        AgentFunnelStep::Topic => "4/7 — Topic",
-        AgentFunnelStep::Acks => "5/7 — Acknowledgement level",
-        AgentFunnelStep::Verify => "6/7 — Verify",
-        AgentFunnelStep::Save => "7/7 — Save",
+    // Position among the steps this form will actually visit —
+    // non-SASL protocols skip the three SASL steps, so the total
+    // is dynamic (8 or 11).
+    let (pos, total) = funnel.step_position();
+    let step_name = match funnel.step {
+        AgentFunnelStep::PickConnectionKind => "Connection",
+        AgentFunnelStep::Name => "Name",
+        AgentFunnelStep::Endpoint => "Broker endpoint",
+        AgentFunnelStep::Topic => "Topic",
+        AgentFunnelStep::Acks => "Acknowledgement level",
+        AgentFunnelStep::Security => "Security",
+        AgentFunnelStep::SaslMechanism => "SASL mechanism",
+        AgentFunnelStep::SaslUsername => "SASL username",
+        AgentFunnelStep::SaslPasswordEnv => "SASL password env var",
+        AgentFunnelStep::Verify => "Verify",
+        AgentFunnelStep::Save => "Save",
     };
     lines.push(Line::from(Span::styled(
-        format!(" {step_label} "),
+        format!(" {pos}/{total} — {step_name} "),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -742,6 +750,55 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(color),
                 )));
             }
+        }
+        AgentFunnelStep::Security => {
+            lines.push(Line::from("Security protocol:"));
+            for (i, proto) in voice_bird_cli::config::KafkaSecurityProtocol::ALL
+                .iter()
+                .enumerate()
+            {
+                let selected = funnel.security_protocol == *proto;
+                let marker = if selected { "● " } else { "  " };
+                let color = if selected { Color::Yellow } else { Color::Gray };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}[{}] {}", i + 1, proto.label()),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        AgentFunnelStep::SaslMechanism => {
+            lines.push(Line::from("SASL mechanism:"));
+            for (i, mech) in voice_bird_cli::config::KafkaSaslMechanism::ALL
+                .iter()
+                .enumerate()
+            {
+                let selected = funnel.sasl_mechanism == *mech;
+                let marker = if selected { "● " } else { "  " };
+                let color = if selected { Color::Yellow } else { Color::Gray };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}[{}] {}", i + 1, mech.as_str()),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        AgentFunnelStep::SaslUsername => {
+            lines.push(Line::from("SASL username:"));
+            lines.push(input_line(&funnel.sasl_username));
+        }
+        AgentFunnelStep::SaslPasswordEnv => {
+            lines.push(Line::from(
+                "NAME of the env var holding the SASL password:",
+            ));
+            lines.push(input_line(&funnel.sasl_password_env));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "The password itself is read from that variable at connect",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "time and is never written to config.toml.",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         AgentFunnelStep::Verify => {
             lines.push(Line::from(Span::styled(
@@ -798,6 +855,21 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
                 format!("acks     : {}", funnel.acks.as_str()),
                 Style::default().fg(Color::White),
             )));
+            lines.push(Line::from(Span::styled(
+                format!("security : {}", funnel.security_protocol.as_str()),
+                Style::default().fg(Color::White),
+            )));
+            if funnel.security_protocol.uses_sasl() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "sasl     : {} as {} (password from ${})",
+                        funnel.sasl_mechanism.as_str(),
+                        funnel.sasl_username,
+                        funnel.sasl_password_env,
+                    ),
+                    Style::default().fg(Color::White),
+                )));
+            }
         }
     }
 
@@ -1765,6 +1837,10 @@ mod tests {
                     topic: "voice-bird".into(),
                     client_id: None,
                     acks: Default::default(),
+                    security_protocol: Default::default(),
+                    sasl_mechanism: None,
+                    sasl_username: None,
+                    sasl_password_env: None,
                 },
             ),
         })

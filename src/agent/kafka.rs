@@ -21,7 +21,6 @@
 use parking_lot::Mutex;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -109,7 +108,7 @@ impl KafkaTarget {
     /// Build (or rebuild) the `FutureProducer` from the saved
     /// connection details. Any previous producer is dropped, which
     /// lets the funnel re-verify cleanly after an edit.
-    fn producer(&self) -> Result<FutureProducer, KafkaError> {
+    fn producer(&self) -> anyhow::Result<FutureProducer> {
         let mut slot = self.inner.producer.lock();
         if let Some(p) = slot.as_ref() {
             return Ok(p.clone());
@@ -366,13 +365,43 @@ impl AgentTarget for KafkaTarget {
     }
 }
 
+/// Apply `security.protocol` (+ SASL credentials when the protocol
+/// needs them) to a client config. The SASL password is resolved
+/// from the environment variable NAMED by `sasl_password_env` at
+/// build time — the secret never lives in `config.toml`. Errors are
+/// config errors (missing username, unset env var), not broker
+/// errors: they surface before any socket is opened, so the funnel's
+/// verify step shows them as actionable form problems.
+fn apply_security(cfg: &mut ClientConfig, conn: &KafkaAgentConnection) -> anyhow::Result<()> {
+    conn.validate_security()?;
+    cfg.set("security.protocol", conn.security_protocol.as_str());
+    if conn.security_protocol.uses_sasl() {
+        let mechanism = conn.sasl_mechanism.unwrap_or_default();
+        // validate_security guarantees both fields are present
+        // and non-empty for SASL protocols.
+        let username = conn.sasl_username.as_deref().unwrap_or_default();
+        let password_env = conn.sasl_password_env.as_deref().unwrap_or_default();
+        let password = std::env::var(password_env).map_err(|_| {
+            anyhow::anyhow!(
+                "SASL password env var '{password_env}' is not set \
+                 (export it before launching voice-bird-cli)"
+            )
+        })?;
+        cfg.set("sasl.mechanism", mechanism.as_str())
+            .set("sasl.username", username)
+            .set("sasl.password", password);
+    }
+    Ok(())
+}
+
 fn build_producer(
     conn: &KafkaAgentConnection,
     session: &AgentSessionId,
     message_timeout: Duration,
     acks: crate::config::KafkaAcks,
-) -> Result<FutureProducer, KafkaError> {
+) -> anyhow::Result<FutureProducer> {
     let mut cfg = ClientConfig::new();
+    apply_security(&mut cfg, conn)?;
     cfg.set("bootstrap.servers", &conn.endpoint)
         // `acks` is passed explicitly rather than read from
         // `conn`: segment pushes honour the user's setting, but
@@ -401,7 +430,7 @@ fn build_producer(
         )
         .set("socket.timeout.ms", "5000")
         .set("enable.idempotence", "false");
-    cfg.create()
+    Ok(cfg.create()?)
 }
 
 fn build_consumer(
@@ -409,8 +438,9 @@ fn build_consumer(
     session: &AgentSessionId,
     group_id: &str,
     auto_offset_reset: &str,
-) -> Result<StreamConsumer, KafkaError> {
+) -> anyhow::Result<StreamConsumer> {
     let mut cfg = ClientConfig::new();
+    apply_security(&mut cfg, conn)?;
     cfg.set("bootstrap.servers", &conn.endpoint)
         // The verify path passes a fresh UUID here so two
         // concurrent verifies (or two app instances) don't
@@ -432,5 +462,68 @@ fn build_consumer(
                 .clone()
                 .unwrap_or_else(|| format!("voice-bird-cli-verify/{}", session.as_str())),
         );
-    cfg.create()
+    Ok(cfg.create()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{KafkaAcks, KafkaSaslMechanism, KafkaSecurityProtocol};
+
+    fn conn(proto: KafkaSecurityProtocol, password_env: &str) -> KafkaAgentConnection {
+        let sasl = proto.uses_sasl();
+        KafkaAgentConnection {
+            endpoint: "localhost:9093".into(),
+            topic: "t".into(),
+            client_id: None,
+            acks: KafkaAcks::All,
+            security_protocol: proto,
+            sasl_mechanism: sasl.then_some(KafkaSaslMechanism::ScramSha256),
+            sasl_username: sasl.then(|| "svc".to_string()),
+            sasl_password_env: sasl.then(|| password_env.to_string()),
+        }
+    }
+
+    #[test]
+    fn apply_security_sets_protocol_for_plaintext() {
+        let mut cfg = ClientConfig::new();
+        apply_security(&mut cfg, &conn(KafkaSecurityProtocol::Plaintext, "")).unwrap();
+        assert_eq!(cfg.get("security.protocol"), Some("plaintext"));
+        assert_eq!(cfg.get("sasl.username"), None);
+    }
+
+    #[test]
+    fn apply_security_resolves_password_from_env() {
+        // Env var name unique to this test so parallel tests
+        // can't race on it.
+        let var = "VB_TEST_KAFKA_PW_RESOLVES";
+        std::env::set_var(var, "s3cret");
+        let mut cfg = ClientConfig::new();
+        apply_security(&mut cfg, &conn(KafkaSecurityProtocol::SaslSsl, var)).unwrap();
+        std::env::remove_var(var);
+        assert_eq!(cfg.get("security.protocol"), Some("sasl_ssl"));
+        assert_eq!(cfg.get("sasl.mechanism"), Some("SCRAM-SHA-256"));
+        assert_eq!(cfg.get("sasl.username"), Some("svc"));
+        assert_eq!(cfg.get("sasl.password"), Some("s3cret"));
+    }
+
+    #[test]
+    fn apply_security_errors_on_unset_password_env() {
+        let var = "VB_TEST_KAFKA_PW_UNSET";
+        std::env::remove_var(var);
+        let mut cfg = ClientConfig::new();
+        let err = apply_security(&mut cfg, &conn(KafkaSecurityProtocol::SaslPlaintext, var))
+            .unwrap_err();
+        // The message must name the missing variable so the user
+        // can act on it.
+        assert!(err.to_string().contains(var), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn apply_security_rejects_sasl_without_credentials() {
+        let mut c = conn(KafkaSecurityProtocol::SaslSsl, "IRRELEVANT");
+        c.sasl_username = None;
+        let mut cfg = ClientConfig::new();
+        assert!(apply_security(&mut cfg, &c).is_err());
+    }
 }

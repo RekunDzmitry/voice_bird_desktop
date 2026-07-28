@@ -16,12 +16,20 @@
 //! 4. **Topic** — destination topic the segment JSON lines
 //!    get published to.
 //! 5. **`acks` level** — All / One / Zero.
-//! 6. **Verify** — runs the round-trip probe against the
-//!    configured broker. Shows the result; user advances to Save
-//!    on success or back to the form on failure.
-//! 7. **Save** — caller commits the resulting `AgentTargetConfig`
-//!    to `App::config` and `App::agent_targets` and closes the
-//!    modal.
+//! 6. **Security** — `security.protocol`: plaintext / ssl /
+//!    sasl_plaintext / sasl_ssl. Picking a non-SASL protocol
+//!    skips the three SASL steps below.
+//! 7. **SASL mechanism** — PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512.
+//! 8. **SASL username**.
+//! 9. **SASL password env var** — the NAME of the environment
+//!    variable holding the password. The secret itself never
+//!    enters the funnel or the config file.
+//! 10. **Verify** — runs the round-trip probe against the
+//!     configured broker. Shows the result; user advances to Save
+//!     on success or back to the form on failure.
+//! 11. **Save** — caller commits the resulting `AgentTargetConfig`
+//!     to `App::config` and `App::agent_targets` and closes the
+//!     modal.
 //!
 //! Each step has its own key bindings. The renderer (see
 //! `ui::render_agent_funnel`) paints the current step + a footer
@@ -31,10 +39,16 @@
 
 use std::time::Duration;
 
-use crate::config::{AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection};
+use crate::config::{
+    AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection, KafkaSaslMechanism,
+    KafkaSecurityProtocol,
+};
 
 /// Funnel step indicator. The order of variants is the
 /// user-visible order; the renderer indexes by `step as usize`.
+/// The three `Sasl*` steps only show when the picked
+/// security protocol uses SASL — `advance`/`back` skip them
+/// otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentFunnelStep {
     PickConnectionKind = 0,
@@ -42,15 +56,44 @@ pub enum AgentFunnelStep {
     Endpoint = 2,
     Topic = 3,
     Acks = 4,
-    Verify = 5,
-    Save = 6,
+    Security = 5,
+    SaslMechanism = 6,
+    SaslUsername = 7,
+    SaslPasswordEnv = 8,
+    Verify = 9,
+    Save = 10,
 }
 
 impl AgentFunnelStep {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 11;
 
     pub fn as_index(self) -> usize {
         self as usize
+    }
+
+    fn from_index(i: usize) -> Self {
+        match i {
+            0 => AgentFunnelStep::PickConnectionKind,
+            1 => AgentFunnelStep::Name,
+            2 => AgentFunnelStep::Endpoint,
+            3 => AgentFunnelStep::Topic,
+            4 => AgentFunnelStep::Acks,
+            5 => AgentFunnelStep::Security,
+            6 => AgentFunnelStep::SaslMechanism,
+            7 => AgentFunnelStep::SaslUsername,
+            8 => AgentFunnelStep::SaslPasswordEnv,
+            9 => AgentFunnelStep::Verify,
+            _ => AgentFunnelStep::Save,
+        }
+    }
+
+    fn is_sasl_step(self) -> bool {
+        matches!(
+            self,
+            AgentFunnelStep::SaslMechanism
+                | AgentFunnelStep::SaslUsername
+                | AgentFunnelStep::SaslPasswordEnv
+        )
     }
 }
 
@@ -83,6 +126,13 @@ pub struct AgentFunnel {
     pub endpoint: String,
     pub topic: String,
     pub acks: KafkaAcks,
+    pub security_protocol: KafkaSecurityProtocol,
+    pub sasl_mechanism: KafkaSaslMechanism,
+    pub sasl_username: String,
+    /// NAME of the env var holding the SASL password — the secret
+    /// itself is resolved at connect time and never enters the
+    /// funnel or the config file.
+    pub sasl_password_env: String,
 
     /// Verify-step state. `None` until the user runs a probe.
     pub verify: VerifyOutcome,
@@ -100,6 +150,10 @@ impl AgentFunnel {
             endpoint: String::new(),
             topic: String::new(),
             acks: KafkaAcks::All,
+            security_protocol: KafkaSecurityProtocol::Plaintext,
+            sasl_mechanism: KafkaSaslMechanism::Plain,
+            sasl_username: String::new(),
+            sasl_password_env: String::new(),
             verify: VerifyOutcome::Pending,
         }
     }
@@ -108,30 +162,56 @@ impl AgentFunnel {
     /// The id is preserved so Save overwrites the row in place
     /// rather than appending a new one.
     pub fn new_edit(existing: &AgentTargetConfig) -> Self {
-        let (endpoint, topic, acks) = match &existing.connection {
-            AgentConnection::Kafka(k) => (k.endpoint.clone(), k.topic.clone(), k.acks),
-        };
+        let AgentConnection::Kafka(k) = &existing.connection;
         Self {
             editing_id: Some(existing.id.clone()),
             step: AgentFunnelStep::PickConnectionKind,
             kind: crate::config::AgentConnectionKind::Kafka,
             name: existing.name.clone(),
-            endpoint,
-            topic,
-            acks,
+            endpoint: k.endpoint.clone(),
+            topic: k.topic.clone(),
+            acks: k.acks,
+            security_protocol: k.security_protocol,
+            sasl_mechanism: k.sasl_mechanism.unwrap_or_default(),
+            sasl_username: k.sasl_username.clone().unwrap_or_default(),
+            sasl_password_env: k.sasl_password_env.clone().unwrap_or_default(),
             verify: VerifyOutcome::Pending,
         }
     }
 
     /// The Kafka connection the form currently describes. Used
-    /// by both the verify step and the save step.
+    /// by both the verify step and the save step. SASL fields are
+    /// `None` for non-SASL protocols even if the user filled them
+    /// in and then switched back to plaintext — the saved config
+    /// only carries what the protocol actually uses.
     pub fn kafka_connection(&self) -> KafkaAgentConnection {
+        let sasl = self.security_protocol.uses_sasl();
         KafkaAgentConnection {
             endpoint: self.endpoint.trim().to_string(),
             topic: self.topic.trim().to_string(),
             client_id: None,
             acks: self.acks,
+            security_protocol: self.security_protocol,
+            sasl_mechanism: sasl.then_some(self.sasl_mechanism),
+            sasl_username: sasl.then(|| self.sasl_username.trim().to_string()),
+            sasl_password_env: sasl.then(|| self.sasl_password_env.trim().to_string()),
         }
+    }
+
+    /// 1-based position of the current step among the steps this
+    /// form will actually visit, plus the total count. Non-SASL
+    /// protocols skip the three SASL steps, so the renderer can't
+    /// just use the enum index for its "step X/Y" header.
+    pub fn step_position(&self) -> (usize, usize) {
+        let sasl = self.security_protocol.uses_sasl();
+        let visible = |s: AgentFunnelStep| sasl || !s.is_sasl_step();
+        let total = (0..AgentFunnelStep::COUNT)
+            .filter(|&i| visible(AgentFunnelStep::from_index(i)))
+            .count();
+        let position = (0..=self.step.as_index())
+            .filter(|&i| visible(AgentFunnelStep::from_index(i)))
+            .count();
+        (position, total)
     }
 
     /// The full `AgentTargetConfig` the funnel will hand to
@@ -162,6 +242,13 @@ impl AgentFunnel {
             }
             AgentFunnelStep::Topic => !self.topic.trim().is_empty(),
             AgentFunnelStep::Acks => true,
+            AgentFunnelStep::Security => true,
+            AgentFunnelStep::SaslMechanism => true,
+            AgentFunnelStep::SaslUsername => !self.sasl_username.trim().is_empty(),
+            // Only require the env var NAME here; whether it is
+            // actually set in the environment is checked by the
+            // verify step, which can show a real error message.
+            AgentFunnelStep::SaslPasswordEnv => !self.sasl_password_env.trim().is_empty(),
             AgentFunnelStep::Verify => {
                 matches!(self.verify, VerifyOutcome::Ok { .. })
             }
@@ -169,39 +256,35 @@ impl AgentFunnel {
         }
     }
 
-    /// Advance to the next step. The caller is responsible for
-    /// checking `can_advance`; this method unconditionally
+    /// Advance to the next step, skipping the SASL steps when the
+    /// picked protocol doesn't use SASL. The caller is responsible
+    /// for checking `can_advance`; this method unconditionally
     /// bumps the step counter and clamps at the end.
     pub fn advance(&mut self) {
-        let next = (self.step.as_index() + 1).min(AgentFunnelStep::COUNT - 1);
-        self.step = match next {
-            0 => AgentFunnelStep::PickConnectionKind,
-            1 => AgentFunnelStep::Name,
-            2 => AgentFunnelStep::Endpoint,
-            3 => AgentFunnelStep::Topic,
-            4 => AgentFunnelStep::Acks,
-            5 => AgentFunnelStep::Verify,
-            _ => AgentFunnelStep::Save,
-        };
+        let mut next = (self.step.as_index() + 1).min(AgentFunnelStep::COUNT - 1);
+        if !self.security_protocol.uses_sasl() {
+            while AgentFunnelStep::from_index(next).is_sasl_step() {
+                next += 1;
+            }
+        }
+        self.step = AgentFunnelStep::from_index(next);
     }
 
-    /// Step backward without losing form values. Used when the
-    /// verify step fails and the user wants to fix the broker
+    /// Step backward without losing form values, skipping the SASL
+    /// steps when the picked protocol doesn't use SASL. Used when
+    /// the verify step fails and the user wants to fix the broker
     /// endpoint.
     pub fn back(&mut self) {
         if self.step.as_index() == 0 {
             return;
         }
-        let prev = self.step.as_index() - 1;
-        self.step = match prev {
-            0 => AgentFunnelStep::PickConnectionKind,
-            1 => AgentFunnelStep::Name,
-            2 => AgentFunnelStep::Endpoint,
-            3 => AgentFunnelStep::Topic,
-            4 => AgentFunnelStep::Acks,
-            5 => AgentFunnelStep::Verify,
-            _ => AgentFunnelStep::Save,
-        };
+        let mut prev = self.step.as_index() - 1;
+        if !self.security_protocol.uses_sasl() {
+            while AgentFunnelStep::from_index(prev).is_sasl_step() {
+                prev -= 1;
+            }
+        }
+        self.step = AgentFunnelStep::from_index(prev);
         // Stepping back to an editable step means the user is
         // about to change the form, which invalidates any prior
         // verify outcome (R5). Stepping back to Verify itself is
@@ -223,6 +306,8 @@ impl AgentFunnel {
             AgentFunnelStep::Name => self.name.push(ch),
             AgentFunnelStep::Endpoint => self.endpoint.push(ch),
             AgentFunnelStep::Topic => self.topic.push(ch),
+            AgentFunnelStep::SaslUsername => self.sasl_username.push(ch),
+            AgentFunnelStep::SaslPasswordEnv => self.sasl_password_env.push(ch),
             _ => return,
         }
         self.verify = VerifyOutcome::Pending;
@@ -241,6 +326,12 @@ impl AgentFunnel {
             }
             AgentFunnelStep::Topic => {
                 self.topic.pop();
+            }
+            AgentFunnelStep::SaslUsername => {
+                self.sasl_username.pop();
+            }
+            AgentFunnelStep::SaslPasswordEnv => {
+                self.sasl_password_env.pop();
             }
             _ => return,
         }
@@ -282,6 +373,10 @@ mod tests {
             topic: "events".into(),
             client_id: Some("svc".into()),
             acks: crate::config::KafkaAcks::One,
+            security_protocol: Default::default(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password_env: None,
         };
         let existing = AgentTargetConfig {
             id: "abc-123".into(),
@@ -359,6 +454,107 @@ mod tests {
             crate::config::AgentConnection::Kafka(k) => &k.endpoint,
         };
         assert_eq!(endpoint, "broker:9092");
+    }
+
+    /// Plaintext (the default) skips the three SASL steps in both
+    /// directions: Security advances straight to Verify, and Verify
+    /// steps back to Security. The "step X/Y" header sees 8 steps.
+    #[test]
+    fn plaintext_walk_skips_sasl_steps() {
+        let mut f = AgentFunnel::new_add();
+        f.step = AgentFunnelStep::Security;
+        assert_eq!(f.step_position(), (6, 8));
+        f.advance();
+        assert_eq!(f.step, AgentFunnelStep::Verify);
+        assert_eq!(f.step_position(), (7, 8));
+        f.back();
+        assert_eq!(f.step, AgentFunnelStep::Security);
+    }
+
+    /// SASL protocols visit mechanism → username → password-env
+    /// between Security and Verify, and the text steps gate
+    /// `can_advance` on non-empty values. The header sees 11 steps.
+    #[test]
+    fn sasl_walk_visits_credential_steps() {
+        let mut f = AgentFunnel::new_add();
+        f.security_protocol = KafkaSecurityProtocol::SaslSsl;
+        f.step = AgentFunnelStep::Security;
+        assert_eq!(f.step_position(), (6, 11));
+
+        f.advance();
+        assert_eq!(f.step, AgentFunnelStep::SaslMechanism);
+        assert!(f.can_advance(), "mechanism has a default; always advanceable");
+
+        f.advance();
+        assert_eq!(f.step, AgentFunnelStep::SaslUsername);
+        assert!(!f.can_advance());
+        f.type_char('u');
+        assert!(f.can_advance());
+
+        f.advance();
+        assert_eq!(f.step, AgentFunnelStep::SaslPasswordEnv);
+        assert!(!f.can_advance());
+        for ch in "KAFKA_PW".chars() {
+            f.type_char(ch);
+        }
+        assert!(f.can_advance());
+
+        f.advance();
+        assert_eq!(f.step, AgentFunnelStep::Verify);
+        assert_eq!(f.step_position(), (10, 11));
+        f.back();
+        assert_eq!(f.step, AgentFunnelStep::SaslPasswordEnv);
+    }
+
+    /// `kafka_connection` only carries SASL fields when the
+    /// protocol uses SASL. Filling the credentials and then
+    /// switching back to plaintext must not leak them into the
+    /// saved config row.
+    #[test]
+    fn kafka_connection_strips_sasl_fields_for_non_sasl_protocols() {
+        let mut f = AgentFunnel::new_add();
+        f.security_protocol = KafkaSecurityProtocol::SaslSsl;
+        f.sasl_username = " user ".into();
+        f.sasl_password_env = " PW_ENV ".into();
+        let conn = f.kafka_connection();
+        assert_eq!(conn.security_protocol, KafkaSecurityProtocol::SaslSsl);
+        assert_eq!(conn.sasl_mechanism, Some(KafkaSaslMechanism::Plain));
+        // Text fields are trimmed like name/endpoint/topic.
+        assert_eq!(conn.sasl_username.as_deref(), Some("user"));
+        assert_eq!(conn.sasl_password_env.as_deref(), Some("PW_ENV"));
+
+        f.security_protocol = KafkaSecurityProtocol::Plaintext;
+        let conn = f.kafka_connection();
+        assert_eq!(conn.security_protocol, KafkaSecurityProtocol::Plaintext);
+        assert!(conn.sasl_mechanism.is_none());
+        assert!(conn.sasl_username.is_none());
+        assert!(conn.sasl_password_env.is_none());
+    }
+
+    /// The Edit funnel pre-fills the security fields from an
+    /// existing SASL-secured target.
+    #[test]
+    fn new_edit_prefills_security_fields() {
+        use crate::config::{AgentConnection, AgentTargetConfig, KafkaAgentConnection};
+        let existing = AgentTargetConfig {
+            id: "sec-1".into(),
+            name: "secure".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "broker:9093".into(),
+                topic: "events".into(),
+                client_id: None,
+                acks: KafkaAcks::All,
+                security_protocol: KafkaSecurityProtocol::SaslSsl,
+                sasl_mechanism: Some(KafkaSaslMechanism::ScramSha512),
+                sasl_username: Some("svc".into()),
+                sasl_password_env: Some("VB_PW".into()),
+            }),
+        };
+        let f = AgentFunnel::new_edit(&existing);
+        assert_eq!(f.security_protocol, KafkaSecurityProtocol::SaslSsl);
+        assert_eq!(f.sasl_mechanism, KafkaSaslMechanism::ScramSha512);
+        assert_eq!(f.sasl_username, "svc");
+        assert_eq!(f.sasl_password_env, "VB_PW");
     }
 
     /// R5 (PR #31 round-3 review): editing any form field must

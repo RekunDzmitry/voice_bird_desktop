@@ -73,7 +73,12 @@ parking_lot = "0.12"
 # fails on end-user machines). Build-time cost: cmake + a C toolchain.
 # rdkafka-sys selects dynamic vs. source build via these cargo features
 # only — there is no RDKAFKA_DYNAMIC_LINKING env-var fallback.
-rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "tokio"] }
+# `ssl-vendored` compiles OpenSSL from source and links it statically
+# (same self-contained-binary rationale as `cmake-build`), enabling the
+# ssl / sasl_ssl security protocols; SASL PLAIN and SCRAM-SHA-* are
+# built into librdkafka and need no extra system libs (GSSAPI would,
+# and is deliberately not offered).
+rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl-vendored", "tokio"] }
 
 # Model download + verification
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
