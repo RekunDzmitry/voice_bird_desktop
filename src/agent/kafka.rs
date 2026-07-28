@@ -114,8 +114,12 @@ impl KafkaTarget {
         if let Some(p) = slot.as_ref() {
             return Ok(p.clone());
         }
-        let producer =
-            build_producer(&self.inner.connection, &self.inner.session, PRODUCE_TIMEOUT)?;
+        let producer = build_producer(
+            &self.inner.connection,
+            &self.inner.session,
+            PRODUCE_TIMEOUT,
+            self.inner.connection.acks,
+        )?;
         *slot = Some(producer.clone());
         Ok(producer)
     }
@@ -134,11 +138,20 @@ impl KafkaTarget {
         // VERIFY_TIMEOUT` so the probe can actually use the
         // generous window the constant advertises (the cached
         // producer uses PRODUCE_TIMEOUT = 5 s, which would cap
-        // delivery well before our 15 s deadline). The consumer
-        // half below also subscribes with `auto.offset.reset =
-        // latest` (see `build_consumer`) so we don't have to
-        // scan the whole topic.
-        let producer = build_producer(&self.inner.connection, &self.inner.session, VERIFY_TIMEOUT)?;
+        // delivery well before our 15 s deadline). `acks` is
+        // pinned to `all` regardless of the target's setting:
+        // verify's whole point is confirming the broker
+        // persisted a record, and the delivery report only
+        // carries a real offset when the broker actually acks
+        // (`acks=0` fakes the report with offset -1, which
+        // would break the assign below). The target's own
+        // `acks` still governs real segment pushes.
+        let producer = build_producer(
+            &self.inner.connection,
+            &self.inner.session,
+            VERIFY_TIMEOUT,
+            crate::config::KafkaAcks::All,
+        )?;
 
         // Probe id is a fresh UUID so two concurrent verifies (or
         // a verify + a real push) can't collide on the same key.
@@ -188,9 +201,18 @@ impl KafkaTarget {
         // case never reached the user (the fallback swallowed
         // it). Producing first gives one code path and one
         // honest error stream.
+        //
+        // The delivery report is the whole trick: with
+        // `acks=all` the resolved future carries the exact
+        // `(partition, offset)` the broker wrote the probe to,
+        // so the consumer can `assign()` precisely there — no
+        // metadata fetch, no watermark round-trips, and no
+        // window for concurrent producers on a busy topic to
+        // push the head past the probe between produce and
+        // assign (the watermark approach raced exactly there).
         let record: FutureRecord<'_, String, Vec<u8>> =
             FutureRecord::to(&topic).key(&key).payload(&probe_bytes);
-        producer
+        let (probe_partition, probe_offset) = producer
             .send(record, Timeout::After(VERIFY_TIMEOUT))
             .await
             .map_err(|(e, _msg)| {
@@ -201,21 +223,27 @@ impl KafkaTarget {
                     self.inner.connection.endpoint
                 )
             })?;
-        // Now the topic is guaranteed to exist with at least
-        // one partition (either it pre-existed, or the produce
-        // above triggered auto-create). Fetch metadata +
-        // watermarks and assign the consumer at `high - 1` on
-        // every partition — the probe we just produced is at
-        // `high - 1` on its partition, and we don't know which
-        // partition without a separate scan, but `high - 1`
-        // on every partition is a superset: the consumer will
-        // replay the probe (and nothing later) on the
-        // partition that has it, and start at the probe's
-        // offset on the partition that doesn't. Either way
-        // the probe lands at or before the consumer's
-        // position, so the recv loop below will see it within
-        // the verify deadline.
-        let tpl = self.assign_at_probe_offset(&consumer, &topic).await?;
+        // `acks=all` is pinned on the verify producer, so a
+        // negative offset here means the broker (or a proxy in
+        // front of it) is not reporting offsets — bail with a
+        // real error rather than assigning a garbage position.
+        debug_assert!(
+            probe_offset >= 0,
+            "delivery report returned offset {probe_offset} with acks=all"
+        );
+        if probe_offset < 0 {
+            anyhow::bail!(
+                "verify: broker acked the probe but reported no offset \
+                 (partition={probe_partition}, offset={probe_offset}) — \
+                 cannot position the read-back consumer"
+            );
+        }
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        tpl.add_partition_offset(
+            &topic,
+            probe_partition,
+            rdkafka::Offset::Offset(probe_offset),
+        )?;
         consumer.assign(&tpl)?;
 
         // Poll until we see the probe id or the timeout elapses.
@@ -252,63 +280,6 @@ impl KafkaTarget {
             VERIFY_TIMEOUT,
             topic_for_loop
         ))
-    }
-
-    /// Build a `TopicPartitionList` that positions the consumer
-    /// at the offset of the probe we just produced. `assign()`
-    /// happens at `high - 1` on every partition so the consumer
-    /// will replay the probe (whichever partition it landed on)
-    /// and all subsequent records. We don't know which partition
-    /// the probe landed on without a separate scan, but
-    /// `high - 1` on every partition is a superset: the consumer
-    /// will replay the probe on the partition that has it, and
-    /// start at the probe's offset on the partition that
-    /// doesn't. Either way the probe lands at or before the
-    /// consumer's position, so the recv loop below will see it
-    /// within the verify deadline.
-    async fn assign_at_probe_offset(
-        &self,
-        consumer: &StreamConsumer,
-        topic: &str,
-    ) -> anyhow::Result<rdkafka::TopicPartitionList> {
-        let metadata = consumer
-            .fetch_metadata(Some(topic), Duration::from_secs(5))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "verify metadata fetch failed (after produce): {e} (broker={})",
-                    self.inner.connection.endpoint
-                )
-            })?;
-        let topic_meta = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == topic)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "verify: topic '{topic}' is still missing after a successful produce — \
-                     the broker is reporting inconsistent state"
-                )
-            })?;
-        if topic_meta.partitions().is_empty() {
-            anyhow::bail!(
-                "verify: topic '{topic}' has no partitions even after a successful produce \
-                 — the broker is reporting inconsistent state"
-            );
-        }
-        let mut tpl = rdkafka::TopicPartitionList::new();
-        for p in topic_meta.partitions() {
-            let (_low, high) = consumer
-                .fetch_watermarks(topic, p.id(), Duration::from_secs(5))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "verify watermark fetch failed (topic={topic}, partition={}): {e}",
-                        p.id()
-                    )
-                })?;
-            let start = high.saturating_sub(1);
-            tpl.add_partition_offset(topic, p.id(), rdkafka::Offset::Offset(start))?;
-        }
-        Ok(tpl)
     }
 
     /// Push a `Segment` to the configured broker + topic. Async
@@ -399,10 +370,16 @@ fn build_producer(
     conn: &KafkaAgentConnection,
     session: &AgentSessionId,
     message_timeout: Duration,
+    acks: crate::config::KafkaAcks,
 ) -> Result<FutureProducer, KafkaError> {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &conn.endpoint)
-        .set("acks", conn.acks.as_str())
+        // `acks` is passed explicitly rather than read from
+        // `conn`: segment pushes honour the user's setting, but
+        // the verify path pins `all` so the delivery report
+        // carries a real offset (with `acks=0` librdkafka fakes
+        // the report and the offset comes back as -1).
+        .set("acks", acks.as_str())
         .set(
             "client.id",
             conn.client_id

@@ -279,8 +279,90 @@ fn verify_fresh_topic_first_attempt() {
     let result = block_on(async move { target.verify().await });
     match result {
         Ok(elapsed) => eprintln!("fresh-topic verify: OK in {elapsed:?}"),
-        Err(e) => panic!(
-            "first verify of brand-new topic '{fresh_topic}' must succeed (R6): {e}"
-        ),
+        Err(e) => panic!("first verify of brand-new topic '{fresh_topic}' must succeed (R6): {e}"),
     }
+}
+
+/// Regression test for the busy-topic verify race (PR #31, reviewer
+/// note on the produce-first rework): with the watermark-based
+/// assign, any record landing on the probe's partition between the
+/// produce-ack and the watermark fetch pushed `high - 1` past the
+/// probe, and verify timed out against a perfectly healthy broker.
+/// The delivery-report assign positions the consumer at the probe's
+/// exact `(partition, offset)`, so concurrent traffic can't hide it.
+///
+/// The test floods a dedicated topic from a background thread while
+/// running verify twice — once while the topic is being auto-created
+/// under load, once against the established busy topic. Both must
+/// succeed. Gated on TEST_KAFKA_BROKER like the rest of this file.
+#[test]
+fn verify_busy_topic() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let Some((broker, _shared_topic)) = broker_or_skip() else {
+        return;
+    };
+    // Dedicated topic so the flood doesn't pollute the shared
+    // TEST_KAFKA_TOPIC other tests read back from.
+    let topic = format!("voice-bird-e2e-busy-{}", uuid::Uuid::new_v4());
+
+    // Background flooder: fire-and-forget produces as fast as the
+    // local queue accepts them. FutureProducer wraps a threaded
+    // poller, so dropped delivery futures still get delivered.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flooder = {
+        let stop = Arc::clone(&stop);
+        let broker = broker.clone();
+        let topic = topic.clone();
+        std::thread::spawn(move || {
+            let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
+                .set("bootstrap.servers", &broker)
+                .set("message.timeout.ms", "5000")
+                .create()
+                .expect("create flooder producer");
+            let mut sent: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let key = sent.to_string();
+                let record = rdkafka::producer::FutureRecord::<str, [u8]>::to(&topic)
+                    .key(&key)
+                    .payload(b"{\"filler\":true}");
+                // Enqueue-only; back off briefly when the local
+                // queue is full so the loop doesn't spin.
+                if producer.send_result(record).is_err() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                sent += 1;
+            }
+            sent
+        })
+    };
+
+    let conn = KafkaAgentConnection {
+        endpoint: broker,
+        topic: topic.clone(),
+        client_id: None,
+        acks: Default::default(),
+    };
+    let target = KafkaTarget::new(AgentSessionId("busy-verify".into()), conn);
+
+    // Verify #1: topic is being auto-created under concurrent load.
+    let t1 = target.clone();
+    let first = block_on(async move { t1.verify().await });
+    // Verify #2: topic now exists and is busy — the exact window the
+    // watermark-based assign raced in.
+    let t2 = target.clone();
+    let second = block_on(async move { t2.verify().await });
+
+    stop.store(true, Ordering::Relaxed);
+    let sent = flooder.join().expect("join flooder thread");
+    eprintln!("verify_busy_topic: flooder sent ~{sent} records");
+
+    let e1 = first.unwrap_or_else(|e| {
+        panic!("verify #1 (auto-create under load) on '{topic}' must succeed: {e}")
+    });
+    let e2 = second.unwrap_or_else(|e| {
+        panic!("verify #2 (established busy topic) on '{topic}' must succeed: {e}")
+    });
+    eprintln!("verify_busy_topic: OK in {e1:?} then {e2:?}");
 }
