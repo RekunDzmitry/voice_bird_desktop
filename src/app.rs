@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,11 @@ pub enum AppMode {
     Normal,
     ModelPicker, // wired in Stage 3's Task 18
     Help,
+    /// Status overlay: the most recent Agent events (target saved,
+    /// verify ok/fail, broker errors, dropped segments), newest
+    /// first, each with a timestamp. Opened with `t`; `?` stays
+    /// help-only.
+    Status,
     /// Centered overlay prompting the user to paste a Voice Bird API key.
     /// Opened when `c` toggles cloud on with an empty key, or when the
     /// engine reports an auth failure during recording.
@@ -425,6 +431,65 @@ pub struct App {
     /// logging. Set alongside `verify_rx`; read by the poll
     /// helper on completion.
     pub verify_started: Option<std::time::Instant>,
+
+    /// Rolling log of Agent-related events (target saved,
+    /// verify ok/fail, push failures, dropped segments),
+    /// newest at the back, capped at [`AGENT_EVENT_CAP`].
+    /// Behind an `Arc<PlMutex<...>>` because the recording
+    /// consumer task appends from its own tokio task while
+    /// the render thread reads. Surfaced by the `t` status
+    /// overlay ([`AppMode::Status`]).
+    pub agent_events: Arc<PlMutex<VecDeque<AgentEvent>>>,
+}
+
+/// Cap on [`App::agent_events`]. Big enough to cover a long
+/// recording session's worth of incidents; small enough that the
+/// overlay and memory stay bounded.
+pub const AGENT_EVENT_CAP: usize = 50;
+
+/// One row in the `t` status overlay.
+#[derive(Debug, Clone)]
+pub struct AgentEvent {
+    /// Local wall-clock time the event was recorded.
+    pub at: chrono::DateTime<chrono::Local>,
+    pub message: String,
+}
+
+/// Append an event to the shared agent-event log, evicting the
+/// oldest entry past [`AGENT_EVENT_CAP`]. Free function (not a
+/// method) so the recording consumer task can call it on its
+/// cloned `Arc` without touching `App`.
+pub fn push_agent_event(events: &Arc<PlMutex<VecDeque<AgentEvent>>>, message: impl Into<String>) {
+    let mut buf = events.lock();
+    if buf.len() == AGENT_EVENT_CAP {
+        buf.pop_front();
+    }
+    buf.push_back(AgentEvent {
+        at: chrono::Local::now(),
+        message: message.into(),
+    });
+}
+
+/// Record the outcome of one consumer-task dispatch into the agent
+/// event log. Only outcomes a user would act on become events —
+/// the happy paths (`Pushed`, `Default`, `NotAgent`) stay silent so
+/// the overlay isn't flooded at one row per segment.
+pub fn record_dispatch_event(
+    events: &Arc<PlMutex<VecDeque<AgentEvent>>>,
+    outcome: AgentDispatch,
+    session_id: &str,
+) {
+    match outcome {
+        AgentDispatch::PushFailed => push_agent_event(
+            events,
+            format!("push to Agent target '{session_id}' failed (broker error — see log)"),
+        ),
+        AgentDispatch::Dropped => push_agent_event(
+            events,
+            format!("Agent target '{session_id}' missing — segment dropped"),
+        ),
+        AgentDispatch::NotAgent | AgentDispatch::Default | AgentDispatch::Pushed => {}
+    }
 }
 /// A single row in the Targets picker. The picker renders
 /// one row per known target; rows that point at a target
@@ -573,6 +638,7 @@ impl App {
             funnel: None,
             verify_rx: None,
             verify_started: None,
+            agent_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
         app.load_agent_targets_from_config();
         // user must provide before recording.
@@ -1424,6 +1490,15 @@ impl App {
         };
     }
 
+    /// Toggle the `t` status overlay (recent Agent events).
+    pub fn toggle_status(&mut self) {
+        self.mode = if self.mode == AppMode::Status {
+            AppMode::Normal
+        } else {
+            AppMode::Status
+        };
+    }
+
     /// Resolve the effective settings for a given source. Prefers a
     /// device-specific override (keyed on the actual selected device
     /// name + kind) over the generic Microphone/System fallback.
@@ -1954,6 +2029,7 @@ impl App {
         // picks up the new target") but surprising if the
         // user expects removal to take effect immediately.
         let agent_targets_for_consumer = self.agent_targets.clone();
+        let agent_events_for_consumer = self.agent_events.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
@@ -2014,12 +2090,15 @@ impl App {
                         // slot's target is `Target::Agent`. See
                         // `dispatch_segment_to_agent` for the
                         // default / known-id / missing-id arms.
-                        dispatch_segment_to_agent(
+                        let outcome = dispatch_segment_to_agent(
                             &target_for_consumer,
                             &seg,
                             &agent_state_for_consumer,
                             &agent_targets_for_consumer,
                         );
+                        if let Target::Agent { session_id } = &target_for_consumer {
+                            record_dispatch_event(&agent_events_for_consumer, outcome, session_id);
+                        }
                         // Mirror to the on-disk live tail so the
                         // MCP server process spawned by the agent
                         // runtime sees the same segments. The
@@ -2497,12 +2576,24 @@ impl App {
         };
         match result {
             Ok(elapsed) => {
+                push_agent_event(
+                    &self.agent_events,
+                    format!(
+                        "verify OK for '{}' in {}ms",
+                        f.endpoint.trim(),
+                        elapsed.as_millis()
+                    ),
+                );
                 f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed };
             }
             Err(e) => {
                 if let Some(started) = started {
                     log::warn!("funnel: verify failed after {:?}: {e}", started.elapsed());
                 }
+                push_agent_event(
+                    &self.agent_events,
+                    format!("verify FAILED for '{}': {e}", f.endpoint.trim()),
+                );
                 f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
                     message: format!("{e}"),
                 };
@@ -2907,6 +2998,59 @@ mod tests {
         assert_eq!(out, AgentDispatch::PushFailed);
         assert!(state.pull(10).is_empty());
         assert!(pushed.lock().is_empty());
+    }
+
+    /// `push_agent_event` caps the log at AGENT_EVENT_CAP by
+    /// evicting the oldest entry, and `record_dispatch_event`
+    /// only records the outcomes a user would act on.
+    #[test]
+    fn agent_event_log_caps_and_records_failures_only() {
+        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
+        for i in 0..(AGENT_EVENT_CAP + 5) {
+            push_agent_event(&events, format!("e{i}"));
+        }
+        let buf = events.lock();
+        assert_eq!(buf.len(), AGENT_EVENT_CAP);
+        assert_eq!(buf.front().unwrap().message, "e5");
+        assert_eq!(
+            buf.back().unwrap().message,
+            format!("e{}", AGENT_EVENT_CAP + 4)
+        );
+        drop(buf);
+
+        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
+        // Happy paths stay silent — one row per segment would
+        // flood the overlay.
+        record_dispatch_event(&events, AgentDispatch::Pushed, "id");
+        record_dispatch_event(&events, AgentDispatch::Default, "id");
+        record_dispatch_event(&events, AgentDispatch::NotAgent, "id");
+        assert!(events.lock().is_empty());
+        // Failure paths are recorded with the target id.
+        record_dispatch_event(&events, AgentDispatch::PushFailed, "prod-a");
+        record_dispatch_event(&events, AgentDispatch::Dropped, "prod-b");
+        let buf = events.lock();
+        assert_eq!(buf.len(), 2);
+        assert!(buf[0].message.contains("prod-a"));
+        assert!(buf[1].message.contains("prod-b"));
+        assert!(buf[1].message.contains("dropped"));
+    }
+
+    /// `?` is help-only and `t` owns the status overlay — the two
+    /// modes toggle independently and neither writes a banner.
+    #[test]
+    fn help_and_status_keys_toggle_independent_modes() {
+        let mut app = App::new();
+        app.toggle_help();
+        assert_eq!(app.mode, AppMode::Help);
+        assert!(app.banner.is_none(), "help must not surface a banner");
+        app.toggle_help();
+        assert_eq!(app.mode, AppMode::Normal);
+
+        app.toggle_status();
+        assert_eq!(app.mode, AppMode::Status);
+        assert!(app.banner.is_none(), "status must not surface a banner");
+        app.toggle_status();
+        assert_eq!(app.mode, AppMode::Normal);
     }
 
     #[test]

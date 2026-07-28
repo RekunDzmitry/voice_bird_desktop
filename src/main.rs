@@ -344,6 +344,7 @@ fn run_app<B: Backend>(
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
+                            AppMode::Status => handle_status_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
                             AppMode::PathModal => handle_path_modal(app, key.code),
                             AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
@@ -420,7 +421,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
     }
     match key {
         KeyCode::Char('q') => app.should_quit = true,
+        // `?` is help-only (D7 resolved in #33): status lives on
+        // its own key so a status event can never race the help
+        // modal.
         KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('t') => app.toggle_status(),
         // Tab cycles which section the c/l/m/s/PgUp keys target.
         KeyCode::Tab => {
             app.focus_next();
@@ -1007,10 +1012,18 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
                         app.verify_rx = None;
                         app.verify_started = None;
                         app.mode = AppMode::Normal;
+                        crate::app::push_agent_event(
+                            &app.agent_events,
+                            format!("saved Agent target '{name}'"),
+                        );
                         app.banner = Some(format!("Saved Agent target '{name}'"));
                     }
                     Err(e) => {
                         log::error!("funnel: save failed: {e}");
+                        crate::app::push_agent_event(
+                            &app.agent_events,
+                            format!("save FAILED for Agent target '{name}': {e}"),
+                        );
                         app.banner = Some(format!("Save failed: {e}"));
                     }
                 }
@@ -1070,6 +1083,10 @@ fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
                 .unwrap_or_else(|| id.to_string());
             app.remove_agent_target(id);
             app.mode = AppMode::Normal;
+            crate::app::push_agent_event(
+                &app.agent_events,
+                format!("deleted Agent target '{name}'"),
+            );
             app.banner = Some(format!("Deleted Agent target '{name}'"));
         }
         _ => {
@@ -1128,6 +1145,16 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
             app.toggle_help();
+        }
+        _ => {}
+    }
+}
+
+/// Status overlay (`t`): any of the usual dismiss keys close it.
+fn handle_status_mode(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+            app.toggle_status();
         }
         _ => {}
     }
@@ -1256,6 +1283,31 @@ mod funnel_dispatch_tests {
         for ch in text.chars() {
             handle_agent_funnel(app, KeyCode::Char(ch));
         }
+    }
+
+    /// #33: `?` is help-only and never surfaces a status banner,
+    /// even right after an agent event landed; `t` opens the
+    /// status overlay through the real key path and the usual
+    /// dismiss keys close it.
+    #[test]
+    fn question_mark_is_help_only_and_t_owns_status() {
+        let mut app = App::new();
+        // Seed an agent event as if the recorder just reported one.
+        crate::app::push_agent_event(&app.agent_events, "verify OK for 'broker:9092' in 12ms");
+
+        handle_normal_mode(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.mode, AppMode::Help, "? must open the help overlay");
+        assert!(
+            app.banner.is_none(),
+            "? must never surface a status banner (D7 bridge removed)"
+        );
+        handle_help_mode(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.mode, AppMode::Normal);
+
+        handle_normal_mode(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.mode, AppMode::Status, "t must open the status overlay");
+        handle_status_mode(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, AppMode::Normal);
     }
 
     /// R4 (PR #31 round-3 review): after a green Verify, Enter must
