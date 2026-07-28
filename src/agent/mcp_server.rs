@@ -557,6 +557,8 @@ mod tests {
             None => std::env::remove_var(key),
         }
     }
+
+    #[test]
     fn server_state_buffer_drops_oldest_when_full() {
         let state = ServerState::new(AgentSessionId::default_session());
         for i in 0..(BUFFER_CAP + 5) {

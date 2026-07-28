@@ -87,7 +87,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub input_device: Option<String>,
     /// Kind of the saved device. `None` for old configs / default input.
-    /// Lets `start_recording` pick the right capture path without having
+    /// Lets `start_section` pick the right capture path without having
     /// to re-enumerate and match by name first.
     #[serde(default)]
     pub input_device_kind: Option<AudioSessionKind>,

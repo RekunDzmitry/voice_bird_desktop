@@ -38,7 +38,6 @@ impl SegmentWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     fn seg(t0: f64, t1: f64, text: &str) -> WrittenSegment {

@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -7,8 +7,7 @@ use ratatui::{
 };
 use std::time::Instant;
 
-use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotId, SlotKind};
-use voice_bird_cli::session::layout::SessionSource;
+use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind};
 use voice_bird_cli::session::target::Target;
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -377,22 +376,6 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
         out
     }
 }
-fn source_label(source: &SessionSource) -> String {
-    match source {
-        SessionSource::Microphone => "mic".into(),
-        SessionSource::System => "system".into(),
-        SessionSource::App {
-            name, device_name, ..
-        } => {
-            if device_name.is_empty() {
-                name.clone()
-            } else {
-                format!("{name} on {device_name}")
-            }
-        }
-    }
-}
-
 fn render_section_transcript(f: &mut Frame, area: Rect, section: &Section) {
     let committed = section.committed.lock();
     let refined = section.refined.lock();
@@ -498,7 +481,7 @@ pub fn render_model_picker(f: &mut Frame, area: Rect, app: &App) {
         let msg = if let Some(err) = &g.error {
             format!("Download failed: {}: {}", g.model_id, err)
         } else {
-            let pct = g.total.map(|t| (g.bytes * 100 / t.max(1))).unwrap_or(0);
+            let pct = g.total.map(|t| g.bytes * 100 / t.max(1) ).unwrap_or(0);
             format!("Downloading {}: {pct}%", g.model_id)
         };
         let popup =
@@ -914,7 +897,7 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
 /// `App::focused_target_kind`). This keeps the visible state and
 /// the pickable state in agreement.
 fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
-    use crate::app::TargetKind;
+    
 
     let focused = app.picker_focus == PickerFocus::Targets;
     let rows = app.targets();
@@ -1289,7 +1272,6 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let timer = app.format_duration();
     let status = match &app.status {
         RecordingStatus::Idle => "idle",
-        RecordingStatus::Recording => "● REC",
         RecordingStatus::Error(_) => "ERROR",
     };
     let device_label = app
@@ -1367,7 +1349,6 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn status_style(status: &RecordingStatus) -> Style {
     match status {
-        RecordingStatus::Recording => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         RecordingStatus::Error(_) => Style::default().fg(Color::Red),
         _ => Style::default().fg(Color::Gray),
     }
@@ -1786,7 +1767,8 @@ mod tests {
                     acks: Default::default(),
                 },
             ),
-        });
+        })
+        .expect("upsert test agent target");
         let out = render_to_string(&app, 180, 40);
         // Pane header (focused variant — Devices is the default focus,
         // so the targets pane shows the unfocused title).

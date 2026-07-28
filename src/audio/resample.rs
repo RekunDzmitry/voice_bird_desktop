@@ -3,7 +3,6 @@ use rubato::{FftFixedInOut, Resampler as RubatoResampler};
 const TARGET_SR: u32 = 16_000;
 
 pub struct Resampler {
-    input_sr: u32,
     channels: u16,
     inner: Option<FftFixedInOut<f32>>,
     chunk_size_in: usize,
@@ -28,7 +27,6 @@ impl Resampler {
             (Some(r), actual)
         };
         Ok(Self {
-            input_sr,
             channels,
             inner,
             chunk_size_in,

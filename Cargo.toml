@@ -20,6 +20,13 @@ path = "src/lib.rs"
 [workspace]
 members = [".", "xtask"]
 
+[lints.rust]
+# The pinned `objc` 0.2 macros (msg_send!/class! via screencapturekit 0.3.6)
+# expand `cfg(feature = "cargo-clippy")` into this crate, which trips
+# `unexpected_cfgs`. Declare the value as known instead of silencing the
+# lint; drop this once the macOS audio stack moves to the objc2 ecosystem.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [dependencies]
 # TUI
 ratatui = "0.29"
