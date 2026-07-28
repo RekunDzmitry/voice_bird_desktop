@@ -982,18 +982,13 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
                         voice_bird_cli::agent::AgentSessionId::default_session(),
                         conn.clone(),
                     );
-                    // Drive verify on a dedicated thread with its own
-                    // runtime. The TUI runs inside its own tokio
-                    // runtime, so `block_on` on `Handle::current()`
-                    // would panic.
+                    // Drive verify on the App's own tokio runtime —
+                    // the event loop keeps polling `verify_rx`, so
+                    // nothing blocks. (Pre-#32 this spawned a
+                    // dedicated thread + one-shot runtime.)
                     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("build one-shot tokio runtime");
-                        let r = rt.block_on(target.verify());
-                        let _ = tx.send(r);
+                    app.rt.spawn(async move {
+                        let _ = tx.send(target.verify().await);
                     });
                     app.verify_rx = Some(rx);
                     app.verify_started = Some(std::time::Instant::now());

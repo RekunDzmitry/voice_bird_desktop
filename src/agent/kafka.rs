@@ -13,11 +13,12 @@
 //! socket, and avoids holding a TCP connection open for the lifetime
 //! of the TUI for targets the user may never record against.
 //!
-//! The trait's [`AgentTarget::push_segment`] is sync; rdkafka's
-//! `send` returns an async future. The Kafka target exposes
-//! `pub async fn push_segment_async` and a sync wrapper
-//! that spawns a fresh thread+runtime so the trait impl
-//! doesn't deadlock the caller's tokio runtime.
+//! [`AgentTarget::push_segment`] is async (since #32), so the
+//! trait impl returns rdkafka's future directly — the recorder's
+//! consumer task awaits it on the runtime it already runs on. The
+//! pre-#32 sync bridge (a dedicated thread + one-shot runtime per
+//! call) is gone.
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -281,11 +282,18 @@ impl KafkaTarget {
         ))
     }
 
-    /// Push a `Segment` to the configured broker + topic. Async
-    /// sibling of [`AgentTarget::push_segment`] — the trait
-    /// implementation calls this from a sync context via
-    /// [`block_on_current`].
-    pub async fn push_segment_async(&self, segment: &Segment) -> anyhow::Result<()> {
+}
+
+#[async_trait]
+impl AgentTarget for KafkaTarget {
+    fn session_id(&self) -> AgentSessionId {
+        self.inner.session.clone()
+    }
+
+    /// Push a `Segment` to the configured broker + topic. Runs on
+    /// the caller's runtime (the recorder's consumer task) — no
+    /// thread bridge, no per-call runtime.
+    async fn push_segment(&self, segment: &Segment) -> anyhow::Result<()> {
         let producer = self.producer()?;
 
         // Stable partition key: the segment's start time so all
@@ -311,48 +319,6 @@ impl KafkaTarget {
         }
         buf.push_back(segment.clone());
         Ok(())
-    }
-}
-
-impl AgentTarget for KafkaTarget {
-    fn session_id(&self) -> AgentSessionId {
-        self.inner.session.clone()
-    }
-
-    fn push_segment(&self, segment: &Segment) -> anyhow::Result<()> {
-        // Drive the async producer on a dedicated thread
-        // with its own current-thread runtime. The
-        // recorder spawns the consumer task on the TUI
-        // runtime; using `block_on` from inside that
-        // runtime would panic. Spinning a fresh thread
-        // here keeps the two runtimes isolated — rdkafka's
-        // background tasks need a real reactor, which
-        // `block_on` on a `Handle` already provides, but
-        // only if the future cooperatively yields and
-        // doesn't deadlock the executor. A separate thread
-        // sidesteps that risk entirely.
-        let seg = segment.clone();
-        let this = self.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build one-shot tokio runtime");
-            let r = rt.block_on(this.push_segment_async(&seg));
-            let _ = tx.send(r);
-        });
-        // Block until the worker sends its result. The only way
-        // `recv` returns Err here is if the worker thread
-        // panicked (which also drops the channel) or the OS
-        // killed the thread — either way the segment wasn't
-        // delivered. Surface that as a per-segment error so the
-        // consumer task logs and moves on; we deliberately do
-        // NOT panic the recorder for a single misbehaving
-        // segment, matching the trait's "best-effort, errors
-        // are non-fatal" contract.
-        rx.recv()
-            .map_err(|e| anyhow::anyhow!("producer worker join failed: {e}"))?
     }
 
     fn pull_recent(&self, limit: usize) -> Vec<Segment> {
