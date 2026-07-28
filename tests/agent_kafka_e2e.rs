@@ -137,12 +137,34 @@ fn funnel_to_kafka_round_trip() {
             .push_segment(&seg)
             .map_err(|e| anyhow::anyhow!("push_segment failed: {e}"))?;
 
-        // 4. Subscribe a consumer from the start of the
-        //    topic and pull the JSON line back. We use a
-        //    30 s wall-clock ceiling to absorb broker
-        //    bring-up on a cold test cluster.
+        // 4. Build a read-back consumer and `assign()` it from
+        //    offset 0 on every partition. We use `assign` rather
+        //    than `subscribe` so the test doesn't depend on a
+        //    consumer-group join — `subscribe` round-trips the
+        //    coordinator and can chew the wall-clock budget on a
+        //    cold broker before the first poll returns. `assign`
+        //    is a local command and starts polling on the next
+        //    `recv()` call. We use a 30 s wall-clock ceiling to
+        //    absorb broker bring-up on a cold test cluster.
         let consumer = build_consumer(&broker);
-        consumer.subscribe(&[&topic])?;
+        let md = consumer
+            .fetch_metadata(Some(&topic), Duration::from_secs(5))
+            .map_err(|e| anyhow::anyhow!("read-back metadata fetch failed: {e}"))?;
+        let partitions = md
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .ok_or_else(|| anyhow::anyhow!("read-back: topic '{topic}' not in metadata"))?
+            .partitions();
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        for p in partitions {
+            tpl.add_partition_offset(
+                &topic,
+                p.id(),
+                rdkafka::topic_partition_list::Offset::Offset(0),
+            )?;
+        }
+        consumer.assign(&tpl)?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {

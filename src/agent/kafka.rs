@@ -158,15 +158,11 @@ impl KafkaTarget {
         // resolve the "log end" at *assignment* time, so the
         // probe we produce right after would already be behind
         // us and the consumer would never see it. `assign()`
-        // with an explicit end-offset is a synchronous metadata
-        // round-trip — fast and race-free.
-        //
-        // Fetch topic metadata first to discover the
-        // partitions; then ask each partition for its
-        // end-offset (`watermark` with timeout = now); then
-        // `assign()` the consumer to those offsets; *then*
-        // produce. The consumer is now positioned exactly at
-        // the head with no delay between assign and produce.
+        // with an explicit offset is a synchronous local command
+        // — fast and race-free. The probe lands at
+        // `high - 1` on its partition, and we replay every
+        // partition from `high - 1` so the consumer is
+        // always positioned at or before the probe.
         let consumer = build_consumer(
             &self.inner.connection,
             &self.inner.session,
@@ -181,42 +177,17 @@ impl KafkaTarget {
             // rewinds the assignment.
             "latest",
         )?;
-        let metadata = consumer
-            .fetch_metadata(Some(&topic), Duration::from_secs(5))
-            .map_err(|e| {
-                anyhow::anyhow!("verify metadata fetch failed: {e} (broker={})", self.inner.connection.endpoint)
-            })?;
-        let topic_meta = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == topic)
-            .ok_or_else(|| anyhow::anyhow!("verify: topic '{}' not in metadata", topic))?;
-        if topic_meta.partitions().is_empty() {
-            return Err(anyhow::anyhow!(
-                "verify: topic '{}' has no partitions",
-                topic
-            ));
- }
-        let mut tpl = rdkafka::TopicPartitionList::new();
-        for p in topic_meta.partitions() {
-            let (_low, high) = consumer
-                .fetch_watermarks(&topic, p.id(), Duration::from_secs(5))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "verify watermark fetch failed (topic={}, partition={}): {e}",
-                        topic,
-                        p.id()
-                    )
-                })?;
-            // `high` is the offset of the next message that
-            // will be produced — i.e. the head. The consumer
-            tpl.add_partition_offset(&topic, p.id(), rdkafka::Offset::Offset(high))?;
-        }
-        consumer.assign(&tpl)?;
-
-        // Produce the probe. `acks=all` (the default) means
-        // this future only resolves once the ISR has the
-        // record.
+        // Produce the probe. The produce is the canonical
+        // "is this broker reachable AND can it accept a record
+        // for this topic?" check: it covers connection,
+        // authorization, and topic auto-create in one shot.
+        // The metadata-first ordering we had before was a
+        // correctly-faster path on pre-existing topics but
+        // raced against auto-create on fresh ones (R6), and
+        // the actionable error message for the auto-create-off
+        // case never reached the user (the fallback swallowed
+        // it). Producing first gives one code path and one
+        // honest error stream.
         let record: FutureRecord<'_, String, Vec<u8>> =
             FutureRecord::to(&topic).key(&key).payload(&probe_bytes);
         producer
@@ -224,10 +195,28 @@ impl KafkaTarget {
             .await
             .map_err(|(e, _msg)| {
                 anyhow::anyhow!(
-                    "produce probe failed: {e} (broker={})",
+                    "produce probe failed: {e} (broker={}). \
+                     If the broker has auto.create.topics.enable=false, \
+                     create the topic '{topic}' manually first.",
                     self.inner.connection.endpoint
                 )
             })?;
+        // Now the topic is guaranteed to exist with at least
+        // one partition (either it pre-existed, or the produce
+        // above triggered auto-create). Fetch metadata +
+        // watermarks and assign the consumer at `high - 1` on
+        // every partition — the probe we just produced is at
+        // `high - 1` on its partition, and we don't know which
+        // partition without a separate scan, but `high - 1`
+        // on every partition is a superset: the consumer will
+        // replay the probe (and nothing later) on the
+        // partition that has it, and start at the probe's
+        // offset on the partition that doesn't. Either way
+        // the probe lands at or before the consumer's
+        // position, so the recv loop below will see it within
+        // the verify deadline.
+        let tpl = self.assign_at_probe_offset(&consumer, &topic).await?;
+        consumer.assign(&tpl)?;
 
         // Poll until we see the probe id or the timeout elapses.
         let deadline = Instant::now() + VERIFY_TIMEOUT;
@@ -263,6 +252,63 @@ impl KafkaTarget {
             VERIFY_TIMEOUT,
             topic_for_loop
         ))
+    }
+
+    /// Build a `TopicPartitionList` that positions the consumer
+    /// at the offset of the probe we just produced. `assign()`
+    /// happens at `high - 1` on every partition so the consumer
+    /// will replay the probe (whichever partition it landed on)
+    /// and all subsequent records. We don't know which partition
+    /// the probe landed on without a separate scan, but
+    /// `high - 1` on every partition is a superset: the consumer
+    /// will replay the probe on the partition that has it, and
+    /// start at the probe's offset on the partition that
+    /// doesn't. Either way the probe lands at or before the
+    /// consumer's position, so the recv loop below will see it
+    /// within the verify deadline.
+    async fn assign_at_probe_offset(
+        &self,
+        consumer: &StreamConsumer,
+        topic: &str,
+    ) -> anyhow::Result<rdkafka::TopicPartitionList> {
+        let metadata = consumer
+            .fetch_metadata(Some(topic), Duration::from_secs(5))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "verify metadata fetch failed (after produce): {e} (broker={})",
+                    self.inner.connection.endpoint
+                )
+            })?;
+        let topic_meta = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verify: topic '{topic}' is still missing after a successful produce — \
+                     the broker is reporting inconsistent state"
+                )
+            })?;
+        if topic_meta.partitions().is_empty() {
+            anyhow::bail!(
+                "verify: topic '{topic}' has no partitions even after a successful produce \
+                 — the broker is reporting inconsistent state"
+            );
+        }
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        for p in topic_meta.partitions() {
+            let (_low, high) = consumer
+                .fetch_watermarks(topic, p.id(), Duration::from_secs(5))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "verify watermark fetch failed (topic={topic}, partition={}): {e}",
+                        p.id()
+                    )
+                })?;
+            let start = high.saturating_sub(1);
+            tpl.add_partition_offset(topic, p.id(), rdkafka::Offset::Offset(start))?;
+        }
+        Ok(tpl)
     }
 
     /// Push a `Segment` to the configured broker + topic. Async
