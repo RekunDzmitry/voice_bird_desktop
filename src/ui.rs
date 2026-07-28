@@ -824,8 +824,9 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
         AgentFunnelStep::Save => "[Enter] save  [Esc] cancel",
         _ => "[Enter] next  [Esc] cancel",
     };
+    let back_hint = "  [←] back";
     lines.push(Line::from(Span::styled(
-        footer,
+        format!("{footer}{back_hint}"),
         Style::default().fg(Color::DarkGray),
     )));
 

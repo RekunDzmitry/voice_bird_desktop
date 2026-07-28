@@ -202,22 +202,35 @@ impl AgentFunnel {
             5 => AgentFunnelStep::Verify,
             _ => AgentFunnelStep::Save,
         };
+        // Stepping back to an editable step means the user is
+        // about to change the form, which invalidates any prior
+        // verify outcome (R5). Stepping back to Verify itself is
+        // a no-op for the outcome (the user is back on the
+        // step whose outcome it is).
+        if !matches!(self.step, AgentFunnelStep::Verify) {
+            self.verify = VerifyOutcome::Pending;
+        }
     }
 
     /// Push a character into the active text field. Only
     /// meaningful on the Name / Endpoint / Topic steps; the
-    /// other steps ignore the result.
+    /// other steps ignore the result. Editing any text field
+    /// invalidates a prior verify outcome: the connection chosen
+    /// by the form may no longer match the connection that was
+    /// probed, so the green "OK" must be cleared (R5).
     pub fn type_char(&mut self, ch: char) {
         match self.step {
             AgentFunnelStep::Name => self.name.push(ch),
             AgentFunnelStep::Endpoint => self.endpoint.push(ch),
             AgentFunnelStep::Topic => self.topic.push(ch),
-            _ => {}
+            _ => return,
         }
+        self.verify = VerifyOutcome::Pending;
     }
 
     /// Pop the last character of the active text field. No-op
-    /// on non-text steps.
+    /// on non-text steps. Editing any text field invalidates a
+    /// prior verify outcome (R5).
     pub fn backspace(&mut self) {
         match self.step {
             AgentFunnelStep::Name => {
@@ -229,8 +242,9 @@ impl AgentFunnel {
             AgentFunnelStep::Topic => {
                 self.topic.pop();
             }
-            _ => {}
+            _ => return,
         }
+        self.verify = VerifyOutcome::Pending;
     }
 }
 

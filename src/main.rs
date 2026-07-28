@@ -961,33 +961,38 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
         KeyCode::Left => funnel.back(),
         KeyCode::Enter => match funnel.step {
             AgentFunnelStep::Verify => {
-                // Re-run if the user just hit Enter again — the
-                // previous probe has already drained (or never
-                // started); always replace the in-flight
-                // channel and start a fresh probe. The TUI
+                // Enter on a green probe advances to Save.
+                // Pending/InProgress/Err re-spawns the probe
+                // (the previous probe has already drained or
+                // never started; always replace the in-flight
+                // channel and start a fresh one). The TUI
                 // event loop polls `verify_rx` each tick, so
-                // we no longer block here.
-                funnel.verify = VerifyOutcome::InProgress;
-                let conn = funnel.kafka_connection();
-                let target = KafkaTarget::new(
-                    voice_bird_cli::agent::AgentSessionId::default_session(),
-                    conn.clone(),
-                );
-                // Drive verify on a dedicated thread with its own
-                // runtime. The TUI runs inside its own tokio
-                // runtime, so `block_on` on `Handle::current()`
-                // would panic.
-                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build one-shot tokio runtime");
-                    let r = rt.block_on(target.verify());
-                    let _ = tx.send(r);
-                });
-                app.verify_rx = Some(rx);
-                app.verify_started = Some(std::time::Instant::now());
+                // we don't block here.
+                if matches!(funnel.verify, VerifyOutcome::Ok { .. }) {
+                    funnel.advance();
+                } else {
+                    funnel.verify = VerifyOutcome::InProgress;
+                    let conn = funnel.kafka_connection();
+                    let target = KafkaTarget::new(
+                        voice_bird_cli::agent::AgentSessionId::default_session(),
+                        conn.clone(),
+                    );
+                    // Drive verify on a dedicated thread with its own
+                    // runtime. The TUI runs inside its own tokio
+                    // runtime, so `block_on` on `Handle::current()`
+                    // would panic.
+                    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build one-shot tokio runtime");
+                        let r = rt.block_on(target.verify());
+                        let _ = tx.send(r);
+                    });
+                    app.verify_rx = Some(rx);
+                    app.verify_started = Some(std::time::Instant::now());
+                }
             }
             AgentFunnelStep::Save => {
                 let config = funnel.to_config();
@@ -1020,12 +1025,15 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
         },
         KeyCode::Char('1') if funnel.step == AgentFunnelStep::Acks => {
             funnel.acks = voice_bird_cli::config::KafkaAcks::All;
+            funnel.verify = VerifyOutcome::Pending;
         }
         KeyCode::Char('2') if funnel.step == AgentFunnelStep::Acks => {
             funnel.acks = voice_bird_cli::config::KafkaAcks::One;
+            funnel.verify = VerifyOutcome::Pending;
         }
         KeyCode::Char('3') if funnel.step == AgentFunnelStep::Acks => {
             funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
+            funnel.verify = VerifyOutcome::Pending;
         }
         KeyCode::Char(ch) => funnel.type_char(ch),
         _ => {}
