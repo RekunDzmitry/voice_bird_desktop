@@ -1035,6 +1035,20 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
             funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
             funnel.verify = VerifyOutcome::Pending;
         }
+        // Security-protocol picker: 1-4 map onto
+        // KafkaSecurityProtocol::ALL in render order.
+        KeyCode::Char(ch @ '1'..='4') if funnel.step == AgentFunnelStep::Security => {
+            let idx = (ch as u8 - b'1') as usize;
+            funnel.security_protocol = voice_bird_cli::config::KafkaSecurityProtocol::ALL[idx];
+            funnel.verify = VerifyOutcome::Pending;
+        }
+        // SASL-mechanism picker: 1-3 map onto
+        // KafkaSaslMechanism::ALL in render order.
+        KeyCode::Char(ch @ '1'..='3') if funnel.step == AgentFunnelStep::SaslMechanism => {
+            let idx = (ch as u8 - b'1') as usize;
+            funnel.sasl_mechanism = voice_bird_cli::config::KafkaSaslMechanism::ALL[idx];
+            funnel.verify = VerifyOutcome::Pending;
+        }
         KeyCode::Char(ch) => funnel.type_char(ch),
         _ => {}
     }
@@ -1237,18 +1251,21 @@ mod funnel_dispatch_tests {
         app.open_add_agent_funnel();
         assert_eq!(app.mode, AppMode::AgentFunnel);
 
-        // 1/7 connection kind (Kafka is preselected)
+        // 1/8 connection kind (Kafka is preselected)
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 2/7 name
+        // 2/8 name
         type_str(&mut app, "prod");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 3/7 broker endpoint
+        // 3/8 broker endpoint
         type_str(&mut app, "localhost:19092");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 4/7 topic
+        // 4/8 topic
         type_str(&mut app, "voice-bird-events");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 5/7 acks (keep the default: All)
+        // 5/8 acks (keep the default: All)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 6/8 security (keep the default: plaintext, which skips
+        // the three SASL steps entirely)
         handle_agent_funnel(&mut app, KeyCode::Enter);
         assert_eq!(
             app.funnel.as_ref().unwrap().step,

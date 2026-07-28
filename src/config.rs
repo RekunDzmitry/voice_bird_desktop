@@ -219,10 +219,106 @@ impl KafkaAcks {
     }
 }
 
+/// Wire security for a Kafka Agent target, mapping 1:1 onto
+/// librdkafka's `security.protocol`. Voice transcripts are
+/// sensitive — anything but a localhost broker should run at
+/// least `ssl`. Defaults to `plaintext` for backward
+/// compatibility with configs written before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaSecurityProtocol {
+    /// No encryption, no authentication. Only sane for localhost
+    /// or an otherwise-trusted network.
+    #[default]
+    Plaintext,
+    /// TLS-encrypted, no client authentication.
+    Ssl,
+    /// SASL authentication over an unencrypted connection.
+    /// Credentials AND transcripts travel in the clear — prefer
+    /// `sasl_ssl` unless the network is trusted.
+    SaslPlaintext,
+    /// SASL authentication over TLS. The right choice for any
+    /// non-localhost broker.
+    SaslSsl,
+}
+
+impl KafkaSecurityProtocol {
+    /// Every variant, in the order the funnel's picker renders.
+    pub const ALL: [Self; 4] = [
+        Self::Plaintext,
+        Self::Ssl,
+        Self::SaslPlaintext,
+        Self::SaslSsl,
+    ];
+
+    /// librdkafka `security.protocol` string form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Ssl => "ssl",
+            Self::SaslPlaintext => "sasl_plaintext",
+            Self::SaslSsl => "sasl_ssl",
+        }
+    }
+
+    /// Human-readable label rendered in the funnel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plaintext => "Plaintext (localhost only)",
+            Self::Ssl => "SSL/TLS",
+            Self::SaslPlaintext => "SASL over plaintext",
+            Self::SaslSsl => "SASL over SSL/TLS (recommended)",
+        }
+    }
+
+    /// Whether this protocol needs SASL credentials
+    /// (mechanism + username + password).
+    pub fn uses_sasl(self) -> bool {
+        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
+    }
+}
+
+/// SASL mechanism for the `sasl_*` security protocols. PLAIN and
+/// SCRAM are built into librdkafka; GSSAPI/Kerberos is deliberately
+/// not offered (it would drag in a system libsasl2 dependency and
+/// break the static, self-contained binary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum KafkaSaslMechanism {
+    /// Username/password in the clear inside the SASL exchange —
+    /// pair with `sasl_ssl` so TLS covers it.
+    #[default]
+    Plain,
+    // Explicit renames: derived kebab-case would give
+    // "scram-sha256"; pin the canonical mechanism spelling.
+    #[serde(rename = "scram-sha-256")]
+    ScramSha256,
+    #[serde(rename = "scram-sha-512")]
+    ScramSha512,
+}
+
+impl KafkaSaslMechanism {
+    /// Every variant, in the order the funnel's picker renders.
+    pub const ALL: [Self; 3] = [Self::Plain, Self::ScramSha256, Self::ScramSha512];
+
+    /// librdkafka `sasl.mechanism` string form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
 /// Connection details for a Kafka-flavoured Agent target. Endpoint
 /// is a librdkafka bootstrap list (e.g. `"localhost:9092"` or
 /// `"broker-1:9092,broker-2:9092"`); topic is the destination
 /// partition key the segment JSON lines get published to.
+///
+/// The SASL password is referenced by environment-variable NAME
+/// (`sasl_password_env`), never stored in `config.toml` — the config
+/// file syncs/backs up too easily to hold a secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KafkaAgentConnection {
     pub endpoint: String,
@@ -231,6 +327,50 @@ pub struct KafkaAgentConnection {
     pub client_id: Option<String>,
     #[serde(default)]
     pub acks: KafkaAcks,
+    #[serde(default)]
+    pub security_protocol: KafkaSecurityProtocol,
+    /// Only consulted when `security_protocol` uses SASL; `None`
+    /// there means [`KafkaSaslMechanism::Plain`].
+    #[serde(default)]
+    pub sasl_mechanism: Option<KafkaSaslMechanism>,
+    #[serde(default)]
+    pub sasl_username: Option<String>,
+    /// NAME of the environment variable that holds the SASL
+    /// password (e.g. `VOICE_BIRD_KAFKA_PASSWORD`). Resolved when
+    /// the producer/consumer is built, so the secret itself never
+    /// touches the config file.
+    #[serde(default)]
+    pub sasl_password_env: Option<String>,
+}
+
+impl KafkaAgentConnection {
+    /// Validate the SASL field combination. `Ok(())` for non-SASL
+    /// protocols regardless of the (ignored) SASL fields, so old
+    /// configs and hand-edits stay loadable.
+    pub fn validate_security(&self) -> anyhow::Result<()> {
+        if !self.security_protocol.uses_sasl() {
+            return Ok(());
+        }
+        let proto = self.security_protocol.as_str();
+        if self
+            .sasl_username
+            .as_deref()
+            .is_none_or(|u| u.trim().is_empty())
+        {
+            anyhow::bail!("security protocol '{proto}' requires sasl_username");
+        }
+        if self
+            .sasl_password_env
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty())
+        {
+            anyhow::bail!(
+                "security protocol '{proto}' requires sasl_password_env \
+                 (the NAME of an environment variable holding the password)"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One user-configured Agent target. `id` is the stable key
@@ -583,6 +723,10 @@ refinement_beam_size = 5
                 topic: "voice-bird-events".into(),
                 client_id: Some("svc".into()),
                 acks: KafkaAcks::All,
+                security_protocol: Default::default(),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
             }),
         });
         c.save_to(&path).unwrap();
@@ -599,6 +743,119 @@ refinement_beam_size = 5
         );
     }
 
+    /// A SASL-secured target round-trips through TOML with all
+    /// four security fields intact, and the wire strings are
+    /// pinned (librdkafka gets them verbatim via `as_str`, but
+    /// the config file uses the serde snake/kebab-case forms).
+    #[test]
+    fn sasl_agent_target_round_trips_through_toml() {
+        use crate::config::{
+            AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection,
+            KafkaSaslMechanism, KafkaSecurityProtocol,
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.agent_targets.push(AgentTargetConfig {
+            id: "sec-1".into(),
+            name: "secure".into(),
+            connection: AgentConnection::Kafka(KafkaAgentConnection {
+                endpoint: "broker:9093".into(),
+                topic: "events".into(),
+                client_id: None,
+                acks: KafkaAcks::All,
+                security_protocol: KafkaSecurityProtocol::SaslSsl,
+                sasl_mechanism: Some(KafkaSaslMechanism::ScramSha256),
+                sasl_username: Some("svc-user".into()),
+                sasl_password_env: Some("VB_KAFKA_PW".into()),
+            }),
+        });
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.agent_targets, c.agent_targets);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("security_protocol = \"sasl_ssl\""),
+            "security_protocol wire format drift: {body}"
+        );
+        assert!(
+            body.contains("sasl_mechanism = \"scram-sha-256\""),
+            "sasl_mechanism wire format drift: {body}"
+        );
+        // The password itself must never appear — only the env
+        // var NAME is stored.
+        assert!(
+            body.contains("sasl_password_env = \"VB_KAFKA_PW\""),
+            "sasl_password_env missing: {body}"
+        );
+    }
+
+    /// Configs written before the security fields existed load
+    /// with plaintext defaults (backward compatibility).
+    #[test]
+    fn pre_security_config_rows_default_to_plaintext() {
+        use crate::config::KafkaSecurityProtocol;
+        let toml_row = r#"
+            [[agent_targets]]
+            id = "old-1"
+            name = "legacy"
+            kind = "kafka"
+            endpoint = "localhost:9092"
+            topic = "voice-bird"
+        "#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            agent_targets: Vec<AgentTargetConfig>,
+        }
+        let w: Wrapper = toml::from_str(toml_row).unwrap();
+        let AgentConnection::Kafka(k) = &w.agent_targets[0].connection;
+        assert_eq!(k.security_protocol, KafkaSecurityProtocol::Plaintext);
+        assert!(k.sasl_mechanism.is_none());
+        assert!(k.sasl_username.is_none());
+        assert!(k.sasl_password_env.is_none());
+    }
+
+    /// `validate_security` rejects SASL protocols missing a
+    /// username or password env-var name, and ignores stale SASL
+    /// fields on non-SASL protocols.
+    #[test]
+    fn validate_security_enforces_sasl_fields() {
+        use crate::config::{KafkaSaslMechanism, KafkaSecurityProtocol};
+        let base = KafkaAgentConnection {
+            endpoint: "b:9093".into(),
+            topic: "t".into(),
+            client_id: None,
+            acks: KafkaAcks::All,
+            security_protocol: KafkaSecurityProtocol::SaslSsl,
+            sasl_mechanism: Some(KafkaSaslMechanism::Plain),
+            sasl_username: Some("u".into()),
+            sasl_password_env: Some("PW_ENV".into()),
+        };
+        assert!(base.validate_security().is_ok());
+
+        let mut no_user = base.clone();
+        no_user.sasl_username = None;
+        assert!(no_user.validate_security().is_err());
+        let mut blank_user = base.clone();
+        blank_user.sasl_username = Some("  ".into());
+        assert!(blank_user.validate_security().is_err());
+
+        let mut no_pw = base.clone();
+        no_pw.sasl_password_env = None;
+        assert!(no_pw.validate_security().is_err());
+
+        // Missing mechanism is fine — it defaults to PLAIN.
+        let mut no_mech = base.clone();
+        no_mech.sasl_mechanism = None;
+        assert!(no_mech.validate_security().is_ok());
+
+        // Plaintext ignores half-filled SASL fields entirely.
+        let mut plain = base.clone();
+        plain.security_protocol = KafkaSecurityProtocol::Plaintext;
+        plain.sasl_username = None;
+        assert!(plain.validate_security().is_ok());
+    }
+
     /// `upsert_agent_target` updates in place when the id
     /// matches, and appends otherwise. Pin both branches.
     #[test]
@@ -613,6 +870,10 @@ refinement_beam_size = 5
                 topic: "t1".into(),
                 client_id: None,
                 acks: KafkaAcks::All,
+                security_protocol: Default::default(),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
             }),
         };
         c.upsert_agent_target(target.clone()).unwrap();
@@ -650,6 +911,10 @@ refinement_beam_size = 5
                 topic: "t1".into(),
                 client_id: None,
                 acks: KafkaAcks::All,
+                security_protocol: Default::default(),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
             }),
         };
         assert!(c.upsert_agent_target(bad).is_err());
@@ -664,6 +929,10 @@ refinement_beam_size = 5
                 topic: "t1".into(),
                 client_id: None,
                 acks: KafkaAcks::All,
+                security_protocol: Default::default(),
+                sasl_mechanism: None,
+                sasl_username: None,
+                sasl_password_env: None,
             }),
         };
         assert!(c.upsert_agent_target(good).is_ok());
