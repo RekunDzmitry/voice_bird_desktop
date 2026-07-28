@@ -1181,6 +1181,29 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
     };
     let api_key_buf_len = app.api_key_buf.as_ref().map(|s| s.len()).unwrap_or(0);
 
+    // Funnel state so a harness (e.g. scripts/demo-kafka.sh) can
+    // drive the Add-Agent form step by step and wait for the
+    // verify probe instead of sleeping blind.
+    let funnel_step = app
+        .funnel
+        .as_ref()
+        .map(|f| format!("{:?}", f.step))
+        .unwrap_or_default();
+    let funnel_verify = app
+        .funnel
+        .as_ref()
+        .map(|f| match &f.verify {
+            voice_bird_cli::agent_funnel::VerifyOutcome::Pending => "Pending".to_string(),
+            voice_bird_cli::agent_funnel::VerifyOutcome::InProgress => "InProgress".to_string(),
+            voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed } => {
+                format!("Ok:{}ms", elapsed.as_millis())
+            }
+            voice_bird_cli::agent_funnel::VerifyOutcome::Err { message } => {
+                format!("Err:{message}")
+            }
+        })
+        .unwrap_or_default();
+
     let snap = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "last_key": last_key,
@@ -1201,6 +1224,8 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         "selected_app_index": app.selected_app_index,
         "selected_app_name": selected_app_name,
         "picker_focus": format!("{:?}", app.picker_focus),
+        "funnel_step": funnel_step,
+        "funnel_verify": funnel_verify,
         "voicebird_api_key_masked": api_key_masked,
         "api_key_buf_len": api_key_buf_len,
         "committed_count": committed_count,
