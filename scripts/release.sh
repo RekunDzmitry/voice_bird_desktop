@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 
 DRY_RUN=0
 SKIP_BUILD=0
+WITH_KAFKA=0
 
 red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
@@ -26,6 +27,9 @@ Commands:
 Options:
   --dry-run     Print publish commands without executing them
   --skip-build  Skip build when running 'all'
+  --with-kafka  Run the manual Kafka e2e demo (scripts/demo-kafka.sh)
+                before releasing; needs Docker or a broker on
+                localhost:9092
 
 Prerequisites:
   cargo:  cargo login
@@ -107,6 +111,10 @@ cmd_pypi() {
 }
 
 cmd_all() {
+  if [ "$WITH_KAFKA" = "1" ]; then
+    bold "Running Kafka e2e demo..."
+    ./scripts/demo-kafka.sh || { red "Kafka demo failed; aborting release"; exit 1; }
+  fi
   if [ "$SKIP_BUILD" != "1" ]; then
     cmd_build
   fi
@@ -125,6 +133,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
+    --with-kafka) WITH_KAFKA=1 ;;
     *) usage ;;
   esac
   shift

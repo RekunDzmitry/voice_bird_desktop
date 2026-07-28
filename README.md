@@ -201,6 +201,13 @@ voice-bird-cli
 
 ## Development
 
+Before a release, the Kafka Agent-target path can be exercised end to end against a real broker (started via Docker if `localhost:9092` is empty). The script drives the actual TUI binary through the Add-Agent funnel — including the produce/consume verify probe — and prints a one-line summary:
+
+```bash
+./scripts/demo-kafka.sh              # standalone
+./scripts/release.sh all --with-kafka  # as a release gate
+```
+
 ```bash
 cargo build            # debug build
 cargo test             # unit + integration tests (mock engines, no downloads)
