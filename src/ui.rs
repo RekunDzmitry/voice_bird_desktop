@@ -2145,6 +2145,21 @@ mod tests {
                     refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
                     label: "EPOS PC 8 USB + Chrome -> Cloud".into(),
                     target: saved_target.clone(),
+                    // The test only cares about the device/target
+                    // picker pin rendering, not resume — supply
+                    // the metadata slots with safe defaults that
+                    // match what stop_section would persist for a
+                    // real Cloud session.
+                    source: voice_bird_cli::session::layout::SessionSource::App {
+                        id: "chrome".into(),
+                        name: "Chrome".into(),
+                        device_name: "EPOS PC 8 USB".into(),
+                    },
+                    settings: crate::app::SectionSettings {
+                        cloud_on: true,
+                        language: "en".into(),
+                        model: "tiny.en".into(),
+                    },
                 },
             },
         };

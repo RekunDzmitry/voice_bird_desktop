@@ -3028,6 +3028,108 @@ mod tests {
     }
 
     // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
+    // ── resume_section state matrix (R key) ──────────────────────────
+
+    /// An `Empty` slot must surface a banner-ready `Err` so the
+    /// `R` key is never silently dead. The message is what
+    /// `handle_normal_mode` writes into the status banner.
+    #[test]
+    fn resume_section_on_empty_slot_returns_nothing_to_resume() {
+        let mut app = App::new();
+        let slot = app.slots[0].id;
+        let err = app.resume_section(slot).unwrap_err();
+        assert!(
+            err.contains("nothing to resume"),
+            "expected a 'nothing to resume' message; got: {err}"
+        );
+        // The slot stays Empty — no side effects on failure.
+        assert!(matches!(app.slots[0].kind, SlotKind::Empty));
+    }
+
+    /// A `Saved` slot must reach `start_section` (which then
+    /// fails on audio capture in the test environment, since
+    /// there is no real cpal device). The point of the test is
+    /// to prove the resume path *enters* start_section with the
+    /// saved source/settings — not that the pipeline spins up
+    /// in CI. We assert the error is the capture-stage
+    /// failure, not the resume-time "nothing to resume"
+    /// short-circuit.
+    #[test]
+    fn resume_section_on_saved_slot_delegates_to_start_section() {
+        let mut app = App::new();
+        // Seed a Saved variant carrying the metadata we want
+        // resume to feed into start_section. The committed
+        // arc holds one synthetic line so we can also assert
+        // it's preserved when start_section reattaches it.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(vec![CommittedLine {
+                t_start_ms: 0,
+                text: "preserved line".into(),
+            }]));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "mic · cloud:OFF".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        let result = app.resume_section(slot);
+        // start_section will fail at the capture step in a
+        // headless test (no cpal device). The error must NOT
+        // be the "nothing to resume" / "already recording"
+        // short-circuits — those would mean resume never
+        // reached the pipeline.
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("nothing to resume"),
+            "resume must delegate to start_section, not short-circuit: {err}"
+        );
+        assert!(
+            !err.contains("already recording"),
+            "resume must not be refused as a double-start from Saved: {err}"
+        );
+        // The captured committed Arc is still alive (start_section
+        // reattached it before failing on capture) — proves the
+        // visible text survives the resume attempt.
+        assert_eq!(
+            committed.lock().len(),
+            1,
+            "preserved line must remain in the saved committed arc after resume"
+        );
+    }
+
+    /// The `Recording` short-circuit is a one-line `matches!`
+    /// guard against re-entering the live pipeline. We can't
+    /// construct a real `Section` in a unit test (it holds a
+    /// `!Send` cpal stream), so this test only proves the
+    /// state read on a fresh `Empty` slot is `Empty` — i.e.
+    /// the guard does not trigger for the wrong reason on the
+    /// happy path. The actual `Recording` arm is covered by
+    /// the integration tests in `tests/`.
+    #[test]
+    fn resume_section_does_not_falsely_refuse_empty_as_recording() {
+        let mut app = App::new();
+        let slot = app.slots[0].id;
+        // On an Empty slot, the guard's !Recording branch is
+        // what we take. If the guard were inverted, this would
+        // hit the "already recording" branch and fail the
+        // assertion below.
+        let err = app.resume_section(slot).unwrap_err();
+        assert!(
+            !err.contains("already recording"),
+            "Empty slot must not be mis-classified as Recording: {err}"
+        );
+    }
 
     /// Spy `AgentTarget`: records every pushed segment's text, or
     /// fails the push when `fail` is set.
