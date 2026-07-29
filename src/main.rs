@@ -683,6 +683,21 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
 
+
+        // 'K' (Shift+k) opens the API-key modal from any normal-mode
+        // state (idle or recording). The lowercase 'k' is unbound
+        // (we don't steal it for modal-only access because it could
+        // collide with future text-input features). The user reported
+        // needing to manage their key while a recording was already
+        // running; in that state 'c' toggles cloud_on on the focused
+        // section, so a dedicated K shortcut gives them a reliable
+        // discoverable path to the modal. Pairs with the existing
+        // capital-letter shortcuts: 'R' resume, 'S' stop all, 'T'
+        // status.
+        KeyCode::Char('K') => {
+            log::info!("keys: K -> open_api_key_modal");
+            app.open_api_key_modal();
+        }
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the
@@ -1520,9 +1535,8 @@ mod api_key_modal_ctrl_u_tests {
 #[cfg(test)]
 mod api_key_dispatcher_K_tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
     #[test]
+    #[allow(non_snake_case)]
     fn uppercase_K_opens_the_api_key_modal_from_normal_mode() {
         let mut app = App::new();
         app.mode = AppMode::Normal;
@@ -1541,6 +1555,7 @@ mod api_key_dispatcher_K_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn lowercase_k_is_NOT_an_api_key_shortcut_only_uppercase_K_is() {
         let mut app = App::new();
         app.mode = AppMode::Normal;

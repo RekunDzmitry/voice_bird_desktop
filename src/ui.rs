@@ -1575,6 +1575,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[-]", "remove slot"),
                 hotkey_line("[r]", "refresh"),
                 hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[K]", "API key"),
                 hotkey_line("[l]", "language"),
             ];
             if local_keys {
@@ -1607,6 +1608,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[R]", "resume"),
                 hotkey_line("[S]", "stop all"),
                 hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[K]", "API key"),
                 hotkey_line("[l]", "language"),
             ];
             if local_keys {
@@ -2026,11 +2028,12 @@ mod tests {
              rendered:\n{out}",
         );
     }
-
     /// The keys sidebar lists `[K]` as the dedicated, always-available
     /// shortcut for opening the API-key modal. Without `[K]` in the
     /// sidebar the user has no in-app way to find the API-key modal
+    /// when 'c' is taken (it toggles cloud on a focused section).
     #[test]
+    #[allow(non_snake_case)]
     fn keys_panel_lists_K_for_setting_api_key() {
         let mut app = App::new();
         let out = render_to_string(&app, 140, 30);
@@ -2212,6 +2215,7 @@ mod tests {
             "[-]",
             "[r]",
             "[c]",
+            "[K]",
             "[l]",
         ] {
             assert!(
