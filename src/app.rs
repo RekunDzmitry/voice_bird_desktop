@@ -3312,6 +3312,132 @@ mod tests {
         }
     }
 
+    /// A `Saved` slot's resume must pick up not just settings
+    /// but also picker-level changes the user made after
+    /// pressing `s`: a different device (source kind), a
+    /// different app, and a different target.
+    ///
+    /// User scenario: record from the MacBook mic to
+    /// Stdout, stop, then change the picker to an output
+    /// device (EPOS) with Chrome selected and the target
+    /// set to Cloud, then resume. The resumed section
+    /// must use the post-stop source and target, not the
+    /// saved snapshot's.
+    ///
+    /// Currently red: `resume_section` pulls the source
+    /// verbatim off the Saved variant and hands it to
+    /// `start_section`, so any post-stop change to the
+    /// Devices or Apps picker is silently ignored. (The
+    /// target IS handled correctly already —
+    /// `start_section` consumes `pending_target_overrides`
+    /// — so the test's target assertion would pass today
+    /// even without the source fix. We assert on target
+    /// anyway as a regression guard.)
+    ///
+    /// The test is pipeline-aware: the slot may stay
+    /// `Saved` (capture fails in headless) or transition
+    /// to `Recording` (capture succeeds). Both outcomes
+    /// are acceptable; the assertion reads source/target
+    /// off whichever variant the slot ended up in.
+    #[test]
+    fn resume_section_picks_up_source_and_target_changed_after_stop() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        // Seed a Saved variant as if a section was
+        // recorded from the MacBook mic to Stdout.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "MacBook Pro Microphone -> Stdout".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Now the user changes the picker state after
+        // pressing s:
+        //   - Devices cursor moves to EPOS (Output)
+        //   - Apps cursor moves to Chrome
+        //   - Targets pane picks Cloud
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: AudioSessionKind::Output,
+            },
+        ];
+        app.apps = vec![AppSession {
+            id: "chrome".into(),
+            name: "Google Chrome".into(),
+            process_id: 12345,
+        }];
+        app.selected_device_index = 1; // EPOS
+        app.selected_app_index = Some(0); // Chrome
+        // Queue Cloud as the next-start target override
+        // for this slot (mirrors what the Targets picker's
+        // Enter handler does).
+        app.pending_target_overrides
+            .insert(slot, Target::Cloud);
+
+        let _ = app.resume_section(slot);
+
+        // Pull source + target off whichever variant the
+        // slot ended up in. Both must reflect the
+        // post-stop picker state.
+        let (applied_source, applied_target): (
+            &SessionSource,
+            &Target,
+        ) = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => (&saved.source, &saved.target),
+            SlotKind::Recording { section } => {
+                (&section.source, &section.target)
+            }
+            SlotKind::Empty => panic!(
+                "resume must not empty the slot on a successful Saved path"
+            ),
+        };
+
+        // Source: must be App { chrome, Google Chrome,
+        // EPOS PC 8 USB } — the post-stop pick, not the
+        // saved Microphone.
+        match applied_source {
+            SessionSource::App {
+                id,
+                name,
+                device_name,
+            } => {
+                assert_eq!(id, "chrome");
+                assert_eq!(name, "Google Chrome");
+                assert_eq!(device_name, "EPOS PC 8 USB");
+            }
+            other => panic!(
+                "resume must apply the post-stop source (App/chrome/EPOS); got: {other:?}"
+            ),
+        }
+
+        // Target: must be Cloud — the pending override
+        // is consumed by start_section.
+        assert_eq!(
+            applied_target,
+            &Target::Cloud,
+            "resume must apply the post-stop target (Cloud); got: {applied_target:?}"
+        );
+    }
+
     /// Spy `AgentTarget`: records every pushed segment's text, or
     /// fails the push when `fail` is set.
     struct SpyTarget {
