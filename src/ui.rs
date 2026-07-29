@@ -362,7 +362,6 @@ fn build_slot_title(
     let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
     let target_color = match target {
         Target::Stdout => Color::Green,
-        Target::Cloud => Color::Magenta,
         Target::Agent { .. } => Color::Cyan,
     };
     if prefix.chars().count() <= inner_w {
@@ -1118,6 +1117,7 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
 /// label and appends a hint so the user knows the row exists but
 /// can't be picked.
 /// (label, style, hint) for a single target row. `disabled=true`
+/// (label, style, hint) for a single target row. `disabled=true`
 /// dims the label and appends a hint so the user knows the row
 /// exists but can't be picked.
 fn target_row_style(
@@ -1128,12 +1128,10 @@ fn target_row_style(
     use crate::app::TargetKind;
     let base_color = match &kind {
         TargetKind::Stdout => Color::Green,
-        TargetKind::Cloud => Color::Magenta,
         TargetKind::Agent { .. } => Color::Cyan,
     };
     let label = match &kind {
         TargetKind::Stdout => "Stdout".to_string(),
-        TargetKind::Cloud => "Cloud".to_string(),
         TargetKind::Agent { .. } => match name {
             Some(n) => format!("Agent: {n}"),
             None => "Agent".to_string(),
@@ -1146,7 +1144,7 @@ fn target_row_style(
             "  (not installed)".into(),
         )
     } else {
-        // Agent is rendered the same as Stdout / Cloud — no
+        // Agent is rendered the same as Stdout — no
         // trailing hint, same row geometry. The disabled
         // case (above) carries the "(not installed)" hint
         // since the row exists but can't be picked.
@@ -1898,16 +1896,18 @@ mod tests {
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
-    /// Targets pane renders as the third picker column. The header is
-    /// " Targets " (focused variant carries the action hint), the
-    /// three rows are Stdout / Cloud / Agent, and the active pick is
-    /// tagged with "(active)" next to the focused slot's current
-    /// target.
+    /// Targets pane renders as the third picker column. The
+    /// header is " Targets " (focused variant carries the
+    /// action hint). The two fixed rows are Stdout and
+    /// Agent — Cloud is no longer a target (cloud is a
+    /// per-section transport flag in the Mode panel).
+    /// The active pick is tagged with "(active)" next to
+    /// the focused slot's current target.
     #[test]
-    fn targets_pane_lists_stdout_cloud_agent_in_order() {
-        // The default Agent row is gone — the user has to add
-        // their own via the funnel. Plant one in the config so
-        // the row renders in the expected order.
+    fn targets_pane_lists_stdout_and_agent_in_order() {
+        // The default Agent row is gone — the user has to
+        // add their own via the funnel. Plant one in the
+        // config so the row renders in the expected order.
         let mut app = App::new();
         app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
             id: "test-uuid".into(),
@@ -1927,17 +1927,25 @@ mod tests {
         })
         .expect("upsert test agent target");
         let out = render_to_string(&app, 180, 40);
-        // Pane header (focused variant — Devices is the default focus,
-        // so the targets pane shows the unfocused title).
+        // Pane header (focused variant — Devices is the
+        // default focus, so the targets pane shows the
+        // unfocused title).
         assert!(out.contains("Targets"), "targets pane missing:\n{out}");
-        // Three rows in the fixed order: Stdout first, Agent last.
+        // Two rows in the fixed order: Stdout first, Agent
+        // last. The cloud toggle lives in the Mode panel,
+        // not here.
         let stdout_pos = out.find("Stdout").expect("Stdout row missing");
-        let cloud_pos = out.find("Cloud").expect("Cloud row missing");
         let agent_pos = out.find("Agent:").expect("Agent row missing");
-        assert!(stdout_pos < cloud_pos, "Stdout must come before Cloud");
-        assert!(cloud_pos < agent_pos, "Cloud must come before Agent");
+        assert!(
+            stdout_pos < agent_pos,
+            "Stdout must come before Agent"
+        );
+        // The Cloud-as-target row must be gone.
+        assert!(
+            !out.contains("→ Cloud"),
+            "the '→ Cloud' target must not appear in the targets pane; got:\n{out}"
+        );
     }
-
     /// When the focused slot has been used before, the row matching
     /// the current target gets a "(active)" tag — without it the user
     /// has no way to tell at a glance which row is the active pick
@@ -1987,16 +1995,17 @@ mod tests {
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(hint, "", "enabled Agent must not carry a trailing hint");
     }
-    /// Enabled Stdout / Cloud also carry no hint — pinning
-    /// the invariant that all three picker rows share a
-    /// single shape so the pin column lands identically.
+    /// Enabled Stdout also carries no hint — pinning the
+    /// invariant that every picker row shares a single
+    /// shape so the pin column lands identically. Cloud
+    /// is no longer a target; its toggle lives in the
+    /// Mode panel.
     #[test]
-    fn target_row_style_stdout_cloud_have_no_hint() {
+    fn target_row_style_stdout_has_no_hint() {
         use crate::app::TargetKind;
-        for k in [TargetKind::Stdout, TargetKind::Cloud] {
-            let (_label, _style, hint) = target_row_style(k.clone(), false, None);
-            assert_eq!(hint, "", "enabled {:?} must not carry a trailing hint", k);
-        }
+        let (_label, _style, hint) =
+            target_row_style(TargetKind::Stdout, false, None);
+        assert_eq!(hint, "", "enabled Stdout must not carry a trailing hint");
     }
     /// Idle key sidebar shows the new Tab/cfg keys.
     #[test]
@@ -2107,19 +2116,37 @@ mod tests {
     /// the *focused* slot's pick.
     #[test]
     fn multi_slot_round_trip_keeps_picked_pins_on_focused_slot() {
-        use crate::app::{RecordingStatus, SavedTranscript, SlotKind};
-        use crate::platform::{AudioDevice, AudioSessionKind};
+        use crate::app::{RecordingStatus, SavedTranscript, SectionSettings, SlotKind};
         use std::sync::Arc;
         use voice_bird_cli::session::target::Target;
 
         let mut app = App::new();
-        // Cloud is always pickable (doesn't depend on the user
-        // having an agent runtime installed). Pick that as
-        // the per-slot target so the test stays portable
-        // across machines.
-        // Seed the picker state so each pane is non-trivial —
-        // otherwise the picked pin would land on a single
-        // vacant row and the test wouldn't catch ordering bugs.
+        // Add a user-configured Agent target so the Targets
+        // pane has a non-default row to pin. Cloud is no
+        // longer a target; the multi-pin exercise now
+        // uses an Agent target the user added via the
+        // funnel.
+        app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
+            id: "uuid-zoom".into(),
+            name: "zoom-bridge".into(),
+            connection: voice_bird_cli::config::AgentConnection::Kafka(
+                voice_bird_cli::config::KafkaAgentConnection {
+                    endpoint: "localhost:9092".into(),
+                    topic: "voice-bird".into(),
+                    client_id: None,
+                    acks: Default::default(),
+                    security_protocol: Default::default(),
+                    sasl_mechanism: None,
+                    sasl_username: None,
+                    sasl_password_env: None,
+                },
+            ),
+        })
+        .expect("upsert test agent target");
+        // Seed the picker state so each pane is non-trivial
+        // — otherwise the picked pin would land on a
+        // single vacant row and the test wouldn't catch
+        // ordering bugs.
         app.devices = vec![
             AudioDevice {
                 name: "MacBook Pro Microphone".into(),
@@ -2141,32 +2168,30 @@ mod tests {
         ];
         app.selected_device_index = 2; // EPOS PC 8 USB
         app.selected_app_index = Some(0); // Chrome
-        app.selected_target_index = Some(1); // Cloud (cursor)
-                                             // slot 1 starts as the only slot (id 1). Mark it as a
-                                             // saved recording on Cloud so the device + target pick
-                                             // are non-default. Bypassing `start_section` keeps the
-                                             // test free of audio / cpal / tokio runtime needs.
-        let saved_target = Target::Cloud;
+        app.selected_target_index = Some(1); // Agent: zoom-bridge
+        // slot 1 starts as the only slot (id 1). Mark
+        // it as a saved recording on the user-configured
+        // Agent target so the device + target pick are
+        // non-default. Bypassing `start_section` keeps
+        // the test free of audio / cpal / tokio runtime
+        // needs.
+        let saved_target =
+            Target::Agent { session_id: "uuid-zoom".into() };
         app.slots[0] = crate::app::Slot {
             id: crate::app::SlotId(1),
             kind: SlotKind::Saved {
                 saved: SavedTranscript {
                     committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
                     refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    label: "EPOS PC 8 USB + Chrome -> Cloud".into(),
+                    label: "EPOS PC 8 USB + Chrome -> Agent: zoom-bridge".into(),
                     target: saved_target.clone(),
-                    // The test only cares about the device/target
-                    // picker pin rendering, not resume — supply
-                    // the metadata slots with safe defaults that
-                    // match what stop_section would persist for a
-                    // real Cloud session.
                     source: voice_bird_cli::session::layout::SessionSource::App {
                         id: "chrome".into(),
                         name: "Chrome".into(),
                         device_name: "EPOS PC 8 USB".into(),
                     },
-                    settings: crate::app::SectionSettings {
-                        cloud_on: true,
+                    settings: SectionSettings {
+                        cloud_on: false,
                         language: "en".into(),
                         model: "tiny.en".into(),
                     },
@@ -2179,21 +2204,18 @@ mod tests {
         app.status = RecordingStatus::Idle;
 
         // ---- Step 0: focus on slot 1 ----
-        // Confirm we start on slot 1 and the picks resolve to
-        // the right rows in every pane.
+        // Confirm we start on slot 1 and the picks
+        // resolve to the right rows in every pane.
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1)); // Chrome at apps[0] + synthetic offset 1
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud)
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() })
         );
         let out0 = render_to_string(&app, 180, 40);
-        // The picked Device row ('EPOS PC 8 USB' at index 2)
-        // must glow yellow + carry the '●' pin. Each
-        // non-cursor device row appears once in the rendered
-        // buffer — counting '●' against the picker tells us
-        // if more than one row picked up the pin.
+        // The picked Device row ('EPOS PC 8 USB' at index
+        // 2) must glow yellow + carry the '●' pin.
         assert!(
             out0.lines()
                 .any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
@@ -2204,47 +2226,22 @@ mod tests {
                 .any(|l| l.contains("Chrome") && l.contains('●')),
             "slot-1 step 0: app row missing '●' pin:\n{out0}"
         );
-        // Helper: locate a Targets-pane row by its label and
-        // report whether the row carries the trailing '●' pin.
-        // Anchors on the row's coordinate markers
-        // ('││  ' header, '│' footer, no '→' arrow) so the
-        // top border / slot title / side-panel cells don't
-        // sneak in.
-        // Helper: locate a Targets-pane row by its label and
-        // report whether the row carries the trailing '●' pin.
-        // The TestBackend pads every line to the column width
-        // with spaces, so a row filter should anchor on the
-        // column-start marker '││  ' and the row's label, not
-        // on '│' (the right border, which is followed by
-        // trailing spaces). Trim trailing whitespace after the
-        // Each rendered row in the Targets pane reads as
-        // "Label [hint] [●]" with one trailing pin. The
-        // TestBackend flattens every pane into one 180-wide
-        // line, so a pin search is the most reliable
-        // verification — substring "Label ●" matches the
-        // exact row we care about without dragging in
-        // neighbour panes.
+        // Helper: locate a Targets-pane row by its label
+        // and report whether the row carries the
+        // trailing '●' pin.
         let target_pin_present = |out: &str, label: &str| -> bool {
             let pinned_text = format!("{label} \u{25CF}");
             out.contains(&pinned_text)
         };
         // ---- Step 1: + adds a second slot ----
-        // focus_next / focus_prev cycle through every slot
-        // including Empty — the user can press Tab or
-        // Shift-Tab between slots regardless of whether a
-        // recording has started there yet.
         let added = app.add_slot();
         assert_eq!(added, Some(crate::app::SlotId(2)));
         assert_eq!(app.slots.len(), 2);
         // `add_slot` advances focused_slot to the new slot.
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
         // Empty slot 2 picks fall back to the global
-        // cursor positions (Device, App) and the
-        // per-slot Stdout default (Target). Device +
-        // App keep their previous state because the
-        // user hasn't interacted with those panes;
-        // Target falls back to Stdout because slot 2
-        // has no recording and no pending override.
+        // cursor positions and the per-slot Stdout
+        // default (Target).
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1));
         assert_eq!(
@@ -2257,8 +2254,8 @@ mod tests {
             "step 1: Stdout must be pinned on slot 2:\n{out1}"
         );
         assert!(
-            !target_pin_present(&out1, "Cloud"),
-            "step 1: Cloud must NOT leak from slot 1 to slot 2:\n{out1}"
+            !target_pin_present(&out1, "Agent: zoom-bridge"),
+            "step 1: the saved Agent pin must NOT leak from slot 1 to slot 2:\n{out1}"
         );
         assert!(out1.contains("[1]"), "slot 1 title missing:\n{out1}");
         assert!(out1.contains("[2]"), "slot 2 title missing:\n{out1}");
@@ -2268,17 +2265,17 @@ mod tests {
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "back on slot 1: picked target should be Cloud again"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "back on slot 1: picked target should be the saved Agent"
         );
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1));
         let out2 = render_to_string(&app, 180, 40);
-        // Returning to slot 1 must re-pin Cloud on Targets
-        // — and must NOT leave Stdout pinned.
+        // Returning to slot 1 must re-pin the saved Agent
+        // on Targets — and must NOT leave Stdout pinned.
         assert!(
-            target_pin_present(&out2, "Cloud"),
-            "back on slot 1: Cloud must be pinned:\n{out2}"
+            target_pin_present(&out2, "Agent: zoom-bridge"),
+            "back on slot 1: Agent must be pinned:\n{out2}"
         );
         assert!(
             !target_pin_present(&out2, "Stdout"),
@@ -2288,8 +2285,7 @@ mod tests {
         // ---- Step 3: focus_next takes us back to slot 2 ----
         app.focus_next();
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        // Empty slot 2 falls back to defaults again — the
-        // pending override from Step 0 hasn't been touched yet.
+        // Empty slot 2 falls back to Stdout again.
         assert_eq!(
             app.picked_target_kind(),
             Some(crate::app::TargetKind::Stdout),
@@ -2301,49 +2297,38 @@ mod tests {
             "back on slot 2: Stdout must be pinned:\n{out3}"
         );
         assert!(
-            !target_pin_present(&out3, "Cloud"),
-            "back on slot 2: Cloud must not be pinned:\n{out3}"
+            !target_pin_present(&out3, "Agent: zoom-bridge"),
+            "back on slot 2: saved Agent must not be pinned:\n{out3}"
         );
 
-        // ---- Bonus: queue a pending Cloud pick on slot 2
-        // and verify the override is per-slot. ----
-        app.pending_target_overrides
-            .insert(crate::app::SlotId(2), Target::Cloud);
+        // ---- Bonus: queue a pending Agent pick on slot
+        // 2 and verify the override is per-slot. ----
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            Target::Agent { session_id: "uuid-zoom".into() },
+        );
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "after queueing Cloud on slot 2, target picks Cloud"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "after queueing Agent on slot 2, target picks Agent"
         );
         app.focus_prev();
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        // Slot 1's pick is independent of slot 2's pending
-        // override: still Cloud (last saved).
+        // Slot 1's pick is independent of slot 2's
+        // pending override: still the saved Agent.
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
             "slot 1 must keep its own target pick across slot 2's override"
         );
         app.focus_next();
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "slot 2 picks Cloud back after forward navigation"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "slot 2 picks Agent back after forward navigation"
         );
     }
-
-    /// A paused (Saved) slot's bottom hint must make the
-    /// Enter/R distinction explicit:
-    ///   - R resumes the focused slot in place.
-    ///   - x clears the focused slot.
-    ///   - Enter starts a brand-new session (in a new
-    ///     slot, if one is free).
-    /// Without the Enter mention, users hit Enter
-    /// expecting to "confirm" the new app pick and get
-    /// a misleading "all slots are full" banner instead
-    /// of the right hint.
-    ///
-    /// The resume + clear hints only appear on the
     /// focused slot, since R/x target the focused slot
     /// regardless of which paused slot is showing the
     /// hint. Non-focused saved slots keep the

@@ -520,7 +520,6 @@ pub struct TargetRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
-    Cloud,
     /// One user-configured Agent target. The `id` is the stable
     /// `AgentTargetId` from `AppConfig::agent_targets` and
     /// resolves to a `KafkaTarget` (today) via
@@ -533,7 +532,6 @@ pub enum TargetKind {
         id: String,
     },
 }
-
 impl App {
     /// Create a new application instance
     pub fn new() -> Self {
@@ -820,18 +818,18 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// The picker list. Rows 0-1 are fixed (`Stdout`, `Cloud`).
-    /// From row 2 onward, one row per user-configured Agent
-    /// target. Disabled flag is reserved for future use; today
-    /// every configured Agent target is pickable.
+    /// The picker list. Row 0 is `Stdout`; rows 1+ are
+    /// one per user-configured Agent target. `Cloud`
+    /// is intentionally absent — cloud is a per-section
+    /// transport flag (see `SectionSettings::cloud_on`),
+    /// not a target. Disabled flag is reserved for
+    /// future use; today every configured Agent target
+    /// is pickable.
     pub fn targets(&self) -> Vec<TargetRow> {
-        let mut rows = Vec::with_capacity(2 + self.config.agent_targets.len());
+        let mut rows =
+            Vec::with_capacity(1 + self.config.agent_targets.len());
         rows.push(TargetRow {
             kind: TargetKind::Stdout,
-            disabled: false,
-        });
-        rows.push(TargetRow {
-            kind: TargetKind::Cloud,
             disabled: false,
         });
         for t in &self.config.agent_targets {
@@ -842,7 +840,6 @@ impl App {
         }
         rows
     }
-
     /// Resolve the currently focused Targets-pane row to a `Target`.
     /// Returns `None` if the cursor is parked on a disabled row or
     /// out of range.
@@ -866,9 +863,13 @@ impl App {
         let slot = self.focused_slot;
         let target = match kind {
             TargetKind::Stdout => Target::Stdout,
-            TargetKind::Cloud => Target::Cloud,
             TargetKind::Agent { id } => Target::Agent { session_id: id },
         };
+        // Queue the override so the next start_section
+        // consumes it. (Today this is the only signal
+        // the picker writes; start_section removes the
+        // override at start time and uses it as the
+        // section's target.)
         self.pending_target_overrides.insert(slot, target.clone());
         target
     }
@@ -1481,7 +1482,6 @@ impl App {
             .unwrap_or(Target::Stdout);
         Some(match t {
             Target::Stdout => TargetKind::Stdout,
-            Target::Cloud => TargetKind::Cloud,
             Target::Agent { session_id } => TargetKind::Agent { id: session_id },
         })
     }
@@ -1668,27 +1668,17 @@ impl App {
         // agent target works alongside the existing Cloud /
         // Stdout switch. The override is consumed at start so
         // it only affects this one start.
+        // The target is whatever the user (or a prior
+        // pending override) picked. There's no implicit
+        // "Cloud" fallback anymore — cloud is a
+        // per-section transport flag (settings.cloud_on),
+        // not a target. The default for a fresh slot
+        // with no override is Stdout.
         let target = self
             .pending_target_overrides
             .remove(&slot)
-            .unwrap_or_else(|| {
-                if settings.cloud_on {
-                    Target::Cloud
-                } else {
-                    Target::Stdout
-                }
-            });
-        // Keep `cloud_on` in sync with the picked target so the
-        // rest of the recording pipeline (engine pick, language
-        // shadowing, etc.) doesn't have to learn about `Agent` yet —
-        // the Agent target piggybacks on local inference today.
+            .unwrap_or(Target::Stdout);
 
-        settings.cloud_on = matches!(target, Target::Cloud);
-
-        // Truncate the per-slot live tail when starting an
-        // Agent session. The TUI writes every committed segment
-        // there; the MCP server process spawned by the agent
-        // runtime tails this file. Starting fresh prevents a new
         // recording from inheriting segments left by a previous
         // session on the same slot.
         if matches!(target, Target::Agent { .. }) {
@@ -3125,8 +3115,6 @@ mod tests {
             app.pending_target_overrides.get(&SlotId(1)).cloned(),
             Some(Target::Stdout)
         );
-        let cloud = app.pick_target(TargetKind::Cloud);
-        assert_eq!(cloud, Target::Cloud);
         let omp = app.pick_target(TargetKind::Agent {
             id: "session-x".into(),
         });
@@ -3189,13 +3177,12 @@ mod tests {
             kinds,
             vec![
                 TargetKind::Stdout,
-                TargetKind::Cloud,
                 TargetKind::Agent { id: "uuid-prod".into() },
                 TargetKind::Agent { id: "uuid-events".into() },
             ]
         );
-        let prod_idx = 2usize;
-        let events_idx = 3usize;
+        let prod_idx = 1usize;
+        let events_idx = 2usize;
 
         // Focus the Targets pane and walk the cursor down from the
         // top. Each ↓ must move one row, regardless of how many
@@ -3583,11 +3570,13 @@ mod tests {
         }];
         app.selected_device_index = 1; // EPOS
         app.selected_app_index = Some(0); // Chrome
-        // Queue Cloud as the next-start target override
-        // for this slot (mirrors what the Targets picker's
-        // Enter handler does).
+        // Queue the next-start target override for
+        // this slot (mirrors what the Targets
+        // picker's Enter handler does). Use a
+        // user-configured Agent target since Cloud
+        // is no longer a target.
         app.pending_target_overrides
-            .insert(slot, Target::Cloud);
+            .insert(slot, Target::Agent { session_id: "kafka-1".into() });
 
         let _ = app.resume_section(slot);
 
@@ -3625,12 +3614,13 @@ mod tests {
             ),
         }
 
-        // Target: must be Cloud — the pending override
-        // is consumed by start_section.
+        // Target: must be the queued Agent override
+        // — the pending override is consumed by
+        // start_section.
         assert_eq!(
             applied_target,
-            &Target::Cloud,
-            "resume must apply the post-stop target (Cloud); got: {applied_target:?}"
+            &Target::Agent { session_id: "kafka-1".into() },
+            "resume must apply the post-stop target (Agent); got: {applied_target:?}"
         );
     }
 
@@ -3779,70 +3769,6 @@ mod tests {
             );
         }
     }
-    /// Resume a Saved slot whose saved target is Cloud
-    /// but whose saved `cloud_on` is false (the user
-    /// toggled cloud off after stopping). The resume
-    /// path must honor the user's explicit cloud_on,
-    /// not clobber it from the saved target.
-    ///
-    /// Currently red: `start_section` runs
-    /// `settings.cloud_on = matches!(target, Target::Cloud)`
-    /// after pulling the saved target, so a saved
-    /// target of Cloud forces cloud_on=true regardless
-    /// of what the user set. The fix drops that line.
-    #[test]
-    fn resume_honors_cloud_off_even_when_saved_target_is_cloud() {
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let mut app = App::new();
-        app.config.voicebird_api_key = "sk-test".into();
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        let slot = app.slots[0].id;
-        // Saved as: target=Cloud, cloud_on=false
-        // (user toggled cloud off after stopping).
-        let saved = SavedTranscript {
-            committed: Arc::new(PlMutex::new(Vec::new())),
-            refined: Arc::new(PlMutex::new(Vec::new())),
-            label: "mic · cloud:OFF".into(),
-            target: Target::Cloud,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: false,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        };
-        app.slots[0].kind = SlotKind::Saved { saved };
-
-        let _ = app.resume_section(slot);
-
-        // Whether the slot is Saved (start_section
-        // failed) or Recording (start_section
-        // succeeded), the cloud_on on the slot's
-        // settings must reflect the user's intent
-        // (false), NOT the saved target (which would
-        // imply true).
-        let applied_cloud_on = match &app.slots[0].kind {
-            SlotKind::Saved { saved } => saved.settings.cloud_on,
-            SlotKind::Recording { section } =>
-                section.settings.cloud_on,
-            SlotKind::Empty => panic!(
-                "resume must not empty the slot"
-            ),
-        };
-        assert!(
-            !applied_cloud_on,
-            "resume must honor the saved cloud_on=false \
-             even when the saved target was Cloud; the \
-             cloud flag is a transport, not a function \
-             of the target"
-        );
-    }
-
     /// Resume a Saved slot whose saved target is
     /// Stdout but whose saved `cloud_on` is true
     /// (the user wants server streaming for a
@@ -3850,9 +3776,13 @@ mod tests {
     /// honor cloud_on=true, not clobber it from
     /// target.
     ///
-    /// Currently red: clobber line forces cloud_on
-    /// from target, so a Stdout target forces
-    /// cloud_on=false.
+    /// Currently red: `start_section` runs
+    /// `settings.cloud_on = matches!(target, Target::Cloud)`,
+    /// which evaluates to false for any non-Cloud
+    /// target (including Stdout). So a user-saved
+    /// cloud_on=true on a Stdout session is
+    /// silently forced to false on resume. The
+    /// fix drops the clobber line.
     #[test]
     fn resume_honors_cloud_on_even_when_saved_target_is_stdout() {
         use voice_bird_cli::config::AudioSessionKind;
@@ -4086,7 +4016,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_non_agent_targets_route_nothing() {
         let (state, targets, pushed) = dispatch_fixture(false);
-        for target in [Target::Stdout, Target::Cloud] {
+        for target in [Target::Stdout] {
             let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets).await;
             assert_eq!(out, AgentDispatch::NotAgent);
         }
