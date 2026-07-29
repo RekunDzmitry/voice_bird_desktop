@@ -2508,6 +2508,29 @@ impl App {
     /// handler that *applies* the picked target first; that
     /// lives in `main.rs` (it's a UI concern) and is called
     /// *before* this method. By the time we get here, the
+    /// Resolve the source the picker would pick on Enter.
+    /// `None` if no device is selected or the device kind
+    /// is the rejected `AudioSessionKind::App` variant.
+    /// Pure read of picker state — no mutation, no
+    /// persistence. Used by both `try_start_new_section`
+    /// and the `c` / `l` / `m` idle-toggle handlers in
+    /// `main.rs` so they write per-source overrides for
+    /// the same source the next start will resolve to.
+    pub fn resolve_picker_source(&self) -> Option<SessionSource> {
+        use voice_bird_cli::config::AudioSessionKind;
+        let dev = self.devices.get(self.selected_device_index)?;
+        let app_pick = self.focused_app().cloned();
+        match (dev.kind, app_pick) {
+            (AudioSessionKind::Input, _) => Some(SessionSource::Microphone),
+            (AudioSessionKind::Output, None) => Some(SessionSource::System),
+            (AudioSessionKind::Output, Some(a)) => Some(SessionSource::App {
+                id: a.id,
+                name: a.name,
+                device_name: dev.name.clone(),
+            }),
+            (AudioSessionKind::App, _) => None,
+        }
+    }
     pub fn try_start_new_section(&mut self) -> Result<(), String> {
         // No Empty slot. Distinguish between the two
         //   - Some slot is actively Recording — they
@@ -2534,7 +2557,6 @@ impl App {
             return Err(msg);
         };
         use voice_bird_cli::config::AudioSessionKind;
-        use voice_bird_cli::session::layout::SessionSource;
         let Some(dev) = self.devices.get(self.selected_device_index).cloned() else {
             log::warn!(
                 "keys: Enter → refused (no device at idx {})",
@@ -2576,17 +2598,8 @@ impl App {
             }
         }
 
-        let source = match (dev.kind, app_pick) {
-            (AudioSessionKind::Input, _) => SessionSource::Microphone,
-            (AudioSessionKind::Output, None) => SessionSource::System,
-            (AudioSessionKind::Output, Some(a)) => SessionSource::App {
-                id: a.id,
-                name: a.name,
-                device_name: dev.name.clone(),
-            },
-            (AudioSessionKind::App, _) => {
-                return Err("Unexpected device kind — press [r] to refresh".into());
-            }
+        let Some(source) = self.resolve_picker_source() else {
+            return Err("Unexpected device kind — press [r] to refresh".into());
         };
 
         // Start in the chosen slot; route through the

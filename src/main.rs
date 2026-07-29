@@ -729,8 +729,32 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "Cloud: OFF for focused section (applies on next start)".into()
                 });
             } else {
-                app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
-                let on = app.config.cloud_broadcast_enabled;
+                // Resolve the source the picker would pick on
+                // Enter, then flip BOTH the per-source override
+                // and the global default. Without the per-source
+                // write, a stale override from a prior session
+                // (e.g. last recorded with Cloud OFF) wins over
+                // the global default at start time, and the
+                // section silently starts with cloud_on=false
+                // even though the user just clicked Cloud ON.
+                let source = app.resolve_picker_source();
+                let key = source
+                    .as_ref()
+                    .map(|s| app.source_key_for(s));
+                let mut ov = key
+                    .as_ref()
+                    .map(|k| app.config.effective_override(k))
+                    .unwrap_or(voice_bird_cli::config::SourceSettingsOverride {
+                        cloud_on: app.config.cloud_broadcast_enabled,
+                        language: app.config.language.clone(),
+                        model: app.config.default_model.clone(),
+                    });
+                ov.cloud_on = !ov.cloud_on;
+                if let Some(k) = key {
+                    app.config.upsert_source_override(k, ov.clone());
+                }
+                app.config.cloud_broadcast_enabled = ov.cloud_on;
+                let on = ov.cloud_on;
                 if let Err(e) = app.config.save() {
                     log::error!("config save (cloud toggle): {e}");
                 }
