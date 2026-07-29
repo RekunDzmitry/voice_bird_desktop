@@ -598,99 +598,29 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     return;
                 }
             }
-            // Pick the next free slot (or refuse if all are full).
-            let Some(slot) = app.next_free_slot() else {
-                log::info!("keys: Enter → refused (all 3 sections full)");
-                app.banner = Some("All 3 sections are recording — stop one first ([s])".into());
-                return;
-            };
-            use voice_bird_cli::config::AudioSessionKind;
-            use voice_bird_cli::session::layout::SessionSource;
-
-            let Some(dev) = app.devices.get(app.selected_device_index).cloned() else {
-                log::warn!(
-                    "keys: Enter → refused (no device at idx {})",
-                    app.selected_device_index
-                );
-                app.banner = Some("No audio device selected — press [r] to refresh".into());
-                return;
-            };
-            let app_pick = app.focused_app().cloned();
-            log::info!(
-                "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
-                slot,
-                app.focused_slot,
-                dev.name,
-                dev.kind,
-                app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
-            );
-
-            // Reject Input + App: per-app loopback can't pair with a
-            // mic capture, and combining them silently would just record
-            // the mic.
-            if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
-                app.banner = Some(
-                    "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app".into(),
-                );
-                return;
-            }
-
-            // Persist the selected device + last app id.
-            let name_changed = app.config.input_device.as_deref() != Some(dev.name.as_str());
-            let kind_changed = app.config.input_device_kind != Some(dev.kind);
-            let app_id_changed =
-                app.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
-            if name_changed || kind_changed || app_id_changed {
-                app.config.input_device = Some(dev.name.clone());
-                app.config.input_device_kind = Some(dev.kind);
-                app.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
-                if let Err(e) = app.config.save() {
-                    log::error!("config save: {e}");
-                }
-            }
-
-            let source = match (dev.kind, app_pick) {
-                (AudioSessionKind::Input, _) => SessionSource::Microphone,
-                (AudioSessionKind::Output, None) => SessionSource::System,
-                (AudioSessionKind::Output, Some(a)) => SessionSource::App {
-                    id: a.id,
-                    name: a.name,
-                    device_name: dev.name.clone(),
-                },
-                (AudioSessionKind::App, _) => {
-                    // Devices pane never emits AudioSessionKind::App
-                    // entries (apps live in the Apps pane), but be safe.
-                    app.banner = Some("Unexpected device kind — press [r] to refresh".into());
-                    return;
-                }
-            };
-
-            // Start in the chosen slot; route through the per-section API
-            // so settings come from `effective_settings_for(source)`.
-            let settings = app.effective_settings_for(&source);
-            app.focused_slot = slot;
-            log::info!(
-                "keys: Enter → resolved source={:?}; calling start_section[{}]",
-                source,
-                slot
-            );
-            match app.start_section(slot, source, settings) {
+            // Hand the rest off to App::try_start_new_section. The
+            // Targets pick_target above is the only Enter-specific
+            // UI concern; everything else (slot pick, source
+            // resolution, config persist, start_section) is shared
+            // and lives in the App method so it can be unit-tested.
+            match app.try_start_new_section() {
                 Ok(()) => {
                     log::info!(
-                        "keys: Enter → start_section[{}] OK; sections active = {}",
-                        slot,
+                        "keys: Enter → start_section OK; sections active = {}",
                         app.active_section_count()
                     );
                 }
                 Err(msg) => {
-                    log::warn!("keys: Enter → start_section[{}] FAILED: {}", slot, msg);
+                    log::warn!("keys: Enter → start_section FAILED: {msg}");
                     app.banner = Some(msg.clone());
                     app.status = RecordingStatus::Error(msg);
                 }
             }
         }
+        // 'r' refreshes the inventory; refresh_inventory preserves
+        // both cursors by name when the previously-cursored
+        // entries still exist after refresh.
         KeyCode::Char('r') => {
-            // Refresh inventory; refresh_inventory preserves both cursors.
             let before_d = app.devices.len();
             let before_a = app.apps.len();
             app.refresh_inventory();

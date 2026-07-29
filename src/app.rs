@@ -2499,6 +2499,101 @@ impl App {
         self.start_section(slot, source, settings)
     }
 
+
+    /// Try to start a brand-new recording in the next free
+    /// slot. Extracted from `main.rs`'s `Enter` handler so
+    /// the workflow is unit-testable and the message
+    /// contract is owned by `App` (not free-form `String`s
+    /// scattered in the key dispatcher).
+    ///
+    /// Flow: pick the first Empty slot, resolve the source
+    /// from the current Devices + Apps picker, persist the
+    /// picks to config (so a refresh preserves them), then
+    /// hand off to `start_section`. Returns the same `Err`
+    /// messages as before for invalid picker state, so the
+    /// caller in `main.rs` can surface them as banners
+    /// unchanged.
+    ///
+    /// The Targets picker has a special-case in the `Enter`
+    /// handler that *applies* the picked target first; that
+    /// lives in `main.rs` (it's a UI concern) and is called
+    /// *before* this method. By the time we get here, the
+    /// target override is already in `pending_target_overrides`.
+    pub fn try_start_new_section(&mut self) -> Result<(), String> {
+        // Pick the next free slot (or refuse if all are full).
+        let Some(slot) = self.next_free_slot() else {
+            log::info!("keys: Enter → refused (no free slot)");
+            return Err("All 3 sections are recording — stop one first ([s])".into());
+        };
+        use voice_bird_cli::config::AudioSessionKind;
+        use voice_bird_cli::session::layout::SessionSource;
+
+        let Some(dev) = self.devices.get(self.selected_device_index).cloned() else {
+            log::warn!(
+                "keys: Enter → refused (no device at idx {})",
+                self.selected_device_index
+            );
+            return Err("No audio device selected — press [r] to refresh".into());
+        };
+        let app_pick = self.focused_app().cloned();
+        log::info!(
+            "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
+            slot,
+            self.focused_slot,
+            dev.name,
+            dev.kind,
+            app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
+        );
+
+        // Reject Input + App: per-app loopback can't pair
+        // with a mic capture, and combining them silently
+        // would just record the mic.
+        if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
+            return Err(
+                "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app"
+                    .into(),
+            );
+        }
+
+        // Persist the selected device + last app id.
+        let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
+        let kind_changed = self.config.input_device_kind != Some(dev.kind);
+        let app_id_changed =
+            self.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
+        if name_changed || kind_changed || app_id_changed {
+            self.config.input_device = Some(dev.name.clone());
+            self.config.input_device_kind = Some(dev.kind);
+            self.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
+            if let Err(e) = self.config.save() {
+                log::error!("config save: {e}");
+            }
+        }
+
+        let source = match (dev.kind, app_pick) {
+            (AudioSessionKind::Input, _) => SessionSource::Microphone,
+            (AudioSessionKind::Output, None) => SessionSource::System,
+            (AudioSessionKind::Output, Some(a)) => SessionSource::App {
+                id: a.id,
+                name: a.name,
+                device_name: dev.name.clone(),
+            },
+            (AudioSessionKind::App, _) => {
+                return Err("Unexpected device kind — press [r] to refresh".into());
+            }
+        };
+
+        // Start in the chosen slot; route through the
+        // per-section API so settings come from
+        // `effective_settings_for(source)`.
+        let settings = self.effective_settings_for(&source);
+        self.focused_slot = slot;
+        log::info!(
+            "keys: Enter → resolved source={:?}; calling start_section[{}]",
+            source,
+            slot
+        );
+        self.start_section(slot, source, settings)
+    }
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
         // Collect ids first so we don't hold a borrow on `self.slots`
@@ -3520,6 +3615,111 @@ mod tests {
             &Target::Cloud,
             "resume must apply the post-stop target (Cloud); got: {applied_target:?}"
         );
+    }
+
+    // ── try_start_new_section state matrix (Enter key) ───────────
+
+    /// Enter pressed with all slots non-Empty (one Saved
+    /// slot) must NOT silently re-start the slot, and the
+    /// error message must clearly tell the user how to
+    /// resume — not the misleading "all 3 sections are
+    /// recording" line that today implies no slots can be
+    /// touched.
+    ///
+    /// The user scenario: record, stop (s), then press
+    /// Enter expecting to start a NEW session. The slot
+    /// is paused, so the right action is [R] to resume
+    /// the existing section, or [x] to clear, or [-] to
+    /// remove the slot. The error must mention R so the
+    /// user discovers the resume key.
+    ///
+    /// Currently red: try_start_new_section returns
+    /// "All 3 sections are recording — stop one first
+    /// ([s])" which (a) is factually wrong (no slot is
+    /// Recording), (b) hardcodes "3" regardless of slot
+    /// count, and (c) doesn't mention the R key the
+    /// user actually wants. The fix in the next commit
+    /// rewrites the message to mention R and to reflect
+    /// the actual state (slots non-Empty, none actively
+    /// recording).
+    #[test]
+    fn try_start_new_section_with_paused_slot_says_use_r_to_resume() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        // Seed a Saved slot so the App has no Empty
+        // slots — next_free_slot returns None.
+        let _slot = app.slots[0].id;
+        app.slots[0].kind = SlotKind::Saved {
+            saved: SavedTranscript {
+                committed: Arc::new(PlMutex::new(Vec::new())),
+                refined: Arc::new(PlMutex::new(Vec::new())),
+                label: "mic · cloud:OFF".into(),
+                target: Target::Stdout,
+                source: SessionSource::Microphone,
+                settings: SectionSettings {
+                    cloud_on: false,
+                    language: "en".into(),
+                    model: "tiny.en".into(),
+                },
+            },
+        };
+        // Populate a device so we don't fail on the
+        // "no device" branch before the "no free slot"
+        // branch.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+
+        let err = app.try_start_new_section().unwrap_err();
+        // The new contract: the message must point the
+        // user at R (resume) since pressing Enter was the
+        // wrong key for a paused slot.
+        assert!(
+            err.contains('R') || err.to_lowercase().contains("resume"),
+            "Enter on a paused slot must point the user at R to resume; got: {err}"
+        );
+        // And it must NOT use the misleading
+        // "all 3 sections are recording" line — the
+        // slot is paused, not recording.
+        assert!(
+            !err.contains("all 3 sections are recording"),
+            "Enter on a paused slot must not claim sections are recording; got: {err}"
+        );
+    }
+
+    /// Enter pressed on a fresh App (one Empty slot) must
+    /// reach `start_section` — the test is pipeline-aware
+    /// (capture may succeed or fail in the test env).
+    /// The point: the "no free slot" branch is only
+    /// taken when no slot is Empty; with the default
+    /// App::new() state we have one Empty slot, so the
+    /// method should NOT return the "no free slot"
+    /// error.
+    ///
+    /// Currently green: the refactor preserved this
+    /// behavior. It's a regression guard so the fix
+    /// doesn't break the happy path.
+    #[test]
+    fn try_start_new_section_with_empty_slot_does_not_refuse_no_free_slot() {
+        let mut app = App::new();
+        // Default App::new() ships one Empty slot. The
+        // method should reach start_section (which may
+        // fail on capture in headless tests, but the
+        // error must NOT be the "no free slot" branch).
+        let result = app.try_start_new_section();
+        if let Err(err) = &result {
+            assert!(
+                !err.contains("All 3 sections are recording"),
+                "fresh App with an Empty slot must not hit the no-free-slot branch; got: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("all 3 sections"),
+                "fresh App must not see the 'all 3' message; got: {err}"
+            );
+        }
     }
 
     /// Spy `AgentTarget`: records every pushed segment's text, or
