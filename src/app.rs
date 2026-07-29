@@ -82,14 +82,26 @@ pub struct CommittedLine {
 /// Transcript state preserved across a section stop, so the text stays
 /// visible in the UI. When the user starts a new section in the same slot,
 /// these Arcs are reattached so new segments append to existing content.
+/// `Clone` lets `App::resume_section` snapshot the saved metadata
+/// without disturbing the `SlotKind` enum (which still contains a
+/// non-`Clone` `Section` in its `Recording` arm and therefore
+/// itself cannot derive `Clone`).
+#[derive(Clone)]
 pub struct SavedTranscript {
     pub committed: Arc<PlMutex<Vec<CommittedLine>>>,
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Column-title label from the stopped section (e.g. "mic · cloud:OFF").
     pub label: String,
-    /// Target the stopped section was using. Keeps the Targets pane
-    /// honest about what the saved text was being routed to.
     pub target: Target,
+    /// Source the stopped section was capturing (mic / system / app).
+    /// Persisted so `App::resume_section` can restart capture with the
+    /// same input without asking the user to re-pick a device.
+    pub source: SessionSource,
+    /// Settings the stopped section was using (cloud on/off, language,
+    /// model). Persisted so resume keeps the same transcription
+    /// pipeline — toggling cloud on after a stop must not silently
+    /// change a resumed section's target.
+    pub settings: SectionSettings,
 }
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
@@ -2257,6 +2269,12 @@ impl App {
             refined: section.refined.clone(),
             label,
             target,
+            // Snapshot the source + settings so App::resume_section
+            // can re-enter start_section with the same input
+            // pipeline (mic/system/app, cloud/language/model)
+            // instead of asking the user to re-pick.
+            source: section.source.clone(),
+            settings: section.settings.clone(),
         };
         self.slots[pos].kind = SlotKind::Saved { saved };
 
@@ -2350,12 +2368,35 @@ impl App {
     /// and new segments append to the visible text.
     ///
     /// Returns `Err` with a banner-ready message when the
-    /// slot is `Empty` (nothing to resume) or already
-    /// `Recording` (no double-start). The caller in
-    /// `handle_normal_mode` surfaces the message verbatim.
+    /// slot is `Empty` (nothing to resume) or already `Recording`
+    /// (no double-start). The caller in `handle_normal_mode`
+    /// surfaces the message verbatim.
     pub fn resume_section(&mut self, slot: SlotId) -> Result<(), String> {
-        let _ = slot;
-        Err("resume: not yet implemented".into())
+        let pos = self
+            .slot_index(slot)
+            .ok_or_else(|| format!("invalid section slot: {slot}"))?;
+        // Refuse double-start: the recording pipeline (cpal stream
+        // + tokio tasks) is already running and re-entering
+        // start_section would race the live audio capture. The
+        // caller surfaces this as a banner so the key is never
+        // silently dead.
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
+            return Err(format!("slot {slot} is already recording"));
+        }
+        // Clone just the saved metadata out of the slot. We
+        // deliberately leave the slot in its current `Saved`
+        // state — start_section itself reads the saved variant
+        // to re-attach the committed/refined Arcs before
+        // replacing the slot with `Recording`. Skipping the
+        // manual mem::replace keeps that contract intact.
+        let SavedTranscript { source, settings, .. } = match &self.slots[pos].kind {
+            SlotKind::Saved { saved } => saved.clone(),
+            SlotKind::Empty => {
+                return Err("nothing to resume — slot is empty".into());
+            }
+            SlotKind::Recording { .. } => unreachable!("guarded above"),
+        };
+        self.start_section(slot, source, settings)
     }
 
     /// Stop every active section. Used at quit.
