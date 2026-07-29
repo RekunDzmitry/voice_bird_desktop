@@ -1993,7 +1993,77 @@ mod tests {
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
 
-    /// The workspace starts at 1 slot. Expanding with `+` adds
+    /// `mask_api_key` exposes the LAST 5 chars of the saved key so the
+    /// user can verify identity at a glance - the prefix is the
+    /// (relatively predictable) `vb_…` or `sk-…` boilerplate, but the
+    /// tail is high-entropy. A 60-char key ending in `3d8e8` is easier
+    /// to recognise than one starting with `vb_01`.
+    #[test]
+    fn mask_api_key_shows_last_five_chars_then_dots() {
+        let masked = mask_api_key(
+            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8",
+        );
+        // Last 5 chars unmasked, preceded by only dots.
+        assert!(
+            masked.ends_with("3d8e8"),
+            "mask must reveal the tail 3d8e8; got {masked:?}",
+        );
+        // The prefix must be masked dot-by-dot - no leak of the
+        // high-entropy secret.
+        let prefix = &masked[..masked.len() - 5];
+        assert!(
+            prefix.chars().all(|c| c == '•'),
+            "prefix must be all dots; got {prefix:?}",
+        );
+        // And the original predictable prefix must NOT appear in the
+        // rendered mask.
+        assert!(
+            !masked.contains("vb_01"),
+            "mask leaked predictable prefix vb_01; got {masked:?}",
+        );
+    }
+    /// The API-key modal surfaces the Ctrl+U clear hint INSIDE the
+    /// popup body itself, not just in the keys sidebar - the keys
+    /// sidebar can be obscured by the modal popup on narrower
+    /// terminals, so the user inside the modal must be able to read
+    /// the controls inline. We assert the phrase `Ctrl+U to clear`
+    /// appears verbatim in the rendered frame; this phrasing is
+    /// distinct from the keys sidebar's `[Ctrl+U] clear` (note the
+    /// brackets around `Ctrl+U` in the sidebar) and from
+    /// `Ctrl+U` followed by a separate `clear` cell.
+    #[test]
+    fn api_key_modal_surfaces_ctrl_u_hint_in_modal_body() {
+        let mut app = App::new();
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        app.api_key_buf = Some(String::new());
+        app.config.voicebird_api_key =
+            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8".into();
+        let out = render_to_string(&app, 200, 50);
+        assert!(
+            out.contains("Ctrl+U to clear"),
+            "modal prompt text must advertise `Ctrl+U to clear` in-place \
+             (distinguishable from the keys sidebar's `[Ctrl+U] clear`); \
+             rendered:\n{out}",
+        );
+    }
+
+    /// The keys sidebar lists `[K]` as the dedicated, always-available
+    /// shortcut for opening the API-key modal. Without `[K]` in the
+    /// sidebar the user has no in-app way to find the API-key modal
+    /// when 'c' is taken (it toggles cloud on a focused section).
+    #[test]
+    fn keys_panel_lists_K_for_setting_api_key() {
+        let mut app = App::new();
+        let out = render_to_string(&app, 140, 30);
+        assert!(
+            out.contains("[K]"),
+            "keys panel must advertise `[K]`; rendered:\n{out}",
+        );
+        assert!(
+            out.contains("API key"),
+            "keys panel must advertise the API-key action; rendered:\n{out}",
+        );
+    }
     /// additional slots; each column carries its slot number in
     /// the title. The empty-slot placeholder still shows when
     /// nothing is recording.

@@ -1511,3 +1511,50 @@ mod api_key_modal_ctrl_u_tests {
         );
     }
 }
+
+/// `K` (uppercase) opens the API-key modal from Normal mode, regardless
+/// of whether a section is focused. The lowercase `k` keystroke must
+/// still be a regular character typed into nothing (we don't bind it),
+/// because crossterm encodes Ctrl+K the same as a plain 'k' - the
+/// uppercase letter is the discoverable, conflict-free shortcut.
+#[cfg(test)]
+mod api_key_dispatcher_K_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn uppercase_K_opens_the_api_key_modal_from_normal_mode() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        let evt = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE);
+        handle_normal_mode(&mut app, evt.code);
+        assert_eq!(
+            app.mode,
+            AppMode::ApiKeyModal,
+            "uppercase K must open the API-key modal; mode = {:?}",
+            app.mode,
+        );
+        assert!(
+            app.api_key_buf.is_some(),
+            "opening the modal must seed api_key_buf so the user sees what's saved"
+        );
+    }
+
+    #[test]
+    fn lowercase_k_is_NOT_an_api_key_shortcut_only_uppercase_K_is() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        let evt = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_normal_mode(&mut app, evt.code);
+        // We do not assert a specific behaviour for lowercase 'k'
+        // (it's not bound to anything), only that it does NOT open
+        // the API-key modal. If a future feature binds 'k' to
+        // something else, this test continues to assert what we
+        // explicitly want - no overlap with the K shortcut.
+        assert_ne!(
+            app.mode,
+            AppMode::ApiKeyModal,
+            "lowercase k must not open the API-key modal",
+        );
+    }
+}
