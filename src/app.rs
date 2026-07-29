@@ -595,9 +595,10 @@ impl App {
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
-            // Targets list is fixed at three rows (Stdout/Cloud/Agent),
-            // so the cursor starts on the first one. We never want
-            // the pane to render in an empty-cursor state.
+            // Targets list starts with Stdout at index 0; the user
+            // grows it with Add Agent (config.agent_targets).
+            // pre-populated so the pane never renders in an
+            // empty-cursor state.
             selected_target_index: Some(0),
             picker_focus: PickerFocus::Devices,
             device_scroll: 0,
@@ -1278,12 +1279,19 @@ impl App {
             }
             PickerFocus::Targets => {
                 let i = self.selected_target_index.unwrap_or(0);
-                // The list is fixed at three rows. The disabled-row
-                // skip happens lazily in `focused_target_kind` so
-                // the cursor still parks on the row visually — the
-                // banner and the start call both treat it as a
-                // no-op when the row is disabled.
-                if i + 1 < 3 {
+                // The Targets list is dynamic — Stdout / Cloud plus
+                // every entry in `config.agent_targets`. The renderer
+                // already iterates the full list, so the cursor cap
+                // must come from `targets().len()` too; a hardcoded
+                // `3` leaves user-added rows beyond the first Agent
+                // unreachable via ↑/↓ (the row renders but never
+                // receives the cursor). The disabled-row skip is
+                // still handled lazily in `focused_target_kind` so
+                // the cursor can park on a row that's visually
+                // present but unpickable — the banner and start call
+                // treat that as a no-op.
+                let total = self.targets().len();
+                if i + 1 < total {
                     self.selected_target_index = Some(i + 1);
                 }
             }
@@ -2857,6 +2865,97 @@ mod tests {
         // Switching back to Stdout overwrites the prior override.
         let stdout = app.pick_target(TargetKind::Stdout);
         assert_eq!(stdout, Target::Stdout);
+    }
+
+    /// Targets list grows past three rows once the user adds a
+    /// second Agent target. ↑/↓ must walk onto the saved row
+    /// instead of leaving it stranded behind a hardcoded cap.
+    /// Regression for the screenshot where `Agent: prod-events`
+    /// rendered in the pane but the ▶ cursor couldn't reach it.
+    #[test]
+    fn select_next_advances_past_first_agent_target() {
+        use crate::app::{PickerFocus, TargetKind};
+        use voice_bird_cli::config::{
+            AgentConnection, AgentTargetConfig, KafkaAgentConnection,
+        };
+
+        fn seed(id: &str, name: &str) -> AgentTargetConfig {
+            AgentTargetConfig {
+                id: id.into(),
+                name: name.into(),
+                connection: AgentConnection::Kafka(KafkaAgentConnection {
+                    endpoint: "localhost:9092".into(),
+                    topic: "voice-bird".into(),
+                    client_id: None,
+                    acks: Default::default(),
+                    security_protocol: Default::default(),
+                    sasl_mechanism: None,
+                    sasl_username: None,
+                    sasl_password_env: None,
+                }),
+            }
+        }
+
+        // App::new() loads the real on-disk config, which on a
+        // developer machine already contains Agent rows whose ids
+        // could collide with the hardcoded "uuid-prod" / "uuid-events"
+        // used here (causing upsert_agent_target_in_memory to take
+        // the replace path instead of append and skewing every
+        // assertion below). Wipe both the config vector and the
+        // runtime map before we seed our own rows so the test is
+        // fully deterministic regardless of the host's config state.
+        let mut app = App::new();
+        app.config.agent_targets.clear();
+        app.agent_targets.clear();
+        app.upsert_agent_target_in_memory(seed("uuid-prod", "prod"))
+            .expect("upsert prod");
+        app.upsert_agent_target_in_memory(seed("uuid-events", "prod-events"))
+            .expect("upsert prod-events");
+
+        // Sanity: the only Agent rows in the list are the two we
+        // just appended, in upsert order. Catches future regressions
+        // in App::targets() without depending on host state.
+        let kinds: Vec<_> = app.targets().into_iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TargetKind::Stdout,
+                TargetKind::Cloud,
+                TargetKind::Agent { id: "uuid-prod".into() },
+                TargetKind::Agent { id: "uuid-events".into() },
+            ]
+        );
+        let prod_idx = 2usize;
+        let events_idx = 3usize;
+
+        // Focus the Targets pane and walk the cursor down from the
+        // top. Each ↓ must move one row, regardless of how many
+        // Agent rows the user has configured.
+        app.picker_focus = PickerFocus::Targets;
+        app.selected_target_index = Some(0);
+
+        // Step down until we land on `prod`, then one more step
+        // must land on `prod-events`.
+        for _ in 0..prod_idx {
+            app.select_next();
+        }
+        assert_eq!(app.selected_target_index, Some(prod_idx));
+        assert_eq!(
+            app.focused_target_kind(),
+            Some(TargetKind::Agent { id: "uuid-prod".into() })
+        );
+
+        // This ↓ is the one that was a no-op before the fix.
+        app.select_next();
+        assert_eq!(app.selected_target_index, Some(events_idx));
+        assert_eq!(
+            app.focused_target_kind(),
+            Some(TargetKind::Agent { id: "uuid-events".into() })
+        );
+
+        // Past the end, ↓ is a no-op (not an underflow into None).
+        app.select_next();
+        assert_eq!(app.selected_target_index, Some(events_idx));
     }
 
     #[test]
