@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -345,7 +346,7 @@ fn run_app<B: Backend>(
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::Status => handle_status_mode(app, key.code),
-                            AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
+                            AppMode::ApiKeyModal => handle_api_key_modal(app, &key),
                             AppMode::PathModal => handle_path_modal(app, key.code),
                             AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
                             AppMode::ConfirmDeleteAgentTarget { id } => {
@@ -856,8 +857,8 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
     }
 }
 
-fn handle_api_key_modal(app: &mut App, key: KeyCode) {
-    match key {
+fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
+    match key.code {
         KeyCode::Esc => {
             // Cancel: revert the cloud toggle so the user isn't left
             // with cloud=on and no key — that would block the next
@@ -899,6 +900,19 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
                 buf.pop();
             }
         }
+        // Ctrl+U clears the buffer so the user can retype from scratch
+        // (standard text-editor kill-line). crossterm encodes this as
+        // `KeyCode::Char('u')` with the CONTROL modifier set; the guard
+        // is mandatory - a plain `u` keystroke (no modifier) must still
+        // type into the buffer normally. Saving an empty buffer (Enter
+        // with the empty buf) clears the saved key on disk, which gives
+        // the user a way to remove a corrupted key without editing
+        // config.toml by hand.
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(buf) = app.api_key_buf.as_mut() {
+                buf.clear();
+            }
+        }
         KeyCode::Char(ch) => {
             if let Some(buf) = app.api_key_buf.as_mut() {
                 buf.push(ch);
@@ -907,7 +921,6 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
         _ => {}
     }
 }
-
 /// Key handler for the multi-step "Add / Edit Agent target"
 /// funnel. Steps share a `KeyCode::Enter` advance and
 /// `KeyCode::Esc` cancel; text-input steps also accept
