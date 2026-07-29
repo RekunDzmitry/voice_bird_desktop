@@ -284,15 +284,15 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
             // the hint on a non-focused slot would mislead.
             // The clear hint (x) is universal and stays on
             // every paused slot.
+            // on every paused slot.
             let hint_text = if is_focused {
-                "… (paused — press [R] to resume, [x] to clear)"
+                "… (paused — [R] resumes · [x] clears · Enter = new session)"
             } else {
                 "… (paused — press [x] to clear)"
             };
             let hint = Paragraph::new(Line::from(Span::styled(
                 hint_text,
                 Style::default()
-                    .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             )));
             f.render_widget(hint, cells[1]);
@@ -1545,7 +1545,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[↑/↓]", "select"),
                 hotkey_line("[←/→]", "pane"),
                 hotkey_line("[Space]", "no app"),
-                hotkey_line("[Enter]", "start"),
+                hotkey_line("[Enter]", "new session"),
                 hotkey_line("[Tab]", "focus slot"),
                 hotkey_line("[+]", "add slot"),
                 hotkey_line("[-]", "remove slot"),
@@ -1575,7 +1575,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             let mut lines = vec![
                 hotkey_line("[↑/↓]", "select"),
                 hotkey_line("[←/→]", "pane"),
-                hotkey_line("[Enter]", "add"),
+                hotkey_line("[Enter]", "new session"),
                 hotkey_line("[Tab]", "focus slot"),
                 hotkey_line("[+]", "add slot"),
                 hotkey_line("[-]", "remove slot"),
@@ -1713,7 +1713,7 @@ mod tests {
     fn key_sidebar_shows_enter_and_refresh_when_idle() {
         let app = App::new();
         let out = render_to_string(&app, 140, 30);
-        assert!(out.contains("[Enter] start"), "enter hint missing:\n{out}");
+        assert!(out.contains("[Enter] new session"), "enter hint missing:\n{out}");
         assert!(out.contains("[r] refresh"), "refresh hint missing:\n{out}");
     }
 
@@ -2332,18 +2332,24 @@ mod tests {
         );
     }
 
-
-    /// A paused (Saved) slot's bottom hint must advertise the
-    /// [R] resume key — but only on the focused slot, since
-    /// R resumes the focused slot regardless of which
-    /// saved slot is showing the hint. Non-focused saved
-    /// slots keep the original (clear-only) hint.
+    /// A paused (Saved) slot's bottom hint must make the
+    /// Enter/R distinction explicit:
+    ///   - R resumes the focused slot in place.
+    ///   - x clears the focused slot.
+    ///   - Enter starts a brand-new session (in a new
+    ///     slot, if one is free).
+    /// Without the Enter mention, users hit Enter
+    /// expecting to "confirm" the new app pick and get
+    /// a misleading "all slots are full" banner instead
+    /// of the right hint.
     ///
-    /// Pinned regression guard for the hint that turns R
-    /// from a "look it up in the help" key into a
-    /// discoverable one.
+    /// The resume + clear hints only appear on the
+    /// focused slot, since R/x target the focused slot
+    /// regardless of which paused slot is showing the
+    /// hint. Non-focused saved slots keep the
+    /// clear-only hint.
     #[test]
-    fn paused_slot_hint_advertises_resume_on_focused_slot_only() {
+    fn paused_slot_hint_advertises_resume_and_enter_contrast() {
         use crate::app::{SavedTranscript, SlotKind};
         use std::sync::Arc;
         use voice_bird_cli::session::target::Target;
@@ -2373,28 +2379,34 @@ mod tests {
             };
         }
 
-        // Focused = slot A. The focused paused slot
-        // must show the resume hint.
+        // Focused = slot A. The focused paused hint
+        // must mention R (resume), x (clear), and
+        // Enter (new session).
         app.focused_slot = slot_a;
         let out_focused = render_to_string(&app, 180, 40);
         assert!(
-            out_focused.contains("press [R] to resume"),
-            "focused paused slot must advertise [R] to resume; got:\n{out_focused}"
+            out_focused.contains("[R] resumes"),
+            "focused paused hint must advertise [R] resumes; got:\n{out_focused}"
         );
         assert!(
-            out_focused.contains("press [x] to clear"),
-            "focused paused slot must also keep the [x] clear hint; got:\n{out_focused}"
+            out_focused.contains("[x] clears"),
+            "focused paused hint must also advertise [x] clears; got:\n{out_focused}"
+        );
+        assert!(
+            out_focused.contains("Enter = new session"),
+            "focused paused hint must clarify Enter starts a new session; got:\n{out_focused}"
         );
 
         // Focused = slot B. Slot A is now non-focused
         // and must show only the clear hint; slot B
-        // is focused and shows the resume hint. Both
-        // strings must be present in the rendered
-        // output (different slots, different lines).
+        // is focused and shows the full R/x/Enter
+        // hint. Both strings must be present in the
+        // rendered output (different slots, different
+        // lines).
         app.focused_slot = slot_b;
         let out_unfocused = render_to_string(&app, 180, 40);
         assert!(
-            out_unfocused.contains("press [R] to resume"),
+            out_unfocused.contains("[R] resumes"),
             "after switching focus to slot B, the focused slot's hint must advertise [R]; got:\n{out_unfocused}"
         );
         assert!(

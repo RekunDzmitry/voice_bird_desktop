@@ -2518,16 +2518,33 @@ impl App {
     /// handler that *applies* the picked target first; that
     /// lives in `main.rs` (it's a UI concern) and is called
     /// *before* this method. By the time we get here, the
-    /// target override is already in `pending_target_overrides`.
     pub fn try_start_new_section(&mut self) -> Result<(), String> {
-        // Pick the next free slot (or refuse if all are full).
+        // No Empty slot. Distinguish between the two
+        //   - Some slot is actively Recording — they
+        //     need to [s] top one to free a slot.
+        //   - All non-Empty slots are Saved (paused) —
+        //     [R] resumes a paused slot in place, [x]
+        //     clears, [-] removes. The old hardcoded
+        //     "all 3 sections are recording" message
+        //     was factually wrong in the second case and
+        //     hid the new R key.
         let Some(slot) = self.next_free_slot() else {
-            log::info!("keys: Enter → refused (no free slot)");
-            return Err("All 3 sections are recording — stop one first ([s])".into());
+            let total = self.slots.len();
+            let recording = self.active_section_count();
+            log::info!("keys: Enter → refused (no free slot, {recording} recording, {total} total)");
+            let msg = if recording > 0 {
+                format!(
+                    "All {total} slots are full — stop the recording with [s] first"
+                )
+            } else {
+                format!(
+                    "No empty slots — press [R] to resume a paused slot, [x] to clear, [-] to remove"
+                )
+            };
+            return Err(msg);
         };
         use voice_bird_cli::config::AudioSessionKind;
         use voice_bird_cli::session::layout::SessionSource;
-
         let Some(dev) = self.devices.get(self.selected_device_index).cloned() else {
             log::warn!(
                 "keys: Enter → refused (no device at idx {})",
