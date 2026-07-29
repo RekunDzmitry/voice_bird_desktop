@@ -111,6 +111,10 @@ fn funnel_to_kafka_round_trip() {
             topic: topic.clone(),
             client_id: Some("voice-bird-e2e".into()),
             acks: Default::default(),
+            security_protocol: Default::default(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password_env: None,
         };
         let target = KafkaTarget::new(AgentSessionId("e2e-session".into()), conn.clone());
 
@@ -135,6 +139,7 @@ fn funnel_to_kafka_round_trip() {
         };
         target
             .push_segment(&seg)
+            .await
             .map_err(|e| anyhow::anyhow!("push_segment failed: {e}"))?;
 
         // 4. Build a read-back consumer and `assign()` it from
@@ -229,6 +234,10 @@ fn verify_only() {
         topic,
         client_id: None,
         acks: Default::default(),
+        security_protocol: Default::default(),
+        sasl_mechanism: None,
+        sasl_username: None,
+        sasl_password_env: None,
     };
     let target = KafkaTarget::new(AgentSessionId("verify-only".into()), conn);
     // Drive verify on its own thread+runtime. We can't
@@ -274,6 +283,10 @@ fn verify_fresh_topic_first_attempt() {
         topic: fresh_topic.clone(),
         client_id: None,
         acks: Default::default(),
+        security_protocol: Default::default(),
+        sasl_mechanism: None,
+        sasl_username: None,
+        sasl_password_env: None,
     };
     let target = KafkaTarget::new(AgentSessionId("fresh-verify".into()), conn);
     let result = block_on(async move { target.verify().await });
@@ -343,6 +356,10 @@ fn verify_busy_topic() {
         topic: topic.clone(),
         client_id: None,
         acks: Default::default(),
+        security_protocol: Default::default(),
+        sasl_mechanism: None,
+        sasl_username: None,
+        sasl_password_env: None,
     };
     let target = KafkaTarget::new(AgentSessionId("busy-verify".into()), conn);
 

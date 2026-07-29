@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,11 @@ pub enum AppMode {
     Normal,
     ModelPicker, // wired in Stage 3's Task 18
     Help,
+    /// Status overlay: the most recent Agent events (target saved,
+    /// verify ok/fail, broker errors, dropped segments), newest
+    /// first, each with a timestamp. Opened with `t`; `?` stays
+    /// help-only.
+    Status,
     /// Centered overlay prompting the user to paste a Voice Bird API key.
     /// Opened when `c` toggles cloud on with an empty key, or when the
     /// engine reports an auth failure during recording.
@@ -425,6 +431,65 @@ pub struct App {
     /// logging. Set alongside `verify_rx`; read by the poll
     /// helper on completion.
     pub verify_started: Option<std::time::Instant>,
+
+    /// Rolling log of Agent-related events (target saved,
+    /// verify ok/fail, push failures, dropped segments),
+    /// newest at the back, capped at [`AGENT_EVENT_CAP`].
+    /// Behind an `Arc<PlMutex<...>>` because the recording
+    /// consumer task appends from its own tokio task while
+    /// the render thread reads. Surfaced by the `t` status
+    /// overlay ([`AppMode::Status`]).
+    pub agent_events: Arc<PlMutex<VecDeque<AgentEvent>>>,
+}
+
+/// Cap on [`App::agent_events`]. Big enough to cover a long
+/// recording session's worth of incidents; small enough that the
+/// overlay and memory stay bounded.
+pub const AGENT_EVENT_CAP: usize = 50;
+
+/// One row in the `t` status overlay.
+#[derive(Debug, Clone)]
+pub struct AgentEvent {
+    /// Local wall-clock time the event was recorded.
+    pub at: chrono::DateTime<chrono::Local>,
+    pub message: String,
+}
+
+/// Append an event to the shared agent-event log, evicting the
+/// oldest entry past [`AGENT_EVENT_CAP`]. Free function (not a
+/// method) so the recording consumer task can call it on its
+/// cloned `Arc` without touching `App`.
+pub fn push_agent_event(events: &Arc<PlMutex<VecDeque<AgentEvent>>>, message: impl Into<String>) {
+    let mut buf = events.lock();
+    if buf.len() == AGENT_EVENT_CAP {
+        buf.pop_front();
+    }
+    buf.push_back(AgentEvent {
+        at: chrono::Local::now(),
+        message: message.into(),
+    });
+}
+
+/// Record the outcome of one consumer-task dispatch into the agent
+/// event log. Only outcomes a user would act on become events —
+/// the happy paths (`Pushed`, `Default`, `NotAgent`) stay silent so
+/// the overlay isn't flooded at one row per segment.
+pub fn record_dispatch_event(
+    events: &Arc<PlMutex<VecDeque<AgentEvent>>>,
+    outcome: AgentDispatch,
+    session_id: &str,
+) {
+    match outcome {
+        AgentDispatch::PushFailed => push_agent_event(
+            events,
+            format!("push to Agent target '{session_id}' failed (broker error — see log)"),
+        ),
+        AgentDispatch::Dropped => push_agent_event(
+            events,
+            format!("Agent target '{session_id}' missing — segment dropped"),
+        ),
+        AgentDispatch::NotAgent | AgentDispatch::Default | AgentDispatch::Pushed => {}
+    }
 }
 /// A single row in the Targets picker. The picker renders
 /// one row per known target; rows that point at a target
@@ -573,6 +638,7 @@ impl App {
             funnel: None,
             verify_rx: None,
             verify_started: None,
+            agent_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
         app.load_agent_targets_from_config();
         // user must provide before recording.
@@ -1424,6 +1490,15 @@ impl App {
         };
     }
 
+    /// Toggle the `t` status overlay (recent Agent events).
+    pub fn toggle_status(&mut self) {
+        self.mode = if self.mode == AppMode::Status {
+            AppMode::Normal
+        } else {
+            AppMode::Status
+        };
+    }
+
     /// Resolve the effective settings for a given source. Prefers a
     /// device-specific override (keyed on the actual selected device
     /// name + kind) over the generic Microphone/System fallback.
@@ -1954,6 +2029,7 @@ impl App {
         // picks up the new target") but surprising if the
         // user expects removal to take effect immediately.
         let agent_targets_for_consumer = self.agent_targets.clone();
+        let agent_events_for_consumer = self.agent_events.clone();
         let slot_for_consumer = slot;
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
@@ -2011,28 +2087,18 @@ impl App {
                             None
                         };
                         // Route into the agent buffer when the
-                        // slot's target is `Target::Agent`. The
-                        // target's session_id picks the
-                        // `AgentTarget` impl to fan the segment
-                        // out to. The default MCP-backed target
-                        // (session_id == "default") still goes
-                        // through `agent_state` for backward
-                        // compatibility with the
-                        // `voice_bird__pull_recent` MCP tool.
+                        // slot's target is `Target::Agent`. See
+                        // `dispatch_segment_to_agent` for the
+                        // default / known-id / missing-id arms.
+                        let outcome = dispatch_segment_to_agent(
+                            &target_for_consumer,
+                            &seg,
+                            &agent_state_for_consumer,
+                            &agent_targets_for_consumer,
+                        )
+                        .await;
                         if let Target::Agent { session_id } = &target_for_consumer {
-                            if session_id == "default" {
-                                agent_state_for_consumer.push(seg.clone());
-                            } else if let Some(agent) = agent_targets_for_consumer.get(session_id) {
-                                if let Err(e) = agent.push_segment(&seg) {
-                                    log::warn!("agent target push_segment ({}): {e}", session_id);
-                                }
-                            } else {
-                                // Target was removed mid-recording.
-                                // Drop the segment — better than
-                                // silently routing to the
-                                // default MCP target.
-                                log::warn!("agent target {session_id} not found; segment dropped");
-                            }
+                            record_dispatch_event(&agent_events_for_consumer, outcome, session_id);
                         }
                         // Mirror to the on-disk live tail so the
                         // MCP server process spawned by the agent
@@ -2511,12 +2577,24 @@ impl App {
         };
         match result {
             Ok(elapsed) => {
+                push_agent_event(
+                    &self.agent_events,
+                    format!(
+                        "verify OK for '{}' in {}ms",
+                        f.endpoint.trim(),
+                        elapsed.as_millis()
+                    ),
+                );
                 f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed };
             }
             Err(e) => {
                 if let Some(started) = started {
                     log::warn!("funnel: verify failed after {:?}: {e}", started.elapsed());
                 }
+                push_agent_event(
+                    &self.agent_events,
+                    format!("verify FAILED for '{}': {e}", f.endpoint.trim()),
+                );
                 f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
                     message: format!("{e}"),
                 };
@@ -2591,6 +2669,66 @@ pub fn section_column_label(slot: SlotId, section: Option<&Section>) -> String {
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Agent segment dispatch ─────────────────────────────────────────────
+
+/// What [`dispatch_segment_to_agent`] did with a segment. Returned so
+/// tests (and future status surfaces) can assert routing without a
+/// live recording pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDispatch {
+    /// The slot's target is not `Target::Agent`; nothing was routed.
+    NotAgent,
+    /// Routed to the legacy MCP `agent_state` buffer (`"default"` id).
+    Default,
+    /// Pushed to the mapped user-configured `AgentTarget`.
+    Pushed,
+    /// The mapped target's `push_segment` failed; error logged.
+    PushFailed,
+    /// No target with that id (removed mid-recording); segment
+    /// dropped with a warning — NOT silently routed to default.
+    Dropped,
+}
+
+/// Route one committed segment to its Agent destination. The default
+/// MCP-backed target (`session_id == "default"`, see
+/// `voice_bird_cli::config::RESERVED_AGENT_TARGET_IDS`) goes through
+/// `agent_state` for backward compatibility with the
+/// `voice_bird__pull_recent` MCP tool; user-configured ids resolve
+/// through `agent_targets`. Called from the recording consumer task
+/// in `App::start_section`. Async since #32: the consumer task
+/// awaits the target's `push_segment` future directly on its own
+/// runtime instead of bridging through a per-call thread.
+async fn dispatch_segment_to_agent(
+    target: &Target,
+    seg: &voice_bird_cli::transcription::Segment,
+    agent_state: &voice_bird_cli::agent::mcp_server::ServerState,
+    agent_targets: &std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
+    >,
+) -> AgentDispatch {
+    let Target::Agent { session_id } = target else {
+        return AgentDispatch::NotAgent;
+    };
+    if session_id == "default" {
+        agent_state.push(seg.clone());
+        AgentDispatch::Default
+    } else if let Some(agent) = agent_targets.get(session_id) {
+        match agent.push_segment(seg).await {
+            Ok(()) => AgentDispatch::Pushed,
+            Err(e) => {
+                log::warn!("agent target push_segment ({session_id}): {e}");
+                AgentDispatch::PushFailed
+            }
+        }
+    } else {
+        // Target was removed mid-recording. Drop the segment —
+        // better than silently routing to the default MCP target.
+        log::warn!("agent target {session_id} not found; segment dropped");
+        AgentDispatch::Dropped
     }
 }
 
@@ -2731,6 +2869,203 @@ mod tests {
         // Empty fallbacks for the focused-* Arcs.
         assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
+    }
+
+    // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
+
+    /// Spy `AgentTarget`: records every pushed segment's text, or
+    /// fails the push when `fail` is set.
+    struct SpyTarget {
+        pushed: Arc<PlMutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl voice_bird_cli::agent::AgentTarget for SpyTarget {
+        fn session_id(&self) -> voice_bird_cli::agent::AgentSessionId {
+            voice_bird_cli::agent::AgentSessionId("spy".into())
+        }
+        async fn push_segment(
+            &self,
+            segment: &voice_bird_cli::transcription::Segment,
+        ) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("spy push_segment failure");
+            }
+            self.pushed.lock().push(segment.text.clone());
+            Ok(())
+        }
+        fn pull_recent(&self, _limit: usize) -> Vec<voice_bird_cli::transcription::Segment> {
+            Vec::new()
+        }
+    }
+
+    fn dispatch_seg(text: &str) -> voice_bird_cli::transcription::Segment {
+        voice_bird_cli::transcription::Segment {
+            t_start: std::time::Duration::from_millis(0),
+            t_end: std::time::Duration::from_millis(500),
+            text: text.into(),
+            tokens: Vec::new(),
+        }
+    }
+
+    fn dispatch_fixture(
+        fail: bool,
+    ) -> (
+        voice_bird_cli::agent::mcp_server::ServerState,
+        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
+        Arc<PlMutex<Vec<String>>>,
+    ) {
+        let state = voice_bird_cli::agent::mcp_server::ServerState::new(
+            voice_bird_cli::agent::AgentSessionId::default_session(),
+        );
+        let pushed = Arc::new(PlMutex::new(Vec::new()));
+        let mut targets: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
+        > = std::collections::HashMap::new();
+        targets.insert(
+            "known-id".into(),
+            std::sync::Arc::new(SpyTarget {
+                pushed: pushed.clone(),
+                fail,
+            }),
+        );
+        (state, targets, pushed)
+    }
+
+    #[tokio::test]
+    async fn dispatch_default_id_routes_to_legacy_mcp_buffer() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "default".into(),
+            },
+            &dispatch_seg("hello"),
+            &state,
+            &targets,
+        ).await;
+        assert_eq!(out, AgentDispatch::Default);
+        let buf = state.pull(10);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].text, "hello");
+        // The user-configured target must NOT see the segment.
+        assert!(pushed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_known_id_pushes_to_mapped_target() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "known-id".into(),
+            },
+            &dispatch_seg("routed"),
+            &state,
+            &targets,
+        ).await;
+        assert_eq!(out, AgentDispatch::Pushed);
+        assert_eq!(*pushed.lock(), vec!["routed".to_string()]);
+        // The legacy MCP buffer must stay empty.
+        assert!(state.pull(10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_missing_id_drops_segment_not_default() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "removed-mid-recording".into(),
+            },
+            &dispatch_seg("lost"),
+            &state,
+            &targets,
+        ).await;
+        assert_eq!(out, AgentDispatch::Dropped);
+        // Dropped means dropped: neither the legacy buffer nor any
+        // configured target receives the segment.
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_push_failure_is_reported_not_rerouted() {
+        let (state, targets, pushed) = dispatch_fixture(true);
+        let out = dispatch_segment_to_agent(
+            &Target::Agent {
+                session_id: "known-id".into(),
+            },
+            &dispatch_seg("boom"),
+            &state,
+            &targets,
+        ).await;
+        assert_eq!(out, AgentDispatch::PushFailed);
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
+    }
+
+    /// `push_agent_event` caps the log at AGENT_EVENT_CAP by
+    /// evicting the oldest entry, and `record_dispatch_event`
+    /// only records the outcomes a user would act on.
+    #[test]
+    fn agent_event_log_caps_and_records_failures_only() {
+        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
+        for i in 0..(AGENT_EVENT_CAP + 5) {
+            push_agent_event(&events, format!("e{i}"));
+        }
+        let buf = events.lock();
+        assert_eq!(buf.len(), AGENT_EVENT_CAP);
+        assert_eq!(buf.front().unwrap().message, "e5");
+        assert_eq!(
+            buf.back().unwrap().message,
+            format!("e{}", AGENT_EVENT_CAP + 4)
+        );
+        drop(buf);
+
+        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
+        // Happy paths stay silent — one row per segment would
+        // flood the overlay.
+        record_dispatch_event(&events, AgentDispatch::Pushed, "id");
+        record_dispatch_event(&events, AgentDispatch::Default, "id");
+        record_dispatch_event(&events, AgentDispatch::NotAgent, "id");
+        assert!(events.lock().is_empty());
+        // Failure paths are recorded with the target id.
+        record_dispatch_event(&events, AgentDispatch::PushFailed, "prod-a");
+        record_dispatch_event(&events, AgentDispatch::Dropped, "prod-b");
+        let buf = events.lock();
+        assert_eq!(buf.len(), 2);
+        assert!(buf[0].message.contains("prod-a"));
+        assert!(buf[1].message.contains("prod-b"));
+        assert!(buf[1].message.contains("dropped"));
+    }
+
+    /// `?` is help-only and `t` owns the status overlay — the two
+    /// modes toggle independently and neither writes a banner.
+    #[test]
+    fn help_and_status_keys_toggle_independent_modes() {
+        let mut app = App::new();
+        app.toggle_help();
+        assert_eq!(app.mode, AppMode::Help);
+        assert!(app.banner.is_none(), "help must not surface a banner");
+        app.toggle_help();
+        assert_eq!(app.mode, AppMode::Normal);
+
+        app.toggle_status();
+        assert_eq!(app.mode, AppMode::Status);
+        assert!(app.banner.is_none(), "status must not surface a banner");
+        app.toggle_status();
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn dispatch_non_agent_targets_route_nothing() {
+        let (state, targets, pushed) = dispatch_fixture(false);
+        for target in [Target::Stdout, Target::Cloud] {
+            let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets).await;
+            assert_eq!(out, AgentDispatch::NotAgent);
+        }
+        assert!(state.pull(10).is_empty());
+        assert!(pushed.lock().is_empty());
     }
 
     // Runs on every platform: asserts the forcing on Windows and the

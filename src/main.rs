@@ -344,6 +344,7 @@ fn run_app<B: Backend>(
                             AppMode::Normal => handle_normal_mode(app, key.code),
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
+                            AppMode::Status => handle_status_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
                             AppMode::PathModal => handle_path_modal(app, key.code),
                             AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
@@ -420,7 +421,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
     }
     match key {
         KeyCode::Char('q') => app.should_quit = true,
+        // `?` is help-only (D7 resolved in #33): status lives on
+        // its own key so a status event can never race the help
+        // modal.
         KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('t') => app.toggle_status(),
         // Tab cycles which section the c/l/m/s/PgUp keys target.
         KeyCode::Tab => {
             app.focus_next();
@@ -977,18 +982,13 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
                         voice_bird_cli::agent::AgentSessionId::default_session(),
                         conn.clone(),
                     );
-                    // Drive verify on a dedicated thread with its own
-                    // runtime. The TUI runs inside its own tokio
-                    // runtime, so `block_on` on `Handle::current()`
-                    // would panic.
+                    // Drive verify on the App's own tokio runtime —
+                    // the event loop keeps polling `verify_rx`, so
+                    // nothing blocks. (Pre-#32 this spawned a
+                    // dedicated thread + one-shot runtime.)
                     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("build one-shot tokio runtime");
-                        let r = rt.block_on(target.verify());
-                        let _ = tx.send(r);
+                    app.rt.spawn(async move {
+                        let _ = tx.send(target.verify().await);
                     });
                     app.verify_rx = Some(rx);
                     app.verify_started = Some(std::time::Instant::now());
@@ -1007,10 +1007,18 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
                         app.verify_rx = None;
                         app.verify_started = None;
                         app.mode = AppMode::Normal;
+                        crate::app::push_agent_event(
+                            &app.agent_events,
+                            format!("saved Agent target '{name}'"),
+                        );
                         app.banner = Some(format!("Saved Agent target '{name}'"));
                     }
                     Err(e) => {
                         log::error!("funnel: save failed: {e}");
+                        crate::app::push_agent_event(
+                            &app.agent_events,
+                            format!("save FAILED for Agent target '{name}': {e}"),
+                        );
                         app.banner = Some(format!("Save failed: {e}"));
                     }
                 }
@@ -1035,6 +1043,20 @@ fn handle_agent_funnel(app: &mut App, key: KeyCode) {
             funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
             funnel.verify = VerifyOutcome::Pending;
         }
+        // Security-protocol picker: 1-4 map onto
+        // KafkaSecurityProtocol::ALL in render order.
+        KeyCode::Char(ch @ '1'..='4') if funnel.step == AgentFunnelStep::Security => {
+            let idx = (ch as u8 - b'1') as usize;
+            funnel.security_protocol = voice_bird_cli::config::KafkaSecurityProtocol::ALL[idx];
+            funnel.verify = VerifyOutcome::Pending;
+        }
+        // SASL-mechanism picker: 1-3 map onto
+        // KafkaSaslMechanism::ALL in render order.
+        KeyCode::Char(ch @ '1'..='3') if funnel.step == AgentFunnelStep::SaslMechanism => {
+            let idx = (ch as u8 - b'1') as usize;
+            funnel.sasl_mechanism = voice_bird_cli::config::KafkaSaslMechanism::ALL[idx];
+            funnel.verify = VerifyOutcome::Pending;
+        }
         KeyCode::Char(ch) => funnel.type_char(ch),
         _ => {}
     }
@@ -1056,6 +1078,10 @@ fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
                 .unwrap_or_else(|| id.to_string());
             app.remove_agent_target(id);
             app.mode = AppMode::Normal;
+            crate::app::push_agent_event(
+                &app.agent_events,
+                format!("deleted Agent target '{name}'"),
+            );
             app.banner = Some(format!("Deleted Agent target '{name}'"));
         }
         _ => {
@@ -1119,6 +1145,16 @@ fn handle_help_mode(app: &mut App, key: KeyCode) {
     }
 }
 
+/// Status overlay (`t`): any of the usual dismiss keys close it.
+fn handle_status_mode(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+            app.toggle_status();
+        }
+        _ => {}
+    }
+}
+
 fn stop_all_sessions(app: &mut App) {
     log::info!("Stopping all sessions");
     app.stop_all_sections();
@@ -1167,6 +1203,29 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
     };
     let api_key_buf_len = app.api_key_buf.as_ref().map(|s| s.len()).unwrap_or(0);
 
+    // Funnel state so a harness (e.g. scripts/demo-kafka.sh) can
+    // drive the Add-Agent form step by step and wait for the
+    // verify probe instead of sleeping blind.
+    let funnel_step = app
+        .funnel
+        .as_ref()
+        .map(|f| format!("{:?}", f.step))
+        .unwrap_or_default();
+    let funnel_verify = app
+        .funnel
+        .as_ref()
+        .map(|f| match &f.verify {
+            voice_bird_cli::agent_funnel::VerifyOutcome::Pending => "Pending".to_string(),
+            voice_bird_cli::agent_funnel::VerifyOutcome::InProgress => "InProgress".to_string(),
+            voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed } => {
+                format!("Ok:{}ms", elapsed.as_millis())
+            }
+            voice_bird_cli::agent_funnel::VerifyOutcome::Err { message } => {
+                format!("Err:{message}")
+            }
+        })
+        .unwrap_or_default();
+
     let snap = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "last_key": last_key,
@@ -1187,6 +1246,8 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         "selected_app_index": app.selected_app_index,
         "selected_app_name": selected_app_name,
         "picker_focus": format!("{:?}", app.picker_focus),
+        "funnel_step": funnel_step,
+        "funnel_verify": funnel_verify,
         "voicebird_api_key_masked": api_key_masked,
         "api_key_buf_len": api_key_buf_len,
         "committed_count": committed_count,
@@ -1219,6 +1280,31 @@ mod funnel_dispatch_tests {
         }
     }
 
+    /// #33: `?` is help-only and never surfaces a status banner,
+    /// even right after an agent event landed; `t` opens the
+    /// status overlay through the real key path and the usual
+    /// dismiss keys close it.
+    #[test]
+    fn question_mark_is_help_only_and_t_owns_status() {
+        let mut app = App::new();
+        // Seed an agent event as if the recorder just reported one.
+        crate::app::push_agent_event(&app.agent_events, "verify OK for 'broker:9092' in 12ms");
+
+        handle_normal_mode(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.mode, AppMode::Help, "? must open the help overlay");
+        assert!(
+            app.banner.is_none(),
+            "? must never surface a status banner (D7 bridge removed)"
+        );
+        handle_help_mode(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.mode, AppMode::Normal);
+
+        handle_normal_mode(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.mode, AppMode::Status, "t must open the status overlay");
+        handle_status_mode(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
     /// R4 (PR #31 round-3 review): after a green Verify, Enter must
     /// advance to the Save step. Today the Verify arm of the Enter
     /// handler unconditionally re-spawns the probe, the
@@ -1237,18 +1323,21 @@ mod funnel_dispatch_tests {
         app.open_add_agent_funnel();
         assert_eq!(app.mode, AppMode::AgentFunnel);
 
-        // 1/7 connection kind (Kafka is preselected)
+        // 1/8 connection kind (Kafka is preselected)
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 2/7 name
+        // 2/8 name
         type_str(&mut app, "prod");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 3/7 broker endpoint
+        // 3/8 broker endpoint
         type_str(&mut app, "localhost:19092");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 4/7 topic
+        // 4/8 topic
         type_str(&mut app, "voice-bird-events");
         handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 5/7 acks (keep the default: All)
+        // 5/8 acks (keep the default: All)
+        handle_agent_funnel(&mut app, KeyCode::Enter);
+        // 6/8 security (keep the default: plaintext, which skips
+        // the three SASL steps entirely)
         handle_agent_funnel(&mut app, KeyCode::Enter);
         assert_eq!(
             app.funnel.as_ref().unwrap().step,

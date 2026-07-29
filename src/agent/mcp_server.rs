@@ -114,11 +114,12 @@ impl StdoutMcpTarget {
     }
 }
 
+#[async_trait::async_trait]
 impl AgentTarget for StdoutMcpTarget {
     fn session_id(&self) -> AgentSessionId {
         self.state.snapshot_session_id()
     }
-    fn push_segment(&self, seg: &Segment) -> anyhow::Result<()> {
+    async fn push_segment(&self, seg: &Segment) -> anyhow::Result<()> {
         self.state.push(seg.clone());
         Ok(())
     }
@@ -569,16 +570,12 @@ mod tests {
         assert_eq!(buf[0].text, "s5");
     }
 
-    #[test]
-    fn stdout_mcp_target_pushes_into_shared_buffer() {
+    #[tokio::test]
+    async fn stdout_mcp_target_pushes_into_shared_buffer() {
         let state = ServerState::new(AgentSessionId::default_session());
         let target = StdoutMcpTarget::new(state.clone());
-        target
-            .push_segment(&seg("first", 0))
-            .unwrap();
-        target
-            .push_segment(&seg("second", 500))
-            .unwrap();
+        target.push_segment(&seg("first", 0)).await.unwrap();
+        target.push_segment(&seg("second", 500)).await.unwrap();
         assert_eq!(state.pull(10).len(), 2);
     }
 }

@@ -109,6 +109,54 @@ pub fn render(f: &mut Frame, app: &App) {
     if let AppMode::ConfirmDeleteAgentTarget { id } = &app.mode {
         render_confirm_delete(f, f.area(), app, id);
     }
+    if app.mode == AppMode::Status {
+        render_status_overlay(f, f.area(), app);
+    }
+}
+
+/// How many agent events the `t` status overlay shows. The
+/// underlying log keeps `AGENT_EVENT_CAP` (50); the overlay shows
+/// the newest slice that fits a modest popup.
+const STATUS_OVERLAY_ROWS: usize = 15;
+
+/// Centered overlay for the `t` status key: the most recent Agent
+/// events, newest first, each with a wall-clock timestamp. `?`
+/// stays help-only — this overlay is the one place recorder/agent
+/// status surfaces on demand.
+fn render_status_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let events = app.agent_events.lock();
+    let h = (events.len().min(STATUS_OVERLAY_ROWS) as u16 + 4).max(6);
+    let popup = centered(72, h, area);
+    f.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if events.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no agent events yet)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for ev in events.iter().rev().take(STATUS_OVERLAY_ROWS) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    ev.at.format("%H:%M:%S ").to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(ev.message.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[t/Esc/Enter] close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Agent status ")
+        .style(Style::default().fg(Color::White));
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Render the slot row. Each slot draws as its own block with a
@@ -674,21 +722,29 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
     let Some(funnel) = app.funnel.as_ref() else {
         return;
     };
-    let popup = centered(72, 14, area);
+    let popup = centered(72, 16, area);
     f.render_widget(Clear, popup);
 
     let mut lines: Vec<Line> = Vec::new();
-    let step_label = match funnel.step {
-        AgentFunnelStep::PickConnectionKind => "1/7 — Connection",
-        AgentFunnelStep::Name => "2/7 — Name",
-        AgentFunnelStep::Endpoint => "3/7 — Broker endpoint",
-        AgentFunnelStep::Topic => "4/7 — Topic",
-        AgentFunnelStep::Acks => "5/7 — Acknowledgement level",
-        AgentFunnelStep::Verify => "6/7 — Verify",
-        AgentFunnelStep::Save => "7/7 — Save",
+    // Position among the steps this form will actually visit —
+    // non-SASL protocols skip the three SASL steps, so the total
+    // is dynamic (8 or 11).
+    let (pos, total) = funnel.step_position();
+    let step_name = match funnel.step {
+        AgentFunnelStep::PickConnectionKind => "Connection",
+        AgentFunnelStep::Name => "Name",
+        AgentFunnelStep::Endpoint => "Broker endpoint",
+        AgentFunnelStep::Topic => "Topic",
+        AgentFunnelStep::Acks => "Acknowledgement level",
+        AgentFunnelStep::Security => "Security",
+        AgentFunnelStep::SaslMechanism => "SASL mechanism",
+        AgentFunnelStep::SaslUsername => "SASL username",
+        AgentFunnelStep::SaslPasswordEnv => "SASL password env var",
+        AgentFunnelStep::Verify => "Verify",
+        AgentFunnelStep::Save => "Save",
     };
     lines.push(Line::from(Span::styled(
-        format!(" {step_label} "),
+        format!(" {pos}/{total} — {step_name} "),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -742,6 +798,55 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(color),
                 )));
             }
+        }
+        AgentFunnelStep::Security => {
+            lines.push(Line::from("Security protocol:"));
+            for (i, proto) in voice_bird_cli::config::KafkaSecurityProtocol::ALL
+                .iter()
+                .enumerate()
+            {
+                let selected = funnel.security_protocol == *proto;
+                let marker = if selected { "● " } else { "  " };
+                let color = if selected { Color::Yellow } else { Color::Gray };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}[{}] {}", i + 1, proto.label()),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        AgentFunnelStep::SaslMechanism => {
+            lines.push(Line::from("SASL mechanism:"));
+            for (i, mech) in voice_bird_cli::config::KafkaSaslMechanism::ALL
+                .iter()
+                .enumerate()
+            {
+                let selected = funnel.sasl_mechanism == *mech;
+                let marker = if selected { "● " } else { "  " };
+                let color = if selected { Color::Yellow } else { Color::Gray };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}[{}] {}", i + 1, mech.as_str()),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        AgentFunnelStep::SaslUsername => {
+            lines.push(Line::from("SASL username:"));
+            lines.push(input_line(&funnel.sasl_username));
+        }
+        AgentFunnelStep::SaslPasswordEnv => {
+            lines.push(Line::from(
+                "NAME of the env var holding the SASL password:",
+            ));
+            lines.push(input_line(&funnel.sasl_password_env));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "The password itself is read from that variable at connect",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "time and is never written to config.toml.",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         AgentFunnelStep::Verify => {
             lines.push(Line::from(Span::styled(
@@ -798,6 +903,21 @@ fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
                 format!("acks     : {}", funnel.acks.as_str()),
                 Style::default().fg(Color::White),
             )));
+            lines.push(Line::from(Span::styled(
+                format!("security : {}", funnel.security_protocol.as_str()),
+                Style::default().fg(Color::White),
+            )));
+            if funnel.security_protocol.uses_sasl() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "sasl     : {} as {} (password from ${})",
+                        funnel.sasl_mechanism.as_str(),
+                        funnel.sasl_username,
+                        funnel.sasl_password_env,
+                    ),
+                    Style::default().fg(Color::White),
+                )));
+            }
         }
     }
 
@@ -1462,6 +1582,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             lines.push(hotkey_line("[Home]", "top"));
             lines.push(hotkey_line("[End]", "bottom"));
             lines.push(hotkey_line("[x]", "clear"));
+            lines.push(hotkey_line("[t]", "status"));
             lines.push(hotkey_line("[q]", "quit"));
             lines.push(hotkey_line("[?]", "help"));
             lines
@@ -1538,6 +1659,27 @@ mod tests {
             name: name.into(),
             process_id: 0,
         }
+    }
+
+    /// The `t` status overlay lists agent events newest-first with
+    /// timestamps, and shows a placeholder when nothing happened yet.
+    #[test]
+    fn status_overlay_lists_recent_agent_events() {
+        let mut app = App::new();
+        app.mode = crate::app::AppMode::Status;
+        let out = render_to_string(&app, 100, 30);
+        assert!(out.contains("Agent status"), "overlay title missing:\n{out}");
+        assert!(out.contains("(no agent events yet)"));
+
+        crate::app::push_agent_event(&app.agent_events, "saved Agent target 'prod'");
+        crate::app::push_agent_event(&app.agent_events, "verify OK for 'b:9092' in 42ms");
+        let out = render_to_string(&app, 100, 30);
+        assert!(out.contains("saved Agent target 'prod'"), "event missing:\n{out}");
+        assert!(out.contains("verify OK for 'b:9092' in 42ms"));
+        // Newest first: the verify line renders above the save line.
+        let verify_pos = out.find("verify OK").unwrap();
+        let saved_pos = out.find("saved Agent target").unwrap();
+        assert!(verify_pos < saved_pos, "events must render newest-first");
     }
 
     #[test]
@@ -1765,6 +1907,10 @@ mod tests {
                     topic: "voice-bird".into(),
                     client_id: None,
                     acks: Default::default(),
+                    security_protocol: Default::default(),
+                    sasl_mechanism: None,
+                    sasl_username: None,
+                    sasl_password_env: None,
                 },
             ),
         })
