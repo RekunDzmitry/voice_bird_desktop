@@ -1311,3 +1311,116 @@ mod funnel_dispatch_tests {
         );
     }
 }
+
+// Bug: toggling Cloud (`c`) while the focused slot is empty
+// only updates the global `cloud_broadcast_enabled` default,
+// not the per-source override. The next start uses the
+// per-source override (when present, it wins over the
+// global), so the banner/display say "Cloud: ON" but the
+// session starts with `cloud_on = false`. Reproduces the
+// screenshot from #48 review: user toggled Cloud ON, hit
+// Enter, the Mode panel flipped to OFF during the
+// recording.
+//
+// The fix must also write to the per-source override for
+// the source the picker would resolve to on Enter, so the
+// next start agrees with what the toggle just advertised.
+#[cfg(test)]
+mod cloud_toggle_dispatch_tests {
+    use super::*;
+    use crate::platform::{AppSession, AudioDevice};
+    use voice_bird_cli::config::AudioSessionKind;
+    use voice_bird_cli::session::layout::SessionSource;
+
+    /// `c` toggled while no section is focused must update the
+    /// per-source override for the source the picker resolves
+    /// to on Enter. Today (pre-fix) the `else` branch in
+    /// `handle_normal_mode` only flips the global
+    /// `cloud_broadcast_enabled`, leaving a stale per-source
+    /// override `cloud_on = false` in place. The next start
+    /// reads the per-source override first, so the section
+    /// starts with `cloud_on = false` even though the user
+    /// just clicked Cloud ON.
+    #[test]
+    fn c_toggle_when_no_section_focused_updates_per_source_override() {
+        use voice_bird_cli::config::SourceSettingsOverride;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+
+        // Picker is parked on EPOS PC 8 USB (output/loopback) +
+        // Google Chrome — the exact combo from the screenshot.
+        app.devices = vec![AudioDevice {
+            name: "EPOS PC 8 USB".into(),
+            kind: AudioSessionKind::Output,
+        }];
+        app.selected_device_index = 0;
+        app.apps = vec![AppSession {
+            id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+            process_id: 12345,
+        }];
+        app.selected_app_index = Some(0);
+        app.config.input_device = Some("EPOS PC 8 USB".into());
+        app.config.input_device_kind = Some(AudioSessionKind::Output);
+
+        // Stale per-source override: this combo last recorded
+        // with Cloud OFF. The toggle target is the SAME source
+        // so the override must be updated.
+        let source = SessionSource::App {
+            id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+            device_name: "EPOS PC 8 USB".into(),
+        };
+        let key = app.source_key_for(&source);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+        // Global default is also OFF today. The toggle should
+        // flip BOTH the per-source override AND the global
+        // default so the Mode panel ("Cloud: ON") and the
+        // next-start state agree.
+        app.config.cloud_broadcast_enabled = false;
+
+        // Sanity: no Recording/Saved section is focused, so the
+        // toggle must take the `else` branch in main.rs.
+        assert!(app.focused().is_none(), "setup must have no focused section");
+
+        // The user presses `c`.
+        #[cfg(not(windows))]
+        {
+            handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+            // Assert 1: the per-source override was flipped.
+            // This is the contract that picks up the toggle and
+            // matches what `start_section` reads via
+            // `effective_settings_for(source)`.
+            let ov = app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("per-source override must exist after toggle");
+            assert!(
+                ov.cloud_on,
+                "toggling Cloud ON while no section is focused must \
+                 update the per-source override for the picker-resolved \
+                 source; otherwise the next start silently uses the stale \
+                 cloud_on=false. Override key: {key}"
+            );
+
+            // Assert 2: the global default also flipped, so the
+            // Mode panel agrees with the next-start state.
+            assert!(
+                app.config.cloud_broadcast_enabled,
+                "toggling Cloud ON must also flip the global default \
+                 so the Mode panel (which reads cloud_broadcast_enabled \
+                 when no section is focused) advertises the new state"
+            );
+        }
+    }
+}
