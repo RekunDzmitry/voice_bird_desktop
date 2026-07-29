@@ -630,19 +630,21 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 fn mask_api_key(key: &str) -> String {
-    // Reveal the FIRST 5 chars (the prefix - e.g. `vb_01`) so the user
-    // can spot a corrupted paste like `sk-testvb_01371…` (real key
-    // accidentally typed after a stale test fixture). Mask the rest to
-    // avoid leaking the secret. For very short keys we mask entirely.
+    // Reveal the LAST 5 chars (the high-entropy tail, e.g. `7d8e8`)
+    // `sk-test…` prefix is the predictable boilerplate and carries
+    // no identifying entropy; the tail does. For very short keys we
+    // mask entirely so a tiny paste doesn't just show itself.
     const REVEAL: usize = 5;
     if key.is_empty() {
         "(empty)".into()
     } else if key.chars().count() <= REVEAL {
         "•".repeat(key.chars().count())
     } else {
-        let prefix: String = key.chars().take(REVEAL).collect();
-        let rest = key.chars().count() - REVEAL;
-        format!("{prefix}{}", "•".repeat(rest))
+        let chars: Vec<char> = key.chars().collect();
+        let total = chars.len();
+        let prefix = "•".repeat(total - REVEAL);
+        let tail: String = chars[total - REVEAL..].iter().collect();
+        format!("{prefix}{tail}")
     }
 }
 
@@ -665,7 +667,12 @@ fn render_api_key_modal(f: &mut Frame, area: Rect, app: &App) {
     let current_key = mask_api_key(&app.config.voicebird_api_key);
     let lines = vec![
         Line::from(Span::styled(
-            "Paste API key — Enter to save, Esc to cancel",
+            // In-modal control hint. Covers the case where the keys
+            // sidebar is partially obscured by the popup on narrower
+            // terminals. Phrasing here is intentionally distinct
+            // from the keys sidebar's `[Ctrl+U] clear` cell row (no
+            // brackets, plain paragraph text).
+            "Paste API key - Enter to save, Ctrl+U to clear, Esc to cancel",
             Style::default().fg(Color::Gray),
         )),
         Line::from(vec![
@@ -1882,65 +1889,35 @@ mod tests {
             out.contains("[Enter] save"),
             "modal key hint missing:\n{out}"
         );
-        // Last 4 chars of the buffer are shown unmasked.
-        // First 5 chars of the buffer are shown unmasked (the rest is
-        // masked dot-by-dot). The old test here asserted the LAST 4 were
-        // unmasked, but the new contract reveals the PREFIX so the user
-        // can spot a corrupted paste (e.g. `sk-testvb_…` pollution).
-        assert!(out.contains("vb-te"), "masked prefix missing:\n{out}");
+        // Last 5 chars of the buffer are shown unmasked (the prefix is
+        // masked dot-by-dot). Revealing the high-entropy tail is the
+        // UX contract; the predictable `vb_…` prefix carries no
+        // identifying entropy.
+        assert!(out.contains("t-key"), "masked tail missing:\n{out}");
     }
-
-    /// `mask_api_key` exposes the FIRST 5 chars of the saved key so the
-    /// user can spot corruption / pasted test prefixes (e.g. `sk-test`
-    /// pollution observed when `vb_01371…` became `sk-testvb_01371…` in
-    /// the saved config). The rest of the key is masked dot-by-dot;
-    /// short keys still reveal nothing.
-    #[test]
-    fn mask_api_key_shows_first_five_chars_then_dots() {
-        let masked = mask_api_key(
-            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8",
-        );
-        // First 5 chars unmasked, followed by only dots.
-        assert!(
-            masked.starts_with("vb_01"),
-            "mask must reveal the prefix vb_01; got {masked:?}",
-        );
-        // The rest must be dots only — no leak of the secret.
-        let tail = &masked[5..];
-        assert!(
-            tail.chars().all(|c| c == '•'),
-            "tail must be all dots; got {tail:?}",
-        );
-        // And the original secret must not appear in the rendered mask.
-        assert!(
-            !masked.contains("f9de05bd6db"),
-            "mask leaked secret suffix; got {masked:?}",
-        );
-    }
-
     /// `mask_api_key` should not reveal short keys (<= 5 chars); we mask
     /// them entirely so a 5-char paste doesn't just show itself.
     #[test]
     fn mask_api_key_never_reveals_short_keys() {
         assert_eq!(mask_api_key(""), "(empty)");
-        // 5 chars — at the cutoff, fully masked.
+        // 5 chars - at the cutoff, fully masked.
         assert_eq!(mask_api_key("abcde"), "•••••");
-        // 4 chars — fully masked.
+        // 4 chars - fully masked.
         assert_eq!(mask_api_key("abcd"), "••••");
-        // 6 chars — first 5 visible, one dot suffix.
-        assert_eq!(mask_api_key("abcdef"), "abcde•");
+        // 6 chars - last 5 visible, one dot prefix.
+        assert_eq!(mask_api_key("abcdef"), "•bcdef");
     }
-
-    /// The API-key modal advertises "Current key: vb_01…" above the input
-    /// line so the user can spot a corrupted prefix (e.g. accidentally
-    /// saved `sk-test` test pollution) without leaving the TUI. The
-    /// rendered label uses the SAVED key, not the buffer.
+    /// The API-key modal advertises `Current key: …7d8e8` above the
+    /// input line. The visible tail lets the user verify the saved
+    /// key is the one they expect (not the in-progress buffer edit).
+    /// A corrupted prefix like `sk-test…` is masked entirely because
+    /// only the last 5 chars are unmasked.
     #[test]
     fn api_key_modal_shows_current_saved_key_above_input() {
         let mut app = App::new();
-        // Saved key is long; buffer holds a brand-new paste. The modal
-        // must show the saved key (so the user can see what is currently
-        // on disk), not the in-progress edit.
+        // Saved key is long; buffer holds a brand-new paste. The
+        // modal must show the saved key (so the user can see what
+        // is currently on disk), not the in-progress edit.
         app.config.voicebird_api_key =
             "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8".into();
         app.api_key_buf = Some("vb_bran-new-paste-here".into());
@@ -1950,10 +1927,12 @@ mod tests {
             out.contains("Current key:"),
             "modal must advertise the currently saved key; rendered:\n{out}",
         );
-        // The label lists the SAVED key's prefix.
+        // Last-5 tail of the saved key must be visible. The mask
+        // contract is "prefix dots, last 5 chars visible", which
+        // also fully masks a `sk-testvb_…` corrupted prefix.
         assert!(
-            out.contains("vb_01"),
-            "saved-key prefix must be visible in the modal; rendered:\n{out}",
+            out.contains("7d8e8"),
+            "saved-key tail must be visible in the modal; rendered:\n{out}",
         );
     }
 
@@ -1996,17 +1975,18 @@ mod tests {
     /// `mask_api_key` exposes the LAST 5 chars of the saved key so the
     /// user can verify identity at a glance - the prefix is the
     /// (relatively predictable) `vb_…` or `sk-…` boilerplate, but the
-    /// tail is high-entropy. A 60-char key ending in `3d8e8` is easier
+    /// tail is high-entropy. A 66-char key ending in `7d8e8` is easier
     /// to recognise than one starting with `vb_01`.
     #[test]
     fn mask_api_key_shows_last_five_chars_then_dots() {
         let masked = mask_api_key(
             "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8",
         );
-        // Last 5 chars unmasked, preceded by only dots.
+        // Last 5 chars of the canonical test key. Counted by hand:
+        // the key ends in `…47d8e8`, so the visible tail is `7d8e8`.
         assert!(
-            masked.ends_with("3d8e8"),
-            "mask must reveal the tail 3d8e8; got {masked:?}",
+            masked.ends_with("7d8e8"),
+            "mask must reveal the tail 7d8e8; got {masked:?}",
         );
         // The prefix must be masked dot-by-dot - no leak of the
         // high-entropy secret.
@@ -2050,7 +2030,6 @@ mod tests {
     /// The keys sidebar lists `[K]` as the dedicated, always-available
     /// shortcut for opening the API-key modal. Without `[K]` in the
     /// sidebar the user has no in-app way to find the API-key modal
-    /// when 'c' is taken (it toggles cloud on a focused section).
     #[test]
     fn keys_panel_lists_K_for_setting_api_key() {
         let mut app = App::new();
