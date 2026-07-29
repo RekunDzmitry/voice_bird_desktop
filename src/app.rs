@@ -3047,13 +3047,16 @@ mod tests {
     }
 
     /// A `Saved` slot must reach `start_section` (which then
-    /// fails on audio capture in the test environment, since
-    /// there is no real cpal device). The point of the test is
-    /// to prove the resume path *enters* start_section with the
-    /// saved source/settings — not that the pipeline spins up
-    /// in CI. We assert the error is the capture-stage
-    /// failure, not the resume-time "nothing to resume"
-    /// short-circuit.
+    /// A `Saved` slot must reach `start_section`. The point of
+    /// the test is to prove the resume path *enters*
+    /// start_section with the saved source — not that the
+    /// pipeline spins up in CI. The test is pipeline-aware:
+    /// on hosts where cpal finds a real device the slot may
+    /// transition to `Recording`; on hosts where it does
+    /// not, the slot stays `Saved` and `start_section`
+    /// returns `Err` from the capture step. Both outcomes
+    /// are acceptable — what matters is that resume did
+    /// not short-circuit on the resume-time guards.
     #[test]
     fn resume_section_on_saved_slot_delegates_to_start_section() {
         let mut app = App::new();
@@ -3084,22 +3087,23 @@ mod tests {
         app.slots[0].kind = SlotKind::Saved { saved };
 
         let result = app.resume_section(slot);
-        // start_section will fail at the capture step in a
-        // headless test (no cpal device). The error must NOT
-        // be the "nothing to resume" / "already recording"
-        // short-circuits — those would mean resume never
-        // reached the pipeline.
-        let err = result.unwrap_err();
-        assert!(
-            !err.contains("nothing to resume"),
-            "resume must delegate to start_section, not short-circuit: {err}"
-        );
-        assert!(
-            !err.contains("already recording"),
-            "resume must not be refused as a double-start from Saved: {err}"
-        );
+        if let Err(err) = &result {
+            // On hosts where capture fails (no cpal device),
+            // the error must NOT be the resume-time
+            // short-circuits — those would mean resume never
+            // reached the pipeline.
+            assert!(
+                !err.contains("nothing to resume"),
+                "resume must delegate to start_section, not short-circuit: {err}"
+            );
+            assert!(
+                !err.contains("already recording"),
+                "resume must not be refused as a double-start from Saved: {err}"
+            );
+        }
         // The captured committed Arc is still alive (start_section
-        // reattached it before failing on capture) — proves the
+        // reattaches it before either failing on capture or
+        // transitioning the slot to `Recording`) — proves the
         // visible text survives the resume attempt.
         assert_eq!(
             committed.lock().len(),
@@ -3129,6 +3133,160 @@ mod tests {
             !err.contains("already recording"),
             "Empty slot must not be mis-classified as Recording: {err}"
         );
+    }
+
+    /// A `Saved` slot's resume must pick up settings the user
+    /// changed *after* pressing `s`. The use case: the user
+    /// records a section in English, stops, then cycles the
+    /// cloud language to Russian and resumes — the next
+    /// captured audio must be transcribed in Russian, not
+    /// English.
+    ///
+    /// Currently red: `resume_section` extracts the saved
+    /// snapshot's `settings` verbatim and hands them to
+    /// `start_section`, so any post-stop change to the
+    /// global config (or per-source override) is silently
+    /// ignored. The fix in the next commit switches to
+    /// `App::effective_settings_for(source)`, which reads
+    /// the live per-source override first and falls back
+    /// to the global config, and persists the new
+    /// settings back onto the saved snapshot so the
+    /// resulting slot reflects what was used.
+    ///
+    /// The test is pipeline-aware: on hosts where cpal
+    /// finds a real device the slot transitions to
+    /// `Recording`; otherwise it stays `Saved`. The
+    /// assertion reads the settings from whichever
+    /// variant the slot ended up in.
+    #[test]
+    fn resume_section_picks_up_settings_changed_after_stop() {
+        let mut app = App::new();
+        // Seed a Saved variant as if a section was
+        // recorded in English, cloud off.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "mic · cloud:OFF".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Simulate the user pressing `l` to cycle the
+        // language to Russian and `c` to flip cloud on
+        // *after* stopping. The c/l handlers update the
+        // global config and per-source override when no
+        // section is focused (the post-stop case). Persist
+        // the override the same way persist_focused_settings
+        // does so the test reflects production state.
+        app.config.cloud_broadcast_enabled = true;
+        app.config.language = "ru".into();
+        let key = app.source_key_for(&SessionSource::Microphone);
+        let mut ov = app.config.effective_override(&key);
+        ov.cloud_on = true;
+        ov.language = "ru".into();
+        app.config.upsert_source_override(key, ov);
+
+        // Resume. The result is pipeline-dependent
+        // (capture may succeed or fail in the test env),
+        // so we only assert on the slot's post-call
+        // settings — not on Ok/Err.
+        let _ = app.resume_section(slot);
+
+        // The settings on the slot — whether it stayed
+        // Saved (capture failed) or transitioned to
+        // Recording (capture succeeded) — must reflect
+        // the post-stop config change, not the original
+        // saved snapshot.
+        let applied: &SectionSettings = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => &saved.settings,
+            SlotKind::Recording { section } => &section.settings,
+            SlotKind::Empty => {
+                panic!("resume must not empty the slot on a successful Saved path")
+            }
+        };
+        assert_eq!(
+            applied.language, "ru",
+            "resume must apply the post-stop language change, \
+             not the original saved snapshot's language (en)"
+        );
+        assert!(
+            applied.cloud_on,
+            "resume must apply the post-stop cloud toggle, \
+             not the original saved snapshot's cloud_off"
+        );
+    }
+
+    /// With two `Saved` slots, pressing `R` must resume the
+    /// focused slot only. The non-focused slot stays
+    /// `Saved` and is untouched.
+    ///
+    /// Currently green: `resume_section` takes a `SlotId`
+    /// and operates only on that slot, so this is
+    /// documenting existing behavior with a regression
+    /// guard.
+    #[test]
+    fn resume_section_only_resumes_focused_slot_when_multiple_saved() {
+        let mut app = App::new();
+        // Add a second slot so we have two to seed.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        let slot_a = app.slots[0].id;
+
+        // Seed both slots as Saved with distinct
+        // settings, so we can tell them apart after
+        // resume and confirm only the focused one was
+        // touched.
+        for (slot, lang) in [(slot_a, "en"), (slot_b, "de")] {
+            let pos = app.slot_index(slot).unwrap();
+            let saved = SavedTranscript {
+                committed: Arc::new(PlMutex::new(Vec::new())),
+                refined: Arc::new(PlMutex::new(Vec::new())),
+                label: format!("mic · cloud:OFF · {lang}"),
+                target: Target::Stdout,
+                source: SessionSource::Microphone,
+                settings: SectionSettings {
+                    cloud_on: false,
+                    language: lang.into(),
+                    model: "tiny.en".into(),
+                },
+            };
+            app.slots[pos].kind = SlotKind::Saved { saved };
+        }
+
+        // Focus slot A. (add_slot advances focus to the
+        // new slot, so we put it back on A explicitly.)
+        app.focused_slot = slot_a;
+
+        let _ = app.resume_section(slot_a);
+
+        // Slot B (non-focused) must remain Saved with
+        // its original German language, identical
+        // structure — not transitioned, not modified
+        // by a resume call on slot A.
+        let b_state = &app.slots[app.slot_index(slot_b).unwrap()].kind;
+        match b_state {
+            SlotKind::Saved { saved } => {
+                assert_eq!(
+                    saved.settings.language, "de",
+                    "non-focused slot B's language must not be modified by \
+                     resume_section on the focused slot"
+                );
+                assert_eq!(saved.label, "mic · cloud:OFF · de");
+            }
+            other => panic!(
+                "non-focused slot B must remain Saved, got: {other:?}"
+            ),
+        }
     }
 
     /// Spy `AgentTarget`: records every pushed segment's text, or
