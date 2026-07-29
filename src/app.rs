@@ -46,7 +46,6 @@ pub const MAX_SECTIONS: usize = 8;
 #[derive(Debug, Clone)]
 pub enum RecordingStatus {
     Idle,
-    Recording,
     Error(String),
 }
 
@@ -71,7 +70,6 @@ pub struct PickerState {
 /// A single committed (finalized) transcript line.
 pub struct CommittedLine {
     pub t_start_ms: u64,
-    pub t_end_ms: u64,
     pub text: String,
 }
 
@@ -90,7 +88,7 @@ pub struct SavedTranscript {
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
     /// Producer task: pulls cpal frames, resamples, tees to WAV + engine.
-    /// Aborted by `stop_recording` so the await on `join` does not hang
+    /// Aborted by `stop_section` so the await on `join` does not hang
     /// when the cpal channel `recv()` is blocked.
     pub producer: Option<tokio::task::JoinHandle<()>>,
     /// Background refinement consumer join. `None` when no refinement
@@ -106,19 +104,6 @@ pub struct SectionSettings {
     pub cloud_on: bool,
     pub language: String,
     pub model: String,
-}
-
-impl SectionSettings {
-    /// Build a section's settings from the current global config. Stage 2
-    /// will replace this with `AppConfig::effective_settings(&source)` so
-    /// per-source overrides win when present.
-    pub fn from_global_config(config: &AppConfig) -> Self {
-        Self {
-            cloud_on: config.cloud_broadcast_enabled,
-            language: config.language.clone(),
-            model: config.default_model.clone(),
-        }
-    }
 }
 
 /// One running recording slot. Each section owns its own audio capture,
@@ -369,7 +354,7 @@ pub struct App {
 
     /// Error banner displayed above the footer. Set when an engine emits
     /// `EngineEvent::Error` (or when the pipeline fails to start); cleared
-    /// on the next successful `start_recording`.
+    /// on the next successful `start_section`.
     pub banner: Option<String>,
 
     /// Transcript scroll offset (lines from the top). Only consulted when
@@ -386,7 +371,6 @@ pub struct App {
     /// section is active — keeps the UI render path Arc-shaped without
     /// special-casing the empty state at every read site.
     empty_committed: Arc<PlMutex<Vec<CommittedLine>>>,
-    empty_refined: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
 
     /// Detected state of the user's agent runtime (today: oh-my-pi
@@ -578,7 +562,6 @@ impl App {
             transcript_scroll: 0,
             transcript_follow: true,
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
-            empty_refined: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
             agent: voice_bird_cli::agent::AgentStatus::NotFound,
             agent_detection_source: None,
@@ -672,11 +655,6 @@ impl App {
         self.slots.iter().find(|s| s.id == id)
     }
 
-    /// Mutable access to a slot by id.
-    fn slot_by_id_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
-        self.slots.iter_mut().find(|s| s.id == id)
-    }
-
     // -- Section accessors --------------------------------------------------
 
     /// Currently focused section (the one `c`/`l`/`m`/`s` operate on),
@@ -763,50 +741,6 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    pub fn cycle_focused_target(&mut self) -> Target {
-        // The cycle is per-slot — pick the *next* target kind
-        // after the slot's current pending-or-last target, so a
-        // user that already picked a specific Agent target
-        // gets to cycle through other Agent targets in order
-        // before falling back to Stdout. The Targets pane
-        // handles full CRUD via `a`/`e`/`d`; this key just
-        // walks the list.
-        let slot = self.focused_slot;
-        let current = self
-            .pending_target_overrides
-            .get(&slot)
-            .cloned()
-            .or_else(|| self.slot_by_id(slot).and_then(|s| s.target()))
-            .unwrap_or(Target::Stdout);
-        let next = match &current {
-            Target::Stdout => Target::Cloud,
-            Target::Cloud => self
-                .config
-                .agent_targets
-                .first()
-                .map(|t| Target::Agent {
-                    session_id: t.id.clone(),
-                })
-                .unwrap_or(Target::Stdout),
-            Target::Agent { session_id } => self
-                .config
-                .agent_targets
-                .iter()
-                .position(|t| t.id == *session_id)
-                .and_then(|idx| {
-                    self.config
-                        .agent_targets
-                        .get(idx + 1)
-                        .map(|t| Target::Agent {
-                            session_id: t.id.clone(),
-                        })
-                })
-                .unwrap_or(Target::Stdout),
-        };
-        self.pending_target_overrides.insert(slot, next.clone());
-        next
-    }
-
     /// The picker list. Rows 0-1 are fixed (`Stdout`, `Cloud`).
     /// From row 2 onward, one row per user-configured Agent
     /// target. Disabled flag is reserved for future use; today
@@ -873,19 +807,6 @@ impl App {
                     })
             })
             .unwrap_or_else(|| self.empty_committed.clone())
-    }
-
-    pub fn focused_refined(&self) -> Arc<PlMutex<Vec<CommittedLine>>> {
-        self.focused()
-            .map(|s| s.refined.clone())
-            .or_else(|| {
-                self.slot_by_id(self.focused_slot)
-                    .and_then(|s| match &s.kind {
-                        SlotKind::Saved { saved } => Some(saved.refined.clone()),
-                        _ => None,
-                    })
-            })
-            .unwrap_or_else(|| self.empty_refined.clone())
     }
 
     pub fn focused_tentative(&self) -> Arc<PlMutex<String>> {
@@ -1439,11 +1360,6 @@ impl App {
         })
     }
 
-    /// Get current audio level
-    pub fn get_audio_level(&self) -> f32 {
-        self.audio_level.lock().map(|l| *l).unwrap_or(0.0)
-    }
-
     /// Update duration from start time
     pub fn update_duration(&mut self) {
         if let Some(start) = self.start_time {
@@ -1506,19 +1422,6 @@ impl App {
         } else {
             AppMode::Help
         };
-    }
-
-    /// Public start hook used by the existing key handler. Resolves the
-    /// effective per-source settings (override if saved, else globals)
-    /// and routes to `start_section` on the focused slot. Failures land
-    /// in `banner` + `status` so the UI can surface them.
-    pub fn start_recording(&mut self, source: SessionSource) {
-        let settings = self.effective_settings_for(&source);
-        let slot = self.focused_slot;
-        if let Err(msg) = self.start_section(slot, source, settings) {
-            self.banner = Some(msg.clone());
-            self.status = RecordingStatus::Error(msg);
-        }
     }
 
     /// Resolve the effective settings for a given source. Prefers a
@@ -2083,7 +1986,6 @@ impl App {
                         let elapsed_ms = session_start.elapsed().as_millis() as u64;
                         committed_for_consumer.lock().push(CommittedLine {
                             t_start_ms: elapsed_ms,
-                            t_end_ms: elapsed_ms,
                             text: seg.text.clone(),
                         });
                         tentative_for_consumer.lock().clear();
@@ -2189,7 +2091,6 @@ impl App {
                             }
                             refined_for_consumer.lock().push(CommittedLine {
                                 t_start_ms: seg.t_start.as_millis() as u64,
-                                t_end_ms: seg.t_end.as_millis() as u64,
                                 text: seg.text,
                             });
                             committed_for_refinement.lock().clear();
@@ -2367,13 +2268,6 @@ impl App {
         }
     }
 
-    /// Stop the focused section. Backwards-compatible shim for callers
-    /// that haven't been updated to the per-section API yet.
-    pub fn stop_recording(&mut self) {
-        let slot = self.focused_slot;
-        self.stop_section(slot);
-    }
-
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
         // Collect ids first so we don't hold a borrow on `self.slots`
@@ -2509,22 +2403,10 @@ impl App {
         }
     }
 
-    /// Look up the Agent target by `Target::Agent`'s session id.
-    /// Returns `None` for the default MCP-backed target (which
-    /// lives on `agent_state`, not here) or for any id the user
-    /// removed while a recording was in flight.
-    pub fn lookup_agent_target(
-        &self,
-        session_id: &str,
-    ) -> Option<std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>> {
-        self.agent_targets.get(session_id).cloned()
-    }
-
     /// Add or replace a user-configured Agent target in memory.
     /// Updates `agent_targets` and the in-process config; does NOT
     /// persist to disk. Use [`Self::upsert_agent_target`] for the
-    /// persisting variant, or call [`Self::persist_config`] after
-    /// the in-memory call when batching several mutations.
+    /// persisting variant.
     /// Idempotent on `id`. Returns `Err` (and leaves both maps
     /// untouched) if `id` is reserved for an internal Agent
     /// destination (see
@@ -2565,8 +2447,8 @@ impl App {
     /// in-process handle and clears any pending target overrides
     /// that pointed at it so the slot doesn't carry a stale
     /// `Target::Agent` (with a now-removed `session_id`) into the
-    /// next recording start. Does NOT persist to disk; call
-    /// [`Self::persist_config`] when the caller is ready to save.
+    /// next recording start. Does NOT persist to disk; use
+    /// [`Self::remove_agent_target`] for the persisting variant.
     pub fn remove_agent_target_in_memory(&mut self, id: &str) {
         self.agent_targets.remove(id);
         self.config.remove_agent_target(id);
@@ -2585,17 +2467,6 @@ impl App {
         self.remove_agent_target_in_memory(id);
         if let Err(e) = self.config.save() {
             log::error!("config save (remove agent target): {e}");
-            self.banner = Some(format!("Save failed: {e}"));
-        }
-    }
-
-    /// Persist the in-process config to disk and surface a banner
-    /// on failure. Used by callers that batch several in-memory
-    /// mutations through the `*_in_memory` variants before
-    /// committing them.
-    pub fn persist_config(&mut self) {
-        if let Err(e) = self.config.save() {
-            log::error!("config save (persist_config): {e}");
             self.banner = Some(format!("Save failed: {e}"));
         }
     }
@@ -2859,20 +2730,7 @@ mod tests {
         assert!(!app.focused_cloud_active());
         // Empty fallbacks for the focused-* Arcs.
         assert!(app.focused_committed().lock().is_empty());
-        assert!(app.focused_refined().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
-    }
-
-    #[test]
-    fn settings_from_global_config_snapshots_relevant_fields() {
-        let mut config = AppConfig::default();
-        config.cloud_broadcast_enabled = true;
-        config.language = "ru".into();
-        config.default_model = "tiny.en".into();
-        let s = SectionSettings::from_global_config(&config);
-        assert!(s.cloud_on);
-        assert_eq!(s.language, "ru");
-        assert_eq!(s.model, "tiny.en");
     }
 
     // Runs on every platform: asserts the forcing on Windows and the
@@ -2884,7 +2742,11 @@ mod tests {
         enforce_cloud_only_platform(&mut config);
         assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
 
-        let mut settings = SectionSettings::from_global_config(&config);
+        let mut settings = SectionSettings {
+            cloud_on: config.cloud_broadcast_enabled,
+            language: config.language.clone(),
+            model: config.default_model.clone(),
+        };
         settings.cloud_on = false;
         clamp_section_settings_for_platform(&mut settings);
         assert_eq!(settings.cloud_on, cfg!(windows));

@@ -1133,7 +1133,6 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
 
     let status = match &app.status {
         RecordingStatus::Idle => "Idle".to_string(),
-        RecordingStatus::Recording => "Recording".to_string(),
         RecordingStatus::Error(s) => format!("Error: {s}"),
     };
 

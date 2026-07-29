@@ -74,7 +74,6 @@ impl TranscriptionEngine for MockEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn emits_scripted_events_in_order() {

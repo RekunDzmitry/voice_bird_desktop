@@ -14,27 +14,15 @@
 //!     actual line-buffered boundary.
 //!   - `segment_index` cursor semantics: every push returns a
 //!     monotonically increasing index, and `pull_recent` orders
-use voice_bird_cli::agent::AgentTarget as _;
-
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use voice_bird_cli::agent::mcp_server::{
-    handle, ServerState, StdoutMcpTarget, TOOL_PULL_RECENT, TOOL_PUSH_SEGMENT,
+    handle, ServerState, TOOL_PULL_RECENT, TOOL_PUSH_SEGMENT,
 };
-use voice_bird_cli::agent::AgentSessionId;
 use voice_bird_cli::agent::rpc::{JsonRpcRequest, JsonRpcResponse};
-use voice_bird_cli::transcription::Segment;
-
-fn fake_segment(text: &str, t_ms: u64) -> Segment {
-    Segment {
-        t_start: std::time::Duration::from_millis(t_ms),
-        t_end: std::time::Duration::from_millis(t_ms + 500),
-        text: text.into(),
-        tokens: Vec::new(),
-    }
-}
+use voice_bird_cli::agent::AgentSessionId;
 
 fn deserialize_response(line: &str) -> JsonRpcResponse {
     serde_json::from_str(line).expect("envelope must be valid JSON-RPC")
