@@ -1372,6 +1372,46 @@ impl App {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
+    /// Resolve the `SessionSource` for the focused slot from the
+    /// current Devices + Apps picker state. Mirrors the
+    /// source-derivation logic in `main.rs`'s Enter handler so
+    /// the two paths agree on what "the user's current pick"
+    /// means. Returns `Err` with a banner-ready message on
+    /// invalid combinations (no device, mic + app, unexpected
+    /// device kind) so the caller can surface the error
+    /// verbatim.
+    pub fn resolve_focused_source(&self) -> Result<SessionSource, String> {
+        use voice_bird_cli::config::AudioSessionKind;
+        let dev = self.focused_device().cloned().ok_or_else(|| {
+            "No audio device selected — press [r] to refresh".to_string()
+        })?;
+        let app_pick = self.focused_app().cloned();
+        // Reject Input + App: per-app loopback can't pair with
+        // a mic capture, and silently recording the mic would
+        // surprise the user. Same check as the Enter handler.
+        if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
+            return Err(
+                "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app"
+                    .to_string(),
+            );
+        }
+        match (dev.kind, app_pick) {
+            (AudioSessionKind::Input, _) => Ok(SessionSource::Microphone),
+            (AudioSessionKind::Output, None) => Ok(SessionSource::System),
+            (AudioSessionKind::Output, Some(a)) => Ok(SessionSource::App {
+                id: a.id,
+                name: a.name,
+                device_name: dev.name.clone(),
+            }),
+            (AudioSessionKind::App, _) => {
+                // Devices pane never emits AudioSessionKind::App
+                // entries (apps live in the Apps pane), but
+                // defend against it.
+                Err("Unexpected device kind — press [r] to refresh".to_string())
+            }
+        }
+    }
+
     /// Row index of the device currently picked for the focused slot.
     /// The picker is always pinned to the slot that's recording (or
     /// about to record), so this matches what `start_section` will
@@ -2361,32 +2401,38 @@ impl App {
     }
 
     /// Resume capture in `slot` from a previously stopped
-    /// (Saved) section. Re-enters `start_section` with the
-    /// saved `source` but the *current* settings — read via
-    /// `App::effective_settings_for`, which consults the
-    /// per-source override first and falls back to the
-    /// global config. The live settings are also persisted
-    /// back onto the saved snapshot so the slot reflects
-    /// what was used.
+    /// (Saved) section. Re-derives the source, target, and
+    /// settings from the current picker state instead of
+    /// reading them off the saved snapshot, so any changes
+    /// the user made after pressing `s` (device, app,
+    /// target, language, cloud toggle) take effect on the
+    /// resumed section.
     ///
-    /// Why current settings, not the saved snapshot: the
-    /// user expects to be able to change the language (l)
-    /// or cloud toggle (c) between `s` and `R` and have
-    /// those changes take effect on the resumed section.
-    /// The c/l handlers update the global config (and the
-    /// per-source override) when no section is focused,
-    /// which is exactly the post-stop state. Feeding the
-    /// saved snapshot's settings into `start_section` would
-    /// silently ignore every post-stop change.
+    /// - Source comes from `App::resolve_focused_source`,
+    ///   which mirrors the Devices+Apps picker resolution
+    ///   in `main.rs`'s Enter handler.
+    /// - Target comes from `focused_pending_target`, which
+    ///   reads the per-slot `pending_target_overrides`
+    ///   entry if the user picked a new target, falling
+    ///   back to the saved target.
+    /// - Settings come from `effective_settings_for(source)`,
+    ///   which reads the per-source override first and
+    ///   falls back to the global config.
     ///
-    /// The committed/refined Arcs on the saved variant are
-    /// re-attached by `start_section` (it reads the slot's
-    /// `Saved` arm and reuses the Arcs), so the visible
-    /// transcript text survives the resume.
+    /// The resolved source, target, and settings are
+    /// persisted back to the saved snapshot so the slot
+    /// reflects what was used regardless of whether
+    /// `start_section` succeeds. The committed/refined
+    /// Arcs on the saved variant are kept intact:
+    /// `start_section` reads them off the slot's `Saved`
+    /// arm and reuses them, so the visible transcript
+    /// text survives the resume.
     ///
     /// Returns `Err` with a banner-ready message when the
-    /// slot is `Empty` (nothing to resume) or already
-    /// `Recording` (no double-start). The caller in
+    /// slot is `Empty` (nothing to resume), already
+    /// `Recording` (no double-start), or when the current
+    /// picker state is invalid (no device, mic + app,
+    /// unexpected device kind). The caller in
     /// `handle_normal_mode` surfaces the message verbatim.
     pub fn resume_section(&mut self, slot: SlotId) -> Result<(), String> {
         let pos = self
@@ -2400,25 +2446,56 @@ impl App {
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
-        // Pull the source out of the saved snapshot, then
-        // compute the current effective settings for it.
-        // The saved snapshot's *committed* and *refined*
-        // Arcs are kept intact: start_section reads them
-        // off the slot's `Saved` variant to re-attach them
-        // to the new Section, so the visible text survives
-        // the resume. Only the `settings` field is
-        // rewritten to the live value.
-        let source = match &self.slots[pos].kind {
-            SlotKind::Saved { saved } => saved.source.clone(),
-            SlotKind::Empty => {
-                return Err("nothing to resume — slot is empty".into());
-            }
-            SlotKind::Recording { .. } => unreachable!("guarded above"),
-        };
-        let settings = self.effective_settings_for(&source);
-        if let SlotKind::Saved { saved } = &mut self.slots[pos].kind {
-            saved.settings = settings.clone();
+        // Re-derive source, target, and settings from the
+        // current picker state. The saved snapshot's
+        // *committed* and *refined* Arcs are kept intact:
+        // start_section reads them off the slot's `Saved`
+        // Check Empty first so a no-op on a fresh slot
+        // returns the specific "nothing to resume" message
+        // instead of the more generic "no device
+        // selected" error from the picker resolution below.
+        if matches!(self.slots[pos].kind, SlotKind::Empty) {
+            return Err("nothing to resume — slot is empty".into());
         }
+        // The Recording guard is below the Empty guard
+        // because a slot in `Recording` is a bug-state
+        // (resume_section should be called from
+        // `Saved`/`Empty`) — surfacing the specific
+        // "already recording" message helps debug
+        // double-resume attempts.
+        // Re-derive source, target, and settings from the
+        // current picker state. The saved snapshot's
+        // *committed* and *refined* Arcs are kept intact:
+        // start_section reads them off the slot's `Saved`
+        // variant to re-attach them to the new Section, so
+        // the visible text survives the resume. Only
+        // source, target, and settings are rewritten to
+        // the live values.
+        let source = self.resolve_focused_source()?;
+        let target = self.focused_pending_target();
+        let settings = self.effective_settings_for(&source);
+        // Slot is Saved here (Empty and Recording both
+        // returned above). Persist the new source, target,
+        // and settings back to the saved snapshot so the
+        // slot reflects what was used regardless of
+        // whether start_section succeeds.
+        if let SlotKind::Saved { saved } = &mut self.slots[pos].kind {
+            saved.source = source.clone();
+            saved.target = target.clone();
+            saved.settings = settings.clone();
+        } else {
+            // Defensive: a concurrent state change between
+            // the guards above and here would land here.
+            unreachable!("slot state must be Saved by this point");
+        }
+        // Queue the target so start_section consumes it
+        // (start_section removes the override at start
+        // time and uses it as the section's target). If
+        // the user already queued an override, this is a
+        // no-op; if they didn't, we re-insert the resolved
+        // target so the resume always honors the current
+        // pick.
+        self.pending_target_overrides.insert(slot, target);
         self.start_section(slot, source, settings)
     }
 
@@ -3168,7 +3245,6 @@ mod tests {
     /// Currently red: `resume_section` extracts the saved
     /// snapshot's `settings` verbatim and hands them to
     /// `start_section`, so any post-stop change to the
-    /// global config (or per-source override) is silently
     /// ignored. The fix in the next commit switches to
     /// `App::effective_settings_for(source)`, which reads
     /// the live per-source override first and falls back
@@ -3184,6 +3260,15 @@ mod tests {
     #[test]
     fn resume_section_picks_up_settings_changed_after_stop() {
         let mut app = App::new();
+        // Populate the Devices picker so the
+        // resolve_focused_source path in resume_section
+        // has a device to read.
+        use voice_bird_cli::config::AudioSessionKind;
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
         // Seed a Saved variant as if a section was
         // recorded in English, cloud off.
         let committed: Arc<PlMutex<Vec<CommittedLine>>> =
@@ -3249,7 +3334,6 @@ mod tests {
              not the original saved snapshot's cloud_off"
         );
     }
-
     /// With two `Saved` slots, pressing `R` must resume the
     /// focused slot only. The non-focused slot stays
     /// `Saved` and is untouched.
