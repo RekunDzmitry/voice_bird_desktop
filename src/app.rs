@@ -2361,41 +2361,64 @@ impl App {
     }
 
     /// Resume capture in `slot` from a previously stopped
-    /// (Saved) section. Pulls the original `source` and
-    /// `settings` off the Saved variant and re-enters
-    /// `start_section` with them, so the existing
-    /// `committed`/`refined` transcript Arcs are re-attached
-    /// and new segments append to the visible text.
+    /// (Saved) section. Re-enters `start_section` with the
+    /// saved `source` but the *current* settings — read via
+    /// `App::effective_settings_for`, which consults the
+    /// per-source override first and falls back to the
+    /// global config. The live settings are also persisted
+    /// back onto the saved snapshot so the slot reflects
+    /// what was used.
+    ///
+    /// Why current settings, not the saved snapshot: the
+    /// user expects to be able to change the language (l)
+    /// or cloud toggle (c) between `s` and `R` and have
+    /// those changes take effect on the resumed section.
+    /// The c/l handlers update the global config (and the
+    /// per-source override) when no section is focused,
+    /// which is exactly the post-stop state. Feeding the
+    /// saved snapshot's settings into `start_section` would
+    /// silently ignore every post-stop change.
+    ///
+    /// The committed/refined Arcs on the saved variant are
+    /// re-attached by `start_section` (it reads the slot's
+    /// `Saved` arm and reuses the Arcs), so the visible
+    /// transcript text survives the resume.
     ///
     /// Returns `Err` with a banner-ready message when the
-    /// slot is `Empty` (nothing to resume) or already `Recording`
-    /// (no double-start). The caller in `handle_normal_mode`
-    /// surfaces the message verbatim.
+    /// slot is `Empty` (nothing to resume) or already
+    /// `Recording` (no double-start). The caller in
+    /// `handle_normal_mode` surfaces the message verbatim.
     pub fn resume_section(&mut self, slot: SlotId) -> Result<(), String> {
         let pos = self
             .slot_index(slot)
             .ok_or_else(|| format!("invalid section slot: {slot}"))?;
-        // Refuse double-start: the recording pipeline (cpal stream
-        // + tokio tasks) is already running and re-entering
-        // start_section would race the live audio capture. The
-        // caller surfaces this as a banner so the key is never
-        // silently dead.
+        // Refuse double-start: the recording pipeline (cpal
+        // stream + tokio tasks) is already running and
+        // re-entering start_section would race the live
+        // audio capture. The caller surfaces this as a
+        // banner so the key is never silently dead.
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
-        // Clone just the saved metadata out of the slot. We
-        // deliberately leave the slot in its current `Saved`
-        // state — start_section itself reads the saved variant
-        // to re-attach the committed/refined Arcs before
-        // replacing the slot with `Recording`. Skipping the
-        // manual mem::replace keeps that contract intact.
-        let SavedTranscript { source, settings, .. } = match &self.slots[pos].kind {
-            SlotKind::Saved { saved } => saved.clone(),
+        // Pull the source out of the saved snapshot, then
+        // compute the current effective settings for it.
+        // The saved snapshot's *committed* and *refined*
+        // Arcs are kept intact: start_section reads them
+        // off the slot's `Saved` variant to re-attach them
+        // to the new Section, so the visible text survives
+        // the resume. Only the `settings` field is
+        // rewritten to the live value.
+        let source = match &self.slots[pos].kind {
+            SlotKind::Saved { saved } => saved.source.clone(),
             SlotKind::Empty => {
                 return Err("nothing to resume — slot is empty".into());
             }
             SlotKind::Recording { .. } => unreachable!("guarded above"),
         };
+        let settings = self.effective_settings_for(&source);
+        if let SlotKind::Saved { saved } = &mut self.slots[pos].kind {
+            saved.settings = settings.clone();
+        }
         self.start_section(slot, source, settings)
     }
 
