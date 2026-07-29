@@ -3739,7 +3739,167 @@ mod tests {
         }
     }
 
-    /// Spy `AgentTarget`: records every pushed segment's text, or
+    // ── Cloud-target refactor: cloud is a transport, not a target ──
+
+    /// The targets picker no longer offers Cloud as a
+    /// destination. With cloud removed from the
+    /// `Target` enum, `App::targets()` returns exactly
+    /// one row per known destination: Stdout (row 0)
+    /// plus one row per user-configured Agent target.
+    /// The "Cloud as a target" row is gone — cloud
+    /// becomes a per-section *transport* flag (cloud_on
+    /// on the section's settings) rather than a
+    /// destination in its own right.
+    ///
+    /// Currently red: `targets()` returns
+    /// `2 + N agent_rows` (Stdout + Cloud + agents).
+    /// After the fix it returns `1 + N agent_rows`.
+    #[test]
+    fn targets_picker_no_longer_offers_cloud_target() {
+        use crate::app::TargetKind;
+
+        let app = App::new();
+        let rows = app.targets();
+        let agent_count = app.config.agent_targets.len();
+        assert_eq!(
+            rows.len(),
+            1 + agent_count,
+            "targets picker should offer Stdout + N agent rows only"
+        );
+        // Every row must be a recognized destination
+        // variant. Today the row at index 1 is Cloud,
+        // which fails this check; after the fix only
+        // Stdout and Agent remain.
+        for r in &rows {
+            assert!(
+                matches!(r.kind, TargetKind::Stdout)
+                    || matches!(r.kind, TargetKind::Agent { .. }),
+                "unexpected target kind: {:?} — Cloud must not be a target",
+                r.kind
+            );
+        }
+    }
+    /// Resume a Saved slot whose saved target is Cloud
+    /// but whose saved `cloud_on` is false (the user
+    /// toggled cloud off after stopping). The resume
+    /// path must honor the user's explicit cloud_on,
+    /// not clobber it from the saved target.
+    ///
+    /// Currently red: `start_section` runs
+    /// `settings.cloud_on = matches!(target, Target::Cloud)`
+    /// after pulling the saved target, so a saved
+    /// target of Cloud forces cloud_on=true regardless
+    /// of what the user set. The fix drops that line.
+    #[test]
+    fn resume_honors_cloud_off_even_when_saved_target_is_cloud() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Saved as: target=Cloud, cloud_on=false
+        // (user toggled cloud off after stopping).
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:OFF".into(),
+            target: Target::Cloud,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        let _ = app.resume_section(slot);
+
+        // Whether the slot is Saved (start_section
+        // failed) or Recording (start_section
+        // succeeded), the cloud_on on the slot's
+        // settings must reflect the user's intent
+        // (false), NOT the saved target (which would
+        // imply true).
+        let applied_cloud_on = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => saved.settings.cloud_on,
+            SlotKind::Recording { section } =>
+                section.settings.cloud_on,
+            SlotKind::Empty => panic!(
+                "resume must not empty the slot"
+            ),
+        };
+        assert!(
+            !applied_cloud_on,
+            "resume must honor the saved cloud_on=false \
+             even when the saved target was Cloud; the \
+             cloud flag is a transport, not a function \
+             of the target"
+        );
+    }
+
+    /// Resume a Saved slot whose saved target is
+    /// Stdout but whose saved `cloud_on` is true
+    /// (the user wants server streaming for a
+    /// local-files session). The resume path must
+    /// honor cloud_on=true, not clobber it from
+    /// target.
+    ///
+    /// Currently red: clobber line forces cloud_on
+    /// from target, so a Stdout target forces
+    /// cloud_on=false.
+    #[test]
+    fn resume_honors_cloud_on_even_when_saved_target_is_stdout() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Saved as: target=Stdout, cloud_on=true
+        // (user wants server streaming + local
+        // files).
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        let _ = app.resume_section(slot);
+
+        let applied_cloud_on = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => saved.settings.cloud_on,
+            SlotKind::Recording { section } =>
+                section.settings.cloud_on,
+            SlotKind::Empty => panic!(
+                "resume must not empty the slot"
+            ),
+        };
+        assert!(
+            applied_cloud_on,
+            "resume must honor the saved cloud_on=true \
+             even when the saved target was Stdout; the \
+             cloud flag is a transport, not a function \
+             of the target"
+        );
+    }
     /// fails the push when `fail` is set.
     struct SpyTarget {
         pushed: Arc<PlMutex<Vec<String>>>,
