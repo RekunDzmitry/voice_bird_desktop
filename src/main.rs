@@ -733,6 +733,25 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
 
+        // 'R' (Shift+r) resumes capture in the focused slot. The
+        // lowercase `r` is taken by refresh, so resume lives on the
+        // shifted variant of the same letter — discoverable as
+        // "uppercase R for resume". A no-op (with a banner) when
+        // there is nothing to resume, so the key is never silently
+        // dead.
+        KeyCode::Char('R') => {
+            let slot = app.focused_slot;
+            match app.resume_section(slot) {
+                Ok(()) => {
+                    log::info!("keys: R → resume_section[{slot}]");
+                }
+                Err(msg) => {
+                    log::info!("keys: R → resume_section[{slot}] no-op: {msg}");
+                    app.banner = Some(msg);
+                }
+            }
+        }
+
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the

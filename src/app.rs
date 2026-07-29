@@ -2342,6 +2342,22 @@ impl App {
         }
     }
 
+    /// Resume capture in `slot` from a previously stopped
+    /// (Saved) section. Pulls the original `source` and
+    /// `settings` off the Saved variant and re-enters
+    /// `start_section` with them, so the existing
+    /// `committed`/`refined` transcript Arcs are re-attached
+    /// and new segments append to the visible text.
+    ///
+    /// Returns `Err` with a banner-ready message when the
+    /// slot is `Empty` (nothing to resume) or already
+    /// `Recording` (no double-start). The caller in
+    /// `handle_normal_mode` surfaces the message verbatim.
+    pub fn resume_section(&mut self, slot: SlotId) -> Result<(), String> {
+        let _ = slot;
+        Err("resume: not yet implemented".into())
+    }
+
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
         // Collect ids first so we don't hold a borrow on `self.slots`

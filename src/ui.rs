@@ -1570,6 +1570,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[+]", "add slot"),
                 hotkey_line("[-]", "remove slot"),
                 hotkey_line("[s]", "stop"),
+                hotkey_line("[R]", "resume"),
                 hotkey_line("[S]", "stop all"),
                 hotkey_line("[c]", cloud_key_label),
                 hotkey_line("[l]", "language"),
