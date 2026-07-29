@@ -279,8 +279,18 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
                 .split(inner);
             let p = Paragraph::new(lines).wrap(Wrap { trim: false });
             f.render_widget(p, cells[0]);
+            // Resume hint only makes sense on the focused slot —
+            // pressing R resumes the focused slot, so showing
+            // the hint on a non-focused slot would mislead.
+            // The clear hint (x) is universal and stays on
+            // every paused slot.
+            let hint_text = if is_focused {
+                "… (paused — press [R] to resume, [x] to clear)"
+            } else {
+                "… (paused — press [x] to clear)"
+            };
             let hint = Paragraph::new(Line::from(Span::styled(
-                "… (paused — press [x] to clear)",
+                hint_text,
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -2322,6 +2332,76 @@ mod tests {
         );
     }
 
+
+    /// A paused (Saved) slot's bottom hint must advertise the
+    /// [R] resume key — but only on the focused slot, since
+    /// R resumes the focused slot regardless of which
+    /// saved slot is showing the hint. Non-focused saved
+    /// slots keep the original (clear-only) hint.
+    ///
+    /// Pinned regression guard for the hint that turns R
+    /// from a "look it up in the help" key into a
+    /// discoverable one.
+    #[test]
+    fn paused_slot_hint_advertises_resume_on_focused_slot_only() {
+        use crate::app::{SavedTranscript, SlotKind};
+        use std::sync::Arc;
+        use voice_bird_cli::session::target::Target;
+
+        let mut app = App::new();
+        // Add a second slot so we can focus one and
+        // leave the other unfocused.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        let slot_a = app.slots[0].id;
+
+        // Seed both slots as Saved.
+        for slot in [slot_a, slot_b] {
+            let pos = app.slot_index(slot).unwrap();
+            app.slots[pos].kind = SlotKind::Saved {
+                saved: SavedTranscript {
+                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    label: "mic · cloud:OFF".into(),
+                    target: Target::Stdout,
+                    source: voice_bird_cli::session::layout::SessionSource::Microphone,
+                    settings: crate::app::SectionSettings {
+                        cloud_on: false,
+                        language: "en".into(),
+                        model: "tiny.en".into(),
+                    },
+                },
+            };
+        }
+
+        // Focused = slot A. The focused paused slot
+        // must show the resume hint.
+        app.focused_slot = slot_a;
+        let out_focused = render_to_string(&app, 180, 40);
+        assert!(
+            out_focused.contains("press [R] to resume"),
+            "focused paused slot must advertise [R] to resume; got:\n{out_focused}"
+        );
+        assert!(
+            out_focused.contains("press [x] to clear"),
+            "focused paused slot must also keep the [x] clear hint; got:\n{out_focused}"
+        );
+
+        // Focused = slot B. Slot A is now non-focused
+        // and must show only the clear hint; slot B
+        // is focused and shows the resume hint. Both
+        // strings must be present in the rendered
+        // output (different slots, different lines).
+        app.focused_slot = slot_b;
+        let out_unfocused = render_to_string(&app, 180, 40);
+        assert!(
+            out_unfocused.contains("press [R] to resume"),
+            "after switching focus to slot B, the focused slot's hint must advertise [R]; got:\n{out_unfocused}"
+        );
+        assert!(
+            out_unfocused.contains("(paused — press [x] to clear)"),
+            "non-focused paused slot A must keep the clear-only hint (no [R]); got:\n{out_unfocused}"
+        );
+    }
     /// R7 (PR #31 round-3 review): the funnel footer must
     /// advertise the [←] back key. main.rs binds KeyCode::Left
     /// to AgentFunnel::back(), but every step footer still reads
