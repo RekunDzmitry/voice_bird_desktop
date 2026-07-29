@@ -1864,7 +1864,97 @@ mod tests {
             "modal key hint missing:\n{out}"
         );
         // Last 4 chars of the buffer are shown unmasked.
-        assert!(out.contains("-key"), "masked tail missing:\n{out}");
+        // First 5 chars of the buffer are shown unmasked (the rest is
+        // masked dot-by-dot). The old test here asserted the LAST 4 were
+        // unmasked, but the new contract reveals the PREFIX so the user
+        // can spot a corrupted paste (e.g. `sk-testvb_…` pollution).
+        assert!(out.contains("vb-te"), "masked prefix missing:\n{out}");
+    }
+
+    /// `mask_api_key` exposes the FIRST 5 chars of the saved key so the
+    /// user can spot corruption / pasted test prefixes (e.g. `sk-test`
+    /// pollution observed when `vb_01371…` became `sk-testvb_01371…` in
+    /// the saved config). The rest of the key is masked dot-by-dot;
+    /// short keys still reveal nothing.
+    #[test]
+    fn mask_api_key_shows_first_five_chars_then_dots() {
+        let masked = mask_api_key(
+            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8",
+        );
+        // First 5 chars unmasked, followed by only dots.
+        assert!(
+            masked.starts_with("vb_01"),
+            "mask must reveal the prefix vb_01; got {masked:?}",
+        );
+        // The rest must be dots only — no leak of the secret.
+        let tail = &masked[5..];
+        assert!(
+            tail.chars().all(|c| c == '•'),
+            "tail must be all dots; got {tail:?}",
+        );
+        // And the original secret must not appear in the rendered mask.
+        assert!(
+            !masked.contains("f9de05bd6db"),
+            "mask leaked secret suffix; got {masked:?}",
+        );
+    }
+
+    /// `mask_api_key` should not reveal short keys (<= 5 chars); we mask
+    /// them entirely so a 5-char paste doesn't just show itself.
+    #[test]
+    fn mask_api_key_never_reveals_short_keys() {
+        assert_eq!(mask_api_key(""), "(empty)");
+        // 5 chars — at the cutoff, fully masked.
+        assert_eq!(mask_api_key("abcde"), "•••••");
+        // 4 chars — fully masked.
+        assert_eq!(mask_api_key("abcd"), "••••");
+        // 6 chars — first 5 visible, one dot suffix.
+        assert_eq!(mask_api_key("abcdef"), "abcde•");
+    }
+
+    /// The API-key modal advertises "Current key: vb_01…" above the input
+    /// line so the user can spot a corrupted prefix (e.g. accidentally
+    /// saved `sk-test` test pollution) without leaving the TUI. The
+    /// rendered label uses the SAVED key, not the buffer.
+    #[test]
+    fn api_key_modal_shows_current_saved_key_above_input() {
+        let mut app = App::new();
+        // Saved key is long; buffer holds a brand-new paste. The modal
+        // must show the saved key (so the user can see what is currently
+        // on disk), not the in-progress edit.
+        app.config.voicebird_api_key =
+            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8".into();
+        app.api_key_buf = Some("vb_bran-new-paste-here".into());
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        let out = render_to_string(&app, 140, 30);
+        assert!(
+            out.contains("Current key:"),
+            "modal must advertise the currently saved key; rendered:\n{out}",
+        );
+        // The label lists the SAVED key's prefix.
+        assert!(
+            out.contains("vb_01"),
+            "saved-key prefix must be visible in the modal; rendered:\n{out}",
+        );
+    }
+
+    /// The API-key modal lists `[Ctrl+U] clear` in the keys sidebar so the
+    /// user knows there is a way to wipe the buffer (and the saved key,
+    /// on Enter with an empty buffer) without leaving the TUI.
+    #[test]
+    fn api_key_modal_lists_clear_in_keys_hints() {
+        let mut app = App::new();
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb-anything".into());
+        let out = render_to_string(&app, 140, 30);
+        assert!(
+            out.contains("[Ctrl+U]"),
+            "modal must advertise [Ctrl+U] clear; rendered:\n{out}",
+        );
+        assert!(
+            out.contains("clear"),
+            "modal must advertise the clear action; rendered:\n{out}",
+        );
     }
 
     /// The mode panel shows the model name (auto-picked or user-chosen)

@@ -1448,3 +1448,53 @@ mod cloud_toggle_dispatch_tests {
         }
     }
 }
+
+/// `handle_api_key_modal` must clear the in-progress paste buffer when
+/// the user presses Ctrl+U. The same keypress saves with an empty
+/// buffer, which deletes the previously-saved key (the user wants a
+/// fresh start — e.g. after spotting `sk-test` test-pollution in
+/// their existing saved key, they want to retype from scratch). The
+/// Char('u') WITHOUT control must still type into the buffer like
+/// any other printable char.
+#[cfg(test)]
+mod api_key_modal_ctrl_u_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ctrl_u_clears_the_in_progress_api_key_buffer() {
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb_partial_paste".into());
+
+        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_api_key_modal(&mut app, &evt);
+
+        assert_eq!(
+            app.api_key_buf.as_deref(),
+            Some(""),
+            "Ctrl+U must clear the in-progress buffer to an empty string"
+        );
+        // Mode stays in the modal so the user can keep typing.
+        assert_eq!(app.mode, AppMode::ApiKeyModal);
+    }
+
+    #[test]
+    fn plain_u_typing_into_api_key_buffer_works_when_control_held_is_false() {
+        // Regression sentinel: Ctrl+U must NOT eat the printable 'u'
+        // keystroke when no modifier is held. The handler still has a
+        // normal-character typing path.
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some(String::new());
+
+        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &evt);
+
+        assert_eq!(
+            app.api_key_buf.as_deref(),
+            Some("u"),
+            "a plain 'u' keystroke (no modifiers) must append to the buffer"
+        );
+    }
+}
