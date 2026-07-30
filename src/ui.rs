@@ -1999,6 +1999,7 @@ mod tests {
         );
     }
     /// The mode panel shows the model name (auto-picked or user-chosen)
+    #[test]
     fn mode_panel_shows_the_model_name() {
         let mut app = App::new();
         app.slots[0].settings.model = "tiny.en".into();

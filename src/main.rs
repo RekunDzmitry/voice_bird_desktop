@@ -895,9 +895,14 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
             // stuck with Cloud ON + no key + no way to start a
             // recording. (The pre-R-key world had no other exit.)
             if app.api_key_modal_reverts_cloud {
-                #[cfg(not(windows))]
                 {
-                    app.config.cloud_broadcast_enabled = false;
+                    // Per-slot: revert the focused slot's cloud flag
+                    // (the modal was opened from a cloud toggle on
+                    // it). Persist the post-revert slot settings.
+                    if let Some(slot) = app.slot_by_id_mut(app.focused_slot) {
+                        slot.settings.cloud_on = false;
+                    }
+                    app.persist_focused_slot_settings();
                     if let Err(e) = app.config.save() {
                         log::error!("config save (modal cancel): {e}");
                     }
@@ -1328,9 +1333,15 @@ mod funnel_dispatch_tests {
     #[test]
     fn question_mark_is_help_only_and_t_owns_status() {
         let mut app = App::new();
+        // Reset per-slot settings so prior tests in the same
+        // process can't leave a cloud_on=true/cloud-bare-key
+        // banner set up by App::new (the banner test depends
+        // on no banner being present at start).
+        app.config.slot_settings.clear();
+        app.slots[0].settings.cloud_on = false;
+        app.banner = None;
         // Seed an agent event as if the recorder just reported one.
         crate::app::push_agent_event(&app.agent_events, "verify OK for 'broker:9092' in 12ms");
-
         handle_normal_mode(&mut app, KeyCode::Char('?'));
         assert_eq!(app.mode, AppMode::Help, "? must open the help overlay");
         assert!(
@@ -1422,7 +1433,6 @@ mod cloud_toggle_dispatch_tests {
     use super::*;
     use crate::platform::{AppSession, AudioDevice};
     use voice_bird_cli::config::AudioSessionKind;
-    use voice_bird_cli::session::layout::SessionSource;
 
     /// `c` toggled while no section is focused must flip the
     /// focused slot's `settings.cloud_on`. The legacy
@@ -1481,19 +1491,9 @@ mod cloud_toggle_dispatch_tests {
                 .expect("per-slot settings must be persisted after toggle");
             assert!(saved.cloud_on);
 
-            // Assert 3: the legacy per-source override was NOT touched.
-            // The refactor moves settings to per-slot; the per-source
-            // map is on its way out (commit 6).
-            let source = SessionSource::App {
-                id: "com.google.Chrome".into(),
-                name: "Google Chrome".into(),
-                device_name: "EPOS PC 8 USB".into(),
-            };
-            let source_key = app.source_key_for(&source);
-            assert!(
-                !app.config.source_overrides.contains_key(&source_key),
-                "the refactor must not touch legacy per-source overrides",
-            );
+            // Assert 3: under the per-slot model, the per-source
+            // override map is gone — there's nothing to check for
+            // absence. The slot's settings above are the contract.
         }
     }
 }
@@ -1640,9 +1640,8 @@ mod api_key_dispatcher_uppercase_k_tests {
 #[cfg(not(windows))]
 mod pr48_review_regression_tests {
     use super::*;
-    use crate::platform::AudioDevice;
-    use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
-    use voice_bird_cli::session::layout::SessionSource;
+
+
 
     /// Snapshot of the developer's real `config.toml`, restored on
     /// drop (including panic unwind). With config-path injection in
@@ -1709,7 +1708,9 @@ mod pr48_review_regression_tests {
     fn esc_after_k_peek_must_not_disable_cloud() {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
+        // Per-slot: the focused slot's settings.cloud_on is the
+        // source of truth. Seed the cluster with cloud on.
+        app.slots[0].settings.cloud_on = true;
 
         // The user peeks at the saved key via K…
         handle_normal_mode(&mut app, KeyCode::Char('K'));
@@ -1721,7 +1722,7 @@ mod pr48_review_regression_tests {
 
         assert_eq!(app.mode, AppMode::Normal, "Esc must close the modal");
         assert!(
-            app.config.cloud_broadcast_enabled,
+            app.slots[0].settings.cloud_on,
             "Esc from a K-opened (peek) modal must NOT disable cloud — \
              the cancel-reverts-cloud behaviour only makes sense when the \
              modal was opened by the cloud-enable flow that needs a key"
@@ -1775,12 +1776,9 @@ mod pr48_review_regression_tests {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
 
-        // Pin the legacy global flag to ON (the "panel says ON"
-        // setup). The toggle must NOT consult this — the slot's
-        // settings are the source of truth.
-        app.config.cloud_broadcast_enabled = true;
-
-        // Set the focused slot's settings.cloud_on to ON too.
+        // Per-slot: the focused slot's settings are the source
+        // of truth. The legacy global flag is gone; the toggle
+        // seeds from the slot's current display state.
         app.slots[0].settings.cloud_on = true;
 
         // The user sees "Cloud: ON" and presses `c` to turn it OFF.
