@@ -962,12 +962,28 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(buf) = app.api_key_buf.take() {
-                app.config.voicebird_api_key = buf.trim().to_string();
+                // Distinguish "user saved a new key" from "user
+                // wiped the buffer (Ctrl+U or Backspace × N) and
+                // committed an empty key". The first case sets
+                // `voicebird_api_key` to a non-empty string and
+                // the existing 'API key saved' banner is fine.
+                // The second case CLEARS the saved key on disk
+                // — `voicebird_api_key` becomes `""` and the
+                // old "API key saved" banner is actively
+                // misleading. The cloud-enable gate (if this
+                // modal was opened as one) will re-trigger on
+                // the next recording because `key.is_empty()`
+                // and `cloud_broadcast_enabled` is unchanged.
+                let trimmed = buf.trim();
+                app.config.voicebird_api_key = trimmed.to_string();
                 if let Err(e) = app.config.save() {
                     log::error!("config save (modal save): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
+                } else if trimmed.is_empty() {
+                    app.banner = Some("API key cleared".into());
                 } else {
-                    app.banner = Some("API key saved — start a recording to verify".into());
+                    app.banner =
+                        Some("API key saved — start a recording to verify".into());
                 }
             }
             app.mode = AppMode::Normal;
@@ -1601,6 +1617,41 @@ mod api_key_modal_ctrl_u_tests {
             Some("u"),
             "a plain 'u' keystroke (no modifiers) must append to the buffer"
         );
+    }
+
+    /// Ctrl+U + Enter (with the empty buffer) must surface a
+    /// "cleared" banner, not the misleading "API key saved —
+    /// start a recording to verify". The user explicitly
+    /// removed the key; the banner should reflect that.
+    #[test]
+    fn enter_with_empty_buf_after_ctrl_u_shows_cleared_banner() {
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb_partial_paste".into());
+
+        // Ctrl+U clears the buffer…
+        let ctrl_u =
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_api_key_modal(&mut app, &ctrl_u);
+        // …Enter commits the empty buf.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &enter);
+
+        assert!(
+            app.banner.as_deref()
+                == Some("API key cleared"),
+            "Ctrl+U + Enter must surface an 'API key cleared' banner \
+             so the user sees the key was removed, not saved. \
+             Got: {:?}",
+            app.banner,
+        );
+        // The saved key is now empty.
+        assert!(
+            app.config.voicebird_api_key.is_empty(),
+            "saving an empty buffer must clear the saved key on disk"
+        );
+        // And the modal is dismissed.
+        assert_eq!(app.mode, AppMode::Normal);
     }
 }
 
