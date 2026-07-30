@@ -548,16 +548,17 @@ pub enum TargetKind {
 impl App {
     /// Create a new application instance
     pub fn new() -> Self {
-        // Ensure the test config tempdir is installed on the first
-        // `App::new()` in a test process. `INSTALL_TEST_CONFIG` is
-        // a `LazyLock<PathBuf>` whose init is a one-time
-        // `set_var("VOICE_BIRD_TEST_CONFIG_PATH", …)`. In
-        // production the LazyLock is still allocated (and
-        // `.deref()`-ed on every `App::new`), but the init is a
-        // single `Ordering::Relaxed` load + a path check; the
-        // first call is a no-op when the env var is already set
-        // by an existing `config.toml`, and an allocation when
-        // it isn't. Tests get a tempdir; production pays ~ns.
+        // Test builds only: install the process-local config
+        // tempdir before the first `AppConfig::load()`, so every
+        // test that constructs an `App` reads from and saves to
+        // the tempdir instead of the developer's real
+        // `config.toml`. The deref MUST be cfg(test)-gated:
+        // `INSTALL_TEST_CONFIG`'s init unconditionally redirects
+        // `AppConfig::config_path()` to a fresh empty tempdir, so
+        // running it in production would make every launch boot
+        // from defaults (API key, devices, agent targets all
+        // "gone") and write settings into /tmp.
+        #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let mut config = AppConfig::load().unwrap_or_default();
         // Windows is cloud-only: force cloud on in memory

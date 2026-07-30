@@ -1688,25 +1688,26 @@ mod api_key_dispatcher_uppercase_k_tests {
     }
 }
 
-// PR #48 review — RED tests. Each test below pins a contract the
-// current code violates; they are expected to FAIL until the
-// matching fix lands. Do not delete a test to make the suite green —
-// implement the fix its comment describes instead.
+// PR #48 review — regression guards. These started life as RED
+// tests pinning contracts the code violated; the fixes landed in
+// 992ae64 (item 1, Esc-from-K), a608402 (item 2, config-path
+// injection), and 25ae726 (item 8, c-toggle seed). They stay as
+// permanent guards against re-regression.
 #[cfg(test)]
 #[cfg(not(windows))]
-mod pr48_review_red_tests {
+mod pr48_review_regression_tests {
     use super::*;
     use crate::platform::AudioDevice;
     use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
     use voice_bird_cli::session::layout::SessionSource;
 
     /// Snapshot of the developer's real `config.toml`, restored on
-    /// drop (including panic unwind) so a RED test in this module
-    /// can exercise handlers that call `config.save()` without
-    /// permanently corrupting the machine's real config. This is a
-    /// band-aid for the exact problem
-    /// `key_handlers_in_tests_must_not_write_real_user_config`
-    /// pins — once config-path injection lands, this guard can go.
+    /// drop (including panic unwind). With config-path injection in
+    /// place the handlers under test write to the tempdir, so this
+    /// guard should never observe a change — it stays as the safety
+    /// net that lets `key_handlers_in_tests_must_not_write_real_user_config`
+    /// fail loudly (without lasting damage) if the injection ever
+    /// regresses.
     struct RealConfigGuard {
         path: std::path::PathBuf,
         before: Option<Vec<u8>>,
@@ -1751,22 +1752,16 @@ mod pr48_review_red_tests {
         }
     }
 
-    /// RED (review item 1) — TODO: implement fix.
+    /// Regression guard (review item 1; was RED, fixed in 992ae64).
     ///
     /// `K` opens the API-key modal from anywhere, and the modal's
     /// "Current key:" line invites opening it just to *look* at the
-    /// saved key. But the Esc arm of `handle_api_key_modal` was
-    /// written for the one flow that existed before `K`: the
-    /// cloud-toggle-needs-a-key funnel. It unconditionally sets
-    /// `cloud_broadcast_enabled = false` and saves — so peek-and-Esc
-    /// silently disables cloud (and, because it does not touch the
-    /// per-source override, recreates the panel/override
-    /// disagreement the idle-`c` fix in this PR just resolved).
-    ///
-    /// Fix: track how the modal was opened (e.g. an
-    /// `api_key_modal_reverts_cloud: bool` set by the cloud-enable
-    /// flow, cleared by the `K` path) and only revert cloud when
-    /// the modal was opened as the cloud-enable gate.
+    /// saved key. The Esc arm used to unconditionally revert
+    /// `cloud_broadcast_enabled` (it was written for the
+    /// cloud-toggle-needs-a-key funnel, the only flow that existed
+    /// before `K`) — so peek-and-Esc silently disabled cloud. Now
+    /// `App::api_key_modal_reverts_cloud` records why the modal was
+    /// opened and Esc only reverts cloud for the cloud-enable gate.
     #[test]
     fn esc_after_k_peek_must_not_disable_cloud() {
         let _guard = RealConfigGuard::snapshot();
@@ -1790,29 +1785,23 @@ mod pr48_review_red_tests {
         );
     }
 
-    /// RED (review item 2) — TODO: implement fix.
+    /// Regression guard (review item 2; was RED, fixed in a608402).
     ///
-    /// `AppConfig::save()` writes to the machine's real config path
-    /// (`~/…/voice-bird/config.toml`), and `App::new()` loads from
-    /// it. Tests that drive real key handlers therefore READ the
-    /// developer's config and WRITE flipped state back to it —
-    /// `c_toggle_when_no_section_focused_updates_per_source_override`
-    /// already persists a flipped cloud flag, a synthetic
-    /// per-source override, and its in-memory `sk-test` API key
-    /// over the developer's real key on every `cargo test` run.
-    /// (The "sk-test pollution" mentioned in the API-key commits is
-    /// this suite's own doing.)
-    ///
-    /// Fix: inject the config path — an env-var override in
-    /// `AppConfig::config_path()` (set to a tempdir in tests) or an
-    /// `App::with_config(AppConfig)` seam that skips disk entirely.
+    /// `AppConfig::save()` used to write straight to the machine's
+    /// real config path, so tests driving real key handlers
+    /// persisted flipped flags and synthetic `sk-test` keys over
+    /// the developer's real `config.toml` on every `cargo test`
+    /// run. `App::new()` now installs a process-local tempdir
+    /// (via `test_utils::INSTALL_TEST_CONFIG` +
+    /// `VOICE_BIRD_TEST_CONFIG_PATH`) under cfg(test), so the
+    /// real file must stay byte-identical across any handler run.
     #[test]
     fn key_handlers_in_tests_must_not_write_real_user_config() {
         let guard = RealConfigGuard::snapshot();
         let before = guard.before.clone();
 
         // Drive the idle `c` toggle — its else-branch calls
-        // `app.config.save()` unconditionally today.
+        // `app.config.save()` unconditionally.
         let mut app = App::new();
         handle_normal_mode(&mut app, KeyCode::Char('c'));
 
@@ -1827,20 +1816,16 @@ mod pr48_review_red_tests {
         );
     }
 
-    /// RED (review item 8) — TODO: implement fix.
+    /// Regression guard (review item 8; was RED, fixed in 25ae726).
     ///
     /// The idle Mode panel displays the GLOBAL flag
-    /// (`cloud_broadcast_enabled`), but the idle `c` toggle seeds
-    /// its flip from the per-source OVERRIDE's current value. When
-    /// the two disagree (a stale override — the very scenario the
-    /// idle-`c` fix targets), the first press appears to do
-    /// nothing: panel shows "Cloud: ON", the user presses `c`
-    /// expecting OFF, and both values land on ON.
-    ///
-    /// Fix: seed the flip from the displayed (global) value —
-    /// `let on = !app.config.cloud_broadcast_enabled;` — and write
-    /// that to both the global flag and the per-source override, so
-    /// one press always visibly toggles the advertised state.
+    /// (`cloud_broadcast_enabled`), and the idle `c` toggle used to
+    /// seed its flip from the per-source OVERRIDE's current value —
+    /// when the two disagreed (stale override), the first press was
+    /// a visible no-op. The toggle now seeds from the displayed
+    /// (global) value and writes it to both the global flag and the
+    /// per-source override, so one press always flips the
+    /// advertised state.
     #[test]
     fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
         let _guard = RealConfigGuard::snapshot();
