@@ -560,6 +560,11 @@ impl App {
         // it isn't. Tests get a tempdir; production pays ~ns.
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let mut config = AppConfig::load().unwrap_or_default();
+        // Windows is cloud-only: force cloud on in memory
+        // regardless of what the on-disk config says. Covers
+        // configs copied from another OS or hand-edited;
+        // the on-disk format is unchanged.
+        enforce_cloud_only_platform(&mut config);
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -3166,14 +3171,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    // Install the per-test-binary config tempdir before any
-    // test in this module runs. Without this every `App::new()`
-    // here would read the developer's real `config.toml` and
-    // any `config.save()` would write to it.
-    static _TEST_CONFIG: std::sync::LazyLock<()> =
-        std::sync::LazyLock::new(|| {
-                        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
-        });
+    // `App::new()` itself derefs `voice_bird_cli::test_utils::INSTALL_TEST_CONFIG`
+    // on its first call (the only way to make the test tempdir
+    // appear before any test in this module's `App::new()`).
+    // No per-module `_TEST_CONFIG` is needed — the `LazyLock`
+    // is touched by every test that constructs an `App`.
 
     #[test]
     fn auth_error_detection_matches_common_phrases() {

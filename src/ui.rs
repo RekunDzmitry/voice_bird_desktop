@@ -2087,7 +2087,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn keys_panel_lists_K_for_setting_api_key() {
-        let mut app = App::new();
+        let app = App::new();
         let out = render_to_string(&app, 140, 30);
         assert!(
             out.contains("[K]"),
