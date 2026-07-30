@@ -1407,44 +1407,51 @@ impl App {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
-    /// Resolve the `SessionSource` for the focused slot from the
-    /// current Devices + Apps picker state. Mirrors the
-    /// source-derivation logic in `main.rs`'s Enter handler so
-    /// the two paths agree on what "the user's current pick"
-    /// means. Returns `Err` with a banner-ready message on
-    /// invalid combinations (no device, mic + app, unexpected
-    /// device kind) so the caller can surface the error
-    /// verbatim.
+    /// Resolve the source the focused Devices + Apps pickers
+    /// would resolve to on Enter. Wraps `resolve_picker_source`
+    /// (the canonical picker→source match) with the error
+    /// strings the TUI surfaces as banners for the three
+    /// invalid-picker configurations.
+    ///
+    /// Single source of truth for the source-resolution
+    /// logic + error message catalog. The Enter handler in
+    /// `main.rs` (which calls `try_start_new_section`) and
+    /// the resume path (`resume_section` for paused slots)
+    /// both go through here, so the error strings can never
+    /// drift between the two flows. `resolve_picker_source`
+    /// is the lower-level helper for callers that don't need
+    /// a `Result` (e.g. the idle `c` toggle, which writes
+    /// the per-source override regardless of which None
+    /// variant applies).
     pub fn resolve_focused_source(&self) -> Result<SessionSource, String> {
         use voice_bird_cli::config::AudioSessionKind;
         let dev = self.focused_device().cloned().ok_or_else(|| {
             "No audio device selected — press [r] to refresh".to_string()
         })?;
         let app_pick = self.focused_app().cloned();
-        // Reject Input + App: per-app loopback can't pair with
-        // a mic capture, and silently recording the mic would
-        // surprise the user. Same check as the Enter handler.
+        // Reject Input + App: per-app loopback can't pair
+        // with a mic capture, and silently recording the mic
+        // would surprise the user. Same check as
+        // `try_start_new_section` and the Enter handler.
         if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
             return Err(
                 "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app"
                     .to_string(),
             );
         }
-        match (dev.kind, app_pick) {
-            (AudioSessionKind::Input, _) => Ok(SessionSource::Microphone),
-            (AudioSessionKind::Output, None) => Ok(SessionSource::System),
-            (AudioSessionKind::Output, Some(a)) => Ok(SessionSource::App {
-                id: a.id,
-                name: a.name,
-                device_name: dev.name.clone(),
-            }),
-            (AudioSessionKind::App, _) => {
-                // Devices pane never emits AudioSessionKind::App
-                // entries (apps live in the Apps pane), but
-                // defend against it.
-                Err("Unexpected device kind — press [r] to refresh".to_string())
-            }
-        }
+        // Delegate the (kind, app) → SessionSource map to
+        // `resolve_picker_source` so the two functions
+        // can't disagree on which picker combinations
+        // produce which source — and so a future
+        // `AudioSessionKind::Loopback` variant (or similar)
+        // only has to be added in one place.
+        self.resolve_picker_source().ok_or_else(|| {
+            // `resolve_picker_source` returns `None` only
+            // when the device kind is `AudioSessionKind::App`
+            // (the Devices pane never emits that, but we
+            // defend against it).
+            "Unexpected device kind — press [r] to refresh".to_string()
+        })
     }
 
     /// Row index of the device currently picked for the focused slot.
@@ -2616,14 +2623,23 @@ impl App {
             };
             return Err(msg);
         };
-        use voice_bird_cli::config::AudioSessionKind;
-        let Some(dev) = self.devices.get(self.selected_device_index).cloned() else {
-            log::warn!(
-                "keys: Enter → refused (no device at idx {})",
-                self.selected_device_index
-            );
-            return Err("No audio device selected — press [r] to refresh".into());
-        };
+        // Resolve the source through the SAME function
+        // (`resolve_focused_source`) that the resume path
+        // uses — so the Enter and R flows share one
+        // picker→source match and one catalog of error
+        // strings. Pre-refactor, the three error paths
+        // (no-device / mic+app / unexpected-kind) plus
+        // the inline `resolve_picker_source` call were
+        // re-coded here, each able to drift independently
+        // of `resolve_focused_source`.
+        let source = self.resolve_focused_source()?;
+        // `resolve_focused_source` returned Ok, so the
+        // focused device is real — fetch a clone for the
+        // persist step below.
+        let dev = self
+            .focused_device()
+            .cloned()
+            .expect("resolve_focused_source returned Ok");
         let app_pick = self.focused_app().cloned();
         log::info!(
             "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
@@ -2633,16 +2649,6 @@ impl App {
             dev.kind,
             app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
         );
-
-        // Reject Input + App: per-app loopback can't pair
-        // with a mic capture, and combining them silently
-        // would just record the mic.
-        if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
-            return Err(
-                "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app"
-                    .into(),
-            );
-        }
 
         // Persist the selected device + last app id.
         let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
@@ -2657,10 +2663,6 @@ impl App {
                 log::error!("config save: {e}");
             }
         }
-
-        let Some(source) = self.resolve_picker_source() else {
-            return Err("Unexpected device kind — press [r] to refresh".into());
-        };
 
         // Start in the chosen slot; route through the
         // per-section API so settings come from
