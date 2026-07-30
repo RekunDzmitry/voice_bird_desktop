@@ -1310,6 +1310,11 @@ mod funnel_dispatch_tests {
     use crate::app::{App, AppMode};
     use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
 
+    #[allow(dead_code)]
+        static _TEST_CONFIG: std::sync::LazyLock<()> =
+            std::sync::LazyLock::new(|| {
+                            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            });
     fn type_str(app: &mut App, text: &str) {
         for ch in text.chars() {
             handle_agent_funnel(app, KeyCode::Char(ch));
@@ -1419,6 +1424,11 @@ mod cloud_toggle_dispatch_tests {
     use voice_bird_cli::config::AudioSessionKind;
     use voice_bird_cli::session::layout::SessionSource;
 
+    #[allow(dead_code)]
+        static _TEST_CONFIG: std::sync::LazyLock<()> =
+            std::sync::LazyLock::new(|| {
+                            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            });
     /// `c` toggled while no section is focused must update the
     /// per-source override for the source the picker resolves
     /// to on Enter. Today (pre-fix) the `else` branch in
@@ -1524,6 +1534,11 @@ mod api_key_modal_ctrl_u_tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    #[allow(dead_code)]
+        static _TEST_CONFIG: std::sync::LazyLock<()> =
+            std::sync::LazyLock::new(|| {
+                            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            });
     #[test]
     fn ctrl_u_clears_the_in_progress_api_key_buffer() {
         let mut app = App::new();
@@ -1570,7 +1585,12 @@ mod api_key_modal_ctrl_u_tests {
 #[cfg(test)]
 mod api_key_dispatcher_uppercase_k_tests {
     use super::*;
-    #[test]
+
+    #[allow(dead_code)]
+        static _TEST_CONFIG: std::sync::LazyLock<()> =
+            std::sync::LazyLock::new(|| {
+                            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            });
     #[allow(non_snake_case)]
     fn uppercase_K_opens_the_api_key_modal_from_normal_mode() {
         let mut app = App::new();
@@ -1621,6 +1641,11 @@ mod pr48_review_red_tests {
     use voice_bird_cli::config::{AppConfig, AudioSessionKind, SourceSettingsOverride};
     use voice_bird_cli::session::layout::SessionSource;
 
+    #[allow(dead_code)]
+        static _TEST_CONFIG: std::sync::LazyLock<()> =
+            std::sync::LazyLock::new(|| {
+                            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            });
     /// Snapshot of the developer's real `config.toml`, restored on
     /// drop (including panic unwind) so a RED test in this module
     /// can exercise handlers that call `config.save()` without
@@ -1643,7 +1668,14 @@ mod pr48_review_red_tests {
             let serial = SERIAL
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let path = AppConfig::config_path().expect("config path");
+            // Use the *real* config path, not the env-var-overridden
+            // `AppConfig::config_path()`. These tests verify that
+            // the production code does NOT touch the developer's
+            // real config — the guard's snapshot/restore has to
+            // refer to that real path, otherwise it would point
+            // at the test tempdir and miss any real-config
+            // pollution.
+            let path = voice_bird_cli::test_utils::real_config_path();
             let before = std::fs::read(&path).ok();
             Self {
                 path,

@@ -548,10 +548,18 @@ pub enum TargetKind {
 impl App {
     /// Create a new application instance
     pub fn new() -> Self {
+        // Ensure the test config tempdir is installed on the first
+        // `App::new()` in a test process. `INSTALL_TEST_CONFIG` is
+        // a `LazyLock<PathBuf>` whose init is a one-time
+        // `set_var("VOICE_BIRD_TEST_CONFIG_PATH", …)`. In
+        // production the LazyLock is still allocated (and
+        // `.deref()`-ed on every `App::new`), but the init is a
+        // single `Ordering::Relaxed` load + a path check; the
+        // first call is a no-op when the env var is already set
+        // by an existing `config.toml`, and an allocation when
+        // it isn't. Tests get a tempdir; production pays ~ns.
+        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let mut config = AppConfig::load().unwrap_or_default();
-
-        enforce_cloud_only_platform(&mut config);
-
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -3156,7 +3164,14 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    // ── existing generic tests ───────────────────────────────────────
+    // Install the per-test-binary config tempdir before any
+    // test in this module runs. Without this every `App::new()`
+    // here would read the developer's real `config.toml` and
+    // any `config.save()` would write to it.
+    static _TEST_CONFIG: std::sync::LazyLock<()> =
+        std::sync::LazyLock::new(|| {
+                        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+        });
 
     #[test]
     fn auth_error_detection_matches_common_phrases() {
@@ -3860,6 +3875,29 @@ mod tests {
         }];
         app.selected_device_index = 0;
         let slot = app.slots[0].id;
+        // Per-source override for the microphone must read
+        // `cloud_on = true` — that's the source the picker
+        // resolves to, and the resume path derives
+        // `effective_settings_for` from the per-source
+        // override first. Without this, the resume would
+        // fall back to the global default
+        // (`cloud_broadcast_enabled = false` in the test
+        // tempdir) and the assertion below would trip.
+        // (Pre-test-overlay this assertion passed only
+        // because the developer's real config happened to
+        // have `cloud_broadcast_enabled = true` and no
+        // per-source override — implicit test data.)
+        let source = SessionSource::Microphone;
+        let key = app.source_key_for(&source);
+        use voice_bird_cli::config::SourceSettingsOverride;
+        app.config.source_overrides.insert(
+            key,
+            SourceSettingsOverride {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        );
         // Saved as: target=Stdout, cloud_on=true
         // (user wants server streaming + local
         // files).
