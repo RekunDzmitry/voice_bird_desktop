@@ -696,7 +696,13 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // status.
         KeyCode::Char('K') => {
             log::info!("keys: K -> open_api_key_modal");
-            app.open_api_key_modal();
+            // `false`: K is a peek/edit shortcut. The user opens the
+            // modal to read the saved key (the modal's "Current key:"
+            // row) or to type a new one. Esc must close the modal
+            // silently without touching cloud — the cloud-enable
+            // flow is its own funnel (the `c` toggle's
+            // "Cloud ON, no key" branch sets `reverts_cloud = true`).
+            app.open_api_key_modal(false);
         }
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
@@ -725,7 +731,9 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // opens the API-key modal (the one cloud setting that matters).
         #[cfg(windows)]
         KeyCode::Char('c') => {
-            app.open_api_key_modal();
+            // `false`: there's no cloud toggle to revert on Windows;
+            // Cloud is always on. Esc just closes the modal.
+            app.open_api_key_modal(false);
         }
         // Toggle cloud transcription. When idle, mutates the global
         // config so the next-start defaults flip (and the mode panel
@@ -775,7 +783,15 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     log::error!("config save (cloud toggle): {e}");
                 }
                 if on && app.config.voicebird_api_key.is_empty() {
-                    app.open_api_key_modal();
+                    // Cloud-enable gate. Esc reverts the just-toggled
+                    // `cloud_broadcast_enabled` back to OFF (it was
+                    // OFF before this `c` press — the user just
+                    // flipped it). Without this, the user could
+                    // press `c` to enable Cloud, then change their
+                    // mind and `Esc` out of the modal — and be left
+                    // with Cloud ON, no key, and no way to start a
+                    // recording until they re-toggle `c` OFF.
+                    app.open_api_key_modal(true);
                 } else {
                     app.banner = Some(if on {
                         "Cloud: ON (next recording streams to voicebird.app)".into()
@@ -875,27 +891,46 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
 fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            // Cancel: revert the cloud toggle so the user isn't left
-            // with cloud=on and no key — that would block the next
-            // recording. Leaves the saved key untouched, so a partial
-            // edit is discarded.
-            #[cfg(not(windows))]
-            {
-                app.config.cloud_broadcast_enabled = false;
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (modal cancel): {e}");
+            // Cancel: only revert the cloud toggle if THIS modal
+            // was opened as the cloud-enable gate. `K` peek,
+            // first-run bootstrap, auth-failure recovery, and
+            // `start_section`'s pre-flight all set
+            // `api_key_modal_reverts_cloud = false` — for those
+            // flows Esc must close the modal silently, because
+            // cloud is either already on (and the user just wants
+            // to fix the key) or not in play (first run / peek).
+            //
+            // The cloud-enable funnel is the one path that
+            // flipped `cloud_broadcast_enabled` from false to
+            // true just before opening the modal; cancelling the
+            // modal there must unwind that flip or the user is
+            // stuck with Cloud ON + no key + no way to start a
+            // recording. (The pre-R-key world had no other exit.)
+            if app.api_key_modal_reverts_cloud {
+                #[cfg(not(windows))]
+                {
+                    app.config.cloud_broadcast_enabled = false;
+                    if let Err(e) = app.config.save() {
+                        log::error!("config save (modal cancel): {e}");
+                    }
+                    app.banner =
+                        Some("Cloud: OFF (cancelled API key entry)".into());
                 }
-                app.banner = Some("Cloud: OFF (cancelled API key entry)".into());
-            }
-            // Windows can't fall back to local, so cloud stays on; the
-            // start-recording guard re-opens this modal when needed.
-            #[cfg(windows)]
-            {
-                app.banner = Some(
-                    "Windows is cloud-only — press 'c' to set an API key before recording".into(),
-                );
+                #[cfg(windows)]
+                {
+                    // Windows can't fall back to local, so cloud
+                    // stays on; the start-recording guard re-opens
+                    // this modal when needed. (This branch is
+                    // defensive — the c-toggle's `reverts_cloud =
+                    // true` path is non-Windows only.)
+                    app.banner = Some(
+                        "Windows is cloud-only — press 'c' to set an API key before recording"
+                            .into(),
+                    );
+                }
             }
             app.api_key_buf = None;
+            app.api_key_modal_reverts_cloud = false;
             app.mode = AppMode::Normal;
         }
         KeyCode::Enter => {

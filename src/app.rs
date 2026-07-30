@@ -363,6 +363,16 @@ pub struct App {
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
     pub api_key_buf: Option<String>,
+    /// Whether the currently-open API-key modal was opened as the
+    /// cloud-enable gate (i.e. the user just flipped Cloud ON with
+    /// no key, or the runtime detected `auth_failure` and needs a
+    /// key to recover). `true` ⇒ Esc cancels the cloud flip and
+    /// reverts `cloud_broadcast_enabled` to `false` (the pre-toggle
+    /// state); `false` ⇒ Esc just closes the modal without touching
+    /// cloud (e.g. `K` peeked at the saved key, or the modal was
+    /// opened as a first-run bootstrap). Set by the opener, reset
+    /// to `false` when the modal closes.
+    pub api_key_modal_reverts_cloud: bool,
 
     /// In-flight text buffer for the output-path modal. `None` when
     /// the modal isn't open. Pre-filled with `config.session_dir`.
@@ -635,6 +645,7 @@ impl App {
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
+            api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
             banner: banner_on_launch,
@@ -658,7 +669,7 @@ impl App {
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
-            app.open_api_key_modal();
+            app.open_api_key_modal(false);
         }
 
         // Probe for the local agent runtime (today: oh-my-pi /
@@ -901,9 +912,21 @@ impl App {
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
-    /// from scratch). Used by the `c` toggle and by auth-error recovery.
-    pub fn open_api_key_modal(&mut self) {
+    /// from scratch). `reverts_cloud` is set on the App so the Esc
+    /// arm can decide whether cancelling the modal should also
+    /// revert the just-toggled `cloud_broadcast_enabled` to its
+    /// pre-toggle value:
+    ///  - `true`  — caller flipped Cloud ON with no key; Esc must
+    ///    unwind the flip (the pre-R-key world had no other way
+    ///    to exit the cloud-enable flow).
+    ///  - `false` — caller just wants to look at / edit the saved
+    ///    key (e.g. `K` peek, first-run bootstrap, auth-recovery
+    ///    pre-flight). Esc closes the modal silently.
+    ///
+    /// Used by the `c` toggle and by auth-error recovery.
+    pub fn open_api_key_modal(&mut self, reverts_cloud: bool) {
         self.api_key_buf = Some(self.config.voicebird_api_key.clone());
+        self.api_key_modal_reverts_cloud = reverts_cloud;
         self.mode = AppMode::ApiKeyModal;
     }
 
@@ -1539,7 +1562,11 @@ impl App {
             // immediately so the user can replace it without hunting
             // for a key binding.
             if auth_failure && self.config.cloud_broadcast_enabled {
-                self.open_api_key_modal();
+                // `false`: the user already has Cloud ON and a key
+                // on disk — they just need to replace the bad
+                // key. Cancelling the modal leaves Cloud ON (the
+                // next recording will re-trigger the auth guard).
+                self.open_api_key_modal(false);
             }
         }
     }
@@ -1651,7 +1678,12 @@ impl App {
         if settings.cloud_on && self.config.voicebird_api_key.is_empty() {
             self.banner = Some("Cloud is on but no API key — press 'c' to paste one".into());
             self.status = RecordingStatus::Error("no api key".into());
-            self.open_api_key_modal();
+            // `false`: cloud was ON before this guard fired; the
+            // user's intent (Cloud ON) is unchanged. We just need
+            // a key to start. Esc closes the modal and the banner
+            // stays as "missing api key" — the user can press 'c'
+            // to re-open or toggle cloud OFF.
+            self.open_api_key_modal(false);
             return Err("missing api key".into());
         }
 
