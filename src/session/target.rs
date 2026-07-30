@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
-    /// Local Whisper inference — transcript is written to disk and
-    /// stays on the user's machine.
+    /// Local persistence: the section writes `audio.wav`,
+    /// `transcript.jsonl`, `transcript.json`, and `transcript.txt`
+    /// into a timestamped directory under `session_dir`. The ASR
+    /// engine itself is chosen independently by `cloud_on`:
+    /// cloud off → local Whisper; cloud on → Voice Bird Web
+    /// (PCM streams to voicebird.app and committed segments
+    /// round-trip back into the same local writer). Stdout
+    /// guarantees a copy on disk in either case.
     Stdout,
     /// Transcript segments are pushed into the user's agent
     /// session (today: oh-my-pi / omp) via MCP stdio JSON-RPC.

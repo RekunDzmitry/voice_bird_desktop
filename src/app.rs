@@ -1695,22 +1695,37 @@ impl App {
         }
 
         let now = chrono::Utc::now();
-        // Local-first persistence: when broadcasting, the recording lives
-        // entirely on voicebird.app and we skip creating a local session
-        // directory. `session_dir` stays None, which finalize-on-stop checks.
-        let session_dir: Option<std::path::PathBuf> = if settings.cloud_on {
-            None
-        } else {
-            let dir = voice_bird_cli::session::layout::session_dir(
-                std::path::Path::new(&self.config.session_dir_expanded()),
-                now,
-                &source,
-            );
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                return Err(format!("create session dir: {e}"));
-            }
-            Some(dir)
-        };
+        // Local-first persistence is a function of the *target*, not
+        // the cloud transport. `Target::Stdout` always lands on disk
+        // (`audio.wav`, `transcript.jsonl`, `meta.json`, plus the
+        // post-stop `transcript.json` / `transcript.txt`); that
+        // contract holds whether the ASR is local-Whisper or
+        // cloud-Voice-Bird-Web, because the cloud engine's committed
+        // segments flow into the same consumer task and the same
+        // local writer. `Target::Agent` is the one case where the
+        // agent runtime *is* the destination, so we skip the local
+        // tree entirely — the agent buffer (`~/.voice-bird/live/`)
+        // is the persistence layer there.
+        //
+        // Pre-this-commit, the decision was gated on `cloud_on`,
+        // which conflated "is the cloud engine the ASR?" with
+        // "should we keep a local copy?". The user-facing picker
+        // for `Stdout + Cloud ON` reads as "transcript streamed to
+        // the server + locally (from server)" — both, not either.
+        let session_dir: Option<std::path::PathBuf> =
+            if matches!(target, Target::Stdout) {
+                let dir = voice_bird_cli::session::layout::session_dir(
+                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    now,
+                    &source,
+                );
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return Err(format!("create session dir: {e}"));
+                }
+                Some(dir)
+            } else {
+                None
+            };
 
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
