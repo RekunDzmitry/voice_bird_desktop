@@ -2,25 +2,27 @@
 //!
 //! `Stdout` is the local path: the section writes `audio.wav`,
 //! `transcript.jsonl`, `transcript.json`, and `transcript.txt` into a
-//! timestamped directory under the configured `session_dir`. `Cloud`
-//! streams audio to the Voice Bird Web backend and skips local files.
+//! timestamped directory under the configured `session_dir`.
 //!
-//! Phase A wires the enum into the data model; the agent-flavoured
-//! variants (Claude / Cursor / etc.) are reserved for Phase C and
-//! intentionally absent here so today's rendering surface stays small
-//! and provable.
+//! Server streaming is no longer a target — it lives on
+//! `Section::settings::cloud_on` as a per-section transport flag.
+//! Pairing `cloud_on = true` with `Target::Stdout` is valid: the
+//! local files are produced AND the audio is streamed to
+//! voicebird.app.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
-    /// Local Whisper inference — transcript is written to disk and
-    /// stays on the user's machine.
+    /// Local persistence: the section writes `audio.wav`,
+    /// `transcript.jsonl`, `transcript.json`, and `transcript.txt`
+    /// into a timestamped directory under `session_dir`. The ASR
+    /// engine itself is chosen independently by `cloud_on`:
+    /// cloud off → local Whisper; cloud on → Voice Bird Web
+    /// (PCM streams to voicebird.app and committed segments
+    /// round-trip back into the same local writer). Stdout
+    /// guarantees a copy on disk in either case.
     Stdout,
-    /// Audio is streamed to the Voice Bird Web backend. No local
-    /// `transcript.*` files; the API key in `config.toml` is used for
-    /// authentication.
-    Cloud,
     /// Transcript segments are pushed into the user's agent
     /// session (today: oh-my-pi / omp) via MCP stdio JSON-RPC.
     /// The session id is opaque today
@@ -43,7 +45,6 @@ impl std::fmt::Display for Target {
         match self {
             Target::Agent { .. } => f.write_str("Agent"),
             Target::Stdout => f.write_str("Stdout"),
-            Target::Cloud => f.write_str("Cloud"),
         }
     }
 }
@@ -60,7 +61,6 @@ mod tests {
     #[test]
     fn display_is_user_readable() {
         assert_eq!(Target::Stdout.to_string(), "Stdout");
-        assert_eq!(Target::Cloud.to_string(), "Cloud");
         assert_eq!(
             Target::Agent { session_id: "x".into() }.to_string(),
             "Agent"
@@ -68,14 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_through_serde() {
-        let json = serde_json::to_string(&Target::Cloud).unwrap();
-        let back: Target = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, Target::Cloud);
-    }
-
-    #[test]
-    fn target_round_trips_omp_session_id() {
+    fn agent_round_trips_omp_session_id() {
         let original = Target::Agent {
             session_id: "abc".into(),
         };

@@ -440,7 +440,28 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolve the on-disk config path.
+    ///
+    /// Production: `<dirs::config_dir>/voice-bird/config.toml` —
+    /// the same path the user (and the TUI) have always read from.
+    ///
+    /// Tests: an env-var override (`VOICE_BIRD_TEST_CONFIG_PATH`)
+    /// lets the test suite point every `App::new()` / `save()` at
+    /// a process-local tempdir instead of the developer's real
+    /// config. This un-flakes the two banner tests that asserted
+    /// `app.banner.is_none()` (they fail when the developer's real
+    /// `cloud_broadcast_enabled = true` + `voicebird_api_key = ""`
+    /// triggers the on-launch banner) and stops the
+    /// `c_toggle…_per_source_override` test from persisting its
+    /// in-memory `sk-test` key and a flipped cloud flag over the
+    /// user's real config on every `cargo test` run. The env var
+    /// is unset in production — the override is inert.
     pub fn config_path() -> anyhow::Result<PathBuf> {
+        if let Ok(p) = std::env::var("VOICE_BIRD_TEST_CONFIG_PATH") {
+            if !p.is_empty() {
+                return Ok(PathBuf::from(p));
+            }
+        }
         let base = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
         Ok(base.join("voice-bird").join("config.toml"))
     }

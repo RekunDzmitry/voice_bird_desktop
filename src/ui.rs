@@ -279,8 +279,28 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
                 .split(inner);
             let p = Paragraph::new(lines).wrap(Wrap { trim: false });
             f.render_widget(p, cells[0]);
+            // Resume hint only makes sense on the focused slot —
+            // pressing R resumes the focused slot, so showing
+            // the hint on a non-focused slot would mislead.
+            // The clear hint (x) is universal and stays on
+            // every paused slot.
+            //
+            // Focused variant must fit in 1/3 of a 180-col
+            // terminal (~58 cols; three section columns side
+            // by side, each ~60 cols, no wrap on this
+            // Paragraph). The full form
+            // `[R] resumes · [x] clears · Enter = new session`
+            // is 56 chars and clips in the slot column at
+            // <180 cols. The shorter form keeps the
+            // discoverability (every key + a one-word verb)
+            // without ellipsising.
+            let hint_text = if is_focused {
+                "[R] resume · [x] clear · Enter = new"
+            } else {
+                "… (paused — press [x] to clear)"
+            };
             let hint = Paragraph::new(Line::from(Span::styled(
-                "… (paused — press [x] to clear)",
+                hint_text,
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -352,7 +372,6 @@ fn build_slot_title(
     let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
     let target_color = match target {
         Target::Stdout => Color::Green,
-        Target::Cloud => Color::Magenta,
         Target::Agent { .. } => Color::Cyan,
     };
     if prefix.chars().count() <= inner_w {
@@ -620,16 +639,31 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
-
 fn mask_api_key(key: &str) -> String {
+    // Reveal BOTH the first 5 chars (the predictable prefix - e.g.
+    // `vb_01`) AND the last 5 chars (the high-entropy tail). The
+    // prefix lets the user spot a corrupted paste like
+    // `sk-testvb_…` (real key accidentally typed after a stale
+    // test fixture); the tail lets the user recognise the key
+    // ("is this the prod key?"). The middle is dotted.
+    //
+    // For keys short enough that the prefix and tail would
+    // overlap (total <= PREFIX + TAIL = 10 chars), the whole key
+    // is masked — there is no way to show both ends without
+    // leaking the body.
+    const PREFIX: usize = 5;
+    const TAIL: usize = 5;
+    let total = key.chars().count();
     if key.is_empty() {
         "(empty)".into()
-    } else if key.len() <= 4 {
-        "•".repeat(key.len())
+    } else if total <= PREFIX + TAIL {
+        "•".repeat(total)
     } else {
-        let shown = &key[key.len() - 4..];
-        let hidden = "•".repeat(key.len() - 4);
-        format!("{hidden}{shown}")
+        let chars: Vec<char> = key.chars().collect();
+        let prefix: String = chars[..PREFIX].iter().collect();
+        let tail: String = chars[total - TAIL..].iter().collect();
+        let middle = total - PREFIX - TAIL;
+        format!("{prefix}{}{tail}", "•".repeat(middle))
     }
 }
 
@@ -640,16 +674,33 @@ fn mask_api_key(key: &str) -> String {
 /// `App::open_api_key_modal` and cleared on Esc/Enter in the main key
 /// handler.
 fn render_api_key_modal(f: &mut Frame, area: Rect, app: &App) {
-    let popup = centered(70, 5, area);
+    let popup = centered(70, 6, area);
     f.render_widget(Clear, popup);
 
     let key = app.api_key_buf.clone().unwrap_or_default();
     let masked = mask_api_key(&key);
+    // Show the SAVED key (not the in-progress buffer) so the user can
+    // see what is currently on disk - e.g. spot a corrupted prefix
+    // like `sk-testvb_…` that has been silently pasted over a real
+    // `vb_…` key. Empty when nothing is saved yet.
+    let current_key = mask_api_key(&app.config.voicebird_api_key);
     let lines = vec![
         Line::from(Span::styled(
-            "Paste API key — Enter to save, Esc to cancel",
+            // In-modal control hint. Covers the case where the keys
+            // sidebar is partially obscured by the popup on narrower
+            // terminals. Phrasing here is intentionally distinct
+            // from the keys sidebar's `[Ctrl+U] clear` cell row (no
+            // brackets, plain paragraph text).
+            "Paste API key - Enter to save, Ctrl+U to clear, Esc to cancel",
             Style::default().fg(Color::Gray),
         )),
+        Line::from(vec![
+            Span::styled("Current key: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                current_key,
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             masked,
@@ -658,7 +709,6 @@ fn render_api_key_modal(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Voice Bird API key ")
@@ -1104,9 +1154,6 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
 }
-/// (label, style) for a single target row. `disabled=true` dims the
-/// label and appends a hint so the user knows the row exists but
-/// can't be picked.
 /// (label, style, hint) for a single target row. `disabled=true`
 /// dims the label and appends a hint so the user knows the row
 /// exists but can't be picked.
@@ -1118,12 +1165,10 @@ fn target_row_style(
     use crate::app::TargetKind;
     let base_color = match &kind {
         TargetKind::Stdout => Color::Green,
-        TargetKind::Cloud => Color::Magenta,
         TargetKind::Agent { .. } => Color::Cyan,
     };
     let label = match &kind {
         TargetKind::Stdout => "Stdout".to_string(),
-        TargetKind::Cloud => "Cloud".to_string(),
         TargetKind::Agent { .. } => match name {
             Some(n) => format!("Agent: {n}"),
             None => "Agent".to_string(),
@@ -1136,7 +1181,7 @@ fn target_row_style(
             "  (not installed)".into(),
         )
     } else {
-        // Agent is rendered the same as Stdout / Cloud — no
+        // Agent is rendered the same as Stdout — no
         // trailing hint, same row geometry. The disabled
         // case (above) carries the "(not installed)" hint
         // since the row exists but can't be picked.
@@ -1522,11 +1567,15 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
     let any_active = app.active_section_count() > 0;
     // Windows is cloud-only: 'c' manages the API key instead of toggling
     // modes, and the local-only model/export/path keys don't exist.
-    // cfg!(...) here is a compile-time constant, not a runtime check.
     let local_keys = cfg!(not(windows));
     let cloud_key_label = if local_keys { "cloud" } else { "API key" };
     let lines: Vec<Line> = match (any_active, &app.mode) {
-        (_, AppMode::ApiKeyModal) | (_, AppMode::PathModal) => vec![
+        (_, AppMode::ApiKeyModal) => vec![
+            hotkey_line("[Enter]", "save"),
+            hotkey_line("[Ctrl+U]", "clear"),
+            hotkey_line("[Esc]", "cancel"),
+        ],
+        (_, AppMode::PathModal) => vec![
             hotkey_line("[Enter]", "save"),
             hotkey_line("[Esc]", "cancel"),
         ],
@@ -1535,12 +1584,13 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 hotkey_line("[↑/↓]", "select"),
                 hotkey_line("[←/→]", "pane"),
                 hotkey_line("[Space]", "no app"),
-                hotkey_line("[Enter]", "start"),
+                hotkey_line("[Enter]", "new session"),
                 hotkey_line("[Tab]", "focus slot"),
                 hotkey_line("[+]", "add slot"),
                 hotkey_line("[-]", "remove slot"),
                 hotkey_line("[r]", "refresh"),
                 hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[K]", "API key"),
                 hotkey_line("[l]", "language"),
             ];
             if local_keys {
@@ -1565,13 +1615,15 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             let mut lines = vec![
                 hotkey_line("[↑/↓]", "select"),
                 hotkey_line("[←/→]", "pane"),
-                hotkey_line("[Enter]", "add"),
+                hotkey_line("[Enter]", "new session"),
                 hotkey_line("[Tab]", "focus slot"),
                 hotkey_line("[+]", "add slot"),
                 hotkey_line("[-]", "remove slot"),
                 hotkey_line("[s]", "stop"),
+                hotkey_line("[R]", "resume"),
                 hotkey_line("[S]", "stop all"),
                 hotkey_line("[c]", cloud_key_label),
+                hotkey_line("[K]", "API key"),
                 hotkey_line("[l]", "language"),
             ];
             if local_keys {
@@ -1623,6 +1675,24 @@ mod tests {
     use crate::platform::{AppSession, AudioDevice, AudioSessionKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// Canonical synthetic API key for mask-rendering tests. The shape
+    /// mirrors a real `vb_<64-hex>` key (5 ASCII + 60 hex-ish chars
+    /// after) so the mask renders a meaningful prefix + dots, but the
+    /// content is obviously fake — production-looking keys (whether
+    /// real or from local config) must never appear in tests because
+    /// they invite accidental leaks via `git log -p` / copy-paste.
+    /// Do NOT replace this with a value from any local config file.
+    const TEST_API_KEY: &str =
+        "vb_TESTSC0res-cure0rts-cure0res-cure-rtscure-rtscure-rtscure-rtscure0res-c0res-c0";
+    /// First 5 chars of `TEST_API_KEY` — the visible prefix the
+    /// prefix-revealing mask contract must surface. Pinned here so
+    /// tests assert a stable substring even if the fake key changes.
+    const TEST_API_KEY_PREFIX: &str = "vb_TE";
+    /// Last 5 chars of `TEST_API_KEY` — the visible suffix the
+    /// both-ends mask contract must surface. Pinned here so tests
+    /// assert a stable substring even if the fake key changes.
+    const TEST_API_KEY_SUFFIX: &str = "es-c0";
 
     fn render_to_string(app: &App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
@@ -1702,7 +1772,7 @@ mod tests {
     fn key_sidebar_shows_enter_and_refresh_when_idle() {
         let app = App::new();
         let out = render_to_string(&app, 140, 30);
-        assert!(out.contains("[Enter] start"), "enter hint missing:\n{out}");
+        assert!(out.contains("[Enter] new session"), "enter hint missing:\n{out}");
         assert!(out.contains("[r] refresh"), "refresh hint missing:\n{out}");
     }
 
@@ -1848,16 +1918,86 @@ mod tests {
         );
         assert!(
             out.contains("Paste API key"),
-            "modal prompt missing:\n{out}"
+            "modal prompt missing:\n{out}",
         );
+        // First 5 chars of the buffer are visible unmasked (the
+        // prefix the user uses to spot a corrupted paste like
+        // `sk-testvb_…` pollution). The last 5 chars are also
+        // visible (high-entropy tail). For `vb-test-key` (11
+        // chars) the prefix is `vb-te` and the tail is `t-key`.
+        assert!(out.contains("vb-te"), "masked prefix missing:\n{out}");
+        assert!(out.contains("t-key"), "masked tail missing:\n{out}");
+    }
+    /// `mask_api_key` should not reveal keys short enough that the
+    /// 5-char prefix and 5-char tail would overlap or touch — the
+    /// whole key is masked at or below the 10-char cutoff.
+    #[test]
+    fn mask_api_key_never_reveals_short_keys() {
+        assert_eq!(mask_api_key(""), "(empty)");
+        // 5 chars - well under the 10-char cutoff, fully masked.
+        assert_eq!(mask_api_key("abcde"), "•••••");
+        // 4 chars - fully masked.
+        assert_eq!(mask_api_key("abcd"), "••••");
+        // 10 chars - exactly at the cutoff (PREFIX + TAIL), still
+        // fully masked because any reveal would overlap.
+        assert_eq!(mask_api_key("abcdefghij"), "••••••••••");
+        // 11 chars - just over the cutoff. Prefix and tail
+        // become visible with a single dot between them.
+        assert_eq!(mask_api_key("abcdefghijk"), "abcde•ghijk");
+    }
+    /// The API-key modal advertises `Current key: vb_01…` above the input
+    /// rendered label uses the SAVED key, not the buffer.
+    #[test]
+    fn api_key_modal_shows_current_saved_key_above_input() {
+        let mut app = App::new();
+        // Saved key is long; buffer holds a brand-new paste. The
+        // modal must show the saved key (so the user can see what
+        // is currently on disk), not the in-progress edit.
+        // Synthetic test key. Production-looking keys (whether real
+        // or from local config) must never appear in tests — they
+        // invite accidental leaks via `git log -p` / copy-paste
+        // snippets. The `TEST_API_KEY` const in this module owns
+        // the canonical synthetic shape (vb_<5 ASCII> + 60 dots).
+        app.config.voicebird_api_key = TEST_API_KEY.into();
+        app.api_key_buf = Some("vb_bran-new-paste-here".into());
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        let out = render_to_string(&app, 140, 30);
         assert!(
-            out.contains("[Enter] save"),
-            "modal key hint missing:\n{out}"
+            out.contains("Current key:"),
+            "modal must advertise the currently saved key; rendered:\n{out}",
         );
-        // Last 4 chars of the buffer are shown unmasked.
-        assert!(out.contains("-key"), "masked tail missing:\n{out}");
+        // The label lists the SAVED key's prefix.
+        assert!(
+            out.contains(TEST_API_KEY_PREFIX),
+            "saved-key prefix must be visible in the modal; rendered:\n{out}",
+        );
     }
 
+    /// The API-key modal lists `[Ctrl+U] clear` in the keys sidebar so the
+    /// user knows there is a way to wipe the buffer (and the saved key,
+    /// on Enter with an empty buffer) without leaving the TUI.
+    #[test]
+    fn api_key_modal_lists_clear_in_keys_hints() {
+        let mut app = App::new();
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb-anything".into());
+        // Big enough viewport that the centered modal popup doesn't
+        // obscure the keys sidebar. On a 140x30 terminal the popup
+        // covers the `[Ctrl+U] clear` line (visible only on wider
+        // terminals), so the production terminal hides part of the
+        // hint but the data is still produced for the rendering pass.
+        // We use a wide viewport here so the assertion can find the
+        // literal text regardless of the modal overlay.
+        let out = render_to_string(&app, 200, 50);
+        assert!(
+            out.contains("[Ctrl+U]"),
+            "modal must advertise [Ctrl+U] clear; rendered:\n{out}",
+        );
+        assert!(
+            out.contains("clear"),
+            "modal must advertise the clear action; rendered:\n{out}",
+        );
+    }
     /// The mode panel shows the model name (auto-picked or user-chosen)
     /// so the user can see what's loaded without leaving the main screen.
     #[test]
@@ -1868,8 +2008,96 @@ mod tests {
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
-
-    /// The workspace starts at 1 slot. Expanding with `+` adds
+    /// `mask_api_key` reveals BOTH the prefix and the tail of a
+    /// long key — the prefix so the user can spot a corrupted
+    /// paste like `sk-testvb_…` (predictable boilerplate carries
+    /// no entropy but reveals "is this the prod key?" at a
+    /// glance), the tail so the user can recognise the key from
+    /// its high-entropy suffix. The middle is dotted. For keys
+    /// short enough that the prefix and tail would overlap (or
+    /// touch), the whole thing is masked.
+    #[test]
+    fn mask_api_key_reveals_prefix_and_suffix() {
+        // A 17-char key reveals 5 + 7 dots + 5 = 17.
+        assert_eq!(
+            mask_api_key("abcdefghijklmnopq"),
+            "abcde•••••••mnopq",
+            "long key must show prefix + dotted middle + tail",
+        );
+        // Synthetic test key from TEST_API_KEY — the prefix and
+        // suffix are both stable substrings of the synthetic
+        // constant, so we assert exact strings rather than
+        // recomputing the dot count.
+        let masked = mask_api_key(TEST_API_KEY);
+        assert!(
+            masked.starts_with(TEST_API_KEY_PREFIX),
+            "mask must reveal the prefix {TEST_API_KEY_PREFIX:?}; got {masked:?}",
+        );
+        assert!(
+            masked.ends_with(TEST_API_KEY_SUFFIX),
+            "mask must reveal the tail {TEST_API_KEY_SUFFIX:?}; got {masked:?}",
+        );
+        // The middle must be dots only — no leak of the secret.
+        // Char-indexed slice so the multi-byte `•` (3 bytes in
+        // UTF-8) doesn't get split on a byte boundary.
+        let chars: Vec<char> = masked.chars().collect();
+        let middle = &chars[TEST_API_KEY_PREFIX.chars().count()
+            ..chars.len() - TEST_API_KEY_SUFFIX.chars().count()];
+        let middle_str: String = middle.iter().collect();
+        assert!(
+            middle_str.chars().all(|c| c == '•'),
+            "middle must be all dots; got {middle_str:?}",
+        );
+        // And the original secret body must not appear in the
+        // rendered mask.
+        assert!(
+            !masked.contains("TESTSC"),
+            "mask leaked synthetic secret body; got {masked:?}",
+        );
+    }
+    /// The API-key modal surfaces the Ctrl+U clear hint INSIDE the
+    /// popup body itself, not just in the keys sidebar - the keys
+    /// sidebar can be obscured by the modal popup on narrower
+    /// terminals, so the user inside the modal must be able to read
+    /// the controls inline. We assert the phrase `Ctrl+U to clear`
+    /// appears verbatim in the rendered frame; this phrasing is
+    /// distinct from the keys sidebar's `[Ctrl+U] clear` (note the
+    /// brackets around `Ctrl+U` in the sidebar) and from
+    /// `Ctrl+U` followed by a separate `clear` cell.
+    #[test]
+    fn api_key_modal_surfaces_ctrl_u_hint_in_modal_body() {
+        let mut app = App::new();
+        app.mode = crate::app::AppMode::ApiKeyModal;
+        app.api_key_buf = Some(String::new());
+        // See TEST_API_KEY in the test module's const block. No
+        // production-looking keys in tests.
+        app.config.voicebird_api_key = TEST_API_KEY.into();
+        let out = render_to_string(&app, 200, 50);
+        assert!(
+            out.contains("Ctrl+U to clear"),
+            "modal prompt text must advertise `Ctrl+U to clear` in-place \
+             (distinguishable from the keys sidebar's `[Ctrl+U] clear`); \
+             rendered:\n{out}",
+        );
+    }
+    /// The keys sidebar lists `[K]` as the dedicated, always-available
+    /// shortcut for opening the API-key modal. Without `[K]` in the
+    /// sidebar the user has no in-app way to find the API-key modal
+    /// when 'c' is taken (it toggles cloud on a focused section).
+    #[test]
+    #[allow(non_snake_case)]
+    fn keys_panel_lists_K_for_setting_api_key() {
+        let app = App::new();
+        let out = render_to_string(&app, 140, 30);
+        assert!(
+            out.contains("[K]"),
+            "keys panel must advertise `[K]`; rendered:\n{out}",
+        );
+        assert!(
+            out.contains("API key"),
+            "keys panel must advertise the API-key action; rendered:\n{out}",
+        );
+    }
     /// additional slots; each column carries its slot number in
     /// the title. The empty-slot placeholder still shows when
     /// nothing is recording.
@@ -1887,16 +2115,18 @@ mod tests {
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
-    /// Targets pane renders as the third picker column. The header is
-    /// " Targets " (focused variant carries the action hint), the
-    /// three rows are Stdout / Cloud / Agent, and the active pick is
-    /// tagged with "(active)" next to the focused slot's current
-    /// target.
+    /// Targets pane renders as the third picker column. The
+    /// header is " Targets " (focused variant carries the
+    /// action hint). The two fixed rows are Stdout and
+    /// Agent — Cloud is no longer a target (cloud is a
+    /// per-section transport flag in the Mode panel).
+    /// The active pick is tagged with "(active)" next to
+    /// the focused slot's current target.
     #[test]
-    fn targets_pane_lists_stdout_cloud_agent_in_order() {
-        // The default Agent row is gone — the user has to add
-        // their own via the funnel. Plant one in the config so
-        // the row renders in the expected order.
+    fn targets_pane_lists_stdout_and_agent_in_order() {
+        // The default Agent row is gone — the user has to
+        // add their own via the funnel. Plant one in the
+        // config so the row renders in the expected order.
         let mut app = App::new();
         app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
             id: "test-uuid".into(),
@@ -1916,17 +2146,25 @@ mod tests {
         })
         .expect("upsert test agent target");
         let out = render_to_string(&app, 180, 40);
-        // Pane header (focused variant — Devices is the default focus,
-        // so the targets pane shows the unfocused title).
+        // Pane header (focused variant — Devices is the
+        // default focus, so the targets pane shows the
+        // unfocused title).
         assert!(out.contains("Targets"), "targets pane missing:\n{out}");
-        // Three rows in the fixed order: Stdout first, Agent last.
+        // Two rows in the fixed order: Stdout first, Agent
+        // last. The cloud toggle lives in the Mode panel,
+        // not here.
         let stdout_pos = out.find("Stdout").expect("Stdout row missing");
-        let cloud_pos = out.find("Cloud").expect("Cloud row missing");
         let agent_pos = out.find("Agent:").expect("Agent row missing");
-        assert!(stdout_pos < cloud_pos, "Stdout must come before Cloud");
-        assert!(cloud_pos < agent_pos, "Cloud must come before Agent");
+        assert!(
+            stdout_pos < agent_pos,
+            "Stdout must come before Agent"
+        );
+        // The Cloud-as-target row must be gone.
+        assert!(
+            !out.contains("→ Cloud"),
+            "the '→ Cloud' target must not appear in the targets pane; got:\n{out}"
+        );
     }
-
     /// When the focused slot has been used before, the row matching
     /// the current target gets a "(active)" tag — without it the user
     /// has no way to tell at a glance which row is the active pick
@@ -1976,16 +2214,17 @@ mod tests {
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(hint, "", "enabled Agent must not carry a trailing hint");
     }
-    /// Enabled Stdout / Cloud also carry no hint — pinning
-    /// the invariant that all three picker rows share a
-    /// single shape so the pin column lands identically.
+    /// Enabled Stdout also carries no hint — pinning the
+    /// invariant that every picker row shares a single
+    /// shape so the pin column lands identically. Cloud
+    /// is no longer a target; its toggle lives in the
+    /// Mode panel.
     #[test]
-    fn target_row_style_stdout_cloud_have_no_hint() {
+    fn target_row_style_stdout_has_no_hint() {
         use crate::app::TargetKind;
-        for k in [TargetKind::Stdout, TargetKind::Cloud] {
-            let (_label, _style, hint) = target_row_style(k.clone(), false, None);
-            assert_eq!(hint, "", "enabled {:?} must not carry a trailing hint", k);
-        }
+        let (_label, _style, hint) =
+            target_row_style(TargetKind::Stdout, false, None);
+        assert_eq!(hint, "", "enabled Stdout must not carry a trailing hint");
     }
     /// Idle key sidebar shows the new Tab/cfg keys.
     #[test]
@@ -2028,6 +2267,7 @@ mod tests {
             "[-]",
             "[r]",
             "[c]",
+            "[K]",
             "[l]",
         ] {
             assert!(
@@ -2096,19 +2336,37 @@ mod tests {
     /// the *focused* slot's pick.
     #[test]
     fn multi_slot_round_trip_keeps_picked_pins_on_focused_slot() {
-        use crate::app::{RecordingStatus, SavedTranscript, SlotKind};
-        use crate::platform::{AudioDevice, AudioSessionKind};
+        use crate::app::{RecordingStatus, SavedTranscript, SectionSettings, SlotKind};
         use std::sync::Arc;
         use voice_bird_cli::session::target::Target;
 
         let mut app = App::new();
-        // Cloud is always pickable (doesn't depend on the user
-        // having an agent runtime installed). Pick that as
-        // the per-slot target so the test stays portable
-        // across machines.
-        // Seed the picker state so each pane is non-trivial —
-        // otherwise the picked pin would land on a single
-        // vacant row and the test wouldn't catch ordering bugs.
+        // Add a user-configured Agent target so the Targets
+        // pane has a non-default row to pin. Cloud is no
+        // longer a target; the multi-pin exercise now
+        // uses an Agent target the user added via the
+        // funnel.
+        app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
+            id: "uuid-zoom".into(),
+            name: "zoom-bridge".into(),
+            connection: voice_bird_cli::config::AgentConnection::Kafka(
+                voice_bird_cli::config::KafkaAgentConnection {
+                    endpoint: "localhost:9092".into(),
+                    topic: "voice-bird".into(),
+                    client_id: None,
+                    acks: Default::default(),
+                    security_protocol: Default::default(),
+                    sasl_mechanism: None,
+                    sasl_username: None,
+                    sasl_password_env: None,
+                },
+            ),
+        })
+        .expect("upsert test agent target");
+        // Seed the picker state so each pane is non-trivial
+        // — otherwise the picked pin would land on a
+        // single vacant row and the test wouldn't catch
+        // ordering bugs.
         app.devices = vec![
             AudioDevice {
                 name: "MacBook Pro Microphone".into(),
@@ -2130,20 +2388,33 @@ mod tests {
         ];
         app.selected_device_index = 2; // EPOS PC 8 USB
         app.selected_app_index = Some(0); // Chrome
-        app.selected_target_index = Some(1); // Cloud (cursor)
-                                             // slot 1 starts as the only slot (id 1). Mark it as a
-                                             // saved recording on Cloud so the device + target pick
-                                             // are non-default. Bypassing `start_section` keeps the
-                                             // test free of audio / cpal / tokio runtime needs.
-        let saved_target = Target::Cloud;
+        app.selected_target_index = Some(1); // Agent: zoom-bridge
+        // slot 1 starts as the only slot (id 1). Mark
+        // it as a saved recording on the user-configured
+        // Agent target so the device + target pick are
+        // non-default. Bypassing `start_section` keeps
+        // the test free of audio / cpal / tokio runtime
+        // needs.
+        let saved_target =
+            Target::Agent { session_id: "uuid-zoom".into() };
         app.slots[0] = crate::app::Slot {
             id: crate::app::SlotId(1),
             kind: SlotKind::Saved {
                 saved: SavedTranscript {
                     committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
                     refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    label: "EPOS PC 8 USB + Chrome -> Cloud".into(),
+                    label: "EPOS PC 8 USB + Chrome -> Agent: zoom-bridge".into(),
                     target: saved_target.clone(),
+                    source: voice_bird_cli::session::layout::SessionSource::App {
+                        id: "chrome".into(),
+                        name: "Chrome".into(),
+                        device_name: "EPOS PC 8 USB".into(),
+                    },
+                    settings: SectionSettings {
+                        cloud_on: false,
+                        language: "en".into(),
+                        model: "tiny.en".into(),
+                    },
                 },
             },
         };
@@ -2153,21 +2424,18 @@ mod tests {
         app.status = RecordingStatus::Idle;
 
         // ---- Step 0: focus on slot 1 ----
-        // Confirm we start on slot 1 and the picks resolve to
-        // the right rows in every pane.
+        // Confirm we start on slot 1 and the picks
+        // resolve to the right rows in every pane.
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1)); // Chrome at apps[0] + synthetic offset 1
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud)
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() })
         );
         let out0 = render_to_string(&app, 180, 40);
-        // The picked Device row ('EPOS PC 8 USB' at index 2)
-        // must glow yellow + carry the '●' pin. Each
-        // non-cursor device row appears once in the rendered
-        // buffer — counting '●' against the picker tells us
-        // if more than one row picked up the pin.
+        // The picked Device row ('EPOS PC 8 USB' at index
+        // 2) must glow yellow + carry the '●' pin.
         assert!(
             out0.lines()
                 .any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
@@ -2178,47 +2446,22 @@ mod tests {
                 .any(|l| l.contains("Chrome") && l.contains('●')),
             "slot-1 step 0: app row missing '●' pin:\n{out0}"
         );
-        // Helper: locate a Targets-pane row by its label and
-        // report whether the row carries the trailing '●' pin.
-        // Anchors on the row's coordinate markers
-        // ('││  ' header, '│' footer, no '→' arrow) so the
-        // top border / slot title / side-panel cells don't
-        // sneak in.
-        // Helper: locate a Targets-pane row by its label and
-        // report whether the row carries the trailing '●' pin.
-        // The TestBackend pads every line to the column width
-        // with spaces, so a row filter should anchor on the
-        // column-start marker '││  ' and the row's label, not
-        // on '│' (the right border, which is followed by
-        // trailing spaces). Trim trailing whitespace after the
-        // Each rendered row in the Targets pane reads as
-        // "Label [hint] [●]" with one trailing pin. The
-        // TestBackend flattens every pane into one 180-wide
-        // line, so a pin search is the most reliable
-        // verification — substring "Label ●" matches the
-        // exact row we care about without dragging in
-        // neighbour panes.
+        // Helper: locate a Targets-pane row by its label
+        // and report whether the row carries the
+        // trailing '●' pin.
         let target_pin_present = |out: &str, label: &str| -> bool {
             let pinned_text = format!("{label} \u{25CF}");
             out.contains(&pinned_text)
         };
         // ---- Step 1: + adds a second slot ----
-        // focus_next / focus_prev cycle through every slot
-        // including Empty — the user can press Tab or
-        // Shift-Tab between slots regardless of whether a
-        // recording has started there yet.
         let added = app.add_slot();
         assert_eq!(added, Some(crate::app::SlotId(2)));
         assert_eq!(app.slots.len(), 2);
         // `add_slot` advances focused_slot to the new slot.
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
         // Empty slot 2 picks fall back to the global
-        // cursor positions (Device, App) and the
-        // per-slot Stdout default (Target). Device +
-        // App keep their previous state because the
-        // user hasn't interacted with those panes;
-        // Target falls back to Stdout because slot 2
-        // has no recording and no pending override.
+        // cursor positions and the per-slot Stdout
+        // default (Target).
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1));
         assert_eq!(
@@ -2231,8 +2474,8 @@ mod tests {
             "step 1: Stdout must be pinned on slot 2:\n{out1}"
         );
         assert!(
-            !target_pin_present(&out1, "Cloud"),
-            "step 1: Cloud must NOT leak from slot 1 to slot 2:\n{out1}"
+            !target_pin_present(&out1, "Agent: zoom-bridge"),
+            "step 1: the saved Agent pin must NOT leak from slot 1 to slot 2:\n{out1}"
         );
         assert!(out1.contains("[1]"), "slot 1 title missing:\n{out1}");
         assert!(out1.contains("[2]"), "slot 2 title missing:\n{out1}");
@@ -2242,17 +2485,17 @@ mod tests {
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "back on slot 1: picked target should be Cloud again"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "back on slot 1: picked target should be the saved Agent"
         );
         assert_eq!(app.picked_device_idx(), Some(2));
         assert_eq!(app.picked_app_idx(), Some(1));
         let out2 = render_to_string(&app, 180, 40);
-        // Returning to slot 1 must re-pin Cloud on Targets
-        // — and must NOT leave Stdout pinned.
+        // Returning to slot 1 must re-pin the saved Agent
+        // on Targets — and must NOT leave Stdout pinned.
         assert!(
-            target_pin_present(&out2, "Cloud"),
-            "back on slot 1: Cloud must be pinned:\n{out2}"
+            target_pin_present(&out2, "Agent: zoom-bridge"),
+            "back on slot 1: Agent must be pinned:\n{out2}"
         );
         assert!(
             !target_pin_present(&out2, "Stdout"),
@@ -2262,8 +2505,7 @@ mod tests {
         // ---- Step 3: focus_next takes us back to slot 2 ----
         app.focus_next();
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        // Empty slot 2 falls back to defaults again — the
-        // pending override from Step 0 hasn't been touched yet.
+        // Empty slot 2 falls back to Stdout again.
         assert_eq!(
             app.picked_target_kind(),
             Some(crate::app::TargetKind::Stdout),
@@ -2275,37 +2517,113 @@ mod tests {
             "back on slot 2: Stdout must be pinned:\n{out3}"
         );
         assert!(
-            !target_pin_present(&out3, "Cloud"),
-            "back on slot 2: Cloud must not be pinned:\n{out3}"
+            !target_pin_present(&out3, "Agent: zoom-bridge"),
+            "back on slot 2: saved Agent must not be pinned:\n{out3}"
         );
 
-        // ---- Bonus: queue a pending Cloud pick on slot 2
-        // and verify the override is per-slot. ----
-        app.pending_target_overrides
-            .insert(crate::app::SlotId(2), Target::Cloud);
+        // ---- Bonus: queue a pending Agent pick on slot
+        // 2 and verify the override is per-slot. ----
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            Target::Agent { session_id: "uuid-zoom".into() },
+        );
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "after queueing Cloud on slot 2, target picks Cloud"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "after queueing Agent on slot 2, target picks Agent"
         );
         app.focus_prev();
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        // Slot 1's pick is independent of slot 2's pending
-        // override: still Cloud (last saved).
+        // Slot 1's pick is independent of slot 2's
+        // pending override: still the saved Agent.
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
             "slot 1 must keep its own target pick across slot 2's override"
         );
         app.focus_next();
         assert_eq!(app.focused_slot, crate::app::SlotId(2));
         assert_eq!(
             app.picked_target_kind(),
-            Some(crate::app::TargetKind::Cloud),
-            "slot 2 picks Cloud back after forward navigation"
+            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
+            "slot 2 picks Agent back after forward navigation"
         );
     }
+    /// A paused (Saved) slot's bottom hint must make the
+    /// Enter/R distinction explicit: R resumes the focused
+    /// slot in place, x clears it, Enter starts a brand-new
+    /// session (in a new slot, if one is free).
+    ///
+    /// The resume + clear hints only appear on the
+    /// focused slot, since R/x target the focused slot
+    /// regardless of which paused slot is showing the
+    /// hint. Non-focused saved slots keep the
+    /// clear-only hint.
+    #[test]
+    fn paused_slot_hint_advertises_resume_and_enter_contrast() {
+        use crate::app::{SavedTranscript, SlotKind};
+        use std::sync::Arc;
+        use voice_bird_cli::session::target::Target;
 
+        let mut app = App::new();
+        // Add a second slot so we can focus one and
+        // leave the other unfocused.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        let slot_a = app.slots[0].id;
+
+        // Seed both slots as Saved.
+        for slot in [slot_a, slot_b] {
+            let pos = app.slot_index(slot).unwrap();
+            app.slots[pos].kind = SlotKind::Saved {
+                saved: SavedTranscript {
+                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    label: "mic · cloud:OFF".into(),
+                    target: Target::Stdout,
+                    source: voice_bird_cli::session::layout::SessionSource::Microphone,
+                    settings: crate::app::SectionSettings {
+                        cloud_on: false,
+                        language: "en".into(),
+                        model: "tiny.en".into(),
+                    },
+                },
+            };
+        }
+        // Focused = slot A. The focused paused hint
+        // must mention R (resume), x (clear), and
+        // Enter (new session).
+        app.focused_slot = slot_a;
+        let out_focused = render_to_string(&app, 180, 40);
+        assert!(
+            out_focused.contains("[R] resume"),
+            "focused paused hint must advertise [R] resume; got:\n{out_focused}"
+        );
+        assert!(
+            out_focused.contains("[x] clear"),
+            "focused paused hint must also advertise [x] clear; got:\n{out_focused}"
+        );
+        assert!(
+            out_focused.contains("Enter = new"),
+            "focused paused hint must clarify Enter starts a new session; got:\n{out_focused}"
+        );
+
+        // Focused = slot B. Slot A is now non-focused
+        // and must show only the clear hint; slot B
+        // is focused and shows the full R/x/Enter
+        // hint. Both strings must be present in the
+        // rendered output (different slots, different
+        // lines).
+        app.focused_slot = slot_b;
+        let out_unfocused = render_to_string(&app, 180, 40);
+        assert!(
+            out_unfocused.contains("[R] resume"),
+            "after switching focus to slot B, the focused slot's hint must advertise [R]; got:\n{out_unfocused}"
+        );
+        assert!(
+            out_unfocused.contains("(paused — press [x] to clear)"),
+            "non-focused paused slot A must keep the clear-only hint (no [R]); got:\n{out_unfocused}"
+        );
+    }
     /// R7 (PR #31 round-3 review): the funnel footer must
     /// advertise the [←] back key. main.rs binds KeyCode::Left
     /// to AgentFunnel::back(), but every step footer still reads

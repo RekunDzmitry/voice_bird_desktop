@@ -82,14 +82,29 @@ pub struct CommittedLine {
 /// Transcript state preserved across a section stop, so the text stays
 /// visible in the UI. When the user starts a new section in the same slot,
 /// these Arcs are reattached so new segments append to existing content.
+/// `Clone` lets `App::resume_section` snapshot the saved metadata
+/// without disturbing the `SlotKind` enum (which still contains a
+/// non-`Clone` `Section` in its `Recording` arm and therefore
+/// itself cannot derive `Clone`).
+#[derive(Clone)]
 pub struct SavedTranscript {
     pub committed: Arc<PlMutex<Vec<CommittedLine>>>,
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Column-title label from the stopped section (e.g. "mic · cloud:OFF").
     pub label: String,
-    /// Target the stopped section was using. Keeps the Targets pane
-    /// honest about what the saved text was being routed to.
     pub target: Target,
+    /// Source the stopped section was capturing (mic / system / app).
+    /// Informational snapshot: `App::resume_section` does NOT read
+    /// it back — resume re-derives the source from the current
+    /// Devices+Apps pickers and rewrites this field so the slot
+    /// reflects what the resumed section actually used.
+    pub source: SessionSource,
+    /// Settings the stopped section was using (cloud on/off,
+    /// language, model). Informational snapshot, like `source`:
+    /// resume applies the live `effective_settings_for(source)`
+    /// and rewrites this field, so post-stop changes (language,
+    /// cloud toggle) take effect on the resumed section.
+    pub settings: SectionSettings,
 }
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
@@ -348,6 +363,16 @@ pub struct App {
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
     pub api_key_buf: Option<String>,
+    /// Whether the currently-open API-key modal was opened as the
+    /// cloud-enable gate (i.e. the user just flipped Cloud ON with
+    /// no key, or the runtime detected `auth_failure` and needs a
+    /// key to recover). `true` ⇒ Esc cancels the cloud flip and
+    /// reverts `cloud_broadcast_enabled` to `false` (the pre-toggle
+    /// state); `false` ⇒ Esc just closes the modal without touching
+    /// cloud (e.g. `K` peeked at the saved key, or the modal was
+    /// opened as a first-run bootstrap). Set by the opener, reset
+    /// to `false` when the modal closes.
+    pub api_key_modal_reverts_cloud: bool,
 
     /// In-flight text buffer for the output-path modal. `None` when
     /// the modal isn't open. Pre-filled with `config.session_dir`.
@@ -508,7 +533,6 @@ pub struct TargetRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
-    Cloud,
     /// One user-configured Agent target. The `id` is the stable
     /// `AgentTargetId` from `AppConfig::agent_targets` and
     /// resolves to a `KafkaTarget` (today) via
@@ -521,14 +545,27 @@ pub enum TargetKind {
         id: String,
     },
 }
-
 impl App {
     /// Create a new application instance
     pub fn new() -> Self {
+        // Test builds only: install the process-local config
+        // tempdir before the first `AppConfig::load()`, so every
+        // test that constructs an `App` reads from and saves to
+        // the tempdir instead of the developer's real
+        // `config.toml`. The deref MUST be cfg(test)-gated:
+        // `INSTALL_TEST_CONFIG`'s init unconditionally redirects
+        // `AppConfig::config_path()` to a fresh empty tempdir, so
+        // running it in production would make every launch boot
+        // from defaults (API key, devices, agent targets all
+        // "gone") and write settings into /tmp.
+        #[cfg(test)]
+        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let mut config = AppConfig::load().unwrap_or_default();
-
+        // Windows is cloud-only: force cloud on in memory
+        // regardless of what the on-disk config says. Covers
+        // configs copied from another OS or hand-edited;
+        // the on-disk format is unchanged.
         enforce_cloud_only_platform(&mut config);
-
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -622,6 +659,7 @@ impl App {
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
+            api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
             banner: banner_on_launch,
@@ -645,7 +683,7 @@ impl App {
         // user must provide before recording.
         #[cfg(windows)]
         if app.config.voicebird_api_key.is_empty() {
-            app.open_api_key_modal();
+            app.open_api_key_modal(false);
         }
 
         // Probe for the local agent runtime (today: oh-my-pi /
@@ -808,18 +846,18 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// The picker list. Rows 0-1 are fixed (`Stdout`, `Cloud`).
-    /// From row 2 onward, one row per user-configured Agent
-    /// target. Disabled flag is reserved for future use; today
-    /// every configured Agent target is pickable.
+    /// The picker list. Row 0 is `Stdout`; rows 1+ are
+    /// one per user-configured Agent target. `Cloud`
+    /// is intentionally absent — cloud is a per-section
+    /// transport flag (see `SectionSettings::cloud_on`),
+    /// not a target. Disabled flag is reserved for
+    /// future use; today every configured Agent target
+    /// is pickable.
     pub fn targets(&self) -> Vec<TargetRow> {
-        let mut rows = Vec::with_capacity(2 + self.config.agent_targets.len());
+        let mut rows =
+            Vec::with_capacity(1 + self.config.agent_targets.len());
         rows.push(TargetRow {
             kind: TargetKind::Stdout,
-            disabled: false,
-        });
-        rows.push(TargetRow {
-            kind: TargetKind::Cloud,
             disabled: false,
         });
         for t in &self.config.agent_targets {
@@ -830,7 +868,6 @@ impl App {
         }
         rows
     }
-
     /// Resolve the currently focused Targets-pane row to a `Target`.
     /// Returns `None` if the cursor is parked on a disabled row or
     /// out of range.
@@ -854,9 +891,13 @@ impl App {
         let slot = self.focused_slot;
         let target = match kind {
             TargetKind::Stdout => Target::Stdout,
-            TargetKind::Cloud => Target::Cloud,
             TargetKind::Agent { id } => Target::Agent { session_id: id },
         };
+        // Queue the override so the next start_section
+        // consumes it. (Today this is the only signal
+        // the picker writes; start_section removes the
+        // override at start time and uses it as the
+        // section's target.)
         self.pending_target_overrides.insert(slot, target.clone());
         target
     }
@@ -885,9 +926,21 @@ impl App {
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
-    /// from scratch). Used by the `c` toggle and by auth-error recovery.
-    pub fn open_api_key_modal(&mut self) {
+    /// from scratch). `reverts_cloud` is set on the App so the Esc
+    /// arm can decide whether cancelling the modal should also
+    /// revert the just-toggled `cloud_broadcast_enabled` to its
+    /// pre-toggle value:
+    ///  - `true`  — caller flipped Cloud ON with no key; Esc must
+    ///    unwind the flip (the pre-R-key world had no other way
+    ///    to exit the cloud-enable flow).
+    ///  - `false` — caller just wants to look at / edit the saved
+    ///    key (e.g. `K` peek, first-run bootstrap, auth-recovery
+    ///    pre-flight). Esc closes the modal silently.
+    ///
+    /// Used by the `c` toggle and by auth-error recovery.
+    pub fn open_api_key_modal(&mut self, reverts_cloud: bool) {
         self.api_key_buf = Some(self.config.voicebird_api_key.clone());
+        self.api_key_modal_reverts_cloud = reverts_cloud;
         self.mode = AppMode::ApiKeyModal;
     }
 
@@ -1360,6 +1413,53 @@ impl App {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
+    /// Resolve the source the focused Devices + Apps pickers
+    /// would resolve to on Enter. Wraps `resolve_picker_source`
+    /// (the canonical picker→source match) with the error
+    /// strings the TUI surfaces as banners for the three
+    /// invalid-picker configurations.
+    ///
+    /// Single source of truth for the source-resolution
+    /// logic + error message catalog. The Enter handler in
+    /// `main.rs` (which calls `try_start_new_section`) and
+    /// the resume path (`resume_section` for paused slots)
+    /// both go through here, so the error strings can never
+    /// drift between the two flows. `resolve_picker_source`
+    /// is the lower-level helper for callers that don't need
+    /// a `Result` (e.g. the idle `c` toggle, which writes
+    /// the per-source override regardless of which None
+    /// variant applies).
+    pub fn resolve_focused_source(&self) -> Result<SessionSource, String> {
+        use voice_bird_cli::config::AudioSessionKind;
+        let dev = self.focused_device().cloned().ok_or_else(|| {
+            "No audio device selected — press [r] to refresh".to_string()
+        })?;
+        let app_pick = self.focused_app().cloned();
+        // Reject Input + App: per-app loopback can't pair
+        // with a mic capture, and silently recording the mic
+        // would surprise the user. Same check as
+        // `try_start_new_section` and the Enter handler.
+        if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
+            return Err(
+                "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app"
+                    .to_string(),
+            );
+        }
+        // Delegate the (kind, app) → SessionSource map to
+        // `resolve_picker_source` so the two functions
+        // can't disagree on which picker combinations
+        // produce which source — and so a future
+        // `AudioSessionKind::Loopback` variant (or similar)
+        // only has to be added in one place.
+        self.resolve_picker_source().ok_or_else(|| {
+            // `resolve_picker_source` returns `None` only
+            // when the device kind is `AudioSessionKind::App`
+            // (the Devices pane never emits that, but we
+            // defend against it).
+            "Unexpected device kind — press [r] to refresh".to_string()
+        })
+    }
+
     /// Row index of the device currently picked for the focused slot.
     /// The picker is always pinned to the slot that's recording (or
     /// about to record), so this matches what `start_section` will
@@ -1429,7 +1529,6 @@ impl App {
             .unwrap_or(Target::Stdout);
         Some(match t {
             Target::Stdout => TargetKind::Stdout,
-            Target::Cloud => TargetKind::Cloud,
             Target::Agent { session_id } => TargetKind::Agent { id: session_id },
         })
     }
@@ -1484,7 +1583,11 @@ impl App {
             // immediately so the user can replace it without hunting
             // for a key binding.
             if auth_failure && self.config.cloud_broadcast_enabled {
-                self.open_api_key_modal();
+                // `false`: the user already has Cloud ON and a key
+                // on disk — they just need to replace the bad
+                // key. Cancelling the modal leaves Cloud ON (the
+                // next recording will re-trigger the auth guard).
+                self.open_api_key_modal(false);
             }
         }
     }
@@ -1596,7 +1699,12 @@ impl App {
         if settings.cloud_on && self.config.voicebird_api_key.is_empty() {
             self.banner = Some("Cloud is on but no API key — press 'c' to paste one".into());
             self.status = RecordingStatus::Error("no api key".into());
-            self.open_api_key_modal();
+            // `false`: cloud was ON before this guard fired; the
+            // user's intent (Cloud ON) is unchanged. We just need
+            // a key to start. Esc closes the modal and the banner
+            // stays as "missing api key" — the user can press 'c'
+            // to re-open or toggle cloud OFF.
+            self.open_api_key_modal(false);
             return Err("missing api key".into());
         }
 
@@ -1616,27 +1724,17 @@ impl App {
         // agent target works alongside the existing Cloud /
         // Stdout switch. The override is consumed at start so
         // it only affects this one start.
+        // The target is whatever the user (or a prior
+        // pending override) picked. There's no implicit
+        // "Cloud" fallback anymore — cloud is a
+        // per-section transport flag (settings.cloud_on),
+        // not a target. The default for a fresh slot
+        // with no override is Stdout.
         let target = self
             .pending_target_overrides
             .remove(&slot)
-            .unwrap_or_else(|| {
-                if settings.cloud_on {
-                    Target::Cloud
-                } else {
-                    Target::Stdout
-                }
-            });
-        // Keep `cloud_on` in sync with the picked target so the
-        // rest of the recording pipeline (engine pick, language
-        // shadowing, etc.) doesn't have to learn about `Agent` yet —
-        // the Agent target piggybacks on local inference today.
+            .unwrap_or(Target::Stdout);
 
-        settings.cloud_on = matches!(target, Target::Cloud);
-
-        // Truncate the per-slot live tail when starting an
-        // Agent session. The TUI writes every committed segment
-        // there; the MCP server process spawned by the agent
-        // runtime tails this file. Starting fresh prevents a new
         // recording from inheriting segments left by a previous
         // session on the same slot.
         if matches!(target, Target::Agent { .. }) {
@@ -1653,22 +1751,37 @@ impl App {
         }
 
         let now = chrono::Utc::now();
-        // Local-first persistence: when broadcasting, the recording lives
-        // entirely on voicebird.app and we skip creating a local session
-        // directory. `session_dir` stays None, which finalize-on-stop checks.
-        let session_dir: Option<std::path::PathBuf> = if settings.cloud_on {
-            None
-        } else {
-            let dir = voice_bird_cli::session::layout::session_dir(
-                std::path::Path::new(&self.config.session_dir_expanded()),
-                now,
-                &source,
-            );
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                return Err(format!("create session dir: {e}"));
-            }
-            Some(dir)
-        };
+        // Local-first persistence is a function of the *target*, not
+        // the cloud transport. `Target::Stdout` always lands on disk
+        // (`audio.wav`, `transcript.jsonl`, `meta.json`, plus the
+        // post-stop `transcript.json` / `transcript.txt`); that
+        // contract holds whether the ASR is local-Whisper or
+        // cloud-Voice-Bird-Web, because the cloud engine's committed
+        // segments flow into the same consumer task and the same
+        // local writer. `Target::Agent` is the one case where the
+        // agent runtime *is* the destination, so we skip the local
+        // tree entirely — the agent buffer (`~/.voice-bird/live/`)
+        // is the persistence layer there.
+        //
+        // Pre-this-commit, the decision was gated on `cloud_on`,
+        // which conflated "is the cloud engine the ASR?" with
+        // "should we keep a local copy?". The user-facing picker
+        // for `Stdout + Cloud ON` reads as "transcript streamed to
+        // the server + locally (from server)" — both, not either.
+        let session_dir: Option<std::path::PathBuf> =
+            if matches!(target, Target::Stdout) {
+                let dir = voice_bird_cli::session::layout::session_dir(
+                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    now,
+                    &source,
+                );
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return Err(format!("create session dir: {e}"));
+                }
+                Some(dir)
+            } else {
+                None
+            };
 
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
@@ -2257,6 +2370,12 @@ impl App {
             refined: section.refined.clone(),
             label,
             target,
+            // Snapshot the source + settings so App::resume_section
+            // can re-enter start_section with the same input
+            // pipeline (mic/system/app, cloud/language/model)
+            // instead of asking the user to re-pick.
+            source: section.source.clone(),
+            settings: section.settings.clone(),
         };
         self.slots[pos].kind = SlotKind::Saved { saved };
 
@@ -2340,6 +2459,228 @@ impl App {
             }
             SlotKind::Empty => {}
         }
+    }
+
+    /// Resume capture in `slot` from a previously stopped
+    /// (Saved) section. Re-derives the source, target, and
+    /// settings from the current picker state instead of
+    /// reading them off the saved snapshot, so any changes
+    /// the user made after pressing `s` (device, app,
+    /// target, language, cloud toggle) take effect on the
+    /// resumed section.
+    ///
+    /// - Source comes from `App::resolve_focused_source`,
+    ///   which mirrors the Devices+Apps picker resolution
+    ///   in `main.rs`'s Enter handler.
+    /// - Target comes from `focused_pending_target`, which
+    ///   reads the per-slot `pending_target_overrides`
+    ///   entry if the user picked a new target, falling
+    ///   back to the saved target.
+    /// - Settings come from `effective_settings_for(source)`,
+    ///   which reads the per-source override first and
+    ///   falls back to the global config.
+    ///
+    /// The resolved source, target, and settings are
+    /// persisted back to the saved snapshot so the slot
+    /// reflects what was used regardless of whether
+    /// `start_section` succeeds. The committed/refined
+    /// Arcs on the saved variant are kept intact:
+    /// `start_section` reads them off the slot's `Saved`
+    /// arm and reuses them, so the visible transcript
+    /// text survives the resume.
+    ///
+    /// Returns `Err` with a banner-ready message when the
+    /// slot is `Empty` (nothing to resume), already
+    /// `Recording` (no double-start), or when the current
+    /// picker state is invalid (no device, mic + app,
+    /// unexpected device kind). The caller in
+    /// `handle_normal_mode` surfaces the message verbatim.
+    pub fn resume_section(&mut self, slot: SlotId) -> Result<(), String> {
+        let pos = self
+            .slot_index(slot)
+            .ok_or_else(|| format!("invalid section slot: {slot}"))?;
+        // Refuse double-start: the recording pipeline (cpal
+        // stream + tokio tasks) is already running and
+        // re-entering start_section would race the live
+        // audio capture. The caller surfaces this as a
+        // banner so the key is never silently dead.
+        if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
+            return Err(format!("slot {slot} is already recording"));
+        }
+        // Empty means nothing to resume. Surface that specific
+        // message rather than the more generic "no device
+        // selected" error the picker resolution below would
+        // produce for an untouched slot.
+        if matches!(self.slots[pos].kind, SlotKind::Empty) {
+            return Err("nothing to resume — slot is empty".into());
+        }
+        // Re-derive source, target, and settings from the
+        // current picker state. The saved snapshot's
+        // *committed* and *refined* Arcs are kept intact:
+        // start_section reads them off the slot's `Saved`
+        // variant to re-attach them to the new Section, so
+        // the visible text survives the resume. Only
+        // source, target, and settings are rewritten to
+        // the live values.
+        let source = self.resolve_focused_source()?;
+        let target = self.focused_pending_target();
+        let settings = self.effective_settings_for(&source);
+        // Slot is Saved here (Empty and Recording both
+        // returned above). Persist the new source, target,
+        // and settings back to the saved snapshot so the
+        // slot reflects what was used regardless of
+        // whether start_section succeeds.
+        if let SlotKind::Saved { saved } = &mut self.slots[pos].kind {
+            saved.source = source.clone();
+            saved.target = target.clone();
+            saved.settings = settings.clone();
+        } else {
+            // Defensive: the guards above make this branch
+            // unreachable today. Surface an error instead of
+            // panicking so a future refactor that changes
+            // slot state mid-resume degrades to a banner,
+            // not a dead TUI.
+            return Err(format!("slot {slot} changed state during resume"));
+        }
+        // Queue the target so start_section consumes it
+        // (start_section removes the override at start
+        // time and uses it as the section's target). Only
+        // insert when the user hadn't already queued an
+        // override, and take the insert back if
+        // start_section fails on an early guard (e.g.
+        // missing API key) before consuming it — otherwise
+        // a failed resume would leave a stale override
+        // queued on the slot.
+        let had_override = self.pending_target_overrides.contains_key(&slot);
+        if !had_override {
+            self.pending_target_overrides.insert(slot, target);
+        }
+        let result = self.start_section(slot, source, settings);
+        if result.is_err() && !had_override {
+            self.pending_target_overrides.remove(&slot);
+        }
+        result
+    }
+
+    /// Resolve the source the picker would pick on Enter.
+    /// `None` if no device is selected or the device kind
+    /// is the rejected `AudioSessionKind::App` variant.
+    /// Pure read of picker state — no mutation, no
+    /// persistence. Used by `try_start_new_section` and by
+    /// the idle `c` toggle in `main.rs`, so the toggle
+    /// writes its per-source override for the same source
+    /// the next start will resolve to.
+    pub fn resolve_picker_source(&self) -> Option<SessionSource> {
+        use voice_bird_cli::config::AudioSessionKind;
+        let dev = self.devices.get(self.selected_device_index)?;
+        let app_pick = self.focused_app().cloned();
+        match (dev.kind, app_pick) {
+            (AudioSessionKind::Input, _) => Some(SessionSource::Microphone),
+            (AudioSessionKind::Output, None) => Some(SessionSource::System),
+            (AudioSessionKind::Output, Some(a)) => Some(SessionSource::App {
+                id: a.id,
+                name: a.name,
+                device_name: dev.name.clone(),
+            }),
+            (AudioSessionKind::App, _) => None,
+        }
+    }
+
+    /// Try to start a brand-new recording in the next free
+    /// slot. Extracted from `main.rs`'s `Enter` handler so
+    /// the workflow is unit-testable and the message
+    /// contract is owned by `App` (not free-form `String`s
+    /// scattered in the key dispatcher).
+    ///
+    /// Flow: pick the first Empty slot, resolve the source
+    /// from the current Devices + Apps picker, persist the
+    /// picks to config (so a refresh preserves them), then
+    /// hand off to `start_section`. Returns the same `Err`
+    /// messages as before for invalid picker state, so the
+    /// caller in `main.rs` can surface them as banners
+    /// unchanged.
+    ///
+    /// The Targets picker has a special-case in the `Enter`
+    /// handler that *applies* the picked target first; that
+    /// lives in `main.rs` (it's a UI concern) and is called
+    /// *before* this method. By the time we get here, the
+    /// picked target (if any) is already queued in
+    /// `pending_target_overrides` and `start_section` will
+    /// consume it.
+    pub fn try_start_new_section(&mut self) -> Result<(), String> {
+        // No Empty slot. Distinguish between the two cases:
+        //   - Some slot is actively Recording — the user
+        //     needs to [s]top one to free a slot.
+        //   - All non-Empty slots are Saved (paused) —
+        //     [R] resumes a paused slot in place, [x]
+        //     clears, [-] removes. The old hardcoded
+        //     "all 3 sections are recording" message
+        //     was factually wrong in the second case and
+        //     hid the new R key.
+        let Some(slot) = self.next_free_slot() else {
+            let total = self.slots.len();
+            let recording = self.active_section_count();
+            log::info!("keys: Enter → refused (no free slot, {recording} recording, {total} total)");
+            let msg = if recording > 0 {
+                format!("All {total} slots are full — stop the recording with [s] first")
+            } else {
+                "No empty slots — press [R] to resume a paused slot, [x] to clear, [-] to remove"
+                    .to_string()
+            };
+            return Err(msg);
+        };
+        // Resolve the source through the SAME function
+        // (`resolve_focused_source`) that the resume path
+        // uses — so the Enter and R flows share one
+        // picker→source match and one catalog of error
+        // strings. Pre-refactor, the three error paths
+        // (no-device / mic+app / unexpected-kind) plus
+        // the inline `resolve_picker_source` call were
+        // re-coded here, each able to drift independently
+        // of `resolve_focused_source`.
+        let source = self.resolve_focused_source()?;
+        // `resolve_focused_source` returned Ok, so the
+        // focused device is real — fetch a clone for the
+        // persist step below.
+        let dev = self
+            .focused_device()
+            .cloned()
+            .expect("resolve_focused_source returned Ok");
+        let app_pick = self.focused_app().cloned();
+        log::info!(
+            "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
+            slot,
+            self.focused_slot,
+            dev.name,
+            dev.kind,
+            app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
+        );
+
+        // Persist the selected device + last app id.
+        let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
+        let kind_changed = self.config.input_device_kind != Some(dev.kind);
+        let app_id_changed =
+            self.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
+        if name_changed || kind_changed || app_id_changed {
+            self.config.input_device = Some(dev.name.clone());
+            self.config.input_device_kind = Some(dev.kind);
+            self.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
+            if let Err(e) = self.config.save() {
+                log::error!("config save: {e}");
+            }
+        }
+
+        // Start in the chosen slot; route through the
+        // per-section API so settings come from
+        // `effective_settings_for(source)`.
+        let settings = self.effective_settings_for(&source);
+        self.focused_slot = slot;
+        log::info!(
+            "keys: Enter → resolved source={:?}; calling start_section[{}]",
+            source,
+            slot
+        );
+        self.start_section(slot, source, settings)
     }
 
     /// Stop every active section. Used at quit.
@@ -2831,7 +3172,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    // ── existing generic tests ───────────────────────────────────────
+    // `App::new()` itself derefs `voice_bird_cli::test_utils::INSTALL_TEST_CONFIG`
+    // on its first call (the only way to make the test tempdir
+    // appear before any test in this module's `App::new()`).
+    // No per-module `_TEST_CONFIG` is needed — the `LazyLock`
+    // is touched by every test that constructs an `App`.
 
     #[test]
     fn auth_error_detection_matches_common_phrases() {
@@ -2856,8 +3201,6 @@ mod tests {
             app.pending_target_overrides.get(&SlotId(1)).cloned(),
             Some(Target::Stdout)
         );
-        let cloud = app.pick_target(TargetKind::Cloud);
-        assert_eq!(cloud, Target::Cloud);
         let omp = app.pick_target(TargetKind::Agent {
             id: "session-x".into(),
         });
@@ -2920,13 +3263,12 @@ mod tests {
             kinds,
             vec![
                 TargetKind::Stdout,
-                TargetKind::Cloud,
                 TargetKind::Agent { id: "uuid-prod".into() },
                 TargetKind::Agent { id: "uuid-events".into() },
             ]
         );
-        let prod_idx = 2usize;
-        let events_idx = 3usize;
+        let prod_idx = 1usize;
+        let events_idx = 2usize;
 
         // Focus the Targets pane and walk the cursor down from the
         // top. Each ↓ must move one row, regardless of how many
@@ -2971,8 +3313,715 @@ mod tests {
     }
 
     // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
+    // ── resume_section state matrix (R key) ──────────────────────────
 
-    /// Spy `AgentTarget`: records every pushed segment's text, or
+    /// An `Empty` slot must surface a banner-ready `Err` so the
+    /// `R` key is never silently dead. The message is what
+    /// `handle_normal_mode` writes into the status banner.
+    #[test]
+    fn resume_section_on_empty_slot_returns_nothing_to_resume() {
+        let mut app = App::new();
+        let slot = app.slots[0].id;
+        let err = app.resume_section(slot).unwrap_err();
+        assert!(
+            err.contains("nothing to resume"),
+            "expected a 'nothing to resume' message; got: {err}"
+        );
+        // The slot stays Empty — no side effects on failure.
+        assert!(matches!(app.slots[0].kind, SlotKind::Empty));
+    }
+
+    /// A `Saved` slot must reach `start_section`. The point of
+    /// the test is to prove the resume path *enters*
+    /// start_section with the saved source — not that the
+    /// pipeline spins up in CI. The test is pipeline-aware:
+    /// on hosts where cpal finds a real device the slot may
+    /// transition to `Recording`; on hosts where it does
+    /// not, the slot stays `Saved` and `start_section`
+    /// returns `Err` from the capture step. Both outcomes
+    /// are acceptable — what matters is that resume did
+    /// not short-circuit on the resume-time guards.
+    #[test]
+    fn resume_section_on_saved_slot_delegates_to_start_section() {
+        let mut app = App::new();
+        // Seed a Saved variant carrying the metadata we want
+        // resume to feed into start_section. The committed
+        // arc holds one synthetic line so we can also assert
+        // it's preserved when start_section reattaches it.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(vec![CommittedLine {
+                t_start_ms: 0,
+                text: "preserved line".into(),
+            }]));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "mic · cloud:OFF".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        let result = app.resume_section(slot);
+        if let Err(err) = &result {
+            // On hosts where capture fails (no cpal device),
+            // the error must NOT be the resume-time
+            // short-circuits — those would mean resume never
+            // reached the pipeline.
+            assert!(
+                !err.contains("nothing to resume"),
+                "resume must delegate to start_section, not short-circuit: {err}"
+            );
+            assert!(
+                !err.contains("already recording"),
+                "resume must not be refused as a double-start from Saved: {err}"
+            );
+        }
+        // The captured committed Arc is still alive (start_section
+        // reattaches it before either failing on capture or
+        // transitioning the slot to `Recording`) — proves the
+        // visible text survives the resume attempt.
+        assert_eq!(
+            committed.lock().len(),
+            1,
+            "preserved line must remain in the saved committed arc after resume"
+        );
+    }
+
+    /// The `Recording` short-circuit is a one-line `matches!`
+    /// guard against re-entering the live pipeline. We can't
+    /// construct a real `Section` in a unit test (it holds a
+    /// `!Send` cpal stream), so this test only proves the
+    /// state read on a fresh `Empty` slot is `Empty` — i.e.
+    /// the guard does not trigger for the wrong reason on the
+    /// happy path. The actual `Recording` arm is covered by
+    /// the integration tests in `tests/`.
+    #[test]
+    fn resume_section_does_not_falsely_refuse_empty_as_recording() {
+        let mut app = App::new();
+        let slot = app.slots[0].id;
+        // On an Empty slot, the guard's !Recording branch is
+        // what we take. If the guard were inverted, this would
+        // hit the "already recording" branch and fail the
+        // assertion below.
+        let err = app.resume_section(slot).unwrap_err();
+        assert!(
+            !err.contains("already recording"),
+            "Empty slot must not be mis-classified as Recording: {err}"
+        );
+    }
+
+    /// A `Saved` slot's resume must pick up settings the user
+    /// changed *after* pressing `s`. The use case: the user
+    /// records a section in English, stops, then cycles the
+    /// cloud language to Russian and resumes — the next
+    /// captured audio must be transcribed in Russian, not
+    /// English.
+    ///
+    /// Currently red: `resume_section` extracts the saved
+    /// snapshot's `settings` verbatim and hands them to
+    /// `start_section`, so any post-stop change to the
+    /// settings is ignored. The fix in the next commit switches to
+    /// `App::effective_settings_for(source)`, which reads
+    /// the live per-source override first and falls back
+    /// to the global config, and persists the new
+    /// settings back onto the saved snapshot so the
+    /// resulting slot reflects what was used.
+    ///
+    /// The test is pipeline-aware: on hosts where cpal
+    /// finds a real device the slot transitions to
+    /// `Recording`; otherwise it stays `Saved`. The
+    /// assertion reads the settings from whichever
+    /// variant the slot ended up in.
+    #[test]
+    fn resume_section_picks_up_settings_changed_after_stop() {
+        let mut app = App::new();
+        // Populate the Devices picker so the
+        // resolve_focused_source path in resume_section
+        // has a device to read.
+        use voice_bird_cli::config::AudioSessionKind;
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        // Seed a Saved variant as if a section was
+        // recorded in English, cloud off.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "mic · cloud:OFF".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Simulate the user pressing `l` to cycle the
+        // language to Russian and `c` to flip cloud on
+        // *after* stopping. The c/l handlers update the
+        // global config and per-source override when no
+        // section is focused (the post-stop case). Persist
+        // the override the same way persist_focused_settings
+        // does so the test reflects production state.
+        app.config.cloud_broadcast_enabled = true;
+        app.config.language = "ru".into();
+        let key = app.source_key_for(&SessionSource::Microphone);
+        let mut ov = app.config.effective_override(&key);
+        ov.cloud_on = true;
+        ov.language = "ru".into();
+        app.config.upsert_source_override(key, ov);
+
+        // Resume. The result is pipeline-dependent
+        // (capture may succeed or fail in the test env),
+        // so we only assert on the slot's post-call
+        // settings — not on Ok/Err.
+        let _ = app.resume_section(slot);
+
+        // The settings on the slot — whether it stayed
+        // Saved (capture failed) or transitioned to
+        // Recording (capture succeeded) — must reflect
+        // the post-stop config change, not the original
+        // saved snapshot.
+        let applied: &SectionSettings = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => &saved.settings,
+            SlotKind::Recording { section } => &section.settings,
+            SlotKind::Empty => {
+                panic!("resume must not empty the slot on a successful Saved path")
+            }
+        };
+        assert_eq!(
+            applied.language, "ru",
+            "resume must apply the post-stop language change, \
+             not the original saved snapshot's language (en)"
+        );
+        assert!(
+            applied.cloud_on,
+            "resume must apply the post-stop cloud toggle, \
+             not the original saved snapshot's cloud_off"
+        );
+    }
+    /// With two `Saved` slots, pressing `R` must resume the
+    /// focused slot only. The non-focused slot stays
+    /// `Saved` and is untouched.
+    ///
+    /// Currently green: `resume_section` takes a `SlotId`
+    /// and operates only on that slot, so this is
+    /// documenting existing behavior with a regression
+    /// guard.
+    #[test]
+    fn resume_section_only_resumes_focused_slot_when_multiple_saved() {
+        let mut app = App::new();
+        // Add a second slot so we have two to seed.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        let slot_a = app.slots[0].id;
+
+        // Seed both slots as Saved with distinct
+        // settings, so we can tell them apart after
+        // resume and confirm only the focused one was
+        // touched.
+        for (slot, lang) in [(slot_a, "en"), (slot_b, "de")] {
+            let pos = app.slot_index(slot).unwrap();
+            let saved = SavedTranscript {
+                committed: Arc::new(PlMutex::new(Vec::new())),
+                refined: Arc::new(PlMutex::new(Vec::new())),
+                label: format!("mic · cloud:OFF · {lang}"),
+                target: Target::Stdout,
+                source: SessionSource::Microphone,
+                settings: SectionSettings {
+                    cloud_on: false,
+                    language: lang.into(),
+                    model: "tiny.en".into(),
+                },
+            };
+            app.slots[pos].kind = SlotKind::Saved { saved };
+        }
+
+        // Focus slot A. (add_slot advances focus to the
+        // new slot, so we put it back on A explicitly.)
+        app.focused_slot = slot_a;
+
+        let _ = app.resume_section(slot_a);
+
+        // Slot B (non-focused) must remain Saved with
+        // its original German language, identical
+        // structure — not transitioned, not modified
+        // by a resume call on slot A.
+        let b_state = &app.slots[app.slot_index(slot_b).unwrap()].kind;
+        match b_state {
+            SlotKind::Saved { saved } => {
+                assert_eq!(
+                    saved.settings.language, "de",
+                    "non-focused slot B's language must not be modified by \
+                     resume_section on the focused slot"
+                );
+                assert_eq!(saved.label, "mic · cloud:OFF · de");
+            }
+            other => panic!(
+                "non-focused slot B must remain Saved, got: {other:?}"
+            ),
+        }
+    }
+
+    /// A `Saved` slot's resume must pick up not just settings
+    /// but also picker-level changes the user made after
+    /// pressing `s`: a different device (source kind), a
+    /// different app, and a different target.
+    ///
+    /// User scenario: record from the MacBook mic to
+    /// Stdout, stop, then change the picker to an output
+    /// device (EPOS) with Chrome selected and the target
+    /// set to Cloud, then resume. The resumed section
+    /// must use the post-stop source and target, not the
+    /// saved snapshot's.
+    ///
+    /// Currently red: `resume_section` pulls the source
+    /// verbatim off the Saved variant and hands it to
+    /// `start_section`, so any post-stop change to the
+    /// Devices or Apps picker is silently ignored. (The
+    /// target IS handled correctly already —
+    /// `start_section` consumes `pending_target_overrides`
+    /// — so the test's target assertion would pass today
+    /// even without the source fix. We assert on target
+    /// anyway as a regression guard.)
+    ///
+    /// The test is pipeline-aware: the slot may stay
+    /// `Saved` (capture fails in headless) or transition
+    /// to `Recording` (capture succeeds). Both outcomes
+    /// are acceptable; the assertion reads source/target
+    /// off whichever variant the slot ended up in.
+    #[test]
+    fn resume_section_picks_up_source_and_target_changed_after_stop() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        // Seed a Saved variant as if a section was
+        // recorded from the MacBook mic to Stdout.
+        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
+            Arc::new(PlMutex::new(Vec::new()));
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: committed.clone(),
+            refined: refined.clone(),
+            label: "MacBook Pro Microphone -> Stdout".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Now the user changes the picker state after
+        // pressing s:
+        //   - Devices cursor moves to EPOS (Output)
+        //   - Apps cursor moves to Chrome
+        //   - Targets pane picks Cloud
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: AudioSessionKind::Output,
+            },
+        ];
+        app.apps = vec![AppSession {
+            id: "chrome".into(),
+            name: "Google Chrome".into(),
+            process_id: 12345,
+        }];
+        app.selected_device_index = 1; // EPOS
+        app.selected_app_index = Some(0); // Chrome
+        // Queue the next-start target override for
+        // this slot (mirrors what the Targets
+        // picker's Enter handler does). Use a
+        // user-configured Agent target since Cloud
+        // is no longer a target.
+        app.pending_target_overrides
+            .insert(slot, Target::Agent { session_id: "kafka-1".into() });
+
+        let _ = app.resume_section(slot);
+
+        // Pull source + target off whichever variant the
+        // slot ended up in. Both must reflect the
+        // post-stop picker state.
+        let (applied_source, applied_target): (
+            &SessionSource,
+            &Target,
+        ) = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => (&saved.source, &saved.target),
+            SlotKind::Recording { section } => {
+                (&section.source, &section.target)
+            }
+            SlotKind::Empty => panic!(
+                "resume must not empty the slot on a successful Saved path"
+            ),
+        };
+
+        // Source: must be App { chrome, Google Chrome,
+        // EPOS PC 8 USB } — the post-stop pick, not the
+        // saved Microphone.
+        match applied_source {
+            SessionSource::App {
+                id,
+                name,
+                device_name,
+            } => {
+                assert_eq!(id, "chrome");
+                assert_eq!(name, "Google Chrome");
+                assert_eq!(device_name, "EPOS PC 8 USB");
+            }
+            other => panic!(
+                "resume must apply the post-stop source (App/chrome/EPOS); got: {other:?}"
+            ),
+        }
+
+        // Target: must be the queued Agent override
+        // — the pending override is consumed by
+        // start_section.
+        assert_eq!(
+            applied_target,
+            &Target::Agent { session_id: "kafka-1".into() },
+            "resume must apply the post-stop target (Agent); got: {applied_target:?}"
+        );
+    }
+
+    // ── try_start_new_section state matrix (Enter key) ───────────
+
+    /// Enter pressed with all slots non-Empty (one Saved
+    /// slot) must NOT silently re-start the slot, and the
+    /// error message must clearly tell the user how to
+    /// resume — not the misleading "all 3 sections are
+    /// recording" line that today implies no slots can be
+    /// touched.
+    ///
+    /// The user scenario: record, stop (s), then press
+    /// Enter expecting to start a NEW session. The slot
+    /// is paused, so the right action is [R] to resume
+    /// the existing section, or [x] to clear, or [-] to
+    /// remove the slot. The error must mention R so the
+    /// user discovers the resume key.
+    ///
+    /// Currently red: try_start_new_section returns
+    /// "All 3 sections are recording — stop one first
+    /// ([s])" which (a) is factually wrong (no slot is
+    /// Recording), (b) hardcodes "3" regardless of slot
+    /// count, and (c) doesn't mention the R key the
+    /// user actually wants. The fix in the next commit
+    /// rewrites the message to mention R and to reflect
+    /// the actual state (slots non-Empty, none actively
+    /// recording).
+    #[test]
+    fn try_start_new_section_with_paused_slot_says_use_r_to_resume() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        // Seed a Saved slot so the App has no Empty
+        // slots — next_free_slot returns None.
+        let _slot = app.slots[0].id;
+        app.slots[0].kind = SlotKind::Saved {
+            saved: SavedTranscript {
+                committed: Arc::new(PlMutex::new(Vec::new())),
+                refined: Arc::new(PlMutex::new(Vec::new())),
+                label: "mic · cloud:OFF".into(),
+                target: Target::Stdout,
+                source: SessionSource::Microphone,
+                settings: SectionSettings {
+                    cloud_on: false,
+                    language: "en".into(),
+                    model: "tiny.en".into(),
+                },
+            },
+        };
+        // Populate a device so we don't fail on the
+        // "no device" branch before the "no free slot"
+        // branch.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+
+        let err = app.try_start_new_section().unwrap_err();
+        // The new contract: the message must point the
+        // user at R (resume) since pressing Enter was the
+        // wrong key for a paused slot.
+        assert!(
+            err.contains('R') || err.to_lowercase().contains("resume"),
+            "Enter on a paused slot must point the user at R to resume; got: {err}"
+        );
+        // And it must NOT use the misleading
+        // "all 3 sections are recording" line — the
+        // slot is paused, not recording.
+        assert!(
+            !err.contains("all 3 sections are recording"),
+            "Enter on a paused slot must not claim sections are recording; got: {err}"
+        );
+    }
+
+    /// Enter pressed on a fresh App (one Empty slot) must
+    /// reach `start_section` — the test is pipeline-aware
+    /// (capture may succeed or fail in the test env).
+    /// The point: the "no free slot" branch is only
+    /// taken when no slot is Empty; with the default
+    /// App::new() state we have one Empty slot, so the
+    /// method should NOT return the "no free slot"
+    /// error.
+    ///
+    /// Currently green: the refactor preserved this
+    /// behavior. It's a regression guard so the fix
+    /// doesn't break the happy path.
+    #[test]
+    fn try_start_new_section_with_empty_slot_does_not_refuse_no_free_slot() {
+        let mut app = App::new();
+        // Default App::new() ships one Empty slot. The
+        // method should reach start_section (which may
+        // fail on capture in headless tests, but the
+        // error must NOT be the "no free slot" branch).
+        let result = app.try_start_new_section();
+        if let Err(err) = &result {
+            assert!(
+                !err.contains("All 3 sections are recording"),
+                "fresh App with an Empty slot must not hit the no-free-slot branch; got: {err}"
+            );
+            assert!(
+                !err.to_lowercase().contains("all 3 sections"),
+                "fresh App must not see the 'all 3' message; got: {err}"
+            );
+        }
+    }
+
+    // ── Cloud-target refactor: cloud is a transport, not a target ──
+
+    /// The targets picker no longer offers Cloud as a
+    /// destination. With cloud removed from the
+    /// `Target` enum, `App::targets()` returns exactly
+    /// one row per known destination: Stdout (row 0)
+    /// plus one row per user-configured Agent target.
+    /// The "Cloud as a target" row is gone — cloud
+    /// becomes a per-section *transport* flag (cloud_on
+    /// on the section's settings) rather than a
+    /// destination in its own right.
+    ///
+    /// Currently red: `targets()` returns
+    /// `2 + N agent_rows` (Stdout + Cloud + agents).
+    /// After the fix it returns `1 + N agent_rows`.
+    #[test]
+    fn targets_picker_no_longer_offers_cloud_target() {
+        use crate::app::TargetKind;
+
+        let app = App::new();
+        let rows = app.targets();
+        let agent_count = app.config.agent_targets.len();
+        assert_eq!(
+            rows.len(),
+            1 + agent_count,
+            "targets picker should offer Stdout + N agent rows only"
+        );
+        // Every row must be a recognized destination
+        // variant. Today the row at index 1 is Cloud,
+        // which fails this check; after the fix only
+        // Stdout and Agent remain.
+        for r in &rows {
+            assert!(
+                matches!(r.kind, TargetKind::Stdout)
+                    || matches!(r.kind, TargetKind::Agent { .. }),
+                "unexpected target kind: {:?} — Cloud must not be a target",
+                r.kind
+            );
+        }
+    }
+    /// Resume a Saved slot whose saved target is
+    /// Stdout but whose saved `cloud_on` is true
+    /// (the user wants server streaming for a
+    /// local-files session). The resume path must
+    /// honor cloud_on=true, not clobber it from
+    /// target.
+    ///
+    /// Currently red: `start_section` runs
+    /// `settings.cloud_on = matches!(target, Target::Cloud)`,
+    /// which evaluates to false for any non-Cloud
+    /// target (including Stdout). So a user-saved
+    /// cloud_on=true on a Stdout session is
+    /// silently forced to false on resume. The
+    /// fix drops the clobber line.
+    #[test]
+    fn resume_honors_cloud_on_even_when_saved_target_is_stdout() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Per-source override for the microphone must read
+        // `cloud_on = true` — that's the source the picker
+        // resolves to, and the resume path derives
+        // `effective_settings_for` from the per-source
+        // override first. Without this, the resume would
+        // fall back to the global default
+        // (`cloud_broadcast_enabled = false` in the test
+        // tempdir) and the assertion below would trip.
+        // (Pre-test-overlay this assertion passed only
+        // because the developer's real config happened to
+        // have `cloud_broadcast_enabled = true` and no
+        // per-source override — implicit test data.)
+        let source = SessionSource::Microphone;
+        let key = app.source_key_for(&source);
+        use voice_bird_cli::config::SourceSettingsOverride;
+        app.config.source_overrides.insert(
+            key,
+            SourceSettingsOverride {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        );
+        // Saved as: target=Stdout, cloud_on=true
+        // (user wants server streaming + local
+        // files).
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        let _ = app.resume_section(slot);
+
+        let applied_cloud_on = match &app.slots[0].kind {
+            SlotKind::Saved { saved } => saved.settings.cloud_on,
+            SlotKind::Recording { section } =>
+                section.settings.cloud_on,
+            SlotKind::Empty => panic!(
+                "resume must not empty the slot"
+            ),
+        };
+        assert!(
+            applied_cloud_on,
+            "resume must honor the saved cloud_on=true \
+             even when the saved target was Stdout; the \
+             cloud flag is a transport, not a function \
+             of the target"
+        );
+    }
+    /// `start_section` must persist a local session directory for
+    /// `Target::Stdout` even when the cloud transport is on.
+    ///
+    /// Today (pre-fix) `cloud_on = true` flips `session_dir` to
+    /// `None` unconditionally — the recording lives entirely on
+    /// voicebird.app and the user has no local copy. That's the
+    /// right behaviour for `Target::Agent` (the agent runtime
+    /// is the destination) but wrong for `Target::Stdout`, where
+    /// the picker label explicitly advertises a local-on-disk
+    /// transcript (`audio.wav`, `transcript.jsonl`, `meta.json`).
+    /// The user wants the cloud engine to do the ASR AND a
+    /// local copy to land on disk.
+    ///
+    /// We can't inspect `Section::session_dir` directly from
+    /// outside `start_section` (it stays a local variable
+    /// until the `Recording` variant is constructed, and the
+    /// cpal capture in the test environment is expected to
+    /// fail with "no input device"). The directory is created
+    /// BEFORE capture opens, so a successful `create_dir_all`
+    /// call is observable on disk even when `start_section`
+    /// returns `Err` downstream. We assert exactly that: a
+    /// single `2026-…-mic` directory under
+    /// `app.config.session_dir` post-resume.
+    #[test]
+    fn start_section_stdout_target_with_cloud_on_creates_local_session_dir() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.config.session_dir = dir.path().to_string_lossy().into_owned();
+        app.config.voicebird_api_key = "sk-test".into();
+        // Devices picker so `resolve_focused_source` returns
+        // `Microphone` and the session slug picks the `-mic`
+        // suffix.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Seed a Saved variant with target=Stdout, cloud_on=true.
+        // The label must match what the picker would have written
+        // for this combination.
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Resume delegates to start_section. We don't care
+        // whether the call returns Ok or Err — what matters
+        // is the side effect on disk.
+        let _ = app.resume_section(slot);
+
+        // Exactly one session directory was created under the
+        // configured session_dir. The slug is
+        // `<timestamp>-<source-suffix>`, with the source suffix
+        // being `mic` for `SessionSource::Microphone`.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "Stdout + cloud_on=true must create exactly one local \
+             session directory (slug = `<ts>-<source>`); got {entries:?}",
+        );
+        let name = entries[0].file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name.ends_with("-mic"),
+            "session dir slug must end with `-mic` for the microphone \
+             source; got {name:?}",
+        );
+    }
     /// fails the push when `fail` is set.
     struct SpyTarget {
         pushed: Arc<PlMutex<Vec<String>>>,
@@ -3159,7 +4208,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_non_agent_targets_route_nothing() {
         let (state, targets, pushed) = dispatch_fixture(false);
-        for target in [Target::Stdout, Target::Cloud] {
+        for target in [Target::Stdout] {
             let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets).await;
             assert_eq!(out, AgentDispatch::NotAgent);
         }

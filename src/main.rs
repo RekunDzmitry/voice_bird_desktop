@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -345,7 +346,7 @@ fn run_app<B: Backend>(
                             AppMode::ModelPicker => handle_picker_mode(app, key.code),
                             AppMode::Help => handle_help_mode(app, key.code),
                             AppMode::Status => handle_status_mode(app, key.code),
-                            AppMode::ApiKeyModal => handle_api_key_modal(app, key.code),
+                            AppMode::ApiKeyModal => handle_api_key_modal(app, &key),
                             AppMode::PathModal => handle_path_modal(app, key.code),
                             AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
                             AppMode::ConfirmDeleteAgentTarget { id } => {
@@ -598,99 +599,29 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     return;
                 }
             }
-            // Pick the next free slot (or refuse if all are full).
-            let Some(slot) = app.next_free_slot() else {
-                log::info!("keys: Enter → refused (all 3 sections full)");
-                app.banner = Some("All 3 sections are recording — stop one first ([s])".into());
-                return;
-            };
-            use voice_bird_cli::config::AudioSessionKind;
-            use voice_bird_cli::session::layout::SessionSource;
-
-            let Some(dev) = app.devices.get(app.selected_device_index).cloned() else {
-                log::warn!(
-                    "keys: Enter → refused (no device at idx {})",
-                    app.selected_device_index
-                );
-                app.banner = Some("No audio device selected — press [r] to refresh".into());
-                return;
-            };
-            let app_pick = app.focused_app().cloned();
-            log::info!(
-                "keys: Enter → slot={} focused_slot_before={} dev=({:?}, {:?}) app={:?}",
-                slot,
-                app.focused_slot,
-                dev.name,
-                dev.kind,
-                app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
-            );
-
-            // Reject Input + App: per-app loopback can't pair with a
-            // mic capture, and combining them silently would just record
-            // the mic.
-            if matches!(dev.kind, AudioSessionKind::Input) && app_pick.is_some() {
-                app.banner = Some(
-                    "Mic + per-app capture isn't supported — pick an output device or [Space] to clear the app".into(),
-                );
-                return;
-            }
-
-            // Persist the selected device + last app id.
-            let name_changed = app.config.input_device.as_deref() != Some(dev.name.as_str());
-            let kind_changed = app.config.input_device_kind != Some(dev.kind);
-            let app_id_changed =
-                app.config.last_app_id.as_deref() != app_pick.as_ref().map(|a| a.id.as_str());
-            if name_changed || kind_changed || app_id_changed {
-                app.config.input_device = Some(dev.name.clone());
-                app.config.input_device_kind = Some(dev.kind);
-                app.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
-                if let Err(e) = app.config.save() {
-                    log::error!("config save: {e}");
-                }
-            }
-
-            let source = match (dev.kind, app_pick) {
-                (AudioSessionKind::Input, _) => SessionSource::Microphone,
-                (AudioSessionKind::Output, None) => SessionSource::System,
-                (AudioSessionKind::Output, Some(a)) => SessionSource::App {
-                    id: a.id,
-                    name: a.name,
-                    device_name: dev.name.clone(),
-                },
-                (AudioSessionKind::App, _) => {
-                    // Devices pane never emits AudioSessionKind::App
-                    // entries (apps live in the Apps pane), but be safe.
-                    app.banner = Some("Unexpected device kind — press [r] to refresh".into());
-                    return;
-                }
-            };
-
-            // Start in the chosen slot; route through the per-section API
-            // so settings come from `effective_settings_for(source)`.
-            let settings = app.effective_settings_for(&source);
-            app.focused_slot = slot;
-            log::info!(
-                "keys: Enter → resolved source={:?}; calling start_section[{}]",
-                source,
-                slot
-            );
-            match app.start_section(slot, source, settings) {
+            // Hand the rest off to App::try_start_new_section. The
+            // Targets pick_target above is the only Enter-specific
+            // UI concern; everything else (slot pick, source
+            // resolution, config persist, start_section) is shared
+            // and lives in the App method so it can be unit-tested.
+            match app.try_start_new_section() {
                 Ok(()) => {
                     log::info!(
-                        "keys: Enter → start_section[{}] OK; sections active = {}",
-                        slot,
+                        "keys: Enter → start_section OK; sections active = {}",
                         app.active_section_count()
                     );
                 }
                 Err(msg) => {
-                    log::warn!("keys: Enter → start_section[{}] FAILED: {}", slot, msg);
+                    log::warn!("keys: Enter → start_section FAILED: {msg}");
                     app.banner = Some(msg.clone());
                     app.status = RecordingStatus::Error(msg);
                 }
             }
         }
+        // 'r' refreshes the inventory; refresh_inventory preserves
+        // both cursors by name when the previously-cursored
+        // entries still exist after refresh.
         KeyCode::Char('r') => {
-            // Refresh inventory; refresh_inventory preserves both cursors.
             let before_d = app.devices.len();
             let before_a = app.apps.len();
             app.refresh_inventory();
@@ -733,6 +664,46 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
 
+        // 'R' (Shift+r) resumes capture in the focused slot. The
+        // lowercase `r` is taken by refresh, so resume lives on the
+        // shifted variant of the same letter — discoverable as
+        // "uppercase R for resume". A no-op (with a banner) when
+        // there is nothing to resume, so the key is never silently
+        // dead.
+        KeyCode::Char('R') => {
+            let slot = app.focused_slot;
+            match app.resume_section(slot) {
+                Ok(()) => {
+                    log::info!("keys: R → resume_section[{slot}]");
+                }
+                Err(msg) => {
+                    log::info!("keys: R → resume_section[{slot}] no-op: {msg}");
+                    app.banner = Some(msg);
+                }
+            }
+        }
+
+
+        // 'K' (Shift+k) opens the API-key modal from any normal-mode
+        // state (idle or recording). The lowercase 'k' is unbound
+        // (we don't steal it for modal-only access because it could
+        // collide with future text-input features). The user reported
+        // needing to manage their key while a recording was already
+        // running; in that state 'c' toggles cloud_on on the focused
+        // section, so a dedicated K shortcut gives them a reliable
+        // discoverable path to the modal. Pairs with the existing
+        // capital-letter shortcuts: 'R' resume, 'S' stop all, 'T'
+        // status.
+        KeyCode::Char('K') => {
+            log::info!("keys: K -> open_api_key_modal");
+            // `false`: K is a peek/edit shortcut. The user opens the
+            // modal to read the saved key (the modal's "Current key:"
+            // row) or to type a new one. Esc must close the modal
+            // silently without touching cloud — the cloud-enable
+            // flow is its own funnel (the `c` toggle's
+            // "Cloud ON, no key" branch sets `reverts_cloud = true`).
+            app.open_api_key_modal(false);
+        }
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
             // displayed model (focused section's if running, else the
@@ -760,7 +731,9 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // opens the API-key modal (the one cloud setting that matters).
         #[cfg(windows)]
         KeyCode::Char('c') => {
-            app.open_api_key_modal();
+            // `false`: there's no cloud toggle to revert on Windows;
+            // Cloud is always on. Esc just closes the modal.
+            app.open_api_key_modal(false);
         }
         // Toggle cloud transcription. When idle, mutates the global
         // config so the next-start defaults flip (and the mode panel
@@ -780,13 +753,72 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "Cloud: OFF for focused section (applies on next start)".into()
                 });
             } else {
-                app.config.cloud_broadcast_enabled = !app.config.cloud_broadcast_enabled;
-                let on = app.config.cloud_broadcast_enabled;
+                // Idle: no section is focused. The Mode panel
+                // advertises the GLOBAL flag
+                // (`cloud_broadcast_enabled`); a press of `c`
+                // must visibly flip the advertised state. Seed
+                // the flip from the displayed value (not from
+                // any stale per-source override) and write the
+                // result to BOTH the per-source override AND
+                // the global flag so they stay in lockstep —
+                // the panel, the next-start state, and the
+                // banner all agree on the new value.
+                //
+                // Pre-this-commit the seed was
+                // `!ov.cloud_on` (per-source override's
+                // current value). When the override was stale
+                // — a prior session left it at OFF while the
+                // global is now ON — the first press of `c`
+                // was a visible no-op: panel said ON, user
+                // pressed `c` expecting OFF, both values
+                // landed on ON. Reproduces the bug screenshot
+                // from #48 review.
+                let source = app.resolve_picker_source();
+                let key = source
+                    .as_ref()
+                    .map(|s| app.source_key_for(s));
+                // Displayed value → flip target. The per-source
+                // override is rewritten to match (so the
+                // next start sees the new state), and the
+                // global is rewritten to match (so the panel
+                // and the next-start default see the new
+                // state).
+                let on = !app.config.cloud_broadcast_enabled;
+                let ov = voice_bird_cli::config::SourceSettingsOverride {
+                    cloud_on: on,
+                    // Preserve the other dimensions of the
+                    // per-source override when one exists, so
+                    // this toggle doesn't clobber a user's
+                    // per-source language/model preferences
+                    // when they flip Cloud.
+                    language: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.language.clone())
+                        .unwrap_or_else(|| app.config.language.clone()),
+                    model: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.model.clone())
+                        .unwrap_or_else(|| app.config.default_model.clone()),
+                };
+                if let Some(k) = key {
+                    app.config.upsert_source_override(k, ov);
+                }
+                app.config.cloud_broadcast_enabled = on;
                 if let Err(e) = app.config.save() {
                     log::error!("config save (cloud toggle): {e}");
                 }
                 if on && app.config.voicebird_api_key.is_empty() {
-                    app.open_api_key_modal();
+                    // Cloud-enable gate. Esc reverts the just-toggled
+                    // `cloud_broadcast_enabled` back to OFF (it was
+                    // OFF before this `c` press — the user just
+                    // flipped it). Without this, the user could
+                    // press `c` to enable Cloud, then change their
+                    // mind and `Esc` out of the modal — and be left
+                    // with Cloud ON, no key, and no way to start a
+                    // recording until they re-toggle `c` OFF.
+                    app.open_api_key_modal(true);
                 } else {
                     app.banner = Some(if on {
                         "Cloud: ON (next recording streams to voicebird.app)".into()
@@ -883,40 +915,75 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
     }
 }
 
-fn handle_api_key_modal(app: &mut App, key: KeyCode) {
-    match key {
+fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
+    match key.code {
         KeyCode::Esc => {
-            // Cancel: revert the cloud toggle so the user isn't left
-            // with cloud=on and no key — that would block the next
-            // recording. Leaves the saved key untouched, so a partial
-            // edit is discarded.
-            #[cfg(not(windows))]
-            {
-                app.config.cloud_broadcast_enabled = false;
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (modal cancel): {e}");
+            // Cancel: only revert the cloud toggle if THIS modal
+            // was opened as the cloud-enable gate. `K` peek,
+            // first-run bootstrap, auth-failure recovery, and
+            // `start_section`'s pre-flight all set
+            // `api_key_modal_reverts_cloud = false` — for those
+            // flows Esc must close the modal silently, because
+            // cloud is either already on (and the user just wants
+            // to fix the key) or not in play (first run / peek).
+            //
+            // The cloud-enable funnel is the one path that
+            // flipped `cloud_broadcast_enabled` from false to
+            // true just before opening the modal; cancelling the
+            // modal there must unwind that flip or the user is
+            // stuck with Cloud ON + no key + no way to start a
+            // recording. (The pre-R-key world had no other exit.)
+            if app.api_key_modal_reverts_cloud {
+                #[cfg(not(windows))]
+                {
+                    app.config.cloud_broadcast_enabled = false;
+                    if let Err(e) = app.config.save() {
+                        log::error!("config save (modal cancel): {e}");
+                    }
+                    app.banner =
+                        Some("Cloud: OFF (cancelled API key entry)".into());
                 }
-                app.banner = Some("Cloud: OFF (cancelled API key entry)".into());
-            }
-            // Windows can't fall back to local, so cloud stays on; the
-            // start-recording guard re-opens this modal when needed.
-            #[cfg(windows)]
-            {
-                app.banner = Some(
-                    "Windows is cloud-only — press 'c' to set an API key before recording".into(),
-                );
+                #[cfg(windows)]
+                {
+                    // Windows can't fall back to local, so cloud
+                    // stays on; the start-recording guard re-opens
+                    // this modal when needed. (This branch is
+                    // defensive — the c-toggle's `reverts_cloud =
+                    // true` path is non-Windows only.)
+                    app.banner = Some(
+                        "Windows is cloud-only — press 'c' to set an API key before recording"
+                            .into(),
+                    );
+                }
             }
             app.api_key_buf = None;
+            app.api_key_modal_reverts_cloud = false;
             app.mode = AppMode::Normal;
         }
         KeyCode::Enter => {
             if let Some(buf) = app.api_key_buf.take() {
-                app.config.voicebird_api_key = buf.trim().to_string();
+                // Distinguish "user saved a new key" from "user
+                // wiped the buffer (Ctrl+U or Backspace × N) and
+                // committed an empty key". The first case sets
+                // `voicebird_api_key` to a non-empty string and
+                // the existing 'API key saved' banner is fine.
+                // The second case CLEARS the saved key on disk
+                // — `voicebird_api_key` becomes `""` and the
+                // old "API key saved" banner is actively
+                // misleading. The cloud-enable gate (if this
+                // modal was opened as one) will re-trigger on
+                // the next recording because `key.is_empty()`
+                // and `cloud_broadcast_enabled` is unchanged.
+                let trimmed = buf.trim();
+                app.config.voicebird_api_key = trimmed.to_string();
                 if let Err(e) = app.config.save() {
                     log::error!("config save (modal save): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
+                } else if trimmed.is_empty() {
+                    app.banner = Some("API key cleared".into());
                 } else {
-                    app.banner = Some("API key saved — start a recording to verify".into());
+                    app.banner =
+                        Some("API key saved — start a recording to verify".into());
                 }
             }
             app.mode = AppMode::Normal;
@@ -924,6 +991,19 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
         KeyCode::Backspace => {
             if let Some(buf) = app.api_key_buf.as_mut() {
                 buf.pop();
+            }
+        }
+        // Ctrl+U clears the buffer so the user can retype from scratch
+        // (standard text-editor kill-line). crossterm encodes this as
+        // `KeyCode::Char('u')` with the CONTROL modifier set; the guard
+        // is mandatory - a plain `u` keystroke (no modifier) must still
+        // type into the buffer normally. Saving an empty buffer (Enter
+        // with the empty buf) clears the saved key on disk, which gives
+        // the user a way to remove a corrupted key without editing
+        // config.toml by hand.
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(buf) = app.api_key_buf.as_mut() {
+                buf.clear();
             }
         }
         KeyCode::Char(ch) => {
@@ -934,7 +1014,6 @@ fn handle_api_key_modal(app: &mut App, key: KeyCode) {
         _ => {}
     }
 }
-
 /// Key handler for the multi-step "Add / Edit Agent target"
 /// funnel. Steps share a `KeyCode::Enter` advance and
 /// `KeyCode::Esc` cancel; text-input steps also accept
@@ -1359,6 +1438,436 @@ mod funnel_dispatch_tests {
             "Enter after VerifyOutcome::Ok must advance to Save (R4); \
              re-spawning the probe forever makes step 7/7 unreachable \
              and the funnel can never save a target"
+        );
+    }
+}
+
+// Bug: toggling Cloud (`c`) while the focused slot is empty
+// only updates the global `cloud_broadcast_enabled` default,
+// not the per-source override. The next start uses the
+// per-source override (when present, it wins over the
+// global), so the banner/display say "Cloud: ON" but the
+// session starts with `cloud_on = false`. Reproduces the
+// screenshot from #48 review: user toggled Cloud ON, hit
+// Enter, the Mode panel flipped to OFF during the
+// recording.
+//
+// The fix must also write to the per-source override for
+// the source the picker would resolve to on Enter, so the
+// next start agrees with what the toggle just advertised.
+#[cfg(test)]
+mod cloud_toggle_dispatch_tests {
+    use super::*;
+    use crate::platform::{AppSession, AudioDevice};
+    use voice_bird_cli::config::AudioSessionKind;
+    use voice_bird_cli::session::layout::SessionSource;
+
+    /// `c` toggled while no section is focused must update the
+    /// per-source override for the source the picker resolves
+    /// to on Enter. Today (pre-fix) the `else` branch in
+    /// `handle_normal_mode` only flips the global
+    /// `cloud_broadcast_enabled`, leaving a stale per-source
+    /// override `cloud_on = false` in place. The next start
+    /// reads the per-source override first, so the section
+    /// starts with `cloud_on = false` even though the user
+    /// just clicked Cloud ON.
+    #[test]
+    fn c_toggle_when_no_section_focused_updates_per_source_override() {
+        use voice_bird_cli::config::SourceSettingsOverride;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+
+        // Picker is parked on EPOS PC 8 USB (output/loopback) +
+        // Google Chrome — the exact combo from the screenshot.
+        app.devices = vec![AudioDevice {
+            name: "EPOS PC 8 USB".into(),
+            kind: AudioSessionKind::Output,
+        }];
+        app.selected_device_index = 0;
+        app.apps = vec![AppSession {
+            id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+            process_id: 12345,
+        }];
+        app.selected_app_index = Some(0);
+        app.config.input_device = Some("EPOS PC 8 USB".into());
+        app.config.input_device_kind = Some(AudioSessionKind::Output);
+
+        // Stale per-source override: this combo last recorded
+        // with Cloud OFF. The toggle target is the SAME source
+        // so the override must be updated.
+        let source = SessionSource::App {
+            id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+            device_name: "EPOS PC 8 USB".into(),
+        };
+        let key = app.source_key_for(&source);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+        // Global default is also OFF today. The toggle should
+        // flip BOTH the per-source override AND the global
+        // default so the Mode panel ("Cloud: ON") and the
+        // next-start state agree.
+        app.config.cloud_broadcast_enabled = false;
+
+        // Sanity: no Recording/Saved section is focused, so the
+        // toggle must take the `else` branch in main.rs.
+        assert!(app.focused().is_none(), "setup must have no focused section");
+
+        // The user presses `c`.
+        #[cfg(not(windows))]
+        {
+            handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+            // Assert 1: the per-source override was flipped.
+            // This is the contract that picks up the toggle and
+            // matches what `start_section` reads via
+            // `effective_settings_for(source)`.
+            let ov = app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("per-source override must exist after toggle");
+            assert!(
+                ov.cloud_on,
+                "toggling Cloud ON while no section is focused must \
+                 update the per-source override for the picker-resolved \
+                 source; otherwise the next start silently uses the stale \
+                 cloud_on=false. Override key: {key}"
+            );
+
+            // Assert 2: the global default also flipped, so the
+            // Mode panel agrees with the next-start state.
+            assert!(
+                app.config.cloud_broadcast_enabled,
+                "toggling Cloud ON must also flip the global default \
+                 so the Mode panel (which reads cloud_broadcast_enabled \
+                 when no section is focused) advertises the new state"
+            );
+        }
+    }
+}
+
+/// `handle_api_key_modal` must clear the in-progress paste buffer when
+/// the user presses Ctrl+U. The same keypress saves with an empty
+/// buffer, which deletes the previously-saved key (the user wants a
+/// fresh start — e.g. after spotting `sk-test` test-pollution in
+/// their existing saved key, they want to retype from scratch). The
+/// Char('u') WITHOUT control must still type into the buffer like
+/// any other printable char.
+#[cfg(test)]
+mod api_key_modal_ctrl_u_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ctrl_u_clears_the_in_progress_api_key_buffer() {
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb_partial_paste".into());
+
+        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_api_key_modal(&mut app, &evt);
+
+        assert_eq!(
+            app.api_key_buf.as_deref(),
+            Some(""),
+            "Ctrl+U must clear the in-progress buffer to an empty string"
+        );
+        // Mode stays in the modal so the user can keep typing.
+        assert_eq!(app.mode, AppMode::ApiKeyModal);
+    }
+
+    #[test]
+    fn plain_u_typing_into_api_key_buffer_works_when_control_held_is_false() {
+        // Regression sentinel: Ctrl+U must NOT eat the printable 'u'
+        // keystroke when no modifier is held. The handler still has a
+        // normal-character typing path.
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some(String::new());
+
+        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &evt);
+
+        assert_eq!(
+            app.api_key_buf.as_deref(),
+            Some("u"),
+            "a plain 'u' keystroke (no modifiers) must append to the buffer"
+        );
+    }
+
+    /// Ctrl+U + Enter (with the empty buffer) must surface a
+    /// "cleared" banner, not the misleading "API key saved —
+    /// start a recording to verify". The user explicitly
+    /// removed the key; the banner should reflect that.
+    #[test]
+    fn enter_with_empty_buf_after_ctrl_u_shows_cleared_banner() {
+        let mut app = App::new();
+        app.mode = AppMode::ApiKeyModal;
+        app.api_key_buf = Some("vb_partial_paste".into());
+
+        // Ctrl+U clears the buffer…
+        let ctrl_u =
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_api_key_modal(&mut app, &ctrl_u);
+        // …Enter commits the empty buf.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &enter);
+
+        assert!(
+            app.banner.as_deref()
+                == Some("API key cleared"),
+            "Ctrl+U + Enter must surface an 'API key cleared' banner \
+             so the user sees the key was removed, not saved. \
+             Got: {:?}",
+            app.banner,
+        );
+        // The saved key is now empty.
+        assert!(
+            app.config.voicebird_api_key.is_empty(),
+            "saving an empty buffer must clear the saved key on disk"
+        );
+        // And the modal is dismissed.
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+}
+
+/// `K` (uppercase) opens the API-key modal from Normal mode, regardless
+/// of whether a section is focused. The lowercase `k` keystroke must
+/// still be a regular character typed into nothing (we don't bind it),
+/// because crossterm encodes Ctrl+K the same as a plain 'k' - the
+/// uppercase letter is the discoverable, conflict-free shortcut.
+#[cfg(test)]
+mod api_key_dispatcher_uppercase_k_tests {
+    use super::*;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn uppercase_K_opens_the_api_key_modal_from_normal_mode() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        let evt = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE);
+        handle_normal_mode(&mut app, evt.code);
+        assert_eq!(
+            app.mode,
+            AppMode::ApiKeyModal,
+            "uppercase K must open the API-key modal; mode = {:?}",
+            app.mode,
+        );
+        assert!(
+            app.api_key_buf.is_some(),
+            "opening the modal must seed api_key_buf so the user sees what's saved"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn lowercase_k_is_NOT_an_api_key_shortcut_only_uppercase_K_is() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        let evt = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_normal_mode(&mut app, evt.code);
+        // We do not assert a specific behaviour for lowercase 'k'
+        // (it's not bound to anything), only that it does NOT open
+        // the API-key modal. If a future feature binds 'k' to
+        // something else, this test continues to assert what we
+        // explicitly want - no overlap with the K shortcut.
+        assert_ne!(
+            app.mode,
+            AppMode::ApiKeyModal,
+            "lowercase k must not open the API-key modal",
+        );
+    }
+}
+
+// PR #48 review — regression guards. These started life as RED
+// tests pinning contracts the code violated; the fixes landed in
+// 992ae64 (item 1, Esc-from-K), a608402 (item 2, config-path
+// injection), and 25ae726 (item 8, c-toggle seed). They stay as
+// permanent guards against re-regression.
+#[cfg(test)]
+#[cfg(not(windows))]
+mod pr48_review_regression_tests {
+    use super::*;
+    use crate::platform::AudioDevice;
+    use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+    use voice_bird_cli::session::layout::SessionSource;
+
+    /// Snapshot of the developer's real `config.toml`, restored on
+    /// drop (including panic unwind). With config-path injection in
+    /// place the handlers under test write to the tempdir, so this
+    /// guard should never observe a change — it stays as the safety
+    /// net that lets `key_handlers_in_tests_must_not_write_real_user_config`
+    /// fail loudly (without lasting damage) if the injection ever
+    /// regresses.
+    struct RealConfigGuard {
+        path: std::path::PathBuf,
+        before: Option<Vec<u8>>,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+    impl RealConfigGuard {
+        fn snapshot() -> Self {
+            // Serialize the tests in this module: they all read,
+            // mutate, and restore the same real file, so running
+            // them in parallel would interleave snapshots and
+            // restores nondeterministically.
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Use the *real* config path, not the env-var-overridden
+            // `AppConfig::config_path()`. These tests verify that
+            // the production code does NOT touch the developer's
+            // real config — the guard's snapshot/restore has to
+            // refer to that real path, otherwise it would point
+            // at the test tempdir and miss any real-config
+            // pollution.
+            let path = voice_bird_cli::test_utils::real_config_path();
+            let before = std::fs::read(&path).ok();
+            Self {
+                path,
+                before,
+                _serial: serial,
+            }
+        }
+    }
+    impl Drop for RealConfigGuard {
+        fn drop(&mut self) {
+            match &self.before {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// Regression guard (review item 1; was RED, fixed in 992ae64).
+    ///
+    /// `K` opens the API-key modal from anywhere, and the modal's
+    /// "Current key:" line invites opening it just to *look* at the
+    /// saved key. The Esc arm used to unconditionally revert
+    /// `cloud_broadcast_enabled` (it was written for the
+    /// cloud-toggle-needs-a-key funnel, the only flow that existed
+    /// before `K`) — so peek-and-Esc silently disabled cloud. Now
+    /// `App::api_key_modal_reverts_cloud` records why the modal was
+    /// opened and Esc only reverts cloud for the cloud-enable gate.
+    #[test]
+    fn esc_after_k_peek_must_not_disable_cloud() {
+        let _guard = RealConfigGuard::snapshot();
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = true;
+
+        // The user peeks at the saved key via K…
+        handle_normal_mode(&mut app, KeyCode::Char('K'));
+        assert_eq!(app.mode, AppMode::ApiKeyModal, "K must open the modal");
+
+        // …and backs out without changing anything.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &esc);
+
+        assert_eq!(app.mode, AppMode::Normal, "Esc must close the modal");
+        assert!(
+            app.config.cloud_broadcast_enabled,
+            "Esc from a K-opened (peek) modal must NOT disable cloud — \
+             the cancel-reverts-cloud behaviour only makes sense when the \
+             modal was opened by the cloud-enable flow that needs a key"
+        );
+    }
+
+    /// Regression guard (review item 2; was RED, fixed in a608402).
+    ///
+    /// `AppConfig::save()` used to write straight to the machine's
+    /// real config path, so tests driving real key handlers
+    /// persisted flipped flags and synthetic `sk-test` keys over
+    /// the developer's real `config.toml` on every `cargo test`
+    /// run. `App::new()` now installs a process-local tempdir
+    /// (via `test_utils::INSTALL_TEST_CONFIG` +
+    /// `VOICE_BIRD_TEST_CONFIG_PATH`) under cfg(test), so the
+    /// real file must stay byte-identical across any handler run.
+    #[test]
+    fn key_handlers_in_tests_must_not_write_real_user_config() {
+        let guard = RealConfigGuard::snapshot();
+        let before = guard.before.clone();
+
+        // Drive the idle `c` toggle — its else-branch calls
+        // `app.config.save()` unconditionally.
+        let mut app = App::new();
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+        let after = std::fs::read(&guard.path).ok();
+        assert_eq!(
+            before, after,
+            "driving a key handler in a unit test must not rewrite the \
+             developer's real config.toml at {} — inject the config path \
+             (env override or App::with_config) so tests run against a \
+             tempdir",
+            guard.path.display()
+        );
+    }
+
+    /// Regression guard (review item 8; was RED, fixed in 25ae726).
+    ///
+    /// The idle Mode panel displays the GLOBAL flag
+    /// (`cloud_broadcast_enabled`), and the idle `c` toggle used to
+    /// seed its flip from the per-source OVERRIDE's current value —
+    /// when the two disagreed (stale override), the first press was
+    /// a visible no-op. The toggle now seeds from the displayed
+    /// (global) value and writes it to both the global flag and the
+    /// per-source override, so one press always flips the
+    /// advertised state.
+    #[test]
+    fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
+        let _guard = RealConfigGuard::snapshot();
+        let mut app = App::new();
+
+        // Panel says ON (global flag)…
+        app.config.cloud_broadcast_enabled = true;
+        // …but a stale per-source override says OFF for the source
+        // the picker currently resolves to.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let key = app.source_key_for(&SessionSource::Microphone);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+
+        // The user sees "Cloud: ON" and presses `c` to turn it OFF.
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+        assert!(
+            !app.config.cloud_broadcast_enabled,
+            "the toggle must flip the DISPLAYED state: panel showed ON, so \
+             one press of `c` must land on OFF — seeding the flip from the \
+             stale override (OFF→ON) makes the first press a visible no-op"
+        );
+        assert!(
+            !app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("override must survive the toggle")
+                .cloud_on,
+            "the per-source override must agree with the newly displayed \
+             state (OFF) after the toggle"
         );
     }
 }
