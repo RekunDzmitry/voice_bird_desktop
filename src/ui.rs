@@ -284,7 +284,6 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
             // the hint on a non-focused slot would mislead.
             // The clear hint (x) is universal and stays on
             // every paused slot.
-            // on every paused slot.
             let hint_text = if is_focused {
                 "… (paused — [R] resumes · [x] clears · Enter = new session)"
             } else {
@@ -1144,10 +1143,6 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
 }
-/// (label, style) for a single target row. `disabled=true` dims the
-/// label and appends a hint so the user knows the row exists but
-/// can't be picked.
-/// (label, style, hint) for a single target row. `disabled=true`
 /// (label, style, hint) for a single target row. `disabled=true`
 /// dims the label and appends a hint so the user knows the row
 /// exists but can't be picked.
@@ -1923,6 +1918,8 @@ mod tests {
         assert!(out.contains("t-key"), "masked tail missing:\n{out}");
     }
     /// `mask_api_key` should not reveal keys short enough that the
+    /// 5-char prefix and 5-char tail would overlap or touch — the
+    /// whole key is masked at or below the 10-char cutoff.
     #[test]
     fn mask_api_key_never_reveals_short_keys() {
         assert_eq!(mask_api_key(""), "(empty)");
@@ -2541,6 +2538,12 @@ mod tests {
             "slot 2 picks Agent back after forward navigation"
         );
     }
+    /// A paused (Saved) slot's bottom hint must make the
+    /// Enter/R distinction explicit: R resumes the focused
+    /// slot in place, x clears it, Enter starts a brand-new
+    /// session (in a new slot, if one is free).
+    ///
+    /// The resume + clear hints only appear on the
     /// focused slot, since R/x target the focused slot
     /// regardless of which paused slot is showing the
     /// hint. Non-focused saved slots keep the

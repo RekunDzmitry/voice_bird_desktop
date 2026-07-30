@@ -94,13 +94,16 @@ pub struct SavedTranscript {
     pub label: String,
     pub target: Target,
     /// Source the stopped section was capturing (mic / system / app).
-    /// Persisted so `App::resume_section` can restart capture with the
-    /// same input without asking the user to re-pick a device.
+    /// Informational snapshot: `App::resume_section` does NOT read
+    /// it back — resume re-derives the source from the current
+    /// Devices+Apps pickers and rewrites this field so the slot
+    /// reflects what the resumed section actually used.
     pub source: SessionSource,
-    /// Settings the stopped section was using (cloud on/off, language,
-    /// model). Persisted so resume keeps the same transcription
-    /// pipeline — toggling cloud on after a stop must not silently
-    /// change a resumed section's target.
+    /// Settings the stopped section was using (cloud on/off,
+    /// language, model). Informational snapshot, like `source`:
+    /// resume applies the live `effective_settings_for(source)`
+    /// and rewrites this field, so post-stop changes (language,
+    /// cloud toggle) take effect on the resumed section.
     pub settings: SectionSettings,
 }
 pub struct RecordingRuntime {
@@ -2451,23 +2454,13 @@ impl App {
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
-        // Re-derive source, target, and settings from the
-        // current picker state. The saved snapshot's
-        // *committed* and *refined* Arcs are kept intact:
-        // start_section reads them off the slot's `Saved`
-        // Check Empty first so a no-op on a fresh slot
-        // returns the specific "nothing to resume" message
-        // instead of the more generic "no device
-        // selected" error from the picker resolution below.
+        // Empty means nothing to resume. Surface that specific
+        // message rather than the more generic "no device
+        // selected" error the picker resolution below would
+        // produce for an untouched slot.
         if matches!(self.slots[pos].kind, SlotKind::Empty) {
             return Err("nothing to resume — slot is empty".into());
         }
-        // The Recording guard is below the Empty guard
-        // because a slot in `Recording` is a bug-state
-        // (resume_section should be called from
-        // `Saved`/`Empty`) — surfacing the specific
-        // "already recording" message helps debug
-        // double-resume attempts.
         // Re-derive source, target, and settings from the
         // current picker state. The saved snapshot's
         // *committed* and *refined* Arcs are kept intact:
@@ -2505,6 +2498,30 @@ impl App {
     }
 
 
+    /// Resolve the source the picker would pick on Enter.
+    /// `None` if no device is selected or the device kind
+    /// is the rejected `AudioSessionKind::App` variant.
+    /// Pure read of picker state — no mutation, no
+    /// persistence. Used by `try_start_new_section` and by
+    /// the idle `c` toggle in `main.rs`, so the toggle
+    /// writes its per-source override for the same source
+    /// the next start will resolve to.
+    pub fn resolve_picker_source(&self) -> Option<SessionSource> {
+        use voice_bird_cli::config::AudioSessionKind;
+        let dev = self.devices.get(self.selected_device_index)?;
+        let app_pick = self.focused_app().cloned();
+        match (dev.kind, app_pick) {
+            (AudioSessionKind::Input, _) => Some(SessionSource::Microphone),
+            (AudioSessionKind::Output, None) => Some(SessionSource::System),
+            (AudioSessionKind::Output, Some(a)) => Some(SessionSource::App {
+                id: a.id,
+                name: a.name,
+                device_name: dev.name.clone(),
+            }),
+            (AudioSessionKind::App, _) => None,
+        }
+    }
+
     /// Try to start a brand-new recording in the next free
     /// slot. Extracted from `main.rs`'s `Enter` handler so
     /// the workflow is unit-testable and the message
@@ -2523,33 +2540,13 @@ impl App {
     /// handler that *applies* the picked target first; that
     /// lives in `main.rs` (it's a UI concern) and is called
     /// *before* this method. By the time we get here, the
-    /// Resolve the source the picker would pick on Enter.
-    /// `None` if no device is selected or the device kind
-    /// is the rejected `AudioSessionKind::App` variant.
-    /// Pure read of picker state — no mutation, no
-    /// persistence. Used by both `try_start_new_section`
-    /// and the `c` / `l` / `m` idle-toggle handlers in
-    /// `main.rs` so they write per-source overrides for
-    /// the same source the next start will resolve to.
-    pub fn resolve_picker_source(&self) -> Option<SessionSource> {
-        use voice_bird_cli::config::AudioSessionKind;
-        let dev = self.devices.get(self.selected_device_index)?;
-        let app_pick = self.focused_app().cloned();
-        match (dev.kind, app_pick) {
-            (AudioSessionKind::Input, _) => Some(SessionSource::Microphone),
-            (AudioSessionKind::Output, None) => Some(SessionSource::System),
-            (AudioSessionKind::Output, Some(a)) => Some(SessionSource::App {
-                id: a.id,
-                name: a.name,
-                device_name: dev.name.clone(),
-            }),
-            (AudioSessionKind::App, _) => None,
-        }
-    }
+    /// picked target (if any) is already queued in
+    /// `pending_target_overrides` and `start_section` will
+    /// consume it.
     pub fn try_start_new_section(&mut self) -> Result<(), String> {
-        // No Empty slot. Distinguish between the two
-        //   - Some slot is actively Recording — they
-        //     need to [s] top one to free a slot.
+        // No Empty slot. Distinguish between the two cases:
+        //   - Some slot is actively Recording — the user
+        //     needs to [s]top one to free a slot.
         //   - All non-Empty slots are Saved (paused) —
         //     [R] resumes a paused slot in place, [x]
         //     clears, [-] removes. The old hardcoded
@@ -3273,7 +3270,6 @@ mod tests {
         assert!(matches!(app.slots[0].kind, SlotKind::Empty));
     }
 
-    /// A `Saved` slot must reach `start_section` (which then
     /// A `Saved` slot must reach `start_section`. The point of
     /// the test is to prove the resume path *enters*
     /// start_section with the saved source — not that the
@@ -3372,7 +3368,7 @@ mod tests {
     /// Currently red: `resume_section` extracts the saved
     /// snapshot's `settings` verbatim and hands them to
     /// `start_section`, so any post-stop change to the
-    /// ignored. The fix in the next commit switches to
+    /// settings is ignored. The fix in the next commit switches to
     /// `App::effective_settings_for(source)`, which reads
     /// the live per-source override first and falls back
     /// to the global config, and persists the new
