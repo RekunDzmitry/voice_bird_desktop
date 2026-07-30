@@ -753,32 +753,59 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "Cloud: OFF for focused section (applies on next start)".into()
                 });
             } else {
-                // Resolve the source the picker would pick on
-                // Enter, then flip BOTH the per-source override
-                // and the global default. Without the per-source
-                // write, a stale override from a prior session
-                // (e.g. last recorded with Cloud OFF) wins over
-                // the global default at start time, and the
-                // section silently starts with cloud_on=false
-                // even though the user just clicked Cloud ON.
+                // Idle: no section is focused. The Mode panel
+                // advertises the GLOBAL flag
+                // (`cloud_broadcast_enabled`); a press of `c`
+                // must visibly flip the advertised state. Seed
+                // the flip from the displayed value (not from
+                // any stale per-source override) and write the
+                // result to BOTH the per-source override AND
+                // the global flag so they stay in lockstep —
+                // the panel, the next-start state, and the
+                // banner all agree on the new value.
+                //
+                // Pre-this-commit the seed was
+                // `!ov.cloud_on` (per-source override's
+                // current value). When the override was stale
+                // — a prior session left it at OFF while the
+                // global is now ON — the first press of `c`
+                // was a visible no-op: panel said ON, user
+                // pressed `c` expecting OFF, both values
+                // landed on ON. Reproduces the bug screenshot
+                // from #48 review.
                 let source = app.resolve_picker_source();
                 let key = source
                     .as_ref()
                     .map(|s| app.source_key_for(s));
-                let mut ov = key
-                    .as_ref()
-                    .map(|k| app.config.effective_override(k))
-                    .unwrap_or(voice_bird_cli::config::SourceSettingsOverride {
-                        cloud_on: app.config.cloud_broadcast_enabled,
-                        language: app.config.language.clone(),
-                        model: app.config.default_model.clone(),
-                    });
-                ov.cloud_on = !ov.cloud_on;
+                // Displayed value → flip target. The per-source
+                // override is rewritten to match (so the
+                // next start sees the new state), and the
+                // global is rewritten to match (so the panel
+                // and the next-start default see the new
+                // state).
+                let on = !app.config.cloud_broadcast_enabled;
+                let ov = voice_bird_cli::config::SourceSettingsOverride {
+                    cloud_on: on,
+                    // Preserve the other dimensions of the
+                    // per-source override when one exists, so
+                    // this toggle doesn't clobber a user's
+                    // per-source language/model preferences
+                    // when they flip Cloud.
+                    language: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.language.clone())
+                        .unwrap_or_else(|| app.config.language.clone()),
+                    model: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.model.clone())
+                        .unwrap_or_else(|| app.config.default_model.clone()),
+                };
                 if let Some(k) = key {
-                    app.config.upsert_source_override(k, ov.clone());
+                    app.config.upsert_source_override(k, ov);
                 }
-                app.config.cloud_broadcast_enabled = ov.cloud_on;
-                let on = ov.cloud_on;
+                app.config.cloud_broadcast_enabled = on;
                 if let Err(e) = app.config.save() {
                     log::error!("config save (cloud toggle): {e}");
                 }
