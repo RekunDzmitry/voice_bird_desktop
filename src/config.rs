@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::layout::SessionSource;
 
 /// Lives in lib so both `platform::AudioSession` (in the bin crate) and
 /// `AppConfig` (in the lib crate) can reference it.
@@ -59,63 +58,9 @@ pub fn slot_settings_key(slot_id: u32) -> String {
     slot_id.to_string()
 }
 
-/// Settings that can be overridden per source. Stored in
-/// `AppConfig::source_overrides` keyed by `source_id`. When a section
-/// starts, the effective settings are computed by merging the saved
-/// override (if any) over the global defaults.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceSettingsOverride {
-    pub cloud_on: bool,
-    pub language: String,
-    pub model: String,
-}
-
-/// Stable identifier for a source used to key `source_overrides`. Format:
-/// `device:input:<name>` / `device:output:<name>` /
-/// `app:<bundle-or-name>@device:<device>`.
-pub fn source_id(source: &SessionSource, kind: Option<AudioSessionKind>) -> String {
-    match source {
-        SessionSource::Microphone => format!(
-            "device:{}:default",
-            kind_str(kind.unwrap_or(AudioSessionKind::Input))
-        ),
-        SessionSource::System => format!(
-            "device:{}:default",
-            kind_str(kind.unwrap_or(AudioSessionKind::Output))
-        ),
-        SessionSource::App {
-            name, device_name, ..
-        } => {
-            if device_name.is_empty() {
-                format!("app:{name}")
-            } else {
-                format!("app:{name}@device:{device_name}")
-            }
-        }
-    }
-}
-
-/// Variant of [`source_id`] keyed by an explicit device name. Preferred
-/// over [`source_id`] when the actual selected device is known (the
-/// generic Microphone/System variants collapse multiple devices to
-/// `default`, which would conflate per-device overrides).
-pub fn device_source_id(name: &str, kind: AudioSessionKind) -> String {
-    format!("device:{}:{}", kind_str(kind), name)
-}
-
-fn kind_str(kind: AudioSessionKind) -> &'static str {
-    match kind {
-        AudioSessionKind::Input => "input",
-        AudioSessionKind::Output => "output",
-        AudioSessionKind::App => "app",
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub default_model: String,
-    pub language: String,
-    pub session_dir: String,
     pub hop_ms: u32,
     pub min_window_ms: u32,
     #[serde(rename = "engine_prefer")]
@@ -158,35 +103,11 @@ pub struct AppConfig {
     #[serde(default = "default_voicebird_server_url")]
     pub voicebird_server_url: String,
 
-    /// When true, recordings stream PCM to `voicebird_server_url` and
-    /// transcripts are produced by the cloud model. The local Whisper
-    /// engine is bypassed and no session files are written to disk —
-    /// the recording lives entirely on the user's voicebird.app
-    /// account. When false (default), the local engine runs and writes
-    /// `~/voice-bird/sessions/<ts>/`.
-    #[serde(default)]
-    pub cloud_broadcast_enabled: bool,
 
-    /// Per-source setting overrides. Key is the result of [`source_id`]
-    /// or [`device_source_id`]; value carries the cloud/language/model
-    /// to use when starting a section for that source. When absent for
-    /// a given source, [`effective_settings`] falls back to the global
-    /// fields above.
-    #[serde(default)]
-    pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
-
-    /// Per-slot settings the TUI flips from the Mode panel. Key is
-    /// `slot_settings_key(slot_id)` (the slot's numeric id as a
-    /// decimal string); value is the slot's full `SlotSettings`
-    /// (cloud_on, language, model, path). When a slot id has no
-    /// entry yet, the runtime layer (App) seeds it from
-    /// `SlotSettings::default()` on construction.
-    ///
-    /// Coexists with the legacy per-source `source_overrides` map
-    /// and the global `default_model` / `language` / `session_dir`
-    /// fields for the duration of the refactor. Commit 6 deletes
-    /// the legacy fields once every call site reads from
-    /// `slot_settings` instead.
+    /// Decimal `slot_id` → `SlotSettings`. The runtime layer
+    /// (`App::new`) seeds slot 1 with any persisted entry, falling
+    /// back to `SlotSettings::default()` on first run.
+    /// back to `SlotSettings::default()` on first run.
     #[serde(default)]
     pub slot_settings: BTreeMap<String, SlotSettings>,
 
@@ -471,9 +392,6 @@ fn default_refinement_beam_size() -> u8 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_model: "distil-small.en".into(),
-            language: "en".into(),
-            session_dir: "~/voice-bird/sessions".into(),
             hop_ms: 750,
             min_window_ms: 1000,
             engine_prefer: "auto".into(),
@@ -486,8 +404,6 @@ impl Default for AppConfig {
             refinement_beam_size: default_refinement_beam_size(),
             voicebird_api_key: String::new(),
             voicebird_server_url: default_voicebird_server_url(),
-            cloud_broadcast_enabled: false,
-            source_overrides: BTreeMap::new(),
             slot_settings: BTreeMap::new(),
             agent_targets: Vec::new(),
         }
@@ -588,38 +504,10 @@ impl AppConfig {
         }
         Ok(())
     }
-
-    pub fn session_dir_expanded(&self) -> String {
-        if let Some(rest) = self.session_dir.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(rest).to_string_lossy().into_owned();
-            }
-        }
-        self.session_dir.clone()
-    }
-
-    /// Effective per-source settings: the saved override for `key` if
-    /// present, else the global defaults from this config. The returned
-    /// override carries the `cloud_on`, `language`, `model` triple a
-    /// section actually uses at start time.
-    pub fn effective_override(&self, key: &str) -> SourceSettingsOverride {
-        if let Some(o) = self.source_overrides.get(key) {
-            return o.clone();
-        }
-        SourceSettingsOverride {
-            cloud_on: self.cloud_broadcast_enabled,
-            language: self.language.clone(),
-            model: self.default_model.clone(),
-        }
-    }
-
-    /// Convenience: persist or update one source's override and save.
-    pub fn upsert_source_override(&mut self, key: String, ov: SourceSettingsOverride) {
-        self.source_overrides.insert(key, ov);
-    }
-
     /// Look up an Agent target by its stable id. Returns `None` if
+
     /// no target with that id has been configured (the user removed
+    /// it, or the config file was hand-edited and lost the row).
     /// it, or the config file was hand-edited and lost the row).
     pub fn agent_target_by_id(&self, id: &str) -> Option<&AgentTargetConfig> {
         self.agent_targets.iter().find(|t| t.id == id)
@@ -669,9 +557,11 @@ mod tests {
     #[test]
     fn defaults_when_file_missing() {
         let c = AppConfig::default();
-        assert_eq!(c.default_model, "distil-small.en");
         assert_eq!(c.hop_ms, 750);
         assert_eq!(c.engine_prefer, "auto");
+        // The slot settings map is empty on first run; the runtime
+        // seeds slot 1 from SlotSettings::default() on construction.
+        assert!(c.slot_settings.is_empty());
     }
 
     #[test]
@@ -691,13 +581,10 @@ mod tests {
     fn missing_voicebird_fields_deserialize_to_defaults() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        // Write an old-style config without the new fields.
+        // Write a minimal config without the optional fields.
         std::fs::write(
             &path,
             r#"
-default_model = "distil-small.en"
-language = "en"
-session_dir = "~/voice-bird/sessions"
 hop_ms = 750
 min_window_ms = 1000
 engine_prefer = "auto"
@@ -710,7 +597,9 @@ refinement_beam_size = 5
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.voicebird_api_key, "");
         assert_eq!(loaded.voicebird_server_url, default_voicebird_server_url());
-        assert!(!loaded.cloud_broadcast_enabled);
+        // The legacy global fields are gone; the dropped keys are
+        // silently ignored by the lenient TOML parser.
+        assert!(loaded.slot_settings.is_empty());
     }
 
     #[test]
@@ -756,9 +645,6 @@ refinement_beam_size = 5
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let c = AppConfig {
-            default_model: "large-v3-turbo".into(),
-            language: "auto".into(),
-            session_dir: "~/foo".into(),
             hop_ms: 600,
             min_window_ms: 800,
             engine_prefer: "whisperkit".into(),
@@ -771,8 +657,6 @@ refinement_beam_size = 5
             refinement_beam_size: 5,
             voicebird_api_key: "vb-test".into(),
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
-            cloud_broadcast_enabled: true,
-            source_overrides: BTreeMap::new(),
             slot_settings: BTreeMap::new(),
             agent_targets: Vec::new(),
         };
@@ -1026,9 +910,6 @@ refinement_beam_size = 5
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let body = "\
-default_model = \"distil-small.en\"\n\
-language = \"en\"\n\
-session_dir = \"~/voice-bird/sessions\"\n\
 hop_ms = 750\n\
 min_window_ms = 1000\n\
 engine_prefer = \"auto\"\n\
@@ -1037,7 +918,6 @@ refinement_window_ms = 20000\n\
 refinement_beam_size = 5\n\
 voicebird_api_key = \"\"\n\
 voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
-cloud_broadcast_enabled = false\n\
 \n\
 [[agent_targets]]\n\
 id = \"default\"\n\
@@ -1067,121 +947,11 @@ acks = \"all\"\n\
         assert!(on_disk.contains("id = \"real-uuid\""));
     }
 
-    #[test]
-    fn effective_override_falls_back_to_globals_when_unset() {
-        let mut c = AppConfig::default();
-        c.cloud_broadcast_enabled = true;
-        c.language = "ru".into();
-        c.default_model = "tiny.en".into();
-        let eff = c.effective_override("device:input:not-saved");
-        assert!(eff.cloud_on);
-        assert_eq!(eff.language, "ru");
-        assert_eq!(eff.model, "tiny.en");
-    }
-
-    #[test]
-    fn effective_override_uses_saved_entry_when_present() {
-        let mut c = AppConfig::default();
-        // Globals: local + en.
-        c.cloud_broadcast_enabled = false;
-        c.language = "en".into();
-        c.default_model = "tiny.en".into();
-        // Override for the EPOS device: cloud + Polish + base.en.
-        c.source_overrides.insert(
-            "device:input:EPOS PC 8 USB".into(),
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "pl".into(),
-                model: "base.en".into(),
-            },
-        );
-        let eff = c.effective_override("device:input:EPOS PC 8 USB");
-        assert!(eff.cloud_on);
-        assert_eq!(eff.language, "pl");
-        assert_eq!(eff.model, "base.en");
-        // Other devices still get global defaults.
-        let other = c.effective_override("device:input:Other");
-        assert!(!other.cloud_on);
-    }
-
-    #[test]
-    fn source_id_distinguishes_kind_and_app_variants() {
-        // Microphone with explicit Input kind:
-        let mic = source_id(&SessionSource::Microphone, Some(AudioSessionKind::Input));
-        assert_eq!(mic, "device:input:default");
-        // System with explicit Output kind:
-        let sys = source_id(&SessionSource::System, Some(AudioSessionKind::Output));
-        assert_eq!(sys, "device:output:default");
-        // App variant ignores the kind argument; key includes device pairing.
-        let zoom = source_id(
-            &SessionSource::App {
-                id: "us.zoom.xos".into(),
-                name: "Zoom".into(),
-                device_name: "MacBook Pro Speakers".into(),
-            },
-            None,
-        );
-        assert_eq!(zoom, "app:Zoom@device:MacBook Pro Speakers");
-        // Device-specific keys via device_source_id:
-        let epos = device_source_id("EPOS PC 8 USB", AudioSessionKind::Input);
-        assert_eq!(epos, "device:input:EPOS PC 8 USB");
-    }
-
-    #[test]
-    fn app_source_key_separates_same_app_on_different_devices() {
-        let zoom_speakers = source_id(
-            &SessionSource::App {
-                id: "us.zoom.xos".into(),
-                name: "Zoom".into(),
-                device_name: "MacBook Pro Speakers".into(),
-            },
-            None,
-        );
-        let zoom_airpods = source_id(
-            &SessionSource::App {
-                id: "us.zoom.xos".into(),
-                name: "Zoom".into(),
-                device_name: "AirPods Pro".into(),
-            },
-            None,
-        );
-        assert_ne!(zoom_speakers, zoom_airpods);
-    }
-
-    #[test]
-    fn source_overrides_round_trip_through_toml() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.source_overrides.insert(
-            "device:input:EPOS PC 8 USB".into(),
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "pl".into(),
-                model: "base.en".into(),
-            },
-        );
-        c.source_overrides.insert(
-            "app:Zoom".into(),
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        );
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.source_overrides.len(), 2);
-        assert_eq!(
-            loaded.source_overrides["device:input:EPOS PC 8 USB"].language,
-            "pl"
-        );
-        assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
-    }
     // ── Per-slot settings (SlotSettings, slot_settings map) ─────────────
     //
     // These pin the storage layer for the per-slot settings refactor:
     // each slot owns its own Cloud/Language/Model/Path settings, and
+    // AppConfig persists them in a `slot_settings` map keyed by SlotId.
     // AppConfig persists them in a `slot_settings` map keyed by SlotId.
     // The field and the BTreeMap are added in commit 1;
     // `slot_settings` is the new source of truth for runtime code.
