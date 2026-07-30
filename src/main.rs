@@ -1271,10 +1271,11 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         "last_key": last_key,
         "mode": format!("{:?}", app.mode),
         "status": status,
-        "cloud_broadcast_active": app.focused_cloud_active(),
-        "cloud_broadcast_enabled": app.config.cloud_broadcast_enabled,
-        "language": app.config.language,
-        "default_model": app.config.default_model,
+        // Per-slot: the snapshot reflects the focused slot's
+        // settings (the source of truth), not a vestigial global.
+        "cloud_broadcast_enabled": app.display_cloud_on(),
+        "language": app.display_language(),
+        "default_model": app.display_model(),
         "engine_kind": app.focused_engine_kind(),
         "duration_secs": app.duration,
         "banner": app.banner,

@@ -563,15 +563,12 @@ impl App {
         // `AppConfig::config_path()` to a fresh empty tempdir, so
         // running it in production would make every launch boot
         // from defaults (API key, devices, agent targets all
-        // "gone") and write settings into /tmp.
+        // Test builds only: install the process-local config
+        // tempdir so every test reads from and saves to a tempdir
+        // instead of the developer's real `config.toml`.
         #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let mut config = AppConfig::load().unwrap_or_default();
-        // Windows is cloud-only: force cloud on in memory
-        // regardless of what the on-disk config says. Covers
-        // configs copied from another OS or hand-edited;
-        // the on-disk format is unchanged.
-        enforce_cloud_only_platform(&mut config);
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -689,6 +686,11 @@ impl App {
             verify_started: None,
             agent_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
+        // Pin every slot's settings.cloud_on to the platform
+        // default. On Windows, every recording is cloud — set it
+        // on the slot's settings so the engine sees the right
+        // state. The on-disk format is unchanged.
+        enforce_cloud_only_platform_on_slots(&mut app.slots);
         app.load_agent_targets_from_config();
         // user must provide before recording.
         #[cfg(windows)]
@@ -3186,18 +3188,32 @@ async fn dispatch_segment_to_agent(
 // ── Platform invariants ────────────────────────────────────────────────
 
 /// Windows is cloud-only: force cloud on in memory regardless of what the
-/// config says (covers configs copied from another OS or hand-edited). The
-/// on-disk format stays identical across platforms. `cfg!` (rather than an
+/// config or persisted slot settings say. `cfg!` (rather than an
 /// attribute) keeps the body compiled and testable on every target.
-fn enforce_cloud_only_platform(config: &mut AppConfig) {
+fn enforce_cloud_only_platform(settings: &mut SlotSettings) {
     if cfg!(windows) {
-        config.cloud_broadcast_enabled = true;
+        settings.cloud_on = true;
     }
 }
 
-/// Windows is cloud-only: clamp the per-source setting at the one choke
-/// point every recording passes through (`start_section`). Covers stale
-/// cloud_on=false overrides persisted by a pre-0.4.0 config.
+/// Apply the platform clamp to every slot's settings. Called from
+/// `App::new` and from `start_section` (the per-slot choke point
+/// that catches stale settings persisted by a pre-0.4.0 config).
+/// `clamp_section_settings_for_platform` (the per-recording
+/// snapshot variant) is preserved for the engine's view.
+fn enforce_cloud_only_platform_on_slots(slots: &mut [Slot]) {
+    if cfg!(windows) {
+        for slot in slots {
+            slot.settings.cloud_on = true;
+        }
+    }
+}
+
+/// Windows is cloud-only: clamp the per-recording `SectionSettings`
+/// snapshot at the one choke point every recording passes through
+/// (`start_section`). Covers stale cloud_on=false settings persisted
+/// by a pre-0.4.0 config. The slot's settings are the source of
+/// truth; this clamp applies to the engine-visible snapshot.
 fn clamp_section_settings_for_platform(settings: &mut SectionSettings) {
     if cfg!(windows) {
         settings.cloud_on = true;
@@ -4606,23 +4622,24 @@ mod tests {
         assert!(pushed.lock().is_empty());
     }
 
-    // Runs on every platform: asserts the forcing on Windows and the
-    // no-op everywhere else, since the helpers branch on cfg! at runtime.
+    // Runs on every platform: asserts the platform clamp pins
+    // cloud_on to true on Windows and leaves it alone elsewhere.
+    // The clamp operates on the focused slot's settings, not the
+    // legacy `config.cloud_broadcast_enabled` (which is on its
+    // way out in commit 6).
     #[test]
     fn cloud_only_platform_invariants() {
-        let mut config = AppConfig::default();
-        config.cloud_broadcast_enabled = false;
-        enforce_cloud_only_platform(&mut config);
-        assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
-
-        let mut settings = SectionSettings {
-            cloud_on: config.cloud_broadcast_enabled,
-            language: config.language.clone(),
-            model: config.default_model.clone(),
-        };
-        settings.cloud_on = false;
-        clamp_section_settings_for_platform(&mut settings);
+        let mut settings = SlotSettings::default();
+        enforce_cloud_only_platform(&mut settings);
         assert_eq!(settings.cloud_on, cfg!(windows));
+
+        let mut section = SectionSettings {
+            cloud_on: false,
+            language: "en".into(),
+            model: "distil-small.en".into(),
+        };
+        clamp_section_settings_for_platform(&mut section);
+        assert_eq!(section.cloud_on, cfg!(windows));
     }
 
     // Everything below exercises the local-session export path
