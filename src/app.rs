@@ -3843,6 +3843,90 @@ mod tests {
              of the target"
         );
     }
+    /// `start_section` must persist a local session directory for
+    /// `Target::Stdout` even when the cloud transport is on.
+    ///
+    /// Today (pre-fix) `cloud_on = true` flips `session_dir` to
+    /// `None` unconditionally — the recording lives entirely on
+    /// voicebird.app and the user has no local copy. That's the
+    /// right behaviour for `Target::Agent` (the agent runtime
+    /// is the destination) but wrong for `Target::Stdout`, where
+    /// the picker label explicitly advertises a local-on-disk
+    /// transcript (`audio.wav`, `transcript.jsonl`, `meta.json`).
+    /// The user wants the cloud engine to do the ASR AND a
+    /// local copy to land on disk.
+    ///
+    /// We can't inspect `Section::session_dir` directly from
+    /// outside `start_section` (it stays a local variable
+    /// until the `Recording` variant is constructed, and the
+    /// cpal capture in the test environment is expected to
+    /// fail with "no input device"). The directory is created
+    /// BEFORE capture opens, so a successful `create_dir_all`
+    /// call is observable on disk even when `start_section`
+    /// returns `Err` downstream. We assert exactly that: a
+    /// single `2026-…-mic` directory under
+    /// `app.config.session_dir` post-resume.
+    #[test]
+    fn start_section_stdout_target_with_cloud_on_creates_local_session_dir() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.config.session_dir = dir.path().to_string_lossy().into_owned();
+        app.config.voicebird_api_key = "sk-test".into();
+        // Devices picker so `resolve_focused_source` returns
+        // `Microphone` and the session slug picks the `-mic`
+        // suffix.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Seed a Saved variant with target=Stdout, cloud_on=true.
+        // The label must match what the picker would have written
+        // for this combination.
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+
+        // Resume delegates to start_section. We don't care
+        // whether the call returns Ok or Err — what matters
+        // is the side effect on disk.
+        let _ = app.resume_section(slot);
+
+        // Exactly one session directory was created under the
+        // configured session_dir. The slug is
+        // `<timestamp>-<source-suffix>`, with the source suffix
+        // being `mic` for `SessionSource::Microphone`.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "Stdout + cloud_on=true must create exactly one local \
+             session directory (slug = `<ts>-<source>`); got {entries:?}",
+        );
+        let name = entries[0].file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name.ends_with("-mic"),
+            "session dir slug must end with `-mic` for the microphone \
+             source; got {name:?}",
+        );
+    }
     /// fails the push when `fail` is set.
     struct SpyTarget {
         pushed: Arc<PlMutex<Vec<String>>>,
