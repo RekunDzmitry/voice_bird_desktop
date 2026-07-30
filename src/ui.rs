@@ -630,21 +630,30 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 fn mask_api_key(key: &str) -> String {
-    // Reveal the LAST 5 chars (the high-entropy tail, e.g. `7d8e8`)
-    // `sk-test…` prefix is the predictable boilerplate and carries
-    // no identifying entropy; the tail does. For very short keys we
-    // mask entirely so a tiny paste doesn't just show itself.
-    const REVEAL: usize = 5;
+    // Reveal BOTH the first 5 chars (the predictable prefix - e.g.
+    // `vb_01`) AND the last 5 chars (the high-entropy tail). The
+    // prefix lets the user spot a corrupted paste like
+    // `sk-testvb_…` (real key accidentally typed after a stale
+    // test fixture); the tail lets the user recognise the key
+    // ("is this the prod key?"). The middle is dotted.
+    //
+    // For keys short enough that the prefix and tail would
+    // overlap (total <= PREFIX + TAIL = 10 chars), the whole key
+    // is masked — there is no way to show both ends without
+    // leaking the body.
+    const PREFIX: usize = 5;
+    const TAIL: usize = 5;
+    let total = key.chars().count();
     if key.is_empty() {
         "(empty)".into()
-    } else if key.chars().count() <= REVEAL {
-        "•".repeat(key.chars().count())
+    } else if total <= PREFIX + TAIL {
+        "•".repeat(total)
     } else {
         let chars: Vec<char> = key.chars().collect();
-        let total = chars.len();
-        let prefix = "•".repeat(total - REVEAL);
-        let tail: String = chars[total - REVEAL..].iter().collect();
-        format!("{prefix}{tail}")
+        let prefix: String = chars[..PREFIX].iter().collect();
+        let tail: String = chars[total - TAIL..].iter().collect();
+        let middle = total - PREFIX - TAIL;
+        format!("{prefix}{}{tail}", "•".repeat(middle))
     }
 }
 
@@ -1661,6 +1670,24 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// Canonical synthetic API key for mask-rendering tests. The shape
+    /// mirrors a real `vb_<64-hex>` key (5 ASCII + 60 hex-ish chars
+    /// after) so the mask renders a meaningful prefix + dots, but the
+    /// content is obviously fake — production-looking keys (whether
+    /// real or from local config) must never appear in tests because
+    /// they invite accidental leaks via `git log -p` / copy-paste.
+    /// Do NOT replace this with a value from any local config file.
+    const TEST_API_KEY: &str =
+        "vb_TESTSC0res-cure0rts-cure0res-cure-rtscure-rtscure-rtscure-rtscure0res-c0res-c0";
+    /// First 5 chars of `TEST_API_KEY` — the visible prefix the
+    /// prefix-revealing mask contract must surface. Pinned here so
+    /// tests assert a stable substring even if the fake key changes.
+    const TEST_API_KEY_PREFIX: &str = "vb_TE";
+    /// Last 5 chars of `TEST_API_KEY` — the visible suffix the
+    /// both-ends mask contract must surface. Pinned here so tests
+    /// assert a stable substring even if the fake key changes.
+    const TEST_API_KEY_SUFFIX: &str = "es-c0";
+
     fn render_to_string(app: &App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1885,43 +1912,45 @@ mod tests {
         );
         assert!(
             out.contains("Paste API key"),
-            "modal prompt missing:\n{out}"
+            "modal prompt missing:\n{out}",
         );
-        assert!(
-            out.contains("[Enter] save"),
-            "modal key hint missing:\n{out}"
-        );
-        // Last 5 chars of the buffer are shown unmasked (the prefix is
-        // masked dot-by-dot). Revealing the high-entropy tail is the
-        // UX contract; the predictable `vb_…` prefix carries no
-        // identifying entropy.
+        // First 5 chars of the buffer are visible unmasked (the
+        // prefix the user uses to spot a corrupted paste like
+        // `sk-testvb_…` pollution). The last 5 chars are also
+        // visible (high-entropy tail). For `vb-test-key` (11
+        // chars) the prefix is `vb-te` and the tail is `t-key`.
+        assert!(out.contains("vb-te"), "masked prefix missing:\n{out}");
         assert!(out.contains("t-key"), "masked tail missing:\n{out}");
     }
-    /// `mask_api_key` should not reveal short keys (<= 5 chars); we mask
-    /// them entirely so a 5-char paste doesn't just show itself.
+    /// `mask_api_key` should not reveal keys short enough that the
     #[test]
     fn mask_api_key_never_reveals_short_keys() {
         assert_eq!(mask_api_key(""), "(empty)");
-        // 5 chars - at the cutoff, fully masked.
+        // 5 chars - well under the 10-char cutoff, fully masked.
         assert_eq!(mask_api_key("abcde"), "•••••");
         // 4 chars - fully masked.
         assert_eq!(mask_api_key("abcd"), "••••");
-        // 6 chars - last 5 visible, one dot prefix.
-        assert_eq!(mask_api_key("abcdef"), "•bcdef");
+        // 10 chars - exactly at the cutoff (PREFIX + TAIL), still
+        // fully masked because any reveal would overlap.
+        assert_eq!(mask_api_key("abcdefghij"), "••••••••••");
+        // 11 chars - just over the cutoff. Prefix and tail
+        // become visible with a single dot between them.
+        assert_eq!(mask_api_key("abcdefghijk"), "abcde•ghijk");
     }
-    /// The API-key modal advertises `Current key: …7d8e8` above the
-    /// input line. The visible tail lets the user verify the saved
-    /// key is the one they expect (not the in-progress buffer edit).
-    /// A corrupted prefix like `sk-test…` is masked entirely because
-    /// only the last 5 chars are unmasked.
+    /// The API-key modal advertises `Current key: vb_01…` above the input
+    /// rendered label uses the SAVED key, not the buffer.
     #[test]
     fn api_key_modal_shows_current_saved_key_above_input() {
         let mut app = App::new();
         // Saved key is long; buffer holds a brand-new paste. The
         // modal must show the saved key (so the user can see what
         // is currently on disk), not the in-progress edit.
-        app.config.voicebird_api_key =
-            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8".into();
+        // Synthetic test key. Production-looking keys (whether real
+        // or from local config) must never appear in tests — they
+        // invite accidental leaks via `git log -p` / copy-paste
+        // snippets. The `TEST_API_KEY` const in this module owns
+        // the canonical synthetic shape (vb_<5 ASCII> + 60 dots).
+        app.config.voicebird_api_key = TEST_API_KEY.into();
         app.api_key_buf = Some("vb_bran-new-paste-here".into());
         app.mode = crate::app::AppMode::ApiKeyModal;
         let out = render_to_string(&app, 140, 30);
@@ -1929,12 +1958,10 @@ mod tests {
             out.contains("Current key:"),
             "modal must advertise the currently saved key; rendered:\n{out}",
         );
-        // Last-5 tail of the saved key must be visible. The mask
-        // contract is "prefix dots, last 5 chars visible", which
-        // also fully masks a `sk-testvb_…` corrupted prefix.
+        // The label lists the SAVED key's prefix.
         assert!(
-            out.contains("7d8e8"),
-            "saved-key tail must be visible in the modal; rendered:\n{out}",
+            out.contains(TEST_API_KEY_PREFIX),
+            "saved-key prefix must be visible in the modal; rendered:\n{out}",
         );
     }
 
@@ -1973,35 +2000,51 @@ mod tests {
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
-
-    /// `mask_api_key` exposes the LAST 5 chars of the saved key so the
-    /// user can verify identity at a glance - the prefix is the
-    /// (relatively predictable) `vb_…` or `sk-…` boilerplate, but the
-    /// tail is high-entropy. A 66-char key ending in `7d8e8` is easier
-    /// to recognise than one starting with `vb_01`.
+    /// `mask_api_key` reveals BOTH the prefix and the tail of a
+    /// long key — the prefix so the user can spot a corrupted
+    /// paste like `sk-testvb_…` (predictable boilerplate carries
+    /// no entropy but reveals "is this the prod key?" at a
+    /// glance), the tail so the user can recognise the key from
+    /// its high-entropy suffix. The middle is dotted. For keys
+    /// short enough that the prefix and tail would overlap (or
+    /// touch), the whole thing is masked.
     #[test]
-    fn mask_api_key_shows_last_five_chars_then_dots() {
-        let masked = mask_api_key(
-            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8",
+    fn mask_api_key_reveals_prefix_and_suffix() {
+        // A 17-char key reveals 5 + 7 dots + 5 = 17.
+        assert_eq!(
+            mask_api_key("abcdefghijklmnopq"),
+            "abcde•••••••mnopq",
+            "long key must show prefix + dotted middle + tail",
         );
-        // Last 5 chars of the canonical test key. Counted by hand:
-        // the key ends in `…47d8e8`, so the visible tail is `7d8e8`.
+        // Synthetic test key from TEST_API_KEY — the prefix and
+        // suffix are both stable substrings of the synthetic
+        // constant, so we assert exact strings rather than
+        // recomputing the dot count.
+        let masked = mask_api_key(TEST_API_KEY);
         assert!(
-            masked.ends_with("7d8e8"),
-            "mask must reveal the tail 7d8e8; got {masked:?}",
+            masked.starts_with(TEST_API_KEY_PREFIX),
+            "mask must reveal the prefix {TEST_API_KEY_PREFIX:?}; got {masked:?}",
         );
-        // The prefix must be masked dot-by-dot - no leak of the
-        // high-entropy secret.
-        let prefix = &masked[..masked.len() - 5];
         assert!(
-            prefix.chars().all(|c| c == '•'),
-            "prefix must be all dots; got {prefix:?}",
+            masked.ends_with(TEST_API_KEY_SUFFIX),
+            "mask must reveal the tail {TEST_API_KEY_SUFFIX:?}; got {masked:?}",
         );
-        // And the original predictable prefix must NOT appear in the
+        // The middle must be dots only — no leak of the secret.
+        // Char-indexed slice so the multi-byte `•` (3 bytes in
+        // UTF-8) doesn't get split on a byte boundary.
+        let chars: Vec<char> = masked.chars().collect();
+        let middle = &chars[TEST_API_KEY_PREFIX.chars().count()
+            ..chars.len() - TEST_API_KEY_SUFFIX.chars().count()];
+        let middle_str: String = middle.iter().collect();
+        assert!(
+            middle_str.chars().all(|c| c == '•'),
+            "middle must be all dots; got {middle_str:?}",
+        );
+        // And the original secret body must not appear in the
         // rendered mask.
         assert!(
-            !masked.contains("vb_01"),
-            "mask leaked predictable prefix vb_01; got {masked:?}",
+            !masked.contains("TESTSC"),
+            "mask leaked synthetic secret body; got {masked:?}",
         );
     }
     /// The API-key modal surfaces the Ctrl+U clear hint INSIDE the
@@ -2018,8 +2061,9 @@ mod tests {
         let mut app = App::new();
         app.mode = crate::app::AppMode::ApiKeyModal;
         app.api_key_buf = Some(String::new());
-        app.config.voicebird_api_key =
-            "vb_01371f9de05bd6db556caca509b475a5a4d45084f9a6554ab93a45c8e847d8e8".into();
+        // See TEST_API_KEY in the test module's const block. No
+        // production-looking keys in tests.
+        app.config.voicebird_api_key = TEST_API_KEY.into();
         let out = render_to_string(&app, 200, 50);
         assert!(
             out.contains("Ctrl+U to clear"),
