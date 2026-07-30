@@ -568,7 +568,7 @@ impl App {
         // instead of the developer's real `config.toml`.
         #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
-        let mut config = AppConfig::load().unwrap_or_default();
+        let config = AppConfig::load().unwrap_or_default();
         let config_path = AppConfig::config_path().ok();
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
@@ -578,49 +578,34 @@ impl App {
         // can still override later with `m`. We treat the config as
         // "loaded from disk" once it exists so the picker behaves like a
         // normal navigation, not a first-run gate.
-        if !config_was_loaded_from_disk {
-            // No local models on cloud-only Windows — just persist the
-            // defaults; the API-key modal below replaces the model picker
-            // as the first-run gate.
-            #[cfg(not(windows))]
-            {
-                let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
-                log::info!("first run: auto-picked local model = {picked}");
-                config.default_model = picked.into();
-            }
-            if let Err(e) = config.save() {
-                log::error!("config save (first run): {e}");
-            } else {
-                config_was_loaded_from_disk = true;
-            }
+        // First-run auto-pick: the slot's settings already carry
+        // the auto-picked model (applied in fresh_slots_with_config
+        // below). The legacy global `default_model` is gone — just
+        // persist the defaults to disk so the next launch reads
+        // the same map.
+        if let Err(e) = config.save() {
+            log::error!("config save (first run): {e}");
+        } else {
+            config_was_loaded_from_disk = true;
         }
-
-        // Only the macOS screen-recording check below mutates this.
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut banner_on_launch: Option<String> =
-            if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
-                Some("Cloud is on but no API key — press 'c' to paste one".into())
-            } else {
-                None
-            };
-
-        // macOS: warn early if Screen Recording permission is missing.
-        // Without it, system-audio loopback and per-app capture both fail
-        // at start, and SCShareableContent returns a near-empty app list.
-        // TCC decisions don't propagate to a running process, so the
-        // remedy is "grant + restart".
+        // macOS screen-recording permission check. The block is
+        // gated on `cfg(target_os = "macos")` so the variable
+        // is only live on macOS — the cloud-on banner is
+        // computed after `app` is built below.
         #[cfg(target_os = "macos")]
-        {
-            if !voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted(
-            ) {
-                banner_on_launch = Some(
+        let macos_banner: Option<String> =
+            if !voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted() {
+                Some(
                     "Screen Recording permission required for system / per-app audio — \
                      System Settings → Privacy & Security → Screen Recording → enable \
                      your terminal (or voice-bird), then restart"
                         .into(),
-                );
-            }
-        }
+                )
+            } else {
+                None
+            };
+        #[cfg(not(target_os = "macos"))]
+        let macos_banner: Option<String> = None;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -669,7 +654,10 @@ impl App {
             api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
-            banner: banner_on_launch,
+            // Banner: macOS screen-recording OR cloud-on-no-key OR None.
+            // The cloud check runs after app build and overwrites this
+            // when the slot's settings.cloud_on is true with no key.
+            banner: macos_banner,
             transcript_scroll: 0,
             transcript_follow: true,
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
@@ -691,6 +679,13 @@ impl App {
         // on the slot's settings so the engine sees the right
         // state. The on-disk format is unchanged.
         enforce_cloud_only_platform_on_slots(&mut app.slots);
+        // On-launch banner: any slot with cloud_on + no key needs
+        // the user to paste a key. Today only slot 1 is checked.
+        app.banner = if app.slots[0].settings.cloud_on && app.config.voicebird_api_key.is_empty() {
+            Some("Cloud is on but no API key — press 'c' to paste one".into())
+        } else {
+            None
+        };
         app.load_agent_targets_from_config();
         // user must provide before recording.
         #[cfg(windows)]
@@ -790,6 +785,10 @@ impl App {
     /// Read-only access to a slot by id.
     fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
         self.slots.iter().find(|s| s.id == id)
+    }
+    /// Mutable access to a slot by id.
+    pub fn slot_by_id_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.id == id)
     }
 
     // -- Section accessors --------------------------------------------------
@@ -985,7 +984,7 @@ impl App {
         self.path_buf = Some(
             self.slot_by_id(self.focused_slot)
                 .map(|s| s.settings.path.clone())
-                .unwrap_or_else(|| self.config.session_dir.clone()),
+                .unwrap_or_default(),
         );
         self.mode = AppMode::PathModal;
     }
@@ -1633,7 +1632,16 @@ impl App {
             // Server rejected the saved key — surface the paste modal
             // immediately so the user can replace it without hunting
             // for a key binding.
-            if auth_failure && self.config.cloud_broadcast_enabled {
+            // Per-slot: the auth failure is on the running section
+            // whose engine_error_channel we just drained. The
+            // slot's settings.cloud_on is the source of truth —
+            // if the user has Cloud ON (on the focused slot at
+            // least), the modal lets them paste a replacement key.
+            let focus_slot_cloud = self
+                .slot_by_id(self.focused_slot)
+                .map(|s| s.settings.cloud_on)
+                .unwrap_or(false);
+            if auth_failure && focus_slot_cloud {
                 // `false`: the user already has Cloud ON and a key
                 // on disk — they just need to replace the bad
                 // key. Cancelling the modal leaves Cloud ON (the
@@ -1661,21 +1669,10 @@ impl App {
         };
     }
 
-    /// Resolve the effective settings for a given source. Prefers a
-    /// device-specific override (keyed on the actual selected device
-    /// name + kind) over the generic Microphone/System fallback.
-    pub fn effective_settings_for(&self, source: &SessionSource) -> SectionSettings {
-        let key = self.source_key_for(source);
-        let ov = self.config.effective_override(&key);
-        SectionSettings {
-            cloud_on: ov.cloud_on,
-            language: ov.language,
-            model: ov.model,
-        }
-    }
-
+    /// Per-slot replacement for the legacy `effective_settings_for`.
     /// Per-slot replacement for [`Self::effective_settings_for`].
     /// Reads the slot's `SlotSettings` directly — no per-source
+    /// merge, no global fallback. The slot's settings are the
     /// merge, no global fallback. The slot's settings are the
     /// source of truth at start time.
     ///
@@ -1690,32 +1687,7 @@ impl App {
         })
     }
 
-    /// Compute the persistence key for a section's source. Device
-    /// sections key on the actual selected device name + kind so two
-    /// physical devices never collide; app sections key on app name +
-    /// paired device so "Zoom on Speakers" and "Zoom on AirPods" don't
-    /// share overrides.
-    pub fn source_key_for(&self, source: &SessionSource) -> String {
-        use voice_bird_cli::config::{device_source_id, source_id, AudioSessionKind};
-        match source {
-            SessionSource::Microphone | SessionSource::System => {
-                if let (Some(name), Some(kind)) = (
-                    self.config.input_device.as_deref(),
-                    self.config.input_device_kind,
-                ) {
-                    return device_source_id(name, kind);
-                }
-                source_id(
-                    source,
-                    self.config.input_device_kind.or(Some(match source {
-                        SessionSource::Microphone => AudioSessionKind::Input,
-                        _ => AudioSessionKind::Output,
-                    })),
-                )
-            }
-            SessionSource::App { .. } => source_id(source, None),
-        }
-    }
+
 
     /// Expand `~` in a slot's `settings.path` the same way
     /// `AppConfig::session_dir_expanded` does. Pulled out so the
@@ -1725,46 +1697,23 @@ impl App {
         let raw = self
             .slot_by_id(slot)
             .map(|s| s.settings.path.clone())
-            .unwrap_or_else(|| self.config.session_dir_expanded());
+            .unwrap_or_default();
         if let Some(rest) = raw.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 return home.join(rest).to_string_lossy().into_owned();
             }
         }
         raw
-    }
-    /// Update the focused section's settings AND persist the change as
 
-
-    /// a per-source override in `config.source_overrides`. The new value
-    /// applies to the running engine on next start; for live mutations
-    /// (toggling cloud while a section runs), Stage 3+ will rebuild
-    /// the engine. For now, the running engine is unaffected and the
-    /// new value is what the next start will use.
-    pub fn persist_focused_settings(&mut self) {
-        let Some(section) = self.focused() else {
-            return;
-        };
-        let key = self.source_key_for(&section.source);
-        let ov = voice_bird_cli::config::SourceSettingsOverride {
-            cloud_on: section.settings.cloud_on,
-            language: section.settings.language.clone(),
-            model: section.settings.model.clone(),
-        };
-        self.config.upsert_source_override(key, ov);
-        if let Err(e) = self.config.save() {
-            log::error!("config save (per-source override): {e}");
-        }
     }
 
-    /// Per-slot replacement for [`Self::persist_focused_settings`].
-    /// Reads the focused slot's `SlotSettings` (which is now the
-    /// authoritative live value — no per-source merge) and writes it
-    /// into `config.slot_settings` under the slot's id, then saves.
-    /// The next `App::new` reloads the same map.
-    ///
-    /// Coexists with `persist_focused_settings` for the duration of
-    /// the refactor; commit 6 deletes the per-source variant.
+
+    /// Persist the focused slot's `SlotSettings` into
+    /// `config.slot_settings` under the slot's id, then save. The
+    /// next `App::new` reloads the same map. The live engine
+    /// snapshot on `Section` is taken at `start_section` time and
+    /// updated alongside the slot's settings; mid-flight engine
+    /// rebuild is still Stage 3+ work.
     pub fn persist_focused_slot_settings(&mut self) {
         let Some(slot) = self.slot_by_id(self.focused_slot) else {
             return;
@@ -2616,7 +2565,6 @@ impl App {
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
-        let settings = self.slot_settings_for(slot).expect("slot exists");
         // message rather than the more generic "no device
         // selected" error the picker resolution below would
         // produce for an untouched slot.
@@ -2633,7 +2581,7 @@ impl App {
         // the live values.
         let source = self.resolve_focused_source()?;
         let target = self.focused_pending_target();
-        let settings = self.effective_settings_for(&source);
+        let settings = self.slot_settings_for(slot).expect("slot exists");
         // Slot is Saved here (Empty and Recording both
         // returned above). Persist the new source, target,
         // and settings back to the saved snapshot so the
@@ -2765,7 +2713,6 @@ impl App {
             app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
         );
 
-        let settings = self.slot_settings_for(slot).expect("slot exists");
         let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
         let kind_changed = self.config.input_device_kind != Some(dev.kind);
         let app_id_changed =
@@ -2780,9 +2727,9 @@ impl App {
         }
 
         // Start in the chosen slot; route through the
-        // per-section API so settings come from
-        // `effective_settings_for(source)`.
-        let settings = self.effective_settings_for(&source);
+        // per-section API so settings come from the
+        // focused slot's SlotSettings.
+        let settings = self.slot_settings_for(slot).expect("slot exists");
         self.focused_slot = slot;
         log::info!(
             "keys: Enter → resolved source={:?}; calling start_section[{}]",
@@ -3187,18 +3134,12 @@ async fn dispatch_segment_to_agent(
 
 // ── Platform invariants ────────────────────────────────────────────────
 
-/// Windows is cloud-only: force cloud on in memory regardless of what the
-/// config or persisted slot settings say. `cfg!` (rather than an
-/// attribute) keeps the body compiled and testable on every target.
-fn enforce_cloud_only_platform(settings: &mut SlotSettings) {
-    if cfg!(windows) {
-        settings.cloud_on = true;
-    }
-}
-
-/// Apply the platform clamp to every slot's settings. Called from
-/// `App::new` and from `start_section` (the per-slot choke point
-/// that catches stale settings persisted by a pre-0.4.0 config).
+/// Windows is cloud-only: force cloud on every slot's settings
+/// regardless of what the config or persisted slot settings say.
+/// `cfg!` (rather than an attribute) keeps the body compiled and
+/// testable on every target. Called from `App::new` and from
+/// `start_section` (the per-slot choke point that catches stale
+/// settings persisted by a pre-0.4.0 config).
 /// `clamp_section_settings_for_platform` (the per-recording
 /// snapshot variant) is preserved for the engine's view.
 fn enforce_cloud_only_platform_on_slots(slots: &mut [Slot]) {
@@ -3555,12 +3496,11 @@ mod tests {
             model: "tiny.en".into(),
             path: "~/voice-bird/slot-one".into(),
         };
-        // Global config says the opposite. If start_section
-        // ever reads these, the slot's settings would be
-        // overwritten or the test would fail in commit 6.
-        app.config.cloud_broadcast_enabled = false;
-        app.config.language = "en".into();
-        app.config.default_model = "distil-small.en".into();
+        // The global config used to hold default_model / language /
+        // cloud_broadcast_enabled. Those fields are gone — the
+        // slot's settings are the source of truth. The test
+        // continues to set the API key (a non-legacy field) so
+        // `start_section` doesn't refuse on the missing-key guard.
         app.config.voicebird_api_key = "sk-test".into();
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
@@ -3587,9 +3527,9 @@ mod tests {
         // untouched — the runtime never consulted it.
         assert!(app.slots[0].settings.cloud_on);
         assert_eq!(app.slots[0].settings.language, "pl");
-        assert_eq!(app.slots[0].settings.model, "tiny.en");
-        assert!(!app.config.cloud_broadcast_enabled);
-        assert_eq!(app.config.language, "en");
+        // The legacy global config fields are gone — there's no
+        // `cloud_broadcast_enabled` / `language` to assert against.
+        // The slot's settings above are the contract.
     }
 
     /// Slot's `settings.path` is the path used for the session
@@ -3880,20 +3820,12 @@ mod tests {
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
-        // Simulate the user pressing `l` to cycle the
-        // language to Russian and `c` to flip cloud on
-        // *after* stopping. The c/l handlers update the
-        // global config and per-source override when no
-        // section is focused (the post-stop case). Persist
-        // the override the same way persist_focused_settings
-        // does so the test reflects production state.
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
-        let key = app.source_key_for(&SessionSource::Microphone);
-        let mut ov = app.config.effective_override(&key);
-        ov.cloud_on = true;
-        ov.language = "ru".into();
-        app.config.upsert_source_override(key, ov);
+        // Per-slot: simulate the user pressing `l` to cycle
+        // the language to Russian and `c` to flip cloud on
+        // *after* stopping. The handlers mutate the
+        // focused slot's settings directly now.
+        app.slots[0].settings.cloud_on = true;
+        app.slots[0].settings.language = "ru".into();
 
         // Resume. The result is pipeline-dependent
         // (capture may succeed or fail in the test env),
@@ -4274,6 +4206,11 @@ mod tests {
     /// cloud_on=true on a Stdout session is
     /// silently forced to false on resume. The
     /// fix drops the clobber line.
+    /// Under the per-slot model, the saved slot's settings
+    /// already carry cloud_on=true — the slot is the source of
+    /// truth, not a per-source override. The resume path must
+    /// honor the saved snapshot's target (Stdout) while leaving
+    /// the cloud transport alone.
     #[test]
     fn resume_honors_cloud_on_even_when_saved_target_is_stdout() {
         use voice_bird_cli::config::AudioSessionKind;
@@ -4286,32 +4223,10 @@ mod tests {
         }];
         app.selected_device_index = 0;
         let slot = app.slots[0].id;
-        // Per-source override for the microphone must read
-        // `cloud_on = true` — that's the source the picker
-        // resolves to, and the resume path derives
-        // `effective_settings_for` from the per-source
-        // override first. Without this, the resume would
-        // fall back to the global default
-        // (`cloud_broadcast_enabled = false` in the test
-        // tempdir) and the assertion below would trip.
-        // (Pre-test-overlay this assertion passed only
-        // because the developer's real config happened to
-        // have `cloud_broadcast_enabled = true` and no
-        // per-source override — implicit test data.)
-        let source = SessionSource::Microphone;
-        let key = app.source_key_for(&source);
-        use voice_bird_cli::config::SourceSettingsOverride;
-        app.config.source_overrides.insert(
-            key,
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        );
-        // Saved as: target=Stdout, cloud_on=true
-        // (user wants server streaming + local
-        // files).
+        // The slot's settings already say cloud_on=true — the
+        // per-slot model means the slot is the source of truth.
+        app.slots[0].settings.cloud_on = true;
+        // Saved as: target=Stdout, cloud_on=true.
         let saved = SavedTranscript {
             committed: Arc::new(PlMutex::new(Vec::new())),
             refined: Arc::new(PlMutex::new(Vec::new())),
@@ -4629,9 +4544,9 @@ mod tests {
     // way out in commit 6).
     #[test]
     fn cloud_only_platform_invariants() {
-        let mut settings = SlotSettings::default();
-        enforce_cloud_only_platform(&mut settings);
-        assert_eq!(settings.cloud_on, cfg!(windows));
+        let mut slots = vec![Slot::empty(SlotId(1))];
+        enforce_cloud_only_platform_on_slots(&mut slots);
+        assert_eq!(slots[0].settings.cloud_on, cfg!(windows));
 
         let mut section = SectionSettings {
             cloud_on: false,
