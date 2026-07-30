@@ -1533,7 +1533,7 @@ mod api_key_modal_ctrl_u_tests {
 /// because crossterm encodes Ctrl+K the same as a plain 'k' - the
 /// uppercase letter is the discoverable, conflict-free shortcut.
 #[cfg(test)]
-mod api_key_dispatcher_K_tests {
+mod api_key_dispatcher_uppercase_k_tests {
     use super::*;
     #[test]
     #[allow(non_snake_case)]

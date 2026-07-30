@@ -2482,21 +2482,32 @@ impl App {
             saved.target = target.clone();
             saved.settings = settings.clone();
         } else {
-            // Defensive: a concurrent state change between
-            // the guards above and here would land here.
-            unreachable!("slot state must be Saved by this point");
+            // Defensive: the guards above make this branch
+            // unreachable today. Surface an error instead of
+            // panicking so a future refactor that changes
+            // slot state mid-resume degrades to a banner,
+            // not a dead TUI.
+            return Err(format!("slot {slot} changed state during resume"));
         }
         // Queue the target so start_section consumes it
         // (start_section removes the override at start
-        // time and uses it as the section's target). If
-        // the user already queued an override, this is a
-        // no-op; if they didn't, we re-insert the resolved
-        // target so the resume always honors the current
-        // pick.
-        self.pending_target_overrides.insert(slot, target);
-        self.start_section(slot, source, settings)
+        // time and uses it as the section's target). Only
+        // insert when the user hadn't already queued an
+        // override, and take the insert back if
+        // start_section fails on an early guard (e.g.
+        // missing API key) before consuming it — otherwise
+        // a failed resume would leave a stale override
+        // queued on the slot.
+        let had_override = self.pending_target_overrides.contains_key(&slot);
+        if !had_override {
+            self.pending_target_overrides.insert(slot, target);
+        }
+        let result = self.start_section(slot, source, settings);
+        if result.is_err() && !had_override {
+            self.pending_target_overrides.remove(&slot);
+        }
+        result
     }
-
 
     /// Resolve the source the picker would pick on Enter.
     /// `None` if no device is selected or the device kind
@@ -2558,13 +2569,10 @@ impl App {
             let recording = self.active_section_count();
             log::info!("keys: Enter → refused (no free slot, {recording} recording, {total} total)");
             let msg = if recording > 0 {
-                format!(
-                    "All {total} slots are full — stop the recording with [s] first"
-                )
+                format!("All {total} slots are full — stop the recording with [s] first")
             } else {
-                format!(
-                    "No empty slots — press [R] to resume a paused slot, [x] to clear, [-] to remove"
-                )
+                "No empty slots — press [R] to resume a paused slot, [x] to clear, [-] to remove"
+                    .to_string()
             };
             return Err(msg);
         };
@@ -2626,6 +2634,7 @@ impl App {
         );
         self.start_section(slot, source, settings)
     }
+
     /// Stop every active section. Used at quit.
     pub fn stop_all_sections(&mut self) {
         // Collect ids first so we don't hold a borrow on `self.slots`

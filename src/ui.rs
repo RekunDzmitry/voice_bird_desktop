@@ -292,6 +292,7 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
             let hint = Paragraph::new(Line::from(Span::styled(
                 hint_text,
                 Style::default()
+                    .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             )));
             f.render_widget(hint, cells[1]);
