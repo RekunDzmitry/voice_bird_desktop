@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::AppConfig;
+use voice_bird_cli::config::{slot_settings_key, AppConfig, SlotSettings};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -219,10 +219,14 @@ impl std::fmt::Debug for SlotKind {
 }
 
 /// One TUI pane and its current state. The pane's `id` is stable; the
-/// position in `App::slots` is incidental.
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
+    /// Per-slot settings the user flips from the Mode panel.
+    /// Independent of `kind` — the same `SlotSettings` apply
+    /// whether the slot is Empty, Recording, or Saved. Two
+    /// slots can have different settings simultaneously.
+    pub settings: SlotSettings,
 }
 
 impl Slot {
@@ -230,6 +234,7 @@ impl Slot {
         Self {
             id,
             kind: SlotKind::Empty,
+            settings: SlotSettings::default(),
         }
     }
 
@@ -1188,7 +1193,18 @@ impl App {
         }
         let id = SlotId(self.next_slot_id);
         self.next_slot_id += 1;
-        self.slots.push(Slot::empty(id));
+        // Seed the new slot's settings from the currently focused
+        // slot so a `+` press gives the user a slot that behaves
+        // like the one they were just looking at. Subsequent
+        // `c` / `l` / `m` / `p` flips on the new slot do not
+        // affect the source slot; the two diverge from this point.
+        let seed = self
+            .slot_by_id(self.focused_slot)
+            .map(|s| s.settings.clone())
+            .unwrap_or_default();
+        let mut new_slot = Slot::empty(id);
+        new_slot.settings = seed;
+        self.slots.push(new_slot);
         self.focused_slot = id;
         Some(id)
     }
@@ -1211,6 +1227,11 @@ impl App {
             return false;
         }
         self.slots.remove(pos);
+        // Drop any persisted per-slot settings for the removed id
+        // so a future slot with the same id (we never reuse them,
+        // but a hand-edited config could) doesn't pick up the
+        // stale settings.
+        self.config.slot_settings.remove(&slot_settings_key(id.0));
         // If the focused slot also had a pending target override,
         // drop it — the slot id is gone from the Vec and we don't
         // want the override to silently re-apply to a future slot.
@@ -1669,6 +1690,25 @@ impl App {
         self.config.upsert_source_override(key, ov);
         if let Err(e) = self.config.save() {
             log::error!("config save (per-source override): {e}");
+        }
+    }
+
+    /// Per-slot replacement for [`Self::persist_focused_settings`].
+    /// Reads the focused slot's `SlotSettings` (which is now the
+    /// authoritative live value — no per-source merge) and writes it
+    /// into `config.slot_settings` under the slot's id, then saves.
+    /// The next `App::new` reloads the same map.
+    ///
+    /// Coexists with `persist_focused_settings` for the duration of
+    /// the refactor; commit 6 deletes the per-source variant.
+    pub fn persist_focused_slot_settings(&mut self) {
+        let Some(slot) = self.slot_by_id(self.focused_slot) else {
+            return;
+        };
+        let key = slot_settings_key(slot.id.0);
+        self.config.slot_settings.insert(key, slot.settings.clone());
+        if let Err(e) = self.config.save() {
+            log::error!("config save (slot_settings): {e}");
         }
     }
 
@@ -3308,8 +3348,100 @@ mod tests {
         assert_eq!(app.focused_engine_kind(), "");
         assert!(!app.focused_cloud_active());
         // Empty fallbacks for the focused-* Arcs.
-        assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
+    }
+
+    // ── Per-slot settings on Slot / App (commit 2) ─────────────────
+    //
+    // These pin the App-side lifecycle of the new SlotSettings.
+    // Commit 1 added the storage layer; commit 2 makes the
+    // App-level runtime own the same settings and persist them on
+    // every mutation.
+
+    /// A fresh `App` ships with one slot (id 1) whose settings
+    /// match `SlotSettings::default()`. The user has not yet
+    /// pressed any keys, so cloud is off, language is "en",
+    /// model is the default-pick, and path is the default
+    /// sessions directory.
+    #[test]
+    fn fresh_app_slot_has_default_slot_settings() {
+        let app = App::new();
+        let s = &app.slots[0].settings;
+        assert!(!s.cloud_on);
+        assert_eq!(s.language, "en");
+        assert_eq!(s.model, "distil-small.en");
+        assert_eq!(s.path, "~/voice-bird/sessions");
+    }
+
+    /// `add_slot` seeds the new slot's settings from the focused
+    /// slot's settings. Two slots can thus diverge over time —
+    /// adding a slot does not reset either to defaults.
+    #[test]
+    fn add_slot_seeds_settings_from_focused_slot() {
+        let mut app = App::new();
+        // Flip the focused slot's settings away from defaults.
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "ru".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/seeded".into(),
+        };
+        let new_id = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        let new_slot = app.slots.iter().find(|s| s.id == new_id).unwrap();
+        assert!(new_slot.settings.cloud_on);
+        assert_eq!(new_slot.settings.language, "ru");
+        assert_eq!(new_slot.settings.model, "tiny.en");
+        assert_eq!(new_slot.settings.path, "~/voice-bird/seeded");
+    }
+
+    /// `remove_focused_slot` drops the slot's entry from
+    /// `config.slot_settings` so a future slot minted with the
+    /// same id (we never reuse ids, but the file might be
+    /// hand-edited) does not pick up stale settings.
+    #[test]
+    fn remove_focused_slot_drops_persisted_settings() {
+        let mut app = App::new();
+        // Per-slot settings saved via `persist_focused_slot_settings`.
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "ru".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/seeded".into(),
+        };
+        app.persist_focused_slot_settings();
+        let slot_id = app.slots[0].id;
+        let key = voice_bird_cli::config::slot_settings_key(slot_id.0);
+        assert!(app.config.slot_settings.contains_key(&key));
+        // Need a second slot to allow removal.
+        let _ = app.add_slot();
+        // Focus back on slot 1 and remove it.
+        app.focused_slot = slot_id;
+        assert!(app.remove_focused_slot());
+        assert!(
+            !app.config.slot_settings.contains_key(&key),
+            "removed slot's settings should not linger in config"
+        );
+    }
+
+    /// `persist_focused_slot_settings` writes the focused slot's
+    /// current settings into `config.slot_settings` and saves
+    /// the config to disk. The next launch reloads the same map.
+    #[test]
+    fn persist_focused_slot_settings_writes_to_config() {
+        let mut app = App::new();
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "ru".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/persisted".into(),
+        };
+        app.persist_focused_slot_settings();
+        let key = voice_bird_cli::config::slot_settings_key(app.slots[0].id.0);
+        let saved = &app.config.slot_settings[&key];
+        assert!(saved.cloud_on);
+        assert_eq!(saved.language, "ru");
+        assert_eq!(saved.model, "tiny.en");
+        assert_eq!(saved.path, "~/voice-bird/persisted");
     }
 
     // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────

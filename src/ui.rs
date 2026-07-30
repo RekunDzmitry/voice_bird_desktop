@@ -2399,6 +2399,7 @@ mod tests {
             Target::Agent { session_id: "uuid-zoom".into() };
         app.slots[0] = crate::app::Slot {
             id: crate::app::SlotId(1),
+            settings: voice_bird_cli::config::SlotSettings::default(),
             kind: SlotKind::Saved {
                 saved: SavedTranscript {
                     committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
