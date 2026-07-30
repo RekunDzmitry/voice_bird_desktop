@@ -20,6 +20,45 @@ pub enum AudioSessionKind {
     App,
 }
 
+/// Per-slot settings the user can flip from the Mode panel: Cloud
+/// on/off, transcription language (cloud-only), local model, and
+/// the on-disk session output path. Each slot owns its own copy and
+/// changes to one slot do not affect any other — two slots can record
+/// with different cloud/language/model/path simultaneously.
+///
+/// Persisted in `AppConfig::slot_settings` keyed by [`slot_settings_key`]
+/// (the slot's numeric id as a decimal string). The key type is `String`
+/// instead of `SlotId` so this module stays free of the binary's
+/// `app::SlotId` definition — `config.rs` is in the lib crate, `app.rs`
+/// is in the bin crate, and the slot identifier is the only field
+/// the two modules need to share.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotSettings {
+    pub cloud_on: bool,
+    pub language: String,
+    pub model: String,
+    pub path: String,
+}
+
+impl Default for SlotSettings {
+    fn default() -> Self {
+        Self {
+            cloud_on: false,
+            language: "en".into(),
+            model: "distil-small.en".into(),
+            path: "~/voice-bird/sessions".into(),
+        }
+    }
+}
+
+/// String key for one slot's row in `AppConfig::slot_settings`. Stable
+/// across the slot's lifetime — `app::SlotId(2)` is always "2" here.
+/// Kept as a free function (not a method on `SlotSettings`) so the
+/// lib crate can format it without depending on the binary's `SlotId`.
+pub fn slot_settings_key(slot_id: u32) -> String {
+    slot_id.to_string()
+}
+
 /// Settings that can be overridden per source. Stored in
 /// `AppConfig::source_overrides` keyed by `source_id`. When a section
 /// starts, the effective settings are computed by merging the saved
@@ -135,6 +174,21 @@ pub struct AppConfig {
     /// fields above.
     #[serde(default)]
     pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
+
+    /// Per-slot settings the TUI flips from the Mode panel. Key is
+    /// `slot_settings_key(slot_id)` (the slot's numeric id as a
+    /// decimal string); value is the slot's full `SlotSettings`
+    /// (cloud_on, language, model, path). When a slot id has no
+    /// entry yet, the runtime layer (App) seeds it from
+    /// `SlotSettings::default()` on construction.
+    ///
+    /// Coexists with the legacy per-source `source_overrides` map
+    /// and the global `default_model` / `language` / `session_dir`
+    /// fields for the duration of the refactor. Commit 6 deletes
+    /// the legacy fields once every call site reads from
+    /// `slot_settings` instead.
+    #[serde(default)]
+    pub slot_settings: BTreeMap<String, SlotSettings>,
 
     /// User-configured Agent targets. Each entry carries the
     /// `Connection` (e.g. Kafka broker + topic) the TUI uses when
@@ -434,6 +488,7 @@ impl Default for AppConfig {
             voicebird_server_url: default_voicebird_server_url(),
             cloud_broadcast_enabled: false,
             source_overrides: BTreeMap::new(),
+            slot_settings: BTreeMap::new(),
             agent_targets: Vec::new(),
         }
     }
@@ -718,6 +773,7 @@ refinement_beam_size = 5
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
             cloud_broadcast_enabled: true,
             source_overrides: BTreeMap::new(),
+            slot_settings: BTreeMap::new(),
             agent_targets: Vec::new(),
         };
         c.save_to(&path).unwrap();
@@ -1121,5 +1177,91 @@ acks = \"all\"\n\
             "pl"
         );
         assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
+    }
+    // ── Per-slot settings (SlotSettings, slot_settings map) ─────────────
+    //
+    // These pin the storage layer for the per-slot settings refactor:
+    // each slot owns its own Cloud/Language/Model/Path settings, and
+    // AppConfig persists them in a `slot_settings` map keyed by SlotId.
+    // The field and the BTreeMap are added in commit 1;
+    // `slot_settings` is the new source of truth for runtime code.
+
+    #[test]
+    fn slot_settings_default_matches_legacy_appconfig_defaults() {
+        let s = SlotSettings::default();
+        // Cloud off, English, auto-pickable default model, default path.
+        assert!(!s.cloud_on);
+        assert_eq!(s.language, "en");
+        assert_eq!(s.model, "distil-small.en");
+        assert_eq!(s.path, "~/voice-bird/sessions");
+    }
+
+    #[test]
+    fn slot_settings_round_trips_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.slot_settings.insert(
+            slot_settings_key(2),
+            SlotSettings {
+                cloud_on: true,
+                language: "ru".into(),
+                model: "tiny.en".into(),
+                path: "~/voice-bird/slot-two".into(),
+            },
+        );
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.slot_settings.len(), 1);
+        let saved = &loaded.slot_settings[&slot_settings_key(2)];
+        assert!(saved.cloud_on);
+        assert_eq!(saved.language, "ru");
+        assert_eq!(saved.model, "tiny.en");
+        assert_eq!(saved.path, "~/voice-bird/slot-two");
+    }
+
+    #[test]
+    fn slot_settings_keeps_each_slot_independent() {
+        // Two slots, two distinct settings. Editing one must not
+        // touch the other.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.slot_settings.insert(
+            slot_settings_key(1),
+            SlotSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "distil-small.en".into(),
+                path: "~/voice-bird/slot-one".into(),
+            },
+        );
+        c.slot_settings.insert(
+            slot_settings_key(2),
+            SlotSettings {
+                cloud_on: true,
+                language: "ru".into(),
+                model: "tiny.en".into(),
+                path: "~/voice-bird/slot-two".into(),
+            },
+        );
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.slot_settings[&slot_settings_key(1)].cloud_on, false);
+        assert_eq!(loaded.slot_settings[&slot_settings_key(2)].cloud_on, true);
+        assert_ne!(
+            loaded.slot_settings[&slot_settings_key(1)].path,
+            loaded.slot_settings[&slot_settings_key(2)].path,
+        );
+    }
+
+    #[test]
+    fn slot_settings_absent_entry_returns_default() {
+        // A slot not yet in the map gets the default settings.
+        // The runtime layer (App) supplies this via
+        // SlotSettings::default(); the storage layer only
+        // round-trips existing entries.
+        let c = AppConfig::default();
+        assert!(c.slot_settings.is_empty());
     }
 }
