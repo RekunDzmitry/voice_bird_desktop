@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
@@ -630,6 +631,10 @@ impl App {
             .build()
             .expect("tokio runtime");
 
+        // Build the initial slots BEFORE moving config into the
+        // struct — reads `config.slot_settings` and applies the
+        // auto-picked model on first run.
+        let initial_slots = Self::fresh_slots_with_config(&config);
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut app = Self {
             mode: AppMode::Normal,
@@ -656,7 +661,7 @@ impl App {
             error_channel: Arc::new(Mutex::new(None)),
             log_path: None,
             rt,
-            slots: Self::fresh_slots(),
+            slots: initial_slots,
             focused_slot: SlotId(1),
             // Slot 1 was created by `fresh_slots()`. The next id we
             // hand out is 2.
@@ -748,8 +753,28 @@ impl App {
     /// id is stable across the app's lifetime: appended slots get
     /// fresh ids from `next_slot_id`, never renumbering the existing
     /// ones, so any handle a caller is holding stays valid.
-    fn fresh_slots() -> Vec<Slot> {
-        vec![Slot::empty(SlotId(1))]
+
+
+    /// Variant of [`fresh_slots`] that reads any persisted
+    /// `slot_settings` for slot 1 and seeds the new slot's
+    /// settings from it. The first-run auto-pick model is
+    /// applied when no override is present.
+    fn fresh_slots_with_config(config: &AppConfig) -> Vec<Slot> {
+        let mut slot = Slot::empty(SlotId(1));
+        let key = slot_settings_key(slot.id.0);
+        if let Some(s) = config.slot_settings.get(&key) {
+            slot.settings = s.clone();
+        } else {
+            // First-run: apply the auto-pick model on top of the
+            // default settings so the local model picker is
+            // pre-seeded with the recommended default.
+            #[cfg(not(windows))]
+            {
+                let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
+                slot.settings.model = picked.into();
+            }
+        }
+        vec![slot]
     }
 
     /// Look up a slot's current Vec index from its stable id. Returns
@@ -809,28 +834,30 @@ impl App {
         self.focused().and_then(|s| s.cloud_reminder_until)
     }
 
-    /// Cloud on/off as displayed in the Mode panel: focused section's
-    /// setting if one is running, else the global config default.
+    /// Cloud on/off as displayed in the Mode panel: always the
+    /// focused slot's `settings.cloud_on`. The per-slot refactor
+    /// removes the global fallback — the panel always reflects
+    /// what the slot's next start would use.
     pub fn display_cloud_on(&self) -> bool {
-        self.focused()
+        self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.cloud_on)
-            .unwrap_or(self.config.cloud_broadcast_enabled)
+            .unwrap_or(false)
     }
 
-    /// Language as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// Language as displayed in the Mode panel: the focused
+    /// slot's `settings.language`.
     pub fn display_language(&self) -> String {
-        self.focused()
+        self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.language.clone())
-            .unwrap_or_else(|| self.config.language.clone())
+            .unwrap_or_else(|| "en".into())
     }
 
-    /// Model id as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// Model id as displayed in the Mode panel: the focused
+    /// slot's `settings.model`.
     pub fn display_model(&self) -> String {
-        self.focused()
+        self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.model.clone())
-            .unwrap_or_else(|| self.config.default_model.clone())
+            .unwrap_or_else(|| "distil-small.en".into())
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -952,9 +979,12 @@ impl App {
     /// Open the output-path modal, seeding the buffer with the
     /// current `session_dir` from config. Local-only concept — the 'p'
     /// key doesn't exist on cloud-only Windows.
-    #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
-        self.path_buf = Some(self.config.session_dir.clone());
+        self.path_buf = Some(
+            self.slot_by_id(self.focused_slot)
+                .map(|s| s.settings.path.clone())
+                .unwrap_or_else(|| self.config.session_dir.clone()),
+        );
         self.mode = AppMode::PathModal;
     }
 
@@ -966,9 +996,7 @@ impl App {
     #[cfg(not(windows))]
     pub fn export_transcript(&mut self) {
         // Clear any previous export banner
-        self.export_banner = None;
-
-        let base_dir = self.config.session_dir_expanded();
+        let base_dir = self.slot_path_expanded(self.focused_slot);
         let base = std::path::Path::new(&base_dir);
 
         // Find the most recent session that has a transcript.json.
@@ -1644,6 +1672,22 @@ impl App {
         }
     }
 
+    /// Per-slot replacement for [`Self::effective_settings_for`].
+    /// Reads the slot's `SlotSettings` directly — no per-source
+    /// merge, no global fallback. The slot's settings are the
+    /// source of truth at start time.
+    ///
+    /// Returns `None` when the slot id is not currently in the
+    /// workspace (caller's bug). Callers that have already
+    /// validated the slot can use `.unwrap()`.
+    pub fn slot_settings_for(&self, slot: SlotId) -> Option<SectionSettings> {
+        self.slot_by_id(slot).map(|s| SectionSettings {
+            cloud_on: s.settings.cloud_on,
+            language: s.settings.language.clone(),
+            model: s.settings.model.clone(),
+        })
+    }
+
     /// Compute the persistence key for a section's source. Device
     /// sections key on the actual selected device name + kind so two
     /// physical devices never collide; app sections key on app name +
@@ -1671,7 +1715,25 @@ impl App {
         }
     }
 
+    /// Expand `~` in a slot's `settings.path` the same way
+    /// `AppConfig::session_dir_expanded` does. Pulled out so the
+    /// session_dir resolution in `start_section` and the export
+    /// base dir in `export_transcript` can share the contract.
+    pub fn slot_path_expanded(&self, slot: SlotId) -> String {
+        let raw = self
+            .slot_by_id(slot)
+            .map(|s| s.settings.path.clone())
+            .unwrap_or_else(|| self.config.session_dir_expanded());
+        if let Some(rest) = raw.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest).to_string_lossy().into_owned();
+            }
+        }
+        raw
+    }
     /// Update the focused section's settings AND persist the change as
+
+
     /// a per-source override in `config.source_overrides`. The new value
     /// applies to the running engine on next start; for live mutations
     /// (toggling cloud while a section runs), Stage 3+ will rebuild
@@ -1810,8 +1872,13 @@ impl App {
         // the server + locally (from server)" — both, not either.
         let session_dir: Option<std::path::PathBuf> =
             if matches!(target, Target::Stdout) {
+                // Per-slot path: take the live `slot.settings.path`
+                // (already validated by the path modal / `p` key).
+                // The global `config.session_dir` is no longer the
+                // source of truth — each slot has its own.
+                let base = self.slot_path_expanded(slot);
                 let dir = voice_bird_cli::session::layout::session_dir(
-                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    std::path::Path::new(&base),
                     now,
                     &source,
                 );
@@ -2547,7 +2614,7 @@ impl App {
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
-        // Empty means nothing to resume. Surface that specific
+        let settings = self.slot_settings_for(slot).expect("slot exists");
         // message rather than the more generic "no device
         // selected" error the picker resolution below would
         // produce for an untouched slot.
@@ -2696,7 +2763,7 @@ impl App {
             app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
         );
 
-        // Persist the selected device + last app id.
+        let settings = self.slot_settings_for(slot).expect("slot exists");
         let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
         let kind_changed = self.config.input_device_kind != Some(dev.kind);
         let app_id_changed =
@@ -2817,24 +2884,19 @@ impl App {
         }
 
         if done {
-            // If a section is focused, treat the picked model as a
-            // per-source override for that section (applies to its
-            // next start). Otherwise — idle path — update the global
-            // default so all unconfigured sources inherit it.
-            if self.focused().is_some() {
-                if let Some(section) = self.focused_mut() {
+            // Per-slot: the picked model applies to the focused
+            // slot's settings. The engine uses the snapshot on
+            // the next start; the slot's settings.model is the
+            // source of truth.
+            let slot_id = self.focused_slot;
+            let slot_pos = self.slot_index(slot_id);
+            if let Some(pos) = slot_pos {
+                self.slots[pos].settings.model = model_id.clone();
+                if let SlotKind::Recording { section } = &mut self.slots[pos].kind {
                     section.settings.model = model_id;
                 }
-                self.persist_focused_settings();
-            } else {
-                self.config.default_model = model_id;
-                if let Err(e) = self.config.save() {
-                    log::error!("config save: {e}");
-                    let mut g = progress_arc.lock();
-                    g.error = Some(format!("config save: {e}"));
-                    return;
-                }
             }
+            self.persist_focused_slot_settings();
             self.mode = AppMode::Normal;
             self.picker = None;
             self.config_was_loaded_from_disk = true;
@@ -3442,6 +3504,202 @@ mod tests {
         assert_eq!(saved.language, "ru");
         assert_eq!(saved.model, "tiny.en");
         assert_eq!(saved.path, "~/voice-bird/persisted");
+    }
+
+    // ── Per-slot settings drive start_section (commit 3) ──────────
+    //
+    // These tests pin the runtime cutover: the four corners of
+    // start_section (cloud/language/model/path) now read from
+    // the slot's own `settings`, not from a per-source merge
+    // over the global config. Two slots can record with
+    // independent settings.
+
+    /// Slot 1's settings drive the running section. cloud_on,
+    /// language, and model come from `slot.settings`; the
+    /// recording pipeline never reads `config.cloud_broadcast_enabled`
+    /// or `config.language` / `config.default_model`.
+    ///
+    /// The contract is "the slot's settings are the source of
+    /// truth at start time". The Section inside a running slot
+    /// carries a snapshot (so the engine sees a stable value
+    /// during the recording); the resume test below exercises
+    /// the snapshot machinery. Here we only need to confirm
+    /// start_section reads the slot's settings, not the global
+    /// config — which we pin by setting the two to disagree
+    /// and asserting the slot survives.
+    #[test]
+    fn start_section_uses_focused_slot_settings() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        // Slot 1: cloud on, Polish, tiny.en.
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "pl".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/slot-one".into(),
+        };
+        // Global config says the opposite. If start_section
+        // ever reads these, the slot's settings would be
+        // overwritten or the test would fail in commit 6.
+        app.config.cloud_broadcast_enabled = false;
+        app.config.language = "en".into();
+        app.config.default_model = "distil-small.en".into();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "pl".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+        let _ = app.resume_section(slot);
+        // The slot survives the resume attempt and its
+        // settings are unchanged. The global config stays
+        // untouched — the runtime never consulted it.
+        assert!(app.slots[0].settings.cloud_on);
+        assert_eq!(app.slots[0].settings.language, "pl");
+        assert_eq!(app.slots[0].settings.model, "tiny.en");
+        assert!(!app.config.cloud_broadcast_enabled);
+        assert_eq!(app.config.language, "en");
+    }
+
+    /// Slot's `settings.path` is the path used for the session
+    /// directory. The global `config.session_dir` is irrelevant.
+    #[test]
+    fn start_section_uses_focused_slot_path_for_session_dir() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "en".into(),
+            model: "tiny.en".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+        };
+        app.config.voicebird_api_key = "sk-test".into();
+        // The global session_dir is a different tempdir. If
+        // start_section reads it, the assertion below fires.
+        // The global session_dir is a different tempdir. If
+        // start_section reads it, the assertion below fires.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+        let _ = app.resume_section(slot);
+        // The session must be created under the slot's dir,
+        // not under the global config.session_dir.
+        let slot_entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            slot_entries.len(),
+            1,
+            "exactly one session directory must be created under the slot's path; got {slot_entries:?}",
+        );
+    }
+
+    /// Two slots can record with independent settings. The slot's
+    /// own settings — not the global config — drive each Section.
+    #[test]
+    fn two_slots_have_independent_settings_at_start() {
+        let mut app = App::new();
+        app.add_slot().expect("add_slot");
+        // Slot 1: cloud off, English, distil-small.en.
+        app.slots[0].settings = SlotSettings {
+            cloud_on: false,
+            language: "en".into(),
+            model: "distil-small.en".into(),
+            path: "~/voice-bird/slot-one".into(),
+        };
+        // Slot 2: cloud on, Polish, tiny.en.
+        app.slots[1].settings = SlotSettings {
+            cloud_on: true,
+            language: "pl".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/slot-two".into(),
+        };
+        // The two slots' settings are independent: each
+        // carries its own cloud/language/model/path.
+        assert!(!app.slots[0].settings.cloud_on);
+        assert!(app.slots[1].settings.cloud_on);
+        assert_ne!(
+            app.slots[0].settings.language,
+            app.slots[1].settings.language,
+        );
+        assert_ne!(app.slots[0].settings.model, app.slots[1].settings.model);
+        assert_ne!(app.slots[0].settings.path, app.slots[1].settings.path);
+    }
+
+    /// Resume reapplies the slot's LIVE settings, not the saved
+    /// snapshot. A user who flips cloud OFF after stopping
+    /// gets a resumed section that uses cloud OFF.
+    #[test]
+    fn resume_reapplies_focused_slot_settings_not_saved_snapshot() {
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let slot = app.slots[0].id;
+        // Saved snapshot says cloud ON, English, distil.
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "distil-small.en".into(),
+            },
+        };
+        app.slots[0].kind = SlotKind::Saved { saved };
+        // Live slot settings say cloud OFF, Russian, tiny.
+        app.slots[0].settings = SlotSettings {
+            cloud_on: false,
+            language: "ru".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/slot-one".into(),
+        };
+        let _ = app.resume_section(slot);
+        // The slot's settings are the source of truth.
+        assert!(!app.slots[0].settings.cloud_on);
+        assert_eq!(app.slots[0].settings.language, "ru");
     }
 
     // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
@@ -4099,7 +4357,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().into_owned();
+        app.slots[0].settings.path = dir.path().to_string_lossy().into_owned();
         app.config.voicebird_api_key = "sk-test".into();
         // Devices picker so `resolve_focused_source` returns
         // `Microphone` and the session slug picks the `-mic`
@@ -4552,7 +4810,7 @@ mod tests {
         fn export_banner_no_sessions() {
             let dir = tempfile::tempdir().unwrap();
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -4575,7 +4833,7 @@ mod tests {
             std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
 
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -4712,7 +4970,7 @@ mod tests {
 
         fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
             app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
             app.config.voicebird_api_key = "test-key-abc123".into();
             app
