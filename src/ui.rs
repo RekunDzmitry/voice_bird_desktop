@@ -284,8 +284,18 @@ fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
             // the hint on a non-focused slot would mislead.
             // The clear hint (x) is universal and stays on
             // every paused slot.
+            //
+            // Focused variant must fit in 1/3 of a 180-col
+            // terminal (~58 cols; three section columns side
+            // by side, each ~60 cols, no wrap on this
+            // Paragraph). The full form
+            // `[R] resumes · [x] clears · Enter = new session`
+            // is 56 chars and clips in the slot column at
+            // <180 cols. The shorter form keeps the
+            // discoverability (every key + a one-word verb)
+            // without ellipsising.
             let hint_text = if is_focused {
-                "… (paused — [R] resumes · [x] clears · Enter = new session)"
+                "[R] resume · [x] clear · Enter = new"
             } else {
                 "… (paused — press [x] to clear)"
             };
@@ -2579,22 +2589,21 @@ mod tests {
                 },
             };
         }
-
         // Focused = slot A. The focused paused hint
         // must mention R (resume), x (clear), and
         // Enter (new session).
         app.focused_slot = slot_a;
         let out_focused = render_to_string(&app, 180, 40);
         assert!(
-            out_focused.contains("[R] resumes"),
-            "focused paused hint must advertise [R] resumes; got:\n{out_focused}"
+            out_focused.contains("[R] resume"),
+            "focused paused hint must advertise [R] resume; got:\n{out_focused}"
         );
         assert!(
-            out_focused.contains("[x] clears"),
-            "focused paused hint must also advertise [x] clears; got:\n{out_focused}"
+            out_focused.contains("[x] clear"),
+            "focused paused hint must also advertise [x] clear; got:\n{out_focused}"
         );
         assert!(
-            out_focused.contains("Enter = new session"),
+            out_focused.contains("Enter = new"),
             "focused paused hint must clarify Enter starts a new session; got:\n{out_focused}"
         );
 
@@ -2607,7 +2616,7 @@ mod tests {
         app.focused_slot = slot_b;
         let out_unfocused = render_to_string(&app, 180, 40);
         assert!(
-            out_unfocused.contains("[R] resumes"),
+            out_unfocused.contains("[R] resume"),
             "after switching focus to slot B, the focused slot's hint must advertise [R]; got:\n{out_unfocused}"
         );
         assert!(
