@@ -1573,3 +1573,195 @@ mod api_key_dispatcher_K_tests {
         );
     }
 }
+
+// PR #48 review — RED tests. Each test below pins a contract the
+// current code violates; they are expected to FAIL until the
+// matching fix lands. Do not delete a test to make the suite green —
+// implement the fix its comment describes instead.
+#[cfg(test)]
+#[cfg(not(windows))]
+mod pr48_review_red_tests {
+    use super::*;
+    use crate::platform::AudioDevice;
+    use voice_bird_cli::config::{AppConfig, AudioSessionKind, SourceSettingsOverride};
+    use voice_bird_cli::session::layout::SessionSource;
+
+    /// Snapshot of the developer's real `config.toml`, restored on
+    /// drop (including panic unwind) so a RED test in this module
+    /// can exercise handlers that call `config.save()` without
+    /// permanently corrupting the machine's real config. This is a
+    /// band-aid for the exact problem
+    /// `key_handlers_in_tests_must_not_write_real_user_config`
+    /// pins — once config-path injection lands, this guard can go.
+    struct RealConfigGuard {
+        path: std::path::PathBuf,
+        before: Option<Vec<u8>>,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+    impl RealConfigGuard {
+        fn snapshot() -> Self {
+            // Serialize the tests in this module: they all read,
+            // mutate, and restore the same real file, so running
+            // them in parallel would interleave snapshots and
+            // restores nondeterministically.
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let path = AppConfig::config_path().expect("config path");
+            let before = std::fs::read(&path).ok();
+            Self {
+                path,
+                before,
+                _serial: serial,
+            }
+        }
+    }
+    impl Drop for RealConfigGuard {
+        fn drop(&mut self) {
+            match &self.before {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// RED (review item 1) — TODO: implement fix.
+    ///
+    /// `K` opens the API-key modal from anywhere, and the modal's
+    /// "Current key:" line invites opening it just to *look* at the
+    /// saved key. But the Esc arm of `handle_api_key_modal` was
+    /// written for the one flow that existed before `K`: the
+    /// cloud-toggle-needs-a-key funnel. It unconditionally sets
+    /// `cloud_broadcast_enabled = false` and saves — so peek-and-Esc
+    /// silently disables cloud (and, because it does not touch the
+    /// per-source override, recreates the panel/override
+    /// disagreement the idle-`c` fix in this PR just resolved).
+    ///
+    /// Fix: track how the modal was opened (e.g. an
+    /// `api_key_modal_reverts_cloud: bool` set by the cloud-enable
+    /// flow, cleared by the `K` path) and only revert cloud when
+    /// the modal was opened as the cloud-enable gate.
+    #[test]
+    fn esc_after_k_peek_must_not_disable_cloud() {
+        let _guard = RealConfigGuard::snapshot();
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = true;
+
+        // The user peeks at the saved key via K…
+        handle_normal_mode(&mut app, KeyCode::Char('K'));
+        assert_eq!(app.mode, AppMode::ApiKeyModal, "K must open the modal");
+
+        // …and backs out without changing anything.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_api_key_modal(&mut app, &esc);
+
+        assert_eq!(app.mode, AppMode::Normal, "Esc must close the modal");
+        assert!(
+            app.config.cloud_broadcast_enabled,
+            "Esc from a K-opened (peek) modal must NOT disable cloud — \
+             the cancel-reverts-cloud behaviour only makes sense when the \
+             modal was opened by the cloud-enable flow that needs a key"
+        );
+    }
+
+    /// RED (review item 2) — TODO: implement fix.
+    ///
+    /// `AppConfig::save()` writes to the machine's real config path
+    /// (`~/…/voice-bird/config.toml`), and `App::new()` loads from
+    /// it. Tests that drive real key handlers therefore READ the
+    /// developer's config and WRITE flipped state back to it —
+    /// `c_toggle_when_no_section_focused_updates_per_source_override`
+    /// already persists a flipped cloud flag, a synthetic
+    /// per-source override, and its in-memory `sk-test` API key
+    /// over the developer's real key on every `cargo test` run.
+    /// (The "sk-test pollution" mentioned in the API-key commits is
+    /// this suite's own doing.)
+    ///
+    /// Fix: inject the config path — an env-var override in
+    /// `AppConfig::config_path()` (set to a tempdir in tests) or an
+    /// `App::with_config(AppConfig)` seam that skips disk entirely.
+    #[test]
+    fn key_handlers_in_tests_must_not_write_real_user_config() {
+        let guard = RealConfigGuard::snapshot();
+        let before = guard.before.clone();
+
+        // Drive the idle `c` toggle — its else-branch calls
+        // `app.config.save()` unconditionally today.
+        let mut app = App::new();
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+        let after = std::fs::read(&guard.path).ok();
+        assert_eq!(
+            before, after,
+            "driving a key handler in a unit test must not rewrite the \
+             developer's real config.toml at {} — inject the config path \
+             (env override or App::with_config) so tests run against a \
+             tempdir",
+            guard.path.display()
+        );
+    }
+
+    /// RED (review item 8) — TODO: implement fix.
+    ///
+    /// The idle Mode panel displays the GLOBAL flag
+    /// (`cloud_broadcast_enabled`), but the idle `c` toggle seeds
+    /// its flip from the per-source OVERRIDE's current value. When
+    /// the two disagree (a stale override — the very scenario the
+    /// idle-`c` fix targets), the first press appears to do
+    /// nothing: panel shows "Cloud: ON", the user presses `c`
+    /// expecting OFF, and both values land on ON.
+    ///
+    /// Fix: seed the flip from the displayed (global) value —
+    /// `let on = !app.config.cloud_broadcast_enabled;` — and write
+    /// that to both the global flag and the per-source override, so
+    /// one press always visibly toggles the advertised state.
+    #[test]
+    fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
+        let _guard = RealConfigGuard::snapshot();
+        let mut app = App::new();
+
+        // Panel says ON (global flag)…
+        app.config.cloud_broadcast_enabled = true;
+        // …but a stale per-source override says OFF for the source
+        // the picker currently resolves to.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let key = app.source_key_for(&SessionSource::Microphone);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+
+        // The user sees "Cloud: ON" and presses `c` to turn it OFF.
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+        assert!(
+            !app.config.cloud_broadcast_enabled,
+            "the toggle must flip the DISPLAYED state: panel showed ON, so \
+             one press of `c` must land on OFF — seeding the flip from the \
+             stale override (OFF→ON) makes the first press a visible no-op"
+        );
+        assert!(
+            !app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("override must survive the toggle")
+                .cloud_on,
+            "the per-source override must agree with the newly displayed \
+             state (OFF) after the toggle"
+        );
+    }
+}
