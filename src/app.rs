@@ -1337,8 +1337,13 @@ impl App {
         // Drop any persisted per-slot settings for the removed id
         // so a future slot with the same id (we never reuse them,
         // but a hand-edited config could) doesn't pick up the
-        // stale settings.
+        // stale settings. Then save — without the save, the row
+        // survives on disk and the next launch reads settings for
+        // a slot the user deleted.
         self.config.slot_settings.remove(&slot_settings_key(id.0));
+        if let Err(e) = self.config.save() {
+            log::error!("config save (slot remove): {e}");
+        }
         // If the focused slot also had a pending target override,
         // drop it — the slot id is gone from the Vec and we don't
         // want the override to silently re-apply to a future slot.
