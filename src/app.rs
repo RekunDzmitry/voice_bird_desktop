@@ -597,11 +597,28 @@ impl App {
             .as_ref()
             .map(|p| !p.exists())
             .unwrap_or(false);
-        // First-run save happens AFTER `fresh_slots_with_config`
-        // below — the auto-picked model lands on the slot's
-        // settings, and that is exactly what needs to land on disk.
-        // Saving here would write an empty slot_settings map.
-
+        // S5 migration: an existing user's pre-per-slot
+        // config.toml carries `default_model` / `language` /
+        // `session_dir` / `cloud_broadcast_enabled` on the
+        // global config. The lenient parser accepted them
+        // but the new schema dropped them silently. Lift
+        // them into slot 1's settings once, latch, save.
+        if let Some((model, language, path, cloud_on)) =
+            config.legacy_migration_source()
+        {
+            let key = slot_settings_key(1);
+            let mut migrated = config.slot_settings.get(&key).cloned()
+                .unwrap_or_default();
+            migrated.model = model;
+            migrated.language = language;
+            migrated.path = path;
+            migrated.cloud_on = cloud_on;
+            config.slot_settings.insert(key, migrated);
+            config.complete_legacy_migration();
+            if let Err(e) = config.save() {
+                log::warn!("config save (legacy migration): {e}");
+            }
+        }
         // macOS screen-recording permission check. The block is
         // gated on `cfg(target_os = "macos")` so the variable
         // is only live on macOS — the cloud-on banner is
