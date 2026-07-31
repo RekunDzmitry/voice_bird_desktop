@@ -288,10 +288,14 @@ pub fn handle(state: &ServerState, req: &JsonRpcRequest) -> Option<JsonRpcRespon
                         .and_then(|v| v.as_u64())
                         .unwrap_or(50)
                         .min(1024) as usize;
+                    // Clamp rather than truncate: `as u32` on an
+                    // out-of-range id would alias a different slot's
+                    // live file.
                     let slot_id = args
                         .get("slot_id")
                         .and_then(|v| v.as_u64())
-                        .unwrap_or(1) as u8;
+                        .unwrap_or(1)
+                        .min(u32::MAX as u64) as u32;
                     // Read from the cross-process live tail. The TUI
                     // (separate process when the agent runtime
                     // spawns this binary) appends each committed
@@ -426,7 +430,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot: u8 = 1;
+        let slot: u32 = 1;
         crate::agent::live::truncate_slot(slot).unwrap();
         for i in 0..5u64 {
             crate::agent::live::append(

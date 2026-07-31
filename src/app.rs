@@ -369,7 +369,20 @@ pub struct App {
     /// `App::new` populates it from `AppConfig::config_path()`;
     /// `App::new_with_config_path` lets tests inject a private
     /// tempdir without touching the process-global env var.
-    pub config_path: PathBuf,
+    ///
+    /// `None` when the path could not be resolved at all (no
+    /// `dirs::config_dir()`). The App still boots — from defaults,
+    /// in memory — and [`Self::save_config`] reports the failure
+    /// instead of panicking at startup.
+    pub config_path: Option<PathBuf>,
+
+    /// True when the on-disk config existed but failed to parse.
+    /// Latches for the process lifetime and makes every
+    /// [`Self::save_config`] refuse: booting from defaults is
+    /// recoverable, but writing those defaults back would destroy
+    /// the API key, devices, and agent targets the user still has
+    /// in the file. They fix or delete `config.toml` and restart.
+    pub config_load_failed: bool,
 
     /// In-flight text buffer for the API-key modal. `None` when the
     /// modal isn't open. Repurposed from the old per-field settings
@@ -566,27 +579,39 @@ impl App {
     /// [`Self::new_with_config_path`] over the env-var dance — the
     /// env var is process-global and races with parallel tests.
     pub fn new() -> Self {
-        // Test builds only: install the process-local config
-        // tempdir before the first `AppConfig::config_path()`,
-        // so every test that constructs an `App` reads from and
-        // saves to the tempdir instead of the developer's real
-        // `config.toml`. The deref MUST be cfg(test)-gated:
-        // `INSTALL_TEST_CONFIG`'s init unconditionally redirects
-        // `AppConfig::config_path()` to a fresh empty tempdir, so
-        // running it in production would make every launch boot
-        // from defaults and write settings into /tmp.
+        // Test builds only. Two layers, both cfg(test)-gated because
+        // either one in production would make every launch boot from
+        // defaults and write settings into /tmp:
+        //
+        // 1. `INSTALL_TEST_CONFIG` redirects `AppConfig::config_path()`
+        //    at a process-wide tempdir, so anything still reading the
+        //    env var stays off the developer's real `config.toml`.
+        // 2. Each `App` then gets its OWN config file. `App` persists
+        //    the slot layout now (`add_slot`, `remove_focused_slot`),
+        //    so a single shared file would leak one test's slots into
+        //    the next test's `App::new()` and make slot ids depend on
+        //    execution order.
         #[cfg(test)]
-        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+        {
+            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            Self::new_with_config_path(voice_bird_cli::test_utils::fresh_test_config_path())
+        }
         // Resolve the path first so all load/save calls in this
         // function (and every `self.save_config()` later) use the
-        // same target. The resolution itself honours the
-        // `VOICE_BIRD_TEST_CONFIG_PATH` env var so the existing
-        // test fixture continues to work; tests that need a
-        // private tempdir should prefer
-        // [`Self::new_with_config_path`] over the env-var dance.
-        let config_path = AppConfig::config_path()
-            .expect("voice-bird config dir must exist");
-        Self::new_with_config_path(config_path)
+        // same target.
+        //
+        // An unresolvable path (no `dirs::config_dir()`) is not
+        // fatal: the App boots from defaults in memory and
+        // `save_config` reports the failure. Panicking here would
+        // turn a degraded boot into a crash on launch.
+        #[cfg(not(test))]
+        match AppConfig::config_path() {
+            Ok(p) => Self::new_with_config_path(p),
+            Err(e) => {
+                log::error!("config path unresolved, running from defaults: {e}");
+                Self::new_with_optional_config_path(None)
+            }
+        }
     }
 
     /// Construct an `App` bound to a specific on-disk config path.
@@ -596,28 +621,39 @@ impl App {
     /// against a private tempdir, with no shared state between
     /// parallel tests.
     pub fn new_with_config_path(config_path: PathBuf) -> Self {
+        Self::new_with_optional_config_path(Some(config_path))
+    }
+
+    /// Shared constructor. `None` means the config path could not be
+    /// resolved — the App runs entirely in memory and every save is
+    /// refused.
+    pub fn new_with_optional_config_path(config_path: Option<PathBuf>) -> Self {
         // Track whether the load actually returned a parsed config.
         // The previous flag (`config_path.exists()`) read the file
         // system, but parse failure produces defaults that the next
         // `config.save()` would happily overwrite the user's API key,
-        // devices, and agent targets with. Only treat the run as
-        // "loaded from disk" when the load succeeded AND the file
-        // existed; only save defaults when the file was absent.
-        let config_load_result = if config_path.exists() {
-            AppConfig::load_from(&config_path)
-        } else {
-            Ok(AppConfig::default())
+        // devices, and agent targets with. So: only save defaults
+        // when the file was absent, and latch `config_load_failed`
+        // when it was present but unreadable so no later save can
+        // clobber it either.
+        let config_file_exists = config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        let config_load_result = match (&config_path, config_file_exists) {
+            (Some(p), true) => AppConfig::load_from(p),
+            _ => Ok(AppConfig::default()),
         };
+        let config_load_failed = config_load_result.is_err();
         let mut config = match &config_load_result {
             Ok(c) => c.clone(),
             Err(e) => {
-                log::error!(
-                    "config load failed, leaving the on-disk file untouched: {e}"
-                );
+                log::error!("config load failed, leaving the on-disk file untouched: {e}");
                 AppConfig::default()
             }
         };
-        let config_was_loaded_from_disk = config_load_result.is_ok();
+        // "First run" means no file at all. A file that exists but
+        // failed to parse is NOT a first run — forcing the
+        // un-cancellable first-run model picker on top of a broken
+        // config would trap the user in a modal with no explanation.
+        let config_was_loaded_from_disk = config_file_exists;
 
         // First-run auto-pick: the slot's settings already carry
         // the auto-picked model (applied in fresh_slots_with_config
@@ -626,27 +662,27 @@ impl App {
         // the next launch reads the same map. A failed parse keeps
         // the original file untouched so the user can recover by
         // hand; we boot from defaults in memory only.
-        let config_was_absent = !config_path.exists();
+        let config_was_absent = config_path.is_some() && !config_file_exists;
         // S5 migration: an existing user's pre-per-slot
         // config.toml carries `default_model` / `language` /
         // `session_dir` / `cloud_broadcast_enabled` on the
         // global config. The lenient parser accepted them
-        // but the new schema dropped them silently. Lift
-        // them into slot 1's settings once, latch, save.
-        if let Some((model, language, path, cloud_on)) =
-            config.legacy_migration_source()
-        {
+        // but the new schema dropped them silently. Lift them
+        // into slot 1's settings and save; the legacy fields are
+        // `skip_serializing`, so that save is what retires them.
+        if let Some((model, language, path, cloud_on)) = config.legacy_migration_source() {
             let key = slot_settings_key(1);
-            let mut migrated = config.slot_settings.get(&key).cloned()
-                .unwrap_or_default();
+            let mut migrated = config.slot_settings.get(&key).cloned().unwrap_or_default();
             migrated.model = model;
             migrated.language = language;
             migrated.path = path;
             migrated.cloud_on = cloud_on;
             config.slot_settings.insert(key, migrated);
             config.complete_legacy_migration();
-            if let Err(e) = config.save_to(&config_path) {
-                log::warn!("config save (legacy migration): {e}");
+            if let Some(p) = &config_path {
+                if let Err(e) = config.save_to(p) {
+                    log::warn!("config save (legacy migration): {e}");
+                }
             }
         }
         // macOS screen-recording permission check. The block is
@@ -654,17 +690,19 @@ impl App {
         // is only live on macOS — the cloud-on banner is
         // computed after `app` is built below.
         #[cfg(target_os = "macos")]
-        let macos_banner: Option<String> =
-            if !voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted() {
+        let macos_banner: Option<String> = {
+            use voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted;
+            if screen_recording_permission_granted() {
+                None
+            } else {
                 Some(
                     "Screen Recording permission required for system / per-app audio — \
                      System Settings → Privacy & Security → Screen Recording → enable \
                      your terminal (or voice-bird), then restart"
                         .into(),
                 )
-            } else {
-                None
-            };
+            }
+        };
         #[cfg(not(target_os = "macos"))]
         let macos_banner: Option<String> = None;
 
@@ -682,8 +720,7 @@ impl App {
         // rebuilt from `config.slot_settings`. Captured here, before
         // `initial_slots` is moved into `slots`, so a freshly-added
         // slot can never collide with a persisted one.
-        let next_slot_id =
-            initial_slots.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
+        let next_slot_id = initial_slots.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
         // First-run persistence: the slots above carry the
         // auto-picked model on slot 1 (and any other propagated
         // defaults). Mirror each slot's settings into
@@ -692,13 +729,14 @@ impl App {
         // existing users aren't silently re-seeded.
         if config_was_absent {
             for slot in &initial_slots {
-                config.slot_settings.insert(
-                    slot_settings_key(slot.id.0),
-                    slot.settings.clone(),
-                );
+                config
+                    .slot_settings
+                    .insert(slot_settings_key(slot.id.0), slot.settings.clone());
             }
-            if let Err(e) = config.save_to(&config_path) {
-                log::error!("config save (first run): {e}");
+            if let Some(p) = &config_path {
+                if let Err(e) = config.save_to(p) {
+                    log::error!("config save (first run): {e}");
+                }
             }
         }
         #[cfg_attr(not(windows), allow(unused_mut))]
@@ -733,13 +771,15 @@ impl App {
             picker: None,
             config_was_loaded_from_disk,
             config_path,
+            config_load_failed,
             api_key_buf: None,
             api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
-            // Banner: macOS screen-recording OR cloud-on-no-key OR None.
-            // The cloud check runs after app build and overwrites this
-        // when the slot's settings.cloud_on is true with no key.
+            // Seeded with the macOS Screen-Recording warning (or
+            // `None`). The two higher-priority launch banners —
+            // unreadable config, cloud-on-with-no-key — are layered
+            // on after the struct is built, below.
             banner: macos_banner,
             transcript_scroll: 0,
             transcript_follow: true,
@@ -769,11 +809,21 @@ impl App {
         // clobber it. The cloud-on-no-key banner takes precedence
         // because it requires an active user decision (paste a key);
         // the permission banner is a passive nag.
-        let cloud_on_no_key = app.slots[0].settings.cloud_on
-            && app.config.voicebird_api_key.is_empty();
+        let cloud_on_no_key =
+            app.slots[0].settings.cloud_on && app.config.voicebird_api_key.is_empty();
         if cloud_on_no_key {
-            app.banner =
-                Some("Cloud is on but no API key — press 'c' to paste one".into());
+            app.banner = Some("Cloud is on but no API key — press 'c' to paste one".into());
+        }
+        // Highest priority: the config exists but could not be read.
+        // The App is running from defaults and every save is refused
+        // (see `save_config`), so the user must be told — otherwise
+        // their settings appear to have silently vanished.
+        if app.config_load_failed {
+            app.banner = Some(
+                "config.toml could not be read — running from defaults and \
+                 NOT saving. Fix or delete it, then restart."
+                    .into(),
+            );
         }
         app.load_agent_targets_from_config();
         // user must provide before recording.
@@ -839,8 +889,27 @@ impl App {
     /// method routes every write through the path the `App` was
     /// constructed with, so an `App::new_with_config_path(test_path)`
     /// never writes the developer's real `config.toml`.
+    ///
+    /// Refuses in two cases, both of which would otherwise destroy
+    /// user data or write to an arbitrary location:
+    ///
+    /// * the on-disk config exists but failed to parse — the App is
+    ///   running from defaults, and persisting those defaults would
+    ///   discard the API key, devices, and agent targets that are
+    ///   still in the file. Gating only `App::new` is not enough:
+    ///   the very next `c` toggle or model pick would clobber it.
+    /// * no config path could be resolved at all.
     pub fn save_config(&self) -> anyhow::Result<()> {
-        self.config.save_to(&self.config_path)
+        if self.config_load_failed {
+            anyhow::bail!(
+                "refusing to save: config.toml could not be read at launch; \
+                 fix or delete it, then restart"
+            );
+        }
+        let Some(path) = &self.config_path else {
+            anyhow::bail!("refusing to save: no config path could be resolved");
+        };
+        self.config.save_to(path)
     }
 
     // -- Slot helpers -------------------------------------------------------
@@ -857,6 +926,13 @@ impl App {
     /// Slot 1's settings are seeded from any persisted entry; on
     /// first run the auto-pick model is applied on top of
     /// `SlotSettings::default()`.
+    ///
+    /// Restore is capped at `MAX_SECTIONS`, the same cap `add_slot`
+    /// enforces. Without it a config carrying more entries (grown by
+    /// an older build that never pruned them, or hand-edited) would
+    /// open more panes at launch than the user could ever create with
+    /// `+`, each too narrow to read. The surplus entries are left in
+    /// the file — dropping them would be a destructive surprise.
     fn fresh_slots_with_config(config: &AppConfig) -> Vec<Slot> {
         // Collect the persisted ids in ascending order so the slot
         // Vec mirrors the user's working layout.
@@ -868,6 +944,17 @@ impl App {
         ids.sort_unstable();
         if !ids.contains(&1) {
             ids.insert(0, 1);
+        }
+        if ids.len() > MAX_SECTIONS {
+            let dropped = &ids[MAX_SECTIONS..];
+            log::warn!(
+                "config carries {} slot entries, more than MAX_SECTIONS ({}); \
+                 not opening slots {:?} (their settings stay in config.toml)",
+                ids.len(),
+                MAX_SECTIONS,
+                dropped,
+            );
+            ids.truncate(MAX_SECTIONS);
         }
         ids.into_iter()
             .map(|raw_id| {
@@ -1354,6 +1441,12 @@ impl App {
         new_slot.settings = seed;
         self.slots.push(new_slot);
         self.focused_slot = id;
+        // Persist immediately. Restore rebuilds the workspace from
+        // `config.slot_settings`, so a slot that is never persisted
+        // silently disappears at the next launch — a `+` press
+        // followed by no `c`/`l`/`m`/`p` flip would be forgotten.
+        // Removal saves too, so the map tracks the live layout.
+        self.persist_focused_slot_settings();
         Some(id)
     }
 
@@ -1910,12 +2003,12 @@ impl App {
         if matches!(target, Target::Agent { .. }) {
             // Truncate the per-slot live tail so a fresh recording
             // does not pick up segments left by a previous session
-            // on the same slot. Slot ids come from `next_slot_id`
-            // which monotonically grows up to `MAX_SECTIONS` (8) and
-            // is never reused, so the cast to `u8` is lossless and
-            // the live file path stays unique per slot.
-            let slot_u8 = slot.0 as u8;
-            if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot_u8) {
+            // on the same slot. The id is passed through at full
+            // width: ids are never reused and now also come back
+            // from `config.slot_settings`, so narrowing to `u8`
+            // would let e.g. slot 999 and slot 1255 collide on one
+            // live file.
+            if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot.0) {
                 log::warn!("agent live truncate: {e}");
             }
         }
@@ -1938,31 +2031,33 @@ impl App {
         // "should we keep a local copy?". The user-facing picker
         // for `Stdout + Cloud ON` reads as "transcript streamed to
         // the server + locally (from server)" — both, not either.
-        let session_dir: Option<std::path::PathBuf> =
-            if matches!(target, Target::Stdout) {
-                // Per-slot path: take the live `slot.settings.path`
-                // (already validated by the path modal / `p` key).
-                // The global `config.session_dir` is no longer the
-                // source of truth — each slot has its own.
-                let base = self.slot_path_expanded(slot);
-                let dir = voice_bird_cli::session::layout::session_dir(
-                    std::path::Path::new(&base),
-                    now,
-                    &source,
-                );
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    return Err(format!("create session dir: {e}"));
-                }
-                Some(dir)
-            } else {
-                None
-            };
+        let session_dir: Option<std::path::PathBuf> = if matches!(target, Target::Stdout) {
+            // Per-slot path: take the live `slot.settings.path`
+            // (already validated by the path modal / `p` key).
+            // The global `config.session_dir` is no longer the
+            // source of truth — each slot has its own.
+            let base = self.slot_path_expanded(slot);
+            let dir = voice_bird_cli::session::layout::session_dir(
+                std::path::Path::new(&base),
+                now,
+                &source,
+            );
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return Err(format!("create session dir: {e}"));
+            }
+            Some(dir)
+        } else {
+            None
+        };
 
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
         let (committed, refined) = match &self.slots[pos].kind {
             SlotKind::Saved { saved } => (saved.committed.clone(), saved.refined.clone()),
-            _ => (Arc::new(PlMutex::new(Vec::new())), Arc::new(PlMutex::new(Vec::new()))),
+            _ => (
+                Arc::new(PlMutex::new(Vec::new())),
+                Arc::new(PlMutex::new(Vec::new())),
+            ),
         };
         let tentative: Arc<PlMutex<String>> = Arc::new(PlMutex::new(String::new()));
         let engine_error_channel: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2400,8 +2495,9 @@ impl App {
                         // process; the live file is the
                         // `pull_recent`.
                         if let Some(live) = live_seg {
-                            let slot_u8 = slot_for_consumer.0 as u8;
-                            if let Err(e) = voice_bird_cli::agent::live::append(slot_u8, &live) {
+                            if let Err(e) =
+                                voice_bird_cli::agent::live::append(slot_for_consumer.0, &live)
+                            {
                                 log::warn!("agent live append: {e}");
                             }
                         }
@@ -5221,32 +5317,19 @@ mod tests {
     }
 }
 
-// ── Per-slot refactor: review contracts (RED) ─────────────────────────
+// ── Per-slot refactor: review contracts ───────────────────────────────
 //
 // These tests pin the blocking / should-fix findings from the review of
-// the per-slot settings refactor. They are expected to FAIL against the
-// current code — each one is the executable statement of a contract the
-// refactor broke or left unfinished. See the review list for the
-// numbering (B1-B3 blocking, S4-S9 should-fix).
+// the per-slot settings refactor — each one is the executable statement
+// of a contract the refactor broke or left unfinished. They landed RED
+// and are green as of the fixes in this branch. See the review list for
+// the numbering (B1-B3 blocking, S4-S9 should-fix).
 //
-// Config isolation: `App::new()` reads and writes the path in
-// `VOICE_BIRD_TEST_CONFIG_PATH`, which `test_utils::INSTALL_TEST_CONFIG`
-// points at ONE process-wide tempdir shared by every test. Tests here
-// that assert on file contents need their own file, so `ConfigFileGuard`
-// repoints the env var at a private tempdir and restores it on drop.
-// The env var is process-global, so those tests serialize on
-// `CONFIG_FILE_LOCK` — that keeps them from racing each other, though
-// not from a pre-existing test in another module saving a config
-// mid-window. Making this airtight wants an injectable config path on
-// `App` (e.g. `App::with_config_path`); the current global is why these
-// contracts have no cheaper test.
-// Config isolation: with the per-App config path now injectable
-// via `App::new_with_config_path`, each review test gets its own
-// private tempdir. The previous `ConfigFileGuard` mutated the
-// process-global `VOICE_BIRD_TEST_CONFIG_PATH` env var, which
-// raced with parallel tests reading the same env var. The new
-// fixture returns a path; tests construct `App::new_with_config_path(path)`
-// directly.
+// Config isolation: the per-App config path is injectable via
+// `App::new_with_config_path`, so each test here gets its own private
+// tempdir. `ConfigFileGuard` just owns that tempdir for the test's
+// lifetime — no process-global `VOICE_BIRD_TEST_CONFIG_PATH` mutation,
+// so parallel tests never race on one shared config file.
 #[cfg(test)]
 mod per_slot_review_contracts {
     use super::*;
@@ -5272,7 +5355,6 @@ mod per_slot_review_contracts {
             &self.path
         }
     }
-
 
     /// A config body that parses: only the four fields without a serde
     /// default are mandatory. `extra` is appended verbatim.
@@ -5329,9 +5411,7 @@ mod per_slot_review_contracts {
     #[test]
     fn macos_permission_banner_is_not_clobbered_by_the_cloud_key_check() {
         if voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted() {
-            eprintln!(
-                "skipping: Screen Recording is granted, so no banner is expected"
-            );
+            eprintln!("skipping: Screen Recording is granted, so no banner is expected");
             return;
         }
         let guard = ConfigFileGuard::new();
@@ -5364,8 +5444,7 @@ mod per_slot_review_contracts {
         let app = App::new_with_config_path(guard.path().to_path_buf());
         let key = slot_settings_key(app.slots[0].id.0);
 
-        let on_disk = AppConfig::load_from(guard.path())
-            .expect("first run must write a config");
+        let on_disk = AppConfig::load_from(guard.path()).expect("first run must write a config");
         let saved = on_disk.slot_settings.get(&key).expect(
             "first run must persist slot 1's settings, including the \
              auto-picked model",
@@ -5571,6 +5650,167 @@ mod per_slot_review_contracts {
             !on_disk.slot_settings.contains_key(&key),
             "removing a slot must save the config — otherwise the deleted \
              slot's settings come back at the next launch",
+        );
+    }
+
+    // ── Second-round review fixes ─────────────────────────────────
+    //
+    // Contracts added after the review of the fixes themselves.
+
+    /// B1, the half that the first fix missed. `App::new` no longer
+    /// overwrites an unparseable config, but the protection has to
+    /// outlive construction: the very next action that persists (a
+    /// `c` toggle, a model pick, a device selection) called
+    /// `save_config` and wrote defaults over the file. Gating only
+    /// the constructor moved the data loss one keystroke away.
+    #[test]
+    fn a_later_save_also_refuses_to_clobber_an_unparseable_config() {
+        let guard = ConfigFileGuard::new();
+        let original = config_toml("voicebird_api_key = \"sk-users-real-key\"\n")
+            .replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
+        std::fs::write(guard.path(), &original).unwrap();
+
+        let mut app = App::new_with_config_path(guard.path().to_path_buf());
+        assert!(app.config_load_failed, "setup: the load must have failed");
+
+        // The user flips cloud on slot 1 — a normal, persisting action.
+        app.slots[0].settings.cloud_on = true;
+        app.persist_focused_slot_settings();
+        assert!(
+            app.save_config().is_err(),
+            "save_config must refuse while the on-disk config is unreadable",
+        );
+
+        let after = std::fs::read_to_string(guard.path()).unwrap();
+        assert_eq!(
+            after, original,
+            "a save after launch must leave the unreadable config alone too — \
+             otherwise the constructor guard just delays the data loss",
+        );
+    }
+
+    /// The user has to be told. An unreadable config means the App is
+    /// running from defaults and refusing to save; without a banner
+    /// the settings simply appear to have vanished, and the next
+    /// launch looks the same.
+    #[test]
+    fn an_unreadable_config_is_surfaced_in_the_launch_banner() {
+        let guard = ConfigFileGuard::new();
+        let broken = config_toml("").replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
+        std::fs::write(guard.path(), broken).unwrap();
+
+        let app = App::new_with_config_path(guard.path().to_path_buf());
+
+        let banner = app.banner.as_deref().unwrap_or_default();
+        assert!(
+            banner.contains("config.toml"),
+            "the launch banner must name the unreadable config; got {banner:?}",
+        );
+    }
+
+    /// An unreadable config is not a first run. Treating it as one
+    /// flips `config_was_loaded_from_disk` to false, which makes the
+    /// model picker refuse to Esc-cancel — trapping the user in a
+    /// modal because of a file they were never told about.
+    #[test]
+    fn an_unreadable_config_is_not_treated_as_a_first_run() {
+        let guard = ConfigFileGuard::new();
+        let broken = config_toml("").replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
+        std::fs::write(guard.path(), broken).unwrap();
+
+        let app = App::new_with_config_path(guard.path().to_path_buf());
+
+        assert!(
+            app.config_was_loaded_from_disk,
+            "a config file that exists but fails to parse is not a first run",
+        );
+    }
+
+    /// An unresolvable config path must not panic the launch.
+    /// `App::new` previously `expect`ed the path, turning a missing
+    /// `dirs::config_dir()` into a crash on startup instead of a
+    /// degraded in-memory session.
+    #[test]
+    fn an_unresolvable_config_path_boots_instead_of_panicking() {
+        let app = App::new_with_optional_config_path(None);
+        assert!(app.config_path.is_none());
+        assert_eq!(app.slots.len(), 1, "the App still boots with slot 1");
+        assert!(
+            app.save_config().is_err(),
+            "with nowhere to save, save_config must report it rather than \
+             silently succeed",
+        );
+    }
+
+    /// Restore is capped at `MAX_SECTIONS`. A config carrying more
+    /// entries — grown by an older build, or hand-edited — must not
+    /// open more panes than `add_slot` would ever allow, each too
+    /// narrow to read.
+    #[test]
+    fn restore_is_capped_at_max_sections() {
+        let guard = ConfigFileGuard::new();
+        let mut c = AppConfig::default();
+        for id in 1..=(MAX_SECTIONS as u32 + 4) {
+            c.slot_settings.insert(
+                slot_settings_key(id),
+                SlotSettings {
+                    cloud_on: false,
+                    language: "en".into(),
+                    model: "tiny.en".into(),
+                    path: format!("~/voice-bird/slot-{id}"),
+                },
+            );
+        }
+        c.save_to(guard.path()).unwrap();
+
+        let app = App::new_with_config_path(guard.path().to_path_buf());
+
+        assert_eq!(
+            app.slots.len(),
+            MAX_SECTIONS,
+            "restore must honour the same cap as add_slot",
+        );
+        // The surplus entries stay in the file — dropping a user's
+        // settings on read would be a destructive surprise.
+        let on_disk = AppConfig::load_from(guard.path()).unwrap();
+        assert_eq!(on_disk.slot_settings.len(), MAX_SECTIONS + 4);
+    }
+
+    /// `add_slot` persists the new slot. Restore rebuilds the
+    /// workspace from `config.slot_settings`, so a slot that is never
+    /// persisted disappears at the next launch — pressing `+` and
+    /// then changing nothing would silently lose the slot.
+    #[test]
+    fn add_slot_persists_so_the_layout_survives_a_relaunch() {
+        let guard = ConfigFileGuard::new();
+        let mut app = App::new_with_config_path(guard.path().to_path_buf());
+        let added = app.add_slot().expect("add_slot under MAX_SECTIONS");
+
+        let on_disk = AppConfig::load_from(guard.path()).unwrap();
+        assert!(
+            on_disk
+                .slot_settings
+                .contains_key(&slot_settings_key(added.0)),
+            "a `+` press must reach disk even with no settings flip",
+        );
+
+        // Relaunch against the same file: the layout comes back.
+        let relaunched = App::new_with_config_path(guard.path().to_path_buf());
+        assert_eq!(relaunched.slots.len(), 2);
+        assert!(relaunched.slots.iter().any(|s| s.id == added));
+    }
+
+    /// Slot ids reach the agent live tail at full width. They are
+    /// never reused and now also come back from `config.slot_settings`,
+    /// so narrowing to `u8` would let two slots (e.g. 999 and 1255)
+    /// alias one live file and cross-feed each other's segments.
+    #[test]
+    fn agent_live_paths_do_not_alias_across_wide_slot_ids() {
+        let a = voice_bird_cli::agent::live::live_path(999);
+        let b = voice_bird_cli::agent::live::live_path(999 + 256);
+        assert_ne!(
+            a, b,
+            "slot ids 256 apart must not share a live file: {a:?} vs {b:?}",
         );
     }
 }

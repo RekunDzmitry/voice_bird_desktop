@@ -37,7 +37,7 @@ fn push_and_pull_recent_round_trip_via_handle() {
     let prev_home = std::env::var("HOME").ok();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", dir.path());
-    let slot: u8 = 1;
+    let slot: u32 = 1;
     voice_bird_cli::agent::live::truncate_slot(slot).unwrap();
     for i in 0..50 {
         voice_bird_cli::agent::live::append(
@@ -134,7 +134,7 @@ fn pull_recent_respects_limit_and_keeps_order() {
     let prev_home = std::env::var("HOME").ok();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", dir.path());
-    let slot: u8 = 1;
+    let slot: u32 = 1;
     voice_bird_cli::agent::live::truncate_slot(slot).unwrap();
     for i in 0..20 {
         voice_bird_cli::agent::live::append(

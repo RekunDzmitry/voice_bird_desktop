@@ -77,7 +77,7 @@ impl LiveSegment {
 
 /// Resolve `~/.voice-bird/live/<slot_id>.jsonl`. Both TUI and MCP
 /// server call this so they always agree on the on-disk location.
-pub fn live_path(slot_id: u8) -> PathBuf {
+pub fn live_path(slot_id: u32) -> PathBuf {
     home()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".voice-bird")
@@ -88,7 +88,7 @@ pub fn live_path(slot_id: u8) -> PathBuf {
 /// Truncate the live file for `slot_id`. Called by the TUI when a
 /// session starts so a brand-new recording doesn't pick up segments
 /// left behind by a previous session on the same slot.
-pub fn truncate_slot(slot_id: u8) -> Result<()> {
+pub fn truncate_slot(slot_id: u32) -> Result<()> {
     let p = live_path(slot_id);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -100,7 +100,7 @@ pub fn truncate_slot(slot_id: u8) -> Result<()> {
 /// Append one segment to the live file for `slot_id`. fsyncs per call
 /// so a subsequent `pull_recent` from the MCP server process is
 /// guaranteed to see the line.
-pub fn append(slot_id: u8, seg: &LiveSegment) -> Result<()> {
+pub fn append(slot_id: u32, seg: &LiveSegment) -> Result<()> {
     let p = live_path(slot_id);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -125,7 +125,7 @@ pub fn append(slot_id: u8, seg: &LiveSegment) -> Result<()> {
 /// re-opens it from the start, walks to the last `limit` lines, and
 /// returns. This keeps the MCP server side stateless — no shared
 /// file cursor to coordinate, no fs-of-the-future shenanigans.
-pub fn pull_recent(slot_id: u8, limit: usize) -> Result<Vec<LiveSegment>> {
+pub fn pull_recent(slot_id: u32, limit: usize) -> Result<Vec<LiveSegment>> {
     let p = live_path(slot_id);
     if !p.exists() {
         return Ok(Vec::new());
@@ -168,7 +168,7 @@ pub fn live_dir() -> Option<PathBuf> {
 
 /// Cheap: `live_path` exists and is readable.
 #[allow(dead_code)]
-pub fn exists(slot_id: u8) -> bool {
+pub fn exists(slot_id: u32) -> bool {
     Path::new(&live_path(slot_id)).exists()
 }
 
@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    fn write_n(slot: u8, n: usize) -> Vec<LiveSegment> {
+    fn write_n(slot: u32, n: usize) -> Vec<LiveSegment> {
         let mut out = Vec::new();
         for i in 0..n {
             let seg = LiveSegment {
@@ -200,7 +200,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot = 1u8;
+        let slot = 1u32;
         truncate_slot(slot).unwrap();
         let written = write_n(slot, 5);
         let got = pull_recent(slot, 50).unwrap();
@@ -214,7 +214,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot = 2u8;
+        let slot = 2u32;
         truncate_slot(slot).unwrap();
         let written = write_n(slot, 10);
         let got = pull_recent(slot, 3).unwrap();
@@ -243,7 +243,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot = 3u8;
+        let slot = 3u32;
         write_n(slot, 5);
         truncate_slot(slot).unwrap();
         let got = pull_recent(slot, 50).unwrap();
@@ -257,7 +257,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot = 4u8;
+        let slot = 4u32;
         truncate_slot(slot).unwrap();
         append(
             slot,
@@ -286,7 +286,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let slot = 5u8;
+        let slot = 5u32;
         truncate_slot(slot).unwrap();
         let p = live_path(slot);
         let mut f = OpenOptions::new()

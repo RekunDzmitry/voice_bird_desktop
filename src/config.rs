@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-
 /// Lives in lib so both `platform::AudioSession` (in the bin crate) and
 /// `AppConfig` (in the lib crate) can reference it.
 ///
@@ -133,22 +132,20 @@ pub struct AppConfig {
     pub legacy_session_dir: Option<String>,
     #[serde(default, rename = "cloud_broadcast_enabled", skip_serializing)]
     pub legacy_cloud_broadcast_enabled: Option<bool>,
-
-    /// True after a one-shot migration has copied the legacy
-    /// fields into slot 1. Latches to `true` once written, so
-    /// the migration never re-runs on a config that already had
-    /// its fresh slots. Persisted so the latch survives a crash
-    /// mid-launch.
-    #[serde(default)]
-    pub slot_migration_complete: bool,
 }
 
 impl AppConfig {
-    /// Read the four legacy migration fields, ignoring the
-    /// `slot_migration_complete` latch. Returns `Some((model,
-    /// language, path, cloud_on))` when at least one legacy
-    /// field is present; `None` when the config is either fresh
-    /// or already migrated.
+    /// Read the four legacy migration fields. Returns
+    /// `Some((model, language, path, cloud_on))` when at least one
+    /// legacy field is present; `None` when the config is either
+    /// fresh or already migrated.
+    ///
+    /// No separate "migration done" latch is needed: the legacy
+    /// fields are `skip_serializing`, so the first successful save
+    /// after a migration drops them from the file and the next
+    /// launch sees nothing to migrate. If that save fails the
+    /// migration simply runs again next launch, which is the
+    /// behaviour we want.
     pub fn legacy_migration_source(&self) -> Option<(String, String, String, bool)> {
         let any_legacy = self.legacy_default_model.is_some()
             || self.legacy_language.is_some()
@@ -166,12 +163,10 @@ impl AppConfig {
         ))
     }
 
-    /// Mark the migration as complete and clear the legacy fields.
-    /// The latch (`slot_migration_complete`) is persisted, the
-    /// legacy fields are dropped — the next save no longer writes
-    /// them and the next read finds no migration to run.
+    /// Clear the legacy fields once they have been copied into a
+    /// slot. The next save no longer writes them and the next read
+    /// finds no migration to run.
     pub fn complete_legacy_migration(&mut self) {
-        self.slot_migration_complete = true;
         self.legacy_default_model = None;
         self.legacy_language = None;
         self.legacy_session_dir = None;
@@ -469,7 +464,6 @@ impl Default for AppConfig {
             legacy_language: None,
             legacy_session_dir: None,
             legacy_cloud_broadcast_enabled: None,
-            slot_migration_complete: false,
         }
     }
 }
@@ -486,7 +480,6 @@ impl AppConfig {
     /// config. This un-flakes the two banner tests that asserted
     /// `app.banner.is_none()` (they fail when the developer's real
     /// `cloud_broadcast_enabled = true` + `voicebird_api_key = ""`
-    /// triggers the on-launch banner) and stops the
     /// triggers the on-launch banner) and stops the
     /// `c_toggle…_per_source_override` test from persisting its
     /// in-memory `sk-test` key and a flipped cloud flag over the
@@ -727,7 +720,6 @@ refinement_beam_size = 5
             legacy_language: None,
             legacy_session_dir: None,
             legacy_cloud_broadcast_enabled: None,
-            slot_migration_complete: false,
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
