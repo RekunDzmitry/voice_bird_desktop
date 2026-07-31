@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
@@ -220,6 +219,7 @@ impl std::fmt::Debug for SlotKind {
 }
 
 /// One TUI pane and its current state. The pane's `id` is stable; the
+/// position in `App::slots` is incidental.
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
@@ -563,9 +563,7 @@ impl App {
         // `AppConfig::config_path()` to a fresh empty tempdir, so
         // running it in production would make every launch boot
         // from defaults (API key, devices, agent targets all
-        // Test builds only: install the process-local config
-        // tempdir so every test reads from and saves to a tempdir
-        // instead of the developer's real `config.toml`.
+        // "gone") and write settings into /tmp.
         #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
         let config = AppConfig::load().unwrap_or_default();
@@ -573,11 +571,6 @@ impl App {
         let mut config_was_loaded_from_disk =
             config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
-        // First launch: auto-pick a local model from system specs, persist
-        // immediately, and skip the manual model-picker overlay. The user
-        // can still override later with `m`. We treat the config as
-        // "loaded from disk" once it exists so the picker behaves like a
-        // normal navigation, not a first-run gate.
         // First-run auto-pick: the slot's settings already carry
         // the auto-picked model (applied in fresh_slots_with_config
         // below). The legacy global `default_model` is gone — just
@@ -750,12 +743,10 @@ impl App {
     /// id is stable across the app's lifetime: appended slots get
     /// fresh ids from `next_slot_id`, never renumbering the existing
     /// ones, so any handle a caller is holding stays valid.
-
-
-    /// Variant of [`fresh_slots`] that reads any persisted
-    /// `slot_settings` for slot 1 and seeds the new slot's
-    /// settings from it. The first-run auto-pick model is
-    /// applied when no override is present.
+    ///
+    /// Slot 1's settings are seeded from any persisted
+    /// `slot_settings` entry; on first run the auto-pick model is
+    /// applied on top of `SlotSettings::default()`.
     fn fresh_slots_with_config(config: &AppConfig) -> Vec<Slot> {
         let mut slot = Slot::empty(SlotId(1));
         let key = slot_settings_key(slot.id.0);
@@ -842,7 +833,7 @@ impl App {
     pub fn display_cloud_on(&self) -> bool {
         self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.cloud_on)
-            .unwrap_or(false)
+            .unwrap_or(SlotSettings::default().cloud_on)
     }
 
     /// Language as displayed in the Mode panel: the focused
@@ -850,7 +841,7 @@ impl App {
     pub fn display_language(&self) -> String {
         self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.language.clone())
-            .unwrap_or_else(|| "en".into())
+            .unwrap_or_else(|| SlotSettings::default().language)
     }
 
     /// Model id as displayed in the Mode panel: the focused
@@ -858,7 +849,7 @@ impl App {
     pub fn display_model(&self) -> String {
         self.slot_by_id(self.focused_slot)
             .map(|s| s.settings.model.clone())
-            .unwrap_or_else(|| "distil-small.en".into())
+            .unwrap_or_else(|| SlotSettings::default().model)
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -978,13 +969,14 @@ impl App {
     }
 
     /// Open the output-path modal, seeding the buffer with the
-    /// current `session_dir` from config. Local-only concept — the 'p'
+    /// focused slot's `settings.path`. Local-only concept — the 'p'
     /// key doesn't exist on cloud-only Windows.
+    #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
         self.path_buf = Some(
             self.slot_by_id(self.focused_slot)
                 .map(|s| s.settings.path.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(|| SlotSettings::default().path),
         );
         self.mode = AppMode::PathModal;
     }
@@ -996,7 +988,8 @@ impl App {
     /// cloud-only Windows.
     #[cfg(not(windows))]
     pub fn export_transcript(&mut self) {
-        // Clear any previous export banner
+        // Every exit path below sets `export_banner`, so there is
+        // nothing to clear up front.
         let base_dir = self.slot_path_expanded(self.focused_slot);
         let base = std::path::Path::new(&base_dir);
 
@@ -1670,9 +1663,7 @@ impl App {
     }
 
     /// Per-slot replacement for the legacy `effective_settings_for`.
-    /// Per-slot replacement for [`Self::effective_settings_for`].
     /// Reads the slot's `SlotSettings` directly — no per-source
-    /// merge, no global fallback. The slot's settings are the
     /// merge, no global fallback. The slot's settings are the
     /// source of truth at start time.
     ///
@@ -1687,26 +1678,21 @@ impl App {
         })
     }
 
-
-
-    /// Expand `~` in a slot's `settings.path` the same way
-    /// `AppConfig::session_dir_expanded` does. Pulled out so the
+    /// Expand `~` in a slot's `settings.path`. Pulled out so the
     /// session_dir resolution in `start_section` and the export
-    /// base dir in `export_transcript` can share the contract.
+    /// base dir in `export_transcript` share one contract.
     pub fn slot_path_expanded(&self, slot: SlotId) -> String {
         let raw = self
             .slot_by_id(slot)
             .map(|s| s.settings.path.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| SlotSettings::default().path);
         if let Some(rest) = raw.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 return home.join(rest).to_string_lossy().into_owned();
             }
         }
         raw
-
     }
-
 
     /// Persist the focused slot's `SlotSettings` into
     /// `config.slot_settings` under the slot's id, then save. The
@@ -2565,6 +2551,7 @@ impl App {
         if matches!(self.slots[pos].kind, SlotKind::Recording { .. }) {
             return Err(format!("slot {slot} is already recording"));
         }
+        // Empty means nothing to resume. Surface that specific
         // message rather than the more generic "no device
         // selected" error the picker resolution below would
         // produce for an untouched slot.
@@ -3137,11 +3124,9 @@ async fn dispatch_segment_to_agent(
 /// Windows is cloud-only: force cloud on every slot's settings
 /// regardless of what the config or persisted slot settings say.
 /// `cfg!` (rather than an attribute) keeps the body compiled and
-/// testable on every target. Called from `App::new` and from
-/// `start_section` (the per-slot choke point that catches stale
-/// settings persisted by a pre-0.4.0 config).
-/// `clamp_section_settings_for_platform` (the per-recording
-/// snapshot variant) is preserved for the engine's view.
+/// testable on every target. Called from `App::new` only;
+/// `clamp_section_settings_for_platform` is the per-recording
+/// choke point that guards the engine-visible snapshot.
 fn enforce_cloud_only_platform_on_slots(slots: &mut [Slot]) {
     if cfg!(windows) {
         for slot in slots {
@@ -3547,10 +3532,9 @@ mod tests {
             path: dir.path().to_string_lossy().into_owned(),
         };
         app.config.voicebird_api_key = "sk-test".into();
-        // The global session_dir is a different tempdir. If
-        // start_section reads it, the assertion below fires.
-        // The global session_dir is a different tempdir. If
-        // start_section reads it, the assertion below fires.
+        // Nothing else points at this tempdir. If start_section
+        // reads a path other than the slot's, the assertion
+        // below fires.
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
             kind: AudioSessionKind::Input,

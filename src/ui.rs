@@ -1999,6 +1999,7 @@ mod tests {
         );
     }
     /// The mode panel shows the model name (auto-picked or user-chosen)
+    /// so the user can see what's loaded without leaving the main screen.
     #[test]
     fn mode_panel_shows_the_model_name() {
         let mut app = App::new();
@@ -2007,7 +2008,6 @@ mod tests {
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
     }
-    /// `mask_api_key` reveals BOTH the prefix and the tail of a
     /// `mask_api_key` reveals BOTH the prefix and the tail of a
     /// long key — the prefix so the user can spot a corrupted
     /// paste like `sk-testvb_…` (predictable boilerplate carries

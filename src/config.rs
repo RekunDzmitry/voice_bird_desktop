@@ -58,7 +58,6 @@ pub fn slot_settings_key(slot_id: u32) -> String {
     slot_id.to_string()
 }
 
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub hop_ms: u32,
@@ -98,15 +97,13 @@ pub struct AppConfig {
     pub voicebird_api_key: String,
 
     /// WebSocket URL of the Voice Bird Web `/api/audio/stream` endpoint
-    /// the desktop client streams to when `cloud_broadcast_enabled` is
+    /// the desktop client streams to when a slot's `cloud_on` is
     /// true. Defaults to the hosted production server.
     #[serde(default = "default_voicebird_server_url")]
     pub voicebird_server_url: String,
 
-
     /// Decimal `slot_id` → `SlotSettings`. The runtime layer
     /// (`App::new`) seeds slot 1 with any persisted entry, falling
-    /// back to `SlotSettings::default()` on first run.
     /// back to `SlotSettings::default()` on first run.
     #[serde(default)]
     pub slot_settings: BTreeMap<String, SlotSettings>,
@@ -504,10 +501,9 @@ impl AppConfig {
         }
         Ok(())
     }
-    /// Look up an Agent target by its stable id. Returns `None` if
 
+    /// Look up an Agent target by its stable id. Returns `None` if
     /// no target with that id has been configured (the user removed
-    /// it, or the config file was hand-edited and lost the row).
     /// it, or the config file was hand-edited and lost the row).
     pub fn agent_target_by_id(&self, id: &str) -> Option<&AgentTargetConfig> {
         self.agent_targets.iter().find(|t| t.id == id)
@@ -952,8 +948,6 @@ acks = \"all\"\n\
     // These pin the storage layer for the per-slot settings refactor:
     // each slot owns its own Cloud/Language/Model/Path settings, and
     // AppConfig persists them in a `slot_settings` map keyed by SlotId.
-    // AppConfig persists them in a `slot_settings` map keyed by SlotId.
-    // The field and the BTreeMap are added in commit 1;
     // `slot_settings` is the new source of truth for runtime code.
 
     #[test]
@@ -1017,8 +1011,8 @@ acks = \"all\"\n\
         );
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.slot_settings[&slot_settings_key(1)].cloud_on, false);
-        assert_eq!(loaded.slot_settings[&slot_settings_key(2)].cloud_on, true);
+        assert!(!loaded.slot_settings[&slot_settings_key(1)].cloud_on);
+        assert!(loaded.slot_settings[&slot_settings_key(2)].cloud_on);
         assert_ne!(
             loaded.slot_settings[&slot_settings_key(1)].path,
             loaded.slot_settings[&slot_settings_key(2)].path,

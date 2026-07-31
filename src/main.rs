@@ -3,7 +3,6 @@ mod logger;
 mod platform;
 mod ui;
 
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -710,12 +709,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // current focused slot's settings.model so the user
             // sees what's already chosen for that slot.
             let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
-            let current = app
-                .slots
-                .iter()
-                .find(|s| s.id == app.focused_slot)
-                .map(|s| s.settings.model.clone())
-                .unwrap_or_else(|| app.display_model());
+            let current = app.display_model();
             let current_idx = catalog
                 .all()
                 .iter()
@@ -783,10 +777,6 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 app.banner = Some(banner);
             }
         }
-        // Cycle the cloud language. When idle, mutates the global config
-        // (and is hidden when cloud is off). When focused-section
-        // recording, cycles that section's language and persists the
-        // override.
         // Cycle the cloud language. Per-slot: a press of `l`
         // cycles the focused slot's `settings.language`. The
         // legacy global config field is gone. The cycle is a
@@ -889,23 +879,25 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
             // to fix the key) or not in play (first run / peek).
             //
             // The cloud-enable funnel is the one path that
-            // flipped `cloud_broadcast_enabled` from false to
+            // flipped the focused slot's `cloud_on` from false to
             // true just before opening the modal; cancelling the
             // modal there must unwind that flip or the user is
             // stuck with Cloud ON + no key + no way to start a
             // recording. (The pre-R-key world had no other exit.)
             if app.api_key_modal_reverts_cloud {
+                // Cloud-only Windows never reverts — the `c`
+                // toggle that sets `reverts_cloud` isn't even
+                // compiled there, and unsetting `cloud_on` would
+                // break the platform invariant.
+                #[cfg(not(windows))]
                 {
                     // Per-slot: revert the focused slot's cloud flag
                     // (the modal was opened from a cloud toggle on
-                    // it). Persist the post-revert slot settings.
+                    // it). `persist_focused_slot_settings` saves.
                     if let Some(slot) = app.slot_by_id_mut(app.focused_slot) {
                         slot.settings.cloud_on = false;
                     }
                     app.persist_focused_slot_settings();
-                    if let Err(e) = app.config.save() {
-                        log::error!("config save (modal cancel): {e}");
-                    }
                     app.banner =
                         Some("Cloud: OFF (cancelled API key entry)".into());
                 }
@@ -1640,8 +1632,6 @@ mod api_key_dispatcher_uppercase_k_tests {
 #[cfg(not(windows))]
 mod pr48_review_regression_tests {
     use super::*;
-
-
 
     /// Snapshot of the developer's real `config.toml`, restored on
     /// drop (including panic unwind). With config-path injection in
