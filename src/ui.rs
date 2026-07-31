@@ -598,7 +598,7 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         " Mode "
     };
 
-    let path_raw = app.config.session_dir_expanded();
+    let path_raw = app.slot_path_expanded(app.focused_slot);
     let path_display = if path_raw.len() > 24 {
         format!("…{}", &path_raw[path_raw.len().saturating_sub(23)..])
     } else {
@@ -1883,7 +1883,7 @@ mod tests {
     #[test]
     fn mode_panel_off_shows_language_locked() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = false;
+        app.slots[0].settings.cloud_on = false;
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("Mode"), "mode panel title missing:\n{out}");
         assert!(out.contains("[OFF]"), "cloud-off label missing:\n{out}");
@@ -1895,8 +1895,8 @@ mod tests {
     #[test]
     fn mode_panel_on_shows_language_cycle_hint() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
+        app.slots[0].settings.cloud_on = true;
+        app.slots[0].settings.language = "ru".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("[ON]"), "cloud-on label missing:\n{out}");
         // `ru` appears in the language line; the (l) hint accompanies it.
@@ -2001,9 +2001,9 @@ mod tests {
     /// The mode panel shows the model name (auto-picked or user-chosen)
     /// so the user can see what's loaded without leaving the main screen.
     #[test]
-    fn mode_panel_shows_model_name() {
+    fn mode_panel_shows_the_model_name() {
         let mut app = App::new();
-        app.config.default_model = "tiny.en".into();
+        app.slots[0].settings.model = "tiny.en".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
@@ -2399,6 +2399,7 @@ mod tests {
             Target::Agent { session_id: "uuid-zoom".into() };
         app.slots[0] = crate::app::Slot {
             id: crate::app::SlotId(1),
+            settings: voice_bird_cli::config::SlotSettings::default(),
             kind: SlotKind::Saved {
                 saved: SavedTranscript {
                     committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
