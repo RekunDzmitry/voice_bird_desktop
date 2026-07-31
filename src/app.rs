@@ -566,20 +566,41 @@ impl App {
         // "gone") and write settings into /tmp.
         #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
-        let config = AppConfig::load().unwrap_or_default();
+        // Track whether the load actually returned a parsed config.
+        // The previous flag (`config_path.exists()`) read the file
+        // system, but parse failure produces defaults that the next
+        // `config.save()` would happily overwrite the user's API key,
+        // devices, and agent targets with. Only treat the run as
+        // "loaded from disk" when the load succeeded AND the file
+        // existed; only save defaults when the file was absent.
+        let config_load_result = AppConfig::load();
+        let mut config = match &config_load_result {
+            Ok(c) => c.clone(),
+            Err(e) => {
+                log::error!(
+                    "config load failed, leaving the on-disk file untouched: {e}"
+                );
+                AppConfig::default()
+            }
+        };
+        let mut config_was_loaded_from_disk = config_load_result.is_ok();
         let config_path = AppConfig::config_path().ok();
-        let mut config_was_loaded_from_disk =
-            config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
         // First-run auto-pick: the slot's settings already carry
         // the auto-picked model (applied in fresh_slots_with_config
-        // below). The legacy global `default_model` is gone — just
-        // persist the defaults to disk so the next launch reads
-        // the same map.
-        if let Err(e) = config.save() {
-            log::error!("config save (first run): {e}");
-        } else {
-            config_was_loaded_from_disk = true;
+        // below). The legacy global `default_model` is gone — when
+        // the file was absent (first run), persist the defaults so
+        // the next launch reads the same map. A failed parse keeps
+        // the original file untouched so the user can recover by
+        // hand; we boot from defaults in memory only.
+        let config_was_absent = config_path
+            .as_ref()
+            .map(|p| !p.exists())
+            .unwrap_or(false);
+        if config_was_absent {
+            if let Err(e) = config.save() {
+                log::error!("config save (first run): {e}");
+            }
         }
         // macOS screen-recording permission check. The block is
         // gated on `cfg(target_os = "macos")` so the variable
