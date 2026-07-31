@@ -631,6 +631,12 @@ impl App {
         // struct — reads `config.slot_settings` and applies the
         // auto-picked model on first run.
         let initial_slots = Self::fresh_slots_with_config(&config);
+        // The next free id is one past the highest id we just
+        // rebuilt from `config.slot_settings`. Captured here, before
+        // `initial_slots` is moved into `slots`, so a freshly-added
+        // slot can never collide with a persisted one.
+        let next_slot_id =
+            initial_slots.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
         // First-run persistence: the slots above carry the
         // auto-picked model on slot 1 (and any other propagated
         // defaults). Mirror each slot's settings into
@@ -676,9 +682,7 @@ impl App {
             rt,
             slots: initial_slots,
             focused_slot: SlotId(1),
-            // Slot 1 was created by `fresh_slots()`. The next id we
-            // hand out is 2.
-            next_slot_id: 2,
+            next_slot_id,
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
@@ -686,6 +690,7 @@ impl App {
             path_buf: None,
             export_banner: None,
             // Banner: macOS screen-recording OR cloud-on-no-key OR None.
+            // The cloud check runs after app build and overwrites this
             // The cloud check runs after app build and overwrites this
             // when the slot's settings.cloud_on is true with no key.
             banner: macos_banner,
@@ -782,31 +787,50 @@ impl App {
 
     // -- Slot helpers -------------------------------------------------------
 
-    /// Build the initial slot Vec. The TUI starts with a single empty
-    /// slot (id 1) — the user expands the workspace with `+`. The
-    /// id is stable across the app's lifetime: appended slots get
-    /// fresh ids from `next_slot_id`, never renumbering the existing
+    /// Build the initial slot Vec. The TUI starts with one slot per
+    /// persisted entry in `config.slot_settings`, in the original
+    /// id order — so a user who added slot 2 in a previous session
+    /// sees it back at the next launch. Slot 1 is always present
+    /// (created here if no entry exists). The id is stable across
+    /// the app's lifetime: appended slots get fresh ids from the
+    /// parent `App`'s `next_slot_id`, never renumbering the existing
     /// ones, so any handle a caller is holding stays valid.
     ///
-    /// Slot 1's settings are seeded from any persisted
-    /// `slot_settings` entry; on first run the auto-pick model is
-    /// applied on top of `SlotSettings::default()`.
+    /// Slot 1's settings are seeded from any persisted entry; on
+    /// first run the auto-pick model is applied on top of
+    /// `SlotSettings::default()`.
     fn fresh_slots_with_config(config: &AppConfig) -> Vec<Slot> {
-        let mut slot = Slot::empty(SlotId(1));
-        let key = slot_settings_key(slot.id.0);
-        if let Some(s) = config.slot_settings.get(&key) {
-            slot.settings = s.clone();
-        } else {
-            // First-run: apply the auto-pick model on top of the
-            // default settings so the local model picker is
-            // pre-seeded with the recommended default.
-            #[cfg(not(windows))]
-            {
-                let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
-                slot.settings.model = picked.into();
-            }
+        // Collect the persisted ids in ascending order so the slot
+        // Vec mirrors the user's working layout.
+        let mut ids: Vec<u32> = config
+            .slot_settings
+            .keys()
+            .filter_map(|k| k.parse::<u32>().ok())
+            .collect();
+        ids.sort_unstable();
+        if !ids.contains(&1) {
+            ids.insert(0, 1);
         }
-        vec![slot]
+        ids.into_iter()
+            .map(|raw_id| {
+                let id = SlotId(raw_id);
+                let mut slot = Slot::empty(id);
+                if let Some(s) = config.slot_settings.get(&slot_settings_key(raw_id)) {
+                    slot.settings = s.clone();
+                } else if raw_id == 1 {
+                    // First-run: apply the auto-pick model on top of
+                    // the default settings so the local model picker
+                    // is pre-seeded with the recommended default.
+                    #[cfg(not(windows))]
+                    {
+                        let picked =
+                            voice_bird_cli::transcription::auto_select::pick_default_model();
+                        slot.settings.model = picked.into();
+                    }
+                }
+                slot
+            })
+            .collect()
     }
 
     /// Look up a slot's current Vec index from its stable id. Returns
