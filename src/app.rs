@@ -693,13 +693,19 @@ impl App {
         // on the slot's settings so the engine sees the right
         // state. The on-disk format is unchanged.
         enforce_cloud_only_platform_on_slots(&mut app.slots);
-        // On-launch banner: any slot with cloud_on + no key needs
-        // the user to paste a key. Today only slot 1 is checked.
-        app.banner = if app.slots[0].settings.cloud_on && app.config.voicebird_api_key.is_empty() {
-            Some("Cloud is on but no API key — press 'c' to paste one".into())
-        } else {
-            None
-        };
+        // On-launch banner: any slot with cloud_on + no key needs the
+        // user to paste a key. The cloud check is additive — when the
+        // macOS Screen-Recording permission is missing, that warning
+        // is already in `app.banner` and the cloud check must not
+        // clobber it. The cloud-on-no-key banner takes precedence
+        // because it requires an active user decision (paste a key);
+        // the permission banner is a passive nag.
+        let cloud_on_no_key = app.slots[0].settings.cloud_on
+            && app.config.voicebird_api_key.is_empty();
+        if cloud_on_no_key {
+            app.banner =
+                Some("Cloud is on but no API key — press 'c' to paste one".into());
+        }
         app.load_agent_targets_from_config();
         // user must provide before recording.
         #[cfg(windows)]
