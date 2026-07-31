@@ -5092,3 +5092,376 @@ mod tests {
         }
     }
 }
+
+// ── Per-slot refactor: review contracts (RED) ─────────────────────────
+//
+// These tests pin the blocking / should-fix findings from the review of
+// the per-slot settings refactor. They are expected to FAIL against the
+// current code — each one is the executable statement of a contract the
+// refactor broke or left unfinished. See the review list for the
+// numbering (B1-B3 blocking, S4-S9 should-fix).
+//
+// Config isolation: `App::new()` reads and writes the path in
+// `VOICE_BIRD_TEST_CONFIG_PATH`, which `test_utils::INSTALL_TEST_CONFIG`
+// points at ONE process-wide tempdir shared by every test. Tests here
+// that assert on file contents need their own file, so `ConfigFileGuard`
+// repoints the env var at a private tempdir and restores it on drop.
+// The env var is process-global, so those tests serialize on
+// `CONFIG_FILE_LOCK` — that keeps them from racing each other, though
+// not from a pre-existing test in another module saving a config
+// mid-window. Making this airtight wants an injectable config path on
+// `App` (e.g. `App::with_config_path`); the current global is why these
+// contracts have no cheaper test.
+#[cfg(test)]
+mod per_slot_review_contracts {
+    use super::*;
+    use voice_bird_cli::config::{slot_settings_key, AppConfig, SlotSettings};
+
+    /// Serializes every test that repoints `VOICE_BIRD_TEST_CONFIG_PATH`.
+    static CONFIG_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Repoints the in-process config path at a private tempdir for the
+    /// duration of one test, restoring the previous value on drop
+    /// (including on panic unwind).
+    struct ConfigFileGuard {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigFileGuard {
+        fn new() -> Self {
+            let lock = CONFIG_FILE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Force the shared LazyLock to initialise FIRST — its init
+            // sets the env var, and it would otherwise clobber ours on
+            // the first `App::new()` of the process.
+            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+            let previous = std::env::var("VOICE_BIRD_TEST_CONFIG_PATH").ok();
+            let dir = tempfile::TempDir::new().expect("private config tempdir");
+            let path = dir.path().join("config.toml");
+            std::env::set_var("VOICE_BIRD_TEST_CONFIG_PATH", &path);
+            Self {
+                _dir: dir,
+                path,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ConfigFileGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(p) => std::env::set_var("VOICE_BIRD_TEST_CONFIG_PATH", p),
+                None => std::env::remove_var("VOICE_BIRD_TEST_CONFIG_PATH"),
+            }
+        }
+    }
+
+    /// A config body that parses: only the four fields without a serde
+    /// default are mandatory. `extra` is appended verbatim.
+    fn config_toml(extra: &str) -> String {
+        format!(
+            "hop_ms = 750\n\
+             min_window_ms = 1000\n\
+             engine_prefer = \"auto\"\n\
+             audio_default_source = \"microphone\"\n\
+             refinement_window_ms = 20000\n\
+             refinement_beam_size = 5\n\
+             {extra}"
+        )
+    }
+
+    // ── B1 ────────────────────────────────────────────────────────────
+    /// A config that fails to parse must NOT be overwritten with
+    /// defaults. `App::new` does `AppConfig::load().unwrap_or_default()`
+    /// and then saves unconditionally, so one malformed value (a
+    /// half-written file, a hand-edit typo) silently destroys the user's
+    /// API key, saved devices, and agent targets on the next launch.
+    /// The old code only saved when no config existed on disk.
+    #[test]
+    fn unparseable_config_is_not_overwritten_with_defaults() {
+        let guard = ConfigFileGuard::new();
+        // `hop_ms` is a u32 — a string here is a hard parse error, so
+        // `load()` returns Err and the caller falls back to defaults.
+        let original = config_toml("voicebird_api_key = \"sk-users-real-key\"\n")
+            .replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
+        std::fs::write(guard.path(), &original).unwrap();
+
+        let _app = App::new();
+
+        let after = std::fs::read_to_string(guard.path()).unwrap();
+        assert_eq!(
+            after, original,
+            "a config that failed to parse must be left on disk untouched — \
+             saving defaults over it discards the user's API key, devices, \
+             and agent targets"
+        );
+    }
+
+    // ── B2 ────────────────────────────────────────────────────────────
+    /// The macOS Screen-Recording warning must survive launch. `App::new`
+    /// computes it into `macos_banner`, seeds `app.banner` with it, then
+    /// unconditionally reassigns `app.banner` from the cloud-key check —
+    /// whose `else` arm is `None`. With cloud off (the default) the
+    /// permission warning is always thrown away, and system / per-app
+    /// capture then fails at start with no explanation.
+    ///
+    /// Skipped when the permission IS granted: the banner is legitimately
+    /// absent then, and there's no in-process way to revoke TCC.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_permission_banner_is_not_clobbered_by_the_cloud_key_check() {
+        if voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted() {
+            eprintln!(
+                "skipping: Screen Recording is granted, so no banner is expected"
+            );
+            return;
+        }
+        let _guard = ConfigFileGuard::new();
+        // Cloud off + no key: the cloud branch contributes nothing, so
+        // the macOS banner is the only candidate.
+        let app = App::new();
+        assert!(
+            app.banner
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Screen Recording"),
+            "the Screen Recording permission warning must survive the \
+             cloud-key check; got {:?}",
+            app.banner
+        );
+    }
+
+    // ── B3 ────────────────────────────────────────────────────────────
+    /// The first-run auto-picked model must reach disk. `App::new` saves
+    /// the config BEFORE `fresh_slots_with_config` computes the pick, and
+    /// the pick only ever lands on `slot.settings` — never in
+    /// `config.slot_settings`. So the map written on first run is empty
+    /// and the "next launch reads the same map" comment is false.
+    #[test]
+    fn first_run_persists_the_auto_picked_model_for_slot_one() {
+        let guard = ConfigFileGuard::new();
+        // No file at the path: this is a genuine first run.
+        assert!(!guard.path().exists());
+
+        let app = App::new();
+        let key = slot_settings_key(app.slots[0].id.0);
+
+        let on_disk = AppConfig::load_from(guard.path())
+            .expect("first run must write a config");
+        let saved = on_disk.slot_settings.get(&key).expect(
+            "first run must persist slot 1's settings, including the \
+             auto-picked model",
+        );
+        assert_eq!(
+            saved.model, app.slots[0].settings.model,
+            "the model on disk must match the one the slot booted with",
+        );
+    }
+
+    // ── S4 ────────────────────────────────────────────────────────────
+    /// Every persisted slot must be restored, not just slot 1.
+    /// `persist_focused_slot_settings` writes an entry for whichever slot
+    /// is focused, but `fresh_slots_with_config` only ever rebuilds slot
+    /// 1 — so a user who configures slot 2 loses it at the next launch
+    /// and the orphaned entry accumulates in `config.toml` forever.
+    #[test]
+    fn every_persisted_slot_is_restored_at_launch() {
+        let guard = ConfigFileGuard::new();
+        let mut c = AppConfig::default();
+        c.slot_settings.insert(
+            slot_settings_key(1),
+            SlotSettings {
+                cloud_on: false,
+                language: "en".into(),
+                model: "distil-small.en".into(),
+                path: "~/voice-bird/slot-one".into(),
+            },
+        );
+        c.slot_settings.insert(
+            slot_settings_key(2),
+            SlotSettings {
+                cloud_on: true,
+                language: "ru".into(),
+                model: "tiny.en".into(),
+                path: "~/voice-bird/slot-two".into(),
+            },
+        );
+        c.save_to(guard.path()).unwrap();
+
+        let app = App::new();
+
+        assert_eq!(
+            app.slots.len(),
+            2,
+            "both persisted slots must come back; got {:?}",
+            app.slots.iter().map(|s| s.id.0).collect::<Vec<_>>(),
+        );
+        let slot_two = app
+            .slots
+            .iter()
+            .find(|s| s.id == SlotId(2))
+            .expect("slot 2 must be restored from config.slot_settings");
+        assert!(slot_two.settings.cloud_on);
+        assert_eq!(slot_two.settings.language, "ru");
+        assert_eq!(slot_two.settings.model, "tiny.en");
+        assert_eq!(slot_two.settings.path, "~/voice-bird/slot-two");
+    }
+
+    // ── S5 ────────────────────────────────────────────────────────────
+    /// An existing user's settings must migrate into slot 1. The refactor
+    /// deleted `default_model` / `language` / `session_dir` /
+    /// `cloud_broadcast_enabled` without a migration, and the lenient TOML
+    /// parser drops unknown keys silently — so on upgrade every user is
+    /// quietly reset to `~/voice-bird/sessions` + `distil-small.en` + en +
+    /// cloud off, with no error to explain it.
+    #[test]
+    fn legacy_global_settings_migrate_into_slot_one() {
+        let guard = ConfigFileGuard::new();
+        let legacy = config_toml(
+            "default_model = \"large-v3-turbo\"\n\
+             language = \"ru\"\n\
+             session_dir = \"~/legacy-sessions\"\n\
+             cloud_broadcast_enabled = true\n",
+        );
+        std::fs::write(guard.path(), legacy).unwrap();
+
+        let app = App::new();
+        let s = &app.slots[0].settings;
+
+        assert_eq!(
+            s.model, "large-v3-turbo",
+            "the legacy default_model must carry over to slot 1"
+        );
+        assert_eq!(
+            s.language, "ru",
+            "the legacy language must carry over to slot 1"
+        );
+        assert_eq!(
+            s.path, "~/legacy-sessions",
+            "the legacy session_dir must carry over to slot 1"
+        );
+        assert!(
+            s.cloud_on,
+            "the legacy cloud_broadcast_enabled must carry over to slot 1"
+        );
+    }
+
+    // ── S6 ────────────────────────────────────────────────────────────
+    /// An auth failure must open the key modal for the slot that FAILED,
+    /// not for whichever slot happens to be focused.
+    /// `check_engine_error` drains every recording slot's error channel
+    /// but then reads `cloud_on` off `self.focused_slot`, so a rejected
+    /// key on slot 2 is swallowed whenever the user is looking at a
+    /// local-only slot 1 — the recording dies with a banner and no way
+    /// to paste a replacement key.
+    ///
+    /// Skipped when the capture pipeline can't start in this environment
+    /// (no input device / no permission), matching the tolerance the
+    /// other `resume_section` tests use.
+    #[test]
+    fn auth_failure_opens_the_key_modal_for_the_failing_slot() {
+        use crate::platform::AudioDevice;
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let _guard = ConfigFileGuard::new();
+        let mut app = App::new();
+        app.config.voicebird_api_key = "sk-stale".into();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+
+        // Slot 2 is the cloud slot that will hit the auth failure.
+        let slot_two = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        app.slot_by_id_mut(slot_two).unwrap().settings.cloud_on = true;
+        let saved = SavedTranscript {
+            committed: Arc::new(PlMutex::new(Vec::new())),
+            refined: Arc::new(PlMutex::new(Vec::new())),
+            label: "mic · cloud:ON".into(),
+            target: Target::Stdout,
+            source: SessionSource::Microphone,
+            settings: SectionSettings {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        };
+        app.slot_by_id_mut(slot_two).unwrap().kind = SlotKind::Saved { saved };
+        let _ = app.resume_section(slot_two);
+
+        let Some(pos) = app.slot_index(slot_two) else {
+            eprintln!("skipping: slot 2 vanished");
+            return;
+        };
+        let SlotKind::Recording { section } = &app.slots[pos].kind else {
+            eprintln!("skipping: capture did not start in this environment");
+            return;
+        };
+        // The server rejects the saved key on slot 2's connection.
+        *section.engine_error_channel.lock().unwrap() =
+            Some("Unauthorized: invalid API key".into());
+
+        // The user is looking at slot 1, which is local-only.
+        let slot_one = app.slots[0].id;
+        app.focused_slot = slot_one;
+        app.slot_by_id_mut(slot_one).unwrap().settings.cloud_on = false;
+
+        app.check_engine_error();
+
+        assert_eq!(
+            app.mode,
+            AppMode::ApiKeyModal,
+            "the rejected key belongs to the slot that raised the error; \
+             the modal must open regardless of which slot is focused",
+        );
+    }
+
+    // ── S8 ────────────────────────────────────────────────────────────
+    /// Removing a slot must persist the removal. `remove_focused_slot`
+    /// drops the entry from the in-memory map but never saves, so the
+    /// row survives on disk and the next launch reads settings for a
+    /// slot the user deleted.
+    #[test]
+    fn removing_a_slot_persists_the_dropped_settings() {
+        let guard = ConfigFileGuard::new();
+        let mut app = App::new();
+        app.slots[0].settings = SlotSettings {
+            cloud_on: true,
+            language: "ru".into(),
+            model: "tiny.en".into(),
+            path: "~/voice-bird/doomed".into(),
+        };
+        app.persist_focused_slot_settings();
+        let doomed = app.slots[0].id;
+        let key = slot_settings_key(doomed.0);
+        assert!(
+            AppConfig::load_from(guard.path())
+                .unwrap()
+                .slot_settings
+                .contains_key(&key),
+            "setup: the slot's settings must be on disk before removal",
+        );
+
+        // A second slot so the last-slot guard allows the removal.
+        let _ = app.add_slot();
+        app.focused_slot = doomed;
+        assert!(app.remove_focused_slot());
+
+        let on_disk = AppConfig::load_from(guard.path()).unwrap();
+        assert!(
+            !on_disk.slot_settings.contains_key(&key),
+            "removing a slot must save the config — otherwise the deleted \
+             slot's settings come back at the next launch",
+        );
+    }
+}

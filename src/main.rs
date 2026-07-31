@@ -1793,3 +1793,49 @@ mod pr48_review_regression_tests {
         );
     }
 }
+
+// ── Per-slot refactor: review contract (RED) ──────────────────────────
+//
+// S9 from the review of the per-slot settings refactor. Expected to FAIL
+// against the current code.
+#[cfg(test)]
+mod per_slot_review_contracts {
+    use super::*;
+
+    /// The state snapshot must keep publishing `cloud_broadcast_active`.
+    /// The refactor dropped that key while repointing the others at the
+    /// focused slot, but it is a consumed contract, not a vestigial
+    /// field: `e2e_human`'s `read_voice_bird_state` tool reads it, and
+    /// the harness's agents justify phase completion with
+    /// "status='Recording' and cloud_broadcast_active=true". Without the
+    /// key the start_recording / stop_recording phases can no longer
+    /// tell a live cloud transport from an idle one.
+    ///
+    /// Note it is NOT the same value as `cloud_broadcast_enabled`:
+    /// "enabled" is the slot's next-start setting, "active" is whether a
+    /// cloud engine is transmitting right now.
+    #[test]
+    fn state_snapshot_still_publishes_cloud_broadcast_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let app = App::new();
+
+        write_state_snapshot(&app, "<startup>", &path);
+
+        let raw = std::fs::read_to_string(&path).expect("snapshot written");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("snapshot is JSON");
+        let active = json.get("cloud_broadcast_active").unwrap_or_else(|| {
+            panic!(
+                "the e2e_human harness reads `cloud_broadcast_active`; \
+                 dropping it breaks the recording phases. Snapshot keys: {:?}",
+                json.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+            )
+        });
+        assert_eq!(
+            active.as_bool(),
+            Some(app.focused_cloud_active()),
+            "`cloud_broadcast_active` must report the live transport \
+             (`focused_cloud_active`), not the slot's next-start setting",
+        );
+    }
+}
