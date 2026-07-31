@@ -934,7 +934,7 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                 // and `cloud_broadcast_enabled` is unchanged.
                 let trimmed = buf.trim();
                 app.config.voicebird_api_key = trimmed.to_string();
-                if let Err(e) = app.config.save() {
+                if let Err(e) = app.save_config() {
                     log::error!("config save (modal save): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
                 } else if trimmed.is_empty() {

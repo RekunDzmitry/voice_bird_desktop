@@ -365,6 +365,12 @@ pub struct App {
     /// false, the model picker refuses to Esc-cancel — first run must pick.
     pub config_was_loaded_from_disk: bool,
 
+    /// Resolved on-disk path this `App` reads from and saves to.
+    /// `App::new` populates it from `AppConfig::config_path()`;
+    /// `App::new_with_config_path` lets tests inject a private
+    /// tempdir without touching the process-global env var.
+    pub config_path: PathBuf,
+
     /// In-flight text buffer for the API-key modal. `None` when the
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
@@ -552,20 +558,44 @@ pub enum TargetKind {
     },
 }
 impl App {
-    /// Create a new application instance
+    /// Create a new application instance.
+    ///
+    /// Resolves the config path through `AppConfig::config_path()`,
+    /// which honours the `VOICE_BIRD_TEST_CONFIG_PATH` env var in
+    /// tests. Tests that need a private tempdir should prefer
+    /// [`Self::new_with_config_path`] over the env-var dance — the
+    /// env var is process-global and races with parallel tests.
     pub fn new() -> Self {
         // Test builds only: install the process-local config
-        // tempdir before the first `AppConfig::load()`, so every
-        // test that constructs an `App` reads from and saves to
-        // the tempdir instead of the developer's real
+        // tempdir before the first `AppConfig::config_path()`,
+        // so every test that constructs an `App` reads from and
+        // saves to the tempdir instead of the developer's real
         // `config.toml`. The deref MUST be cfg(test)-gated:
         // `INSTALL_TEST_CONFIG`'s init unconditionally redirects
         // `AppConfig::config_path()` to a fresh empty tempdir, so
         // running it in production would make every launch boot
-        // from defaults (API key, devices, agent targets all
-        // "gone") and write settings into /tmp.
+        // from defaults and write settings into /tmp.
         #[cfg(test)]
         let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+        // Resolve the path first so all load/save calls in this
+        // function (and every `self.save_config()` later) use the
+        // same target. The resolution itself honours the
+        // `VOICE_BIRD_TEST_CONFIG_PATH` env var so the existing
+        // test fixture continues to work; tests that need a
+        // private tempdir should prefer
+        // [`Self::new_with_config_path`] over the env-var dance.
+        let config_path = AppConfig::config_path()
+            .expect("voice-bird config dir must exist");
+        Self::new_with_config_path(config_path)
+    }
+
+    /// Construct an `App` bound to a specific on-disk config path.
+    /// The path is the source of truth for every load and save the
+    /// `App` performs; the env-var override is not consulted. This
+    /// is the durable test fixture: each test constructs an `App`
+    /// against a private tempdir, with no shared state between
+    /// parallel tests.
+    pub fn new_with_config_path(config_path: PathBuf) -> Self {
         // Track whether the load actually returned a parsed config.
         // The previous flag (`config_path.exists()`) read the file
         // system, but parse failure produces defaults that the next
@@ -573,7 +603,11 @@ impl App {
         // devices, and agent targets with. Only treat the run as
         // "loaded from disk" when the load succeeded AND the file
         // existed; only save defaults when the file was absent.
-        let config_load_result = AppConfig::load();
+        let config_load_result = if config_path.exists() {
+            AppConfig::load_from(&config_path)
+        } else {
+            Ok(AppConfig::default())
+        };
         let mut config = match &config_load_result {
             Ok(c) => c.clone(),
             Err(e) => {
@@ -584,7 +618,6 @@ impl App {
             }
         };
         let config_was_loaded_from_disk = config_load_result.is_ok();
-        let config_path = AppConfig::config_path().ok();
 
         // First-run auto-pick: the slot's settings already carry
         // the auto-picked model (applied in fresh_slots_with_config
@@ -593,10 +626,7 @@ impl App {
         // the next launch reads the same map. A failed parse keeps
         // the original file untouched so the user can recover by
         // hand; we boot from defaults in memory only.
-        let config_was_absent = config_path
-            .as_ref()
-            .map(|p| !p.exists())
-            .unwrap_or(false);
+        let config_was_absent = !config_path.exists();
         // S5 migration: an existing user's pre-per-slot
         // config.toml carries `default_model` / `language` /
         // `session_dir` / `cloud_broadcast_enabled` on the
@@ -615,7 +645,7 @@ impl App {
             migrated.cloud_on = cloud_on;
             config.slot_settings.insert(key, migrated);
             config.complete_legacy_migration();
-            if let Err(e) = config.save() {
+            if let Err(e) = config.save_to(&config_path) {
                 log::warn!("config save (legacy migration): {e}");
             }
         }
@@ -667,7 +697,7 @@ impl App {
                     slot.settings.clone(),
                 );
             }
-            if let Err(e) = config.save() {
+            if let Err(e) = config.save_to(&config_path) {
                 log::error!("config save (first run): {e}");
             }
         }
@@ -702,14 +732,14 @@ impl App {
             next_slot_id,
             picker: None,
             config_was_loaded_from_disk,
+            config_path,
             api_key_buf: None,
             api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
             // Banner: macOS screen-recording OR cloud-on-no-key OR None.
             // The cloud check runs after app build and overwrites this
-            // The cloud check runs after app build and overwrites this
-            // when the slot's settings.cloud_on is true with no key.
+        // when the slot's settings.cloud_on is true with no key.
             banner: macos_banner,
             transcript_scroll: 0,
             transcript_follow: true,
@@ -800,6 +830,17 @@ impl App {
         }
 
         app
+    }
+
+    /// Save the current `AppConfig` to this `App`'s bound
+    /// `config_path`. The single chokepoint for every `config.save`
+    /// call in the runtime — replacing the previous
+    /// `self.save_config()` (which read the env-var path) with this
+    /// method routes every write through the path the `App` was
+    /// constructed with, so an `App::new_with_config_path(test_path)`
+    /// never writes the developer's real `config.toml`.
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        self.config.save_to(&self.config_path)
     }
 
     // -- Slot helpers -------------------------------------------------------
@@ -1341,7 +1382,7 @@ impl App {
         // survives on disk and the next launch reads settings for
         // a slot the user deleted.
         self.config.slot_settings.remove(&slot_settings_key(id.0));
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.save_config() {
             log::error!("config save (slot remove): {e}");
         }
         // If the focused slot also had a pending target override,
@@ -1796,7 +1837,7 @@ impl App {
         };
         let key = slot_settings_key(slot.id.0);
         self.config.slot_settings.insert(key, slot.settings.clone());
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.save_config() {
             log::error!("config save (slot_settings): {e}");
         }
     }
@@ -1921,10 +1962,7 @@ impl App {
         // slot had a Saved variant; otherwise start fresh.
         let (committed, refined) = match &self.slots[pos].kind {
             SlotKind::Saved { saved } => (saved.committed.clone(), saved.refined.clone()),
-            _ => (
-                Arc::new(PlMutex::new(Vec::new())),
-                Arc::new(PlMutex::new(Vec::new())),
-            ),
+            _ => (Arc::new(PlMutex::new(Vec::new())), Arc::new(PlMutex::new(Vec::new()))),
         };
         let tentative: Arc<PlMutex<String>> = Arc::new(PlMutex::new(String::new()));
         let engine_error_channel: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2798,7 +2836,7 @@ impl App {
             self.config.input_device = Some(dev.name.clone());
             self.config.input_device_kind = Some(dev.kind);
             self.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
-            if let Err(e) = self.config.save() {
+            if let Err(e) = self.save_config() {
                 log::error!("config save: {e}");
             }
         }
@@ -2979,7 +3017,7 @@ impl App {
         config_target: voice_bird_cli::config::AgentTargetConfig,
     ) -> anyhow::Result<()> {
         self.upsert_agent_target_in_memory(config_target)?;
-        self.config.save().map_err(|e| {
+        self.save_config().map_err(|e| {
             log::error!("config save (upsert agent target): {e}");
             self.banner = Some(format!("Save failed: {e}"));
             e
@@ -3008,7 +3046,7 @@ impl App {
     /// config to disk.
     pub fn remove_agent_target(&mut self, id: &str) {
         self.remove_agent_target_in_memory(id);
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.save_config() {
             log::error!("config save (remove agent target): {e}");
             self.banner = Some(format!("Save failed: {e}"));
         }
@@ -5202,43 +5240,32 @@ mod tests {
 // mid-window. Making this airtight wants an injectable config path on
 // `App` (e.g. `App::with_config_path`); the current global is why these
 // contracts have no cheaper test.
+// Config isolation: with the per-App config path now injectable
+// via `App::new_with_config_path`, each review test gets its own
+// private tempdir. The previous `ConfigFileGuard` mutated the
+// process-global `VOICE_BIRD_TEST_CONFIG_PATH` env var, which
+// raced with parallel tests reading the same env var. The new
+// fixture returns a path; tests construct `App::new_with_config_path(path)`
+// directly.
 #[cfg(test)]
 mod per_slot_review_contracts {
     use super::*;
     use voice_bird_cli::config::{slot_settings_key, AppConfig, SlotSettings};
 
-    /// Serializes every test that repoints `VOICE_BIRD_TEST_CONFIG_PATH`.
-    static CONFIG_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Repoints the in-process config path at a private tempdir for the
-    /// duration of one test, restoring the previous value on drop
-    /// (including on panic unwind).
+    /// A private tempdir tied to the test's lifetime. Tests build
+    /// an `App` with `new_with_config_path(self.path().to_path_buf())`
+    /// so no env-var mutation is involved and parallel tests do
+    /// not race.
     struct ConfigFileGuard {
         _dir: tempfile::TempDir,
         path: PathBuf,
-        previous: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ConfigFileGuard {
         fn new() -> Self {
-            let lock = CONFIG_FILE_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Force the shared LazyLock to initialise FIRST — its init
-            // sets the env var, and it would otherwise clobber ours on
-            // the first `App::new()` of the process.
-            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
-            let previous = std::env::var("VOICE_BIRD_TEST_CONFIG_PATH").ok();
             let dir = tempfile::TempDir::new().expect("private config tempdir");
             let path = dir.path().join("config.toml");
-            std::env::set_var("VOICE_BIRD_TEST_CONFIG_PATH", &path);
-            Self {
-                _dir: dir,
-                path,
-                previous,
-                _lock: lock,
-            }
+            Self { _dir: dir, path }
         }
 
         fn path(&self) -> &std::path::Path {
@@ -5246,14 +5273,6 @@ mod per_slot_review_contracts {
         }
     }
 
-    impl Drop for ConfigFileGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(p) => std::env::set_var("VOICE_BIRD_TEST_CONFIG_PATH", p),
-                None => std::env::remove_var("VOICE_BIRD_TEST_CONFIG_PATH"),
-            }
-        }
-    }
 
     /// A config body that parses: only the four fields without a serde
     /// default are mandatory. `extra` is appended verbatim.
@@ -5285,7 +5304,7 @@ mod per_slot_review_contracts {
             .replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
         std::fs::write(guard.path(), &original).unwrap();
 
-        let _app = App::new();
+        let _app = App::new_with_config_path(guard.path().to_path_buf());
 
         let after = std::fs::read_to_string(guard.path()).unwrap();
         assert_eq!(
@@ -5315,10 +5334,10 @@ mod per_slot_review_contracts {
             );
             return;
         }
-        let _guard = ConfigFileGuard::new();
+        let guard = ConfigFileGuard::new();
         // Cloud off + no key: the cloud branch contributes nothing, so
         // the macOS banner is the only candidate.
-        let app = App::new();
+        let app = App::new_with_config_path(guard.path().to_path_buf());
         assert!(
             app.banner
                 .as_deref()
@@ -5342,7 +5361,7 @@ mod per_slot_review_contracts {
         // No file at the path: this is a genuine first run.
         assert!(!guard.path().exists());
 
-        let app = App::new();
+        let app = App::new_with_config_path(guard.path().to_path_buf());
         let key = slot_settings_key(app.slots[0].id.0);
 
         let on_disk = AppConfig::load_from(guard.path())
@@ -5387,7 +5406,7 @@ mod per_slot_review_contracts {
         );
         c.save_to(guard.path()).unwrap();
 
-        let app = App::new();
+        let app = App::new_with_config_path(guard.path().to_path_buf());
 
         assert_eq!(
             app.slots.len(),
@@ -5424,7 +5443,7 @@ mod per_slot_review_contracts {
         );
         std::fs::write(guard.path(), legacy).unwrap();
 
-        let app = App::new();
+        let app = App::new_with_config_path(guard.path().to_path_buf());
         let s = &app.slots[0].settings;
 
         assert_eq!(
@@ -5462,8 +5481,8 @@ mod per_slot_review_contracts {
         use crate::platform::AudioDevice;
         use voice_bird_cli::config::AudioSessionKind;
 
-        let _guard = ConfigFileGuard::new();
-        let mut app = App::new();
+        let guard = ConfigFileGuard::new();
+        let mut app = App::new_with_config_path(guard.path().to_path_buf());
         app.config.voicebird_api_key = "sk-stale".into();
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
@@ -5524,7 +5543,7 @@ mod per_slot_review_contracts {
     #[test]
     fn removing_a_slot_persists_the_dropped_settings() {
         let guard = ConfigFileGuard::new();
-        let mut app = App::new();
+        let mut app = App::new_with_config_path(guard.path().to_path_buf());
         app.slots[0].settings = SlotSettings {
             cloud_on: true,
             language: "ru".into(),
