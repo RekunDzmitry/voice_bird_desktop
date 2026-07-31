@@ -1691,39 +1691,39 @@ impl App {
     /// intentionally not implemented; we surface the error as a red
     /// banner and let the user press `r` to retry.
     pub fn check_engine_error(&mut self) {
-        // Drain all sections, but only one banner — the most recent error
-        // wins (last write of multiple in the same tick survives).
-        let mut drained: Option<String> = None;
+        // Drain all sections, but only one banner — the most recent
+        // error wins (last write of multiple in the same tick
+        // survives). The failing slot's id is captured alongside
+        // the message so the post-drain decisions (which `cloud_on`
+        // to read, whether to pop the API-key modal) target the
+        // slot that actually broke, not whichever slot the user
+        // happens to be looking at.
+        let mut drained: Option<(SlotId, String)> = None;
         for slot in self.slots.iter() {
             if let SlotKind::Recording { section } = &slot.kind {
                 if let Ok(mut err) = section.engine_error_channel.lock() {
                     if let Some(msg) = err.take() {
-                        drained = Some(msg);
+                        drained = Some((slot.id, msg));
                     }
                 }
             }
         }
-        if let Some(msg) = drained {
+        if let Some((failing_slot, msg)) = drained {
             let auth_failure = looks_like_auth_error(&msg);
             self.banner = Some(msg.clone());
             self.status = RecordingStatus::Error(msg);
-            // Server rejected the saved key — surface the paste modal
-            // immediately so the user can replace it without hunting
-            // for a key binding.
-            // Per-slot: the auth failure is on the running section
-            // whose engine_error_channel we just drained. The
-            // slot's settings.cloud_on is the source of truth —
-            // if the user has Cloud ON (on the focused slot at
-            // least), the modal lets them paste a replacement key.
-            let focus_slot_cloud = self
-                .slot_by_id(self.focused_slot)
+            // Server rejected the saved key — surface the paste
+            // modal on the slot that raised the error so the user
+            // can replace the bad key. Reading the failing slot's
+            // `cloud_on` (not the focused slot's) is what surfaces
+            // the modal for the right place: a rejected key on
+            // slot 2 is no longer swallowed when the user is
+            // looking at a local-only slot 1.
+            let failing_slot_cloud = self
+                .slot_by_id(failing_slot)
                 .map(|s| s.settings.cloud_on)
                 .unwrap_or(false);
-            if auth_failure && focus_slot_cloud {
-                // `false`: the user already has Cloud ON and a key
-                // on disk — they just need to replace the bad
-                // key. Cancelling the modal leaves Cloud ON (the
-                // next recording will re-trigger the auth guard).
+            if auth_failure && failing_slot_cloud {
                 self.open_api_key_modal(false);
             }
         }
