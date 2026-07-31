@@ -583,7 +583,7 @@ impl App {
                 AppConfig::default()
             }
         };
-        let mut config_was_loaded_from_disk = config_load_result.is_ok();
+        let config_was_loaded_from_disk = config_load_result.is_ok();
         let config_path = AppConfig::config_path().ok();
 
         // First-run auto-pick: the slot's settings already carry
@@ -597,11 +597,11 @@ impl App {
             .as_ref()
             .map(|p| !p.exists())
             .unwrap_or(false);
-        if config_was_absent {
-            if let Err(e) = config.save() {
-                log::error!("config save (first run): {e}");
-            }
-        }
+        // First-run save happens AFTER `fresh_slots_with_config`
+        // below — the auto-picked model lands on the slot's
+        // settings, and that is exactly what needs to land on disk.
+        // Saving here would write an empty slot_settings map.
+
         // macOS screen-recording permission check. The block is
         // gated on `cfg(target_os = "macos")` so the variable
         // is only live on macOS — the cloud-on banner is
@@ -631,6 +631,23 @@ impl App {
         // struct — reads `config.slot_settings` and applies the
         // auto-picked model on first run.
         let initial_slots = Self::fresh_slots_with_config(&config);
+        // First-run persistence: the slots above carry the
+        // auto-picked model on slot 1 (and any other propagated
+        // defaults). Mirror each slot's settings into
+        // `config.slot_settings` so the next launch reads the same
+        // map; only run on a true first run (file was absent) so
+        // existing users aren't silently re-seeded.
+        if config_was_absent {
+            for slot in &initial_slots {
+                config.slot_settings.insert(
+                    slot_settings_key(slot.id.0),
+                    slot.settings.clone(),
+                );
+            }
+            if let Err(e) = config.save() {
+                log::error!("config save (first run): {e}");
+            }
+        }
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut app = Self {
             mode: AppMode::Normal,
