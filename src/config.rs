@@ -135,6 +135,27 @@ pub struct AppConfig {
     /// fields above.
     #[serde(default)]
     pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
+
+    /// Per-slot override for which cloud Character to run on `g`.
+    /// Keyed by `SlotId` (so the picker picks persist per slot).
+    /// When absent, the picker cursor in §10 falls back to the
+    /// most recently used character (`last_character_id`).
+    #[serde(default)]
+    pub character_overrides: BTreeMap<String, String>,
+
+    /// Most recently used Character id, persisted between sessions.
+    /// The §11 `g` key handler uses this as the default when a
+    /// slot has no override.
+    #[serde(default)]
+    pub last_character_id: Option<String>,
+
+    /// Set to `true` after the user accepts the one-time consent
+    /// modal (§11) that asks before sending transcripts that came
+    /// from a `cloud_on = false` recording. The flag sticks across
+    /// launches — once accepted, the `g` key fires immediately
+    /// for every future recording on every slot.
+    #[serde(default)]
+    pub dont_ask_character_upload: bool,
 }
 
 /// Ids that the segment dispatcher in the consumer task
@@ -174,6 +195,9 @@ impl Default for AppConfig {
             voicebird_server_url: default_voicebird_server_url(),
             cloud_broadcast_enabled: false,
             source_overrides: BTreeMap::new(),
+            character_overrides: BTreeMap::new(),
+            last_character_id: None,
+            dont_ask_character_upload: false,
         }
     }
 }
@@ -390,41 +414,14 @@ refinement_beam_size = 5
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
             cloud_broadcast_enabled: true,
             source_overrides: BTreeMap::new(),
+            character_overrides: BTreeMap::new(),
+            last_character_id: None,
+            dont_ask_character_upload: false,
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded, c);
     }
-
-    /// `agent_targets` survives a save/load round trip.
-    /// The TOML form uses `[[agent_targets]]` with a
-    /// tagged `kind = "kafka"` field; the parser must
-    /// reconstruct the `AgentConnection::Kafka` variant
-    /// exactly, including the `acks` enum string.
-    #[test]
-
-    /// A SASL-secured target round-trips through TOML with all
-    /// four security fields intact, and the wire strings are
-    /// pinned (librdkafka gets them verbatim via `as_str`, but
-    /// the config file uses the serde snake/kebab-case forms).
-    #[test]
-
-    /// Configs written before the security fields existed load
-    /// with plaintext defaults (backward compatibility).
-    #[test]
-
-    /// `validate_security` rejects SASL protocols missing a
-    /// username or password env-var name, and ignores stale SASL
-    /// fields on non-SASL protocols.
-    #[test]
-
-    /// `upsert_agent_target` updates in place when the id
-    /// matches, and appends otherwise. Pin both branches.
-    #[test]
-
-    #[test]
-
-    #[test]
 
     #[test]
     fn effective_override_falls_back_to_globals_when_unset() {
@@ -536,5 +533,60 @@ refinement_beam_size = 5
             "pl"
         );
         assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
+    }
+
+    /// §9b: per-slot Character override + last-used character id +
+    /// `dont_ask_character_upload` consent flag must all survive a
+    /// save/load round trip. Old config.toml files written before
+    /// these fields existed must still parse — the
+    /// `#[serde(default)]` attributes give every missing field its
+    /// default.
+    #[test]
+    fn character_run_fields_round_trip_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.character_overrides
+            .insert("2".into(), "uuid-prod-events".into());
+        c.character_overrides
+            .insert("3".into(), "uuid-zoom-bridge".into());
+        c.last_character_id = Some("uuid-zoom-bridge".into());
+        c.dont_ask_character_upload = true;
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.character_overrides.len(), 2);
+        assert_eq!(
+            loaded.character_overrides.get("2").map(String::as_str),
+            Some("uuid-prod-events")
+        );
+        assert_eq!(loaded.last_character_id.as_deref(), Some("uuid-zoom-bridge"));
+        assert!(loaded.dont_ask_character_upload);
+    }
+
+    /// Old config.toml files (pre-§9b) load with the new fields
+    /// at their defaults — `#[serde(default)]` makes the missing
+    /// keys behave like absent.
+    #[test]
+    fn character_run_fields_default_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_model = \"tiny.en\"\nlanguage = \"en\"\n\
+             session_dir = \"~/sessions\"\n\
+             hop_ms = 750\n\
+             min_window_ms = 1000\n\
+             engine_prefer = \"auto\"\n\
+             audio_default_source = \"microphone\"\n\
+             voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
+             voicebird_api_key = \"\"\n\
+             cloud_broadcast_enabled = false\n\
+             source_overrides = {}\n",
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(loaded.character_overrides.is_empty());
+        assert!(loaded.last_character_id.is_none());
+        assert!(!loaded.dont_ask_character_upload);
     }
 }
