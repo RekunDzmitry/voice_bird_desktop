@@ -3895,6 +3895,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "bytemuck",
+ "bytes",
  "chrono",
  "core-audio-types-rs",
  "core-foundation",

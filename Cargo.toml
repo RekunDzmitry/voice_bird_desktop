@@ -82,7 +82,8 @@ parking_lot = "0.12"
 rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl-vendored", "tokio"] }
 
 # Model download + verification
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream", "json"] }
+bytes = "1"
 sha2 = "0.10"
 hex = "0.4"
 
