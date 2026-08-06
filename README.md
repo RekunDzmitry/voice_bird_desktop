@@ -112,22 +112,31 @@ The interface is split into source panes (microphones, system output, running ap
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Select device or app |
-| `←` / `→` | Move between panes |
+| `↑` / `↓` (or `k` / `j`) | Select device or app |
+| `←` / `→` (or `h` / `l`) | Move between panes |
 | `Enter` | Start the selected source |
 | `Space` | Clear selected app pairing |
-| `Tab` | Move between transcript slots |
+| `Tab` / `BackTab` | Move between transcript slots |
+| `+` / `-` | Add / remove a transcript slot |
 | `r` | Refresh devices and apps |
+| `R` | Resume capture in the focused slot |
+| `s` | Stop the focused slot |
 | `c` | Toggle cloud mode for the focused source |
 | `l` | Change language for cloud mode |
 | `m` | Change model |
 | `e` | Export the latest local transcript |
 | `p` | Change local session path |
 | `x` | Clear stopped transcript slot |
+| `K` | Open the API-key modal |
+| `PgUp` / `PgDn` | Scroll the transcript by 10 lines |
+| `Home` / `End` | Jump to the start / end of the transcript |
 | `t` | Status overlay — recent app events (verify, push, run) with timestamps |
 | `?` | Help |
+| `Esc` / `Enter` | Close modal / status / help overlay |
+| `Ctrl+U` | Clear the API-key field while in the modal |
+| `q` | Quit |
 
-On Windows, `c` opens the API-key dialog (cloud is always on), and the local-only keys `m`, `e`, and `p` are not available.
+On Windows, `c` opens the API-key dialog (cloud is always on), and the local-only keys `m`, `e`, `p`, `R`, `+` and `-` are not available.
 
 ## Local and cloud modes
 
@@ -175,13 +184,10 @@ The Voice Bird API key is stored in plaintext in `config.toml`; on Unix the app 
 
 ```bash
 cargo build            # debug build
-```bash
-cargo build            # debug build
 cargo test             # unit + integration tests (mock engines, no downloads)
 cargo test --features engine-smoke   # real-engine smoke tests (downloads tiny.en)
 cargo run -p xtask -- build-sidecar  # build the macOS WhisperKit sidecar
-
-## Development
+```
 
 ## License
 
