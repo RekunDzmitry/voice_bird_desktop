@@ -1,12 +1,12 @@
-//! Cloud Character run — `POST /api/character-runs` + SSE consumer.
+//! Cloud Agent run — `POST /api/agent-runs` + SSE consumer.
 //!
 //! Mirrors the server contract in `voice_bird_web` §4. The
 //! desktop is the client:
 //!
-//!   - `POST /api/character-runs` with the joined transcript + the
-//!     picked character id. The server replies 201 with the run id
+//!   - `POST /api/agent-runs` with the joined transcript + the
+//!     picked agent id. The server replies 201 with the run id
 //!     and persists a streaming row.
-//!   - `GET /api/character-runs/<id>/events` over SSE delivers the
+//!   - `GET /api/agent-runs/<id>/events` over SSE delivers the
 //!     same `status | delta | done | error` frame shape the
 //!     dashboard consumes. `run_event_loop` walks the stream and
 //!     forwards each frame to a caller-supplied closure.
@@ -59,22 +59,22 @@ struct StartRun {
     status: String,
 }
 
-/// Fire a `POST /api/character-runs`. Returns the new run id on
+/// Fire a `POST /api/agent-runs`. Returns the new run id on
 /// success. The server's `201` carries the run summary; `4xx` and
 /// `5xx` map to specific user-facing messages.
 pub fn start(
     base_url: &str,
     api_key: &str,
-    character_id: &str,
+    agent_id: &str,
     transcript: &str,
     source_label: Option<&str>,
 ) -> anyhow::Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
-    let url = format!("{}/api/character-runs", base_url.trim_end_matches('/'));
+    let url = format!("{}/api/agent-runs", base_url.trim_end_matches('/'));
     let mut body = serde_json::json!({
-        "characterId": character_id,
+        "characterId": agent_id,
         "transcript": transcript,
     });
     if let Some(label) = source_label {
@@ -85,7 +85,7 @@ pub fn start(
         .bearer_auth(api_key)
         .json(&body)
         .send()
-        .map_err(|e| anyhow::anyhow!("character run request failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("agent run request failed: {e}"))?;
     let status = resp.status();
     if status.as_u16() == 413 {
         return Err(anyhow::anyhow!("Transcript too long"));
@@ -94,14 +94,14 @@ pub fn start(
         return Err(anyhow::anyhow!("API key rejected — check Settings"));
     }
     if status.as_u16() == 402 {
-        return Err(anyhow::anyhow!("Character runs require Pro"));
+        return Err(anyhow::anyhow!("Agent runs require Pro"));
     }
     if !status.is_success() {
-        return Err(anyhow::anyhow!("character run returned {}", status));
+        return Err(anyhow::anyhow!("agent run returned {}", status));
     }
     let body: StartResponse = resp
         .json()
-        .map_err(|e| anyhow::anyhow!("character run response was not JSON: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("agent run response was not JSON: {e}"))?;
     let _ = body.run.status;
     Ok(body.run.id)
 }
@@ -130,7 +130,7 @@ where
 {
     let client = reqwest::blocking::Client::builder().build()?;
     let url = format!(
-        "{}/api/character-runs/{}/events",
+        "{}/api/agent-runs/{}/events",
         base_url.trim_end_matches('/'),
         run_id
     );
@@ -183,7 +183,7 @@ where
         };
         let payload = rest.trim();
         let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            log::warn!("character run: skipping non-JSON SSE frame: {payload}");
+            log::warn!("agent run: skipping non-JSON SSE frame: {payload}");
             continue;
         };
         if let Some(frame) = parse_frame(run_id, &value) {

@@ -118,8 +118,8 @@ fn main() -> Result<()> {
     // agent-runtime registration entry points. Both removed in §8
     // along with `src/agent/mcp_server.rs` and
     // `src/agent/register.rs`; the `omp` integration no longer
-    // exists. Users who need an LLM-backed Character run the
-    // desktop, pick a Character at voicebird.app, and press `g`
+    // exists. Users who need an LLM-backed Agent run the
+    // desktop, pick a Agent at voicebird.app, and press `g`
     // (§11).
     let args: Vec<String> = std::env::args().collect();
     // Handle `--recover <dir>` before any TTY/terminal setup so it works
@@ -1236,7 +1236,7 @@ mod api_key_modal_ctrl_u_tests {
     fn plain_u_typing_into_api_key_buffer_works_when_control_held_is_false() {
         // Regression sentinel: Ctrl+U must NOT eat the printable 'u'
         // keystroke when no modifier is held. The handler still has a
-        // normal-character typing path.
+        // normal-agent typing path.
         let mut app = App::new();
         app.mode = AppMode::ApiKeyModal;
         app.api_key_buf = Some(String::new());
@@ -1289,7 +1289,7 @@ mod api_key_modal_ctrl_u_tests {
 
 /// `K` (uppercase) opens the API-key modal from Normal mode, regardless
 /// of whether a section is focused. The lowercase `k` keystroke must
-/// still be a regular character typed into nothing (we don't bind it),
+/// still be a regular agent typed into nothing (we don't bind it),
 /// because crossterm encodes Ctrl+K the same as a plain 'k' - the
 /// uppercase letter is the discoverable, conflict-free shortcut.
 #[cfg(test)]

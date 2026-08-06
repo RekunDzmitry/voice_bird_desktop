@@ -453,7 +453,7 @@ pub struct TargetRow {
 }
 /// Picker-side classification of a target. Single-variant after §8.5
 /// — `Stdout` is the only routing choice. §10 replaces `TargetKind`
-/// with the cloud Characters list and the picker is rebuilt.
+/// with the cloud Agents list and the picker is rebuilt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
@@ -705,7 +705,7 @@ impl App {
     /// future use; today every configured Agent target
     /// is pickable.
     /// §8.5: returns a single `Stdout` row. §10 repaints this
-    /// with the cloud Characters list.
+    /// with the cloud Agents list.
     pub fn targets(&self) -> Vec<TargetRow> {
         vec![TargetRow {
             kind: TargetKind::Stdout,
@@ -735,7 +735,7 @@ impl App {
         let slot = self.focused_slot;
         // §8.5: `TargetKind::Agent` is gone. `pick_target` is now
         // a thin wrapper around `Target::Stdout` and exists for
-        // call-site compatibility; §10's Character picker replaces it.
+        // call-site compatibility; §10's Agent picker replaces it.
         let _ = kind;
         let target = Target::Stdout;
         // Queue the override so the next start_section
@@ -1373,7 +1373,7 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout);
         // §8.5: `Target::Agent` is gone. The picker only ever returns
-        // `Stdout` until §10 repaints the pane with Characters.
+        // `Stdout` until §10 repaints the pane with Agents.
         Some(TargetKind::Stdout)
     }
 

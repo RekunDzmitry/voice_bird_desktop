@@ -11,7 +11,7 @@
 //! voicebird.app.
 //!
 //! The previous `Agent { session_id }` variant (MCP stdio routing
-//! to a local oh-my-pi runtime) is gone. Agents are now Characters
+//! to a local oh-my-pi runtime) is gone. Agents are configured
 //! at voicebird.app, and the run path lives in
 //! `src/cloud/run.rs`. The enum stays as a single variant so the
 //! `meta.json` on-disk format keeps parsing.

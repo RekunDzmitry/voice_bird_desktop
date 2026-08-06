@@ -4,7 +4,7 @@
 //! `AppConfig::voicebird_server_url` — a WebSocket URL the user
 //! (or default config) configured for cloud recording. From that
 //! single value the HTTP client here derives the REST base URL
-//! used by the character-run path (`POST /api/character-runs`).
+//! used by the agent-run path (`POST /api/agent-runs`).
 
 /// Derive the HTTP(S) REST base URL from a `ws://` or `wss://`
 /// stream URL.
@@ -19,7 +19,7 @@
 ///
 /// The path component of the input is dropped — callers compose
 /// their own REST path on top of the returned base (e.g.
-/// `format!("{base}/api/character-runs")`).
+/// `format!("{base}/api/agent-runs")`).
 pub fn rest_base_url(ws_url: &str) -> String {
     let (scheme, rest) = if let Some(r) = ws_url.strip_prefix("wss://") {
         ("https", r)

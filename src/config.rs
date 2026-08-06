@@ -136,14 +136,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
 
-    /// Per-slot override for which cloud Character to run on `g`.
+    /// Per-slot override for which cloud Agent to run on `g`.
     /// Keyed by `SlotId` (so the picker picks persist per slot).
     /// When absent, the picker cursor in §10 falls back to the
-    /// most recently used character (`last_character_id`).
+    /// most recently used agent (`last_character_id`).
     #[serde(default)]
     pub character_overrides: BTreeMap<String, String>,
 
-    /// Most recently used Character id, persisted between sessions.
+    /// Most recently used Agent id, persisted between sessions.
     /// The §11 `g` key handler uses this as the default when a
     /// slot has no override.
     #[serde(default)]
@@ -535,7 +535,7 @@ refinement_beam_size = 5
         assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
     }
 
-    /// §9b: per-slot Character override + last-used character id +
+    /// §9b: per-slot Agent override + last-used agent id +
     /// `dont_ask_character_upload` consent flag must all survive a
     /// save/load round trip. Old config.toml files written before
     /// these fields existed must still parse — the

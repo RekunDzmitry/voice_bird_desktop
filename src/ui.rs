@@ -366,7 +366,7 @@ fn build_slot_title(
     let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
     // §8.5: `Target` is a single-variant enum now, so the color
     // is fixed. Kept as a match for clarity at the call site; §10's
-    // Character picker will replace it.
+    // Agent picker will replace it.
     let _ = target;
     let target_color = Color::Green;
     if prefix.chars().count() <= inner_w {
@@ -1323,7 +1323,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             }
             // `[a]`/`[e]`/`[d]` Agent CRUD keys removed in §8.
             // `[e]` exports a recording from the Devices pane;
-            // the Targets pane will be repurposed for Characters in §10.
+            // the Targets pane will be repurposed for Agents in §10.
             if app.picker_focus != crate::app::PickerFocus::Targets && local_keys {
                 lines.push(hotkey_line("[e]", "export"));
             }
