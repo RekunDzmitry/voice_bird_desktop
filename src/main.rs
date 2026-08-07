@@ -420,7 +420,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             let next = match app.picker_focus {
                 Devices => Devices,
                 Apps => Devices,
-                Targets => Apps,
+                Agents => Apps,
             };
             app.picker_focus = next;
             log::info!("keys: Left → picker_focus = {:?}", next);
@@ -429,8 +429,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             use crate::app::PickerFocus::*;
             let next = match app.picker_focus {
                 Devices => Apps,
-                Apps => Targets,
-                Targets => Targets,
+                Apps => Agents,
+                Agents => Agents,
             };
             app.picker_focus = next;
             log::info!("keys: Right → picker_focus = {:?}", next);
@@ -493,18 +493,18 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // `a`/`e`/`d` agent CRUD keys removed in §8 — see plan §8.1.
         // Their handler functions and `AppMode` variants are gone in §8.3.
         KeyCode::Enter => {
-            // When the Targets pane is focused, Enter first applies
+            // When the Agents pane is focused, Enter first applies
             // the picked target to the focused slot's
             // pending_target_overrides (so start_section consumes
             // it). The picked target may be disabled (e.g. Agent when
             // the binary is missing) — in that case we surface a
             // banner and abort; the user can press Down to land on
             // a pickable row.
-            if app.picker_focus == crate::app::PickerFocus::Targets {
+            if app.picker_focus == crate::app::PickerFocus::Agents {
                 if let Some(kind) = app.focused_target_kind() {
                     let target = app.pick_target(kind);
                     log::info!(
-                        "keys: Enter in Targets pane → picked {target:?} for slot {}",
+                        "keys: Enter in Agents pane → picked {target:?} for slot {}",
                         app.focused_slot.0
                     );
                 } else {
@@ -516,7 +516,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 }
             }
             // Hand the rest off to App::try_start_new_section. The
-            // Targets pick_target above is the only Enter-specific
+            // Agents pick_target above is the only Enter-specific
             // UI concern; everything else (slot pick, source
             // resolution, config persist, start_section) is shared
             // and lives in the App method so it can be unit-tested.
@@ -788,10 +788,10 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.open_path_modal();
         }
         // The O / S / A target-cycle keys have been replaced by the
-        // Targets picker pane — the user picks a target with the
+        // Agents picker pane — the user picks a target with the
         // same arrow / Enter pattern as Devices and Apps. The change
         // is queued in `pending_target_overrides` by the Enter
-        // handler when the Targets pane is focused.
+        // handler when the Agents pane is focused.
         _ => {}
     }
 }

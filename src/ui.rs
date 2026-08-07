@@ -63,8 +63,8 @@ pub fn render(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(72), Constraint::Length(36)])
         .split(root[1]);
 
-    // Three rows stacked: a 3-pane picker (Devices / Apps / Targets)
-    // and the slot row. The Targets pane replaces the per-slot chip
+    // Three rows stacked: a 3-pane picker (Devices / Apps / Agents)
+    // and the slot row. The Agents pane replaces the per-slot chip
     // strip and makes picking a target as discoverable as picking a
     // device or app. Heights are weighted so the picker keeps its
     // room while the slot row keeps the bulk of the screen.
@@ -773,15 +773,16 @@ fn input_line(value: &str) -> Line<'static> {
 }
 
 /// Top-row picker. Three panes side by side: Devices (physical I/O),
-/// Apps (per-application capture), and Targets (routing — Stdout /
-/// Cloud / Agent). Each pane is a self-contained `Block` with its own
-/// border + title + cursor; the picker wires them through a single
-/// outer layout so they all share the same row height.
+/// Apps (per-application capture), and Agents (cloud-prompt picker —
+/// today a single `Stdout` row while the cloud list lands in §10).
+/// Each pane is a self-contained `Block` with its own border +
+/// title + cursor; the picker wires them through a single outer
+/// layout so they all share the same row height.
 ///
 /// Width split is percentage-based and intentionally biased toward
 /// Devices: device names are the longest strings we render, and
 /// dropping Devices below ~40% starts clipping them. Apps and
-/// Targets are short lists so they can survive narrower columns.
+/// Agents are short lists so they can survive narrower columns.
 fn render_picker(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -807,19 +808,19 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
 /// the pickable state in agreement.
 fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
 
-    let focused = app.picker_focus == PickerFocus::Targets;
+    let focused = app.picker_focus == PickerFocus::Agents;
     // §8.5: `app.targets()` returns just the Stdout row.
     let rows = app.targets();
     let picked = app.picked_target_kind();
     // pending-or-last target. Highlights survive the pane's focus
-    // state — even when Targets isn't focused, the user can see
+    // state — even when Agents isn't focused, the user can see
     // which row is the live choice.
     let picked = app.picked_target_kind();
 
     let title = if focused {
-        " Targets ▸ [↑/↓] pick  [←] apps  [Enter] start "
+        " Agents ▸ [↑/↓] pick  [←] apps  [Enter] start "
     } else {
-        " Targets  ([→] focus) "
+        " Agents  ([→] focus) "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -833,7 +834,7 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, row)| {
             let is_cursor = i == app.selected_target_index.unwrap_or(0) && focused;
-            // The Targets pane is now dynamic — `Agent` rows
+            // The Agents pane is now dynamic — `Agent` rows
             // can also be picked. Clone the kind so the borrow
             // on `row` ends before the next iteration's call.
             let is_picked = picked.as_ref() == Some(&row.kind) && !row.disabled;
@@ -986,7 +987,7 @@ fn render_devices_pane(f: &mut Frame, area: Rect, app: &App) {
             };
             // "●" pin appears only on the row that's pinned to the
             // slot. It survives the focus state of this pane —
-            // users looking at Apps or Targets can still see what
+            // users looking at Apps or Agents can still see what
             // the device choice is.
             let picked_tag = if is_picked {
                 Span::styled(
@@ -1023,7 +1024,7 @@ fn render_apps_pane(f: &mut Frame, area: Rect, app: &App) {
     let picked = app.picked_app_idx();
 
     let title = if focused {
-        " Apps ▸ [↑/↓] pick  [Space] none  [←] devices  [→] targets "
+        " Apps ▸ [↑/↓] pick  [Space] none  [←] devices  [→] agents "
     } else {
         " Apps  ([→] focus) "
     };
@@ -1323,8 +1324,8 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             }
             // `[a]`/`[e]`/`[d]` Agent CRUD keys removed in §8.
             // `[e]` exports a recording from the Devices pane;
-            // the Targets pane will be repurposed for Agents in §10.
-            if app.picker_focus != crate::app::PickerFocus::Targets && local_keys {
+            // the Agents pane will be repurposed for cloud Agents in §10.
+            if app.picker_focus != crate::app::PickerFocus::Agents && local_keys {
                 lines.push(hotkey_line("[e]", "export"));
             }
             lines
@@ -1833,8 +1834,8 @@ mod tests {
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
-    /// Targets pane renders as the third picker column. The
-    /// header is " Targets " (focused variant carries the
+    /// Agents pane renders as the third picker column. The
+    /// header is " Agents " (focused variant carries the
     /// action hint). The two fixed rows are Stdout and
     /// Agent — Cloud is no longer a target (cloud is a
     /// per-section transport flag in the Mode panel).
@@ -1896,7 +1897,7 @@ mod tests {
         // when no section is recording. Recording-only keys
         // ([s]top, [x]clear, …) live on the `(true, _)` branch.
         // No `/mcp` line — the Agent target lives in the
-        // Targets picker pane rather than a separate hotkey.
+        // Agents picker pane rather than a separate hotkey.
         for key in [
             "[↑/↓]",
             "[←/→]",

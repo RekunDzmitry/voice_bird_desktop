@@ -161,7 +161,7 @@ pub struct Section {
     pub transcript_follow: bool,
     /// Where this section is sending its transcript. Derived from
     /// `settings.cloud_on` at start time and kept in sync on the
-    /// `Target` axis so the Targets pane can show it without poking
+    /// `Target` axis so the Agents pane can show it without poking
     /// into the per-section settings.
     pub target: Target,
 }
@@ -254,14 +254,15 @@ impl std::fmt::Debug for Slot {
 }
 /// Which pane the picker arrows / Enter key target. Devices is the
 /// physical-input/output column on the left; Apps is the
-/// per-application column in the middle; Targets is the routing
-/// choice (Stdout / Cloud / Agent) on the right. Each pane has its
-/// own cursor and scroll offset.
+/// per-application column in the middle; Agents is the cloud-prompt
+/// picker on the right (today a single `Stdout` row while the cloud
+/// agent list lands in §10). Each pane has its own cursor and scroll
+/// offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFocus {
     Devices,
     Apps,
-    Targets,
+    Agents,
 }
 
 /// Main application state
@@ -281,7 +282,7 @@ pub struct App {
     /// Cursor in the Apps pane. `None` = no app paired (run device alone).
     pub selected_app_index: Option<usize>,
 
-    /// Cursor in the Targets pane. The list of targets is fixed at
+    /// Cursor in the Agents pane. The list of agents is fixed at
     /// three entries (Stdout / Cloud / Agent) — see `targets()`. Always
     /// `Some(idx)` while the TUI runs; the cursor is one of the
     /// rendered rows.
@@ -395,7 +396,7 @@ pub struct App {
     empty_committed: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
 
-    /// Per-slot pending target override. The Targets picker writes
+    /// Per-slot pending target override. The Agents picker writes
     /// to this when the user picks a row; the next `start_section`
     /// consults it and applies it instead of the default
     /// `cloud_on` heuristic. The value is consumed (set back to
@@ -440,7 +441,7 @@ pub fn push_app_event(events: &Arc<PlMutex<VecDeque<AppEvent>>>, message: impl I
     });
 }
 
-/// A single row in the Targets picker.
+/// A single row in the Agents picker.
 /// The picker renders
 /// one row per known target; rows that point at a target
 /// the user can't actually use (e.g. Agent when the
@@ -545,7 +546,7 @@ impl App {
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
-            // Targets list starts with Stdout at index 0; the user
+            // Agents list starts with Stdout at index 0; the user
             // grows it with Add Agent (config.agent_targets).
             // pre-populated so the pane never renders in an
             // empty-cursor state.
@@ -681,14 +682,14 @@ impl App {
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
     /// when the slot has never been used. UI uses this to drive the
-    /// Targets pane.
+    /// Agents pane.
     pub fn focused_target(&self) -> Option<Target> {
         self.slot_by_id(self.focused_slot).and_then(|s| s.target())
     }
 
     /// The current pending target for the focused slot, falling
     /// through to the slot's last-used target, then Stdout. The UI
-    /// uses this for the per-slot title and the targets pane's
+    /// uses this for the per-slot title and the agents pane's
     /// "active" marker.
     pub fn focused_pending_target(&self) -> Target {
         self.pending_target_overrides
@@ -712,7 +713,7 @@ impl App {
             disabled: false,
         }]
     }
-    /// Resolve the currently focused Targets-pane row to a `Target`.
+    /// Resolve the currently focused Agents-pane row to a `Target`.
     /// Returns `None` if the cursor is parked on a disabled row or
     /// out of range.
     pub fn focused_target_kind(&self) -> Option<TargetKind> {
@@ -1111,7 +1112,7 @@ impl App {
     }
 
     /// Move the cursor up one row in whichever pane is focused.
-    /// In the Targets pane, disabled rows (currently just `Agent` when
+    /// In the Agents pane, disabled rows (currently just `Agent` when
     /// the binary is missing) are skipped so the cursor never parks
     /// on a row that can't be picked.
     pub fn select_previous(&mut self) {
@@ -1128,7 +1129,7 @@ impl App {
                     self.selected_app_index = Some(next);
                 }
             }
-            PickerFocus::Targets => {
+            PickerFocus::Agents => {
                 let i = self.selected_target_index.unwrap_or(0);
                 if i > 0 {
                     self.selected_target_index = Some(i - 1);
@@ -1175,9 +1176,9 @@ impl App {
                     self.selected_app_index = Some(0);
                 }
             }
-            PickerFocus::Targets => {
+            PickerFocus::Agents => {
                 let i = self.selected_target_index.unwrap_or(0);
-                // The Targets list is dynamic — Stdout / Cloud plus
+                // The Agents list is dynamic — Stdout / Cloud plus
                 // every entry in `config.agent_targets`. The renderer
                 // already iterates the full list, so the cursor cap
                 // must come from `targets().len()` too; a hardcoded
@@ -1364,7 +1365,7 @@ impl App {
 
     /// Picked-target kind for the focused slot. Falls through to
     /// the last-saved target if no pending override is queued. The
-    /// Targets pane uses this to mark the active row.
+    /// Agents pane uses this to mark the active row.
     pub fn picked_target_kind(&self) -> Option<TargetKind> {
         let t = self
             .pending_target_overrides
@@ -1562,7 +1563,7 @@ impl App {
             "en".to_string()
         };
 
-        // Where this section is heading. The Targets picker
+        // Where this section is heading. The Agents picker
         // writes a per-slot override when the user picks a
         // row; that overrides the cloud_on heuristic so the
         // agent target works alongside the existing Cloud /
@@ -2344,7 +2345,7 @@ impl App {
     /// caller in `main.rs` can surface them as banners
     /// unchanged.
     ///
-    /// The Targets picker has a special-case in the `Enter`
+    /// The Agents picker has a special-case in the `Enter`
     /// handler that *applies* the picked target first; that
     /// lives in `main.rs` (it's a UI concern) and is called
     /// *before* this method. By the time we get here, the
@@ -2708,7 +2709,7 @@ mod tests {
         assert!(!looks_like_auth_error("connection reset by peer"));
         assert!(!looks_like_auth_error("audio format unsupported"));
     }
-    /// The Targets pane's `pick_target` writes the focused slot's
+    /// The Agents pane's `pick_target` writes the focused slot's
     /// pending target, which `start_section` consumes on the next
     /// start. Each call returns the resolved `Target` (with a
     /// second Agent target. ↑/↓ must walk onto the saved row
@@ -3130,7 +3131,7 @@ mod tests {
 
     // ── Cloud-target refactor: cloud is a transport, not a target ──
 
-    /// The targets picker no longer offers Cloud as a
+    /// The agents picker no longer offers Cloud as a
     /// destination. With cloud removed from the
     /// `Target` enum, `App::targets()` returns exactly
     /// one row per known destination: Stdout (row 0)
