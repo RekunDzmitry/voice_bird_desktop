@@ -8,9 +8,9 @@
 //!   - the configured server URL (`AppConfig::voicebird_server_url`)
 //!     points at a `wss://...` host whose HTTP origin is reachable.
 //!
-//! The split between `mod http`, `mod characters`, and `mod run`:
+//! The split between `mod http`, `mod agents`, and `mod run`:
 //!   - `http` — small helpers (URL translation, header construction).
-//!   - `characters` — `GET /api/agents` for the picker; the prompt
+//!   - `agents` — `GET /api/agents` for the picker; the prompt
 //!     template never leaves the server.
 //!   - `run` — `POST /api/agent-runs` + SSE consumer for the
 //!     `g`-key run path (§11).

@@ -467,12 +467,25 @@ pub struct TargetRow {
     pub kind: TargetKind,
     pub disabled: bool,
 }
-/// Picker-side classification of a target. Single-variant after §8.5
-/// — `Stdout` is the only routing choice. §10 replaces `TargetKind`
-/// with the cloud Agents list and the picker is rebuilt.
+/// Picker-side classification of a target row. `Stdout` is
+/// retained for legacy `pick_target` callers but never
+/// produced by `App::targets()` — the §10 picker only shows
+/// `Agent(id)` rows derived from `GET /api/agents`. Routing
+/// on-disk (the `Target` enum in `session/target`) is a
+/// separate axis: an `Agent(id)` pick still defaults to
+/// `Target::Stdout` for local file persistence unless the
+/// caller explicitly switches the section's transport flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
+    /// Legacy: forces local persistence via the routing
+    /// `Target::Stdout` override. Never emitted by
+    /// `App::targets()`.
     Stdout,
+    /// A cloud Agent id fetched from `GET /api/agents`.
+    /// `pick_target(TargetKind::Agent(id))` records the id
+    /// in `pending_agent_overrides` so `start_section` /
+    /// the §11 `g` key handler can look it up.
+    Agent(String),
 }
 impl App {
     /// Create a new application instance
@@ -602,6 +615,7 @@ impl App {
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
 
+        app.refresh_agents();
         app
     }
 
@@ -716,19 +730,23 @@ impl App {
             .unwrap_or(Target::Stdout)
     }
     /// The picker list. Row 0 is `Stdout`; rows 1+ are
-    /// one per user-configured Agent target. `Cloud`
-    /// is intentionally absent — cloud is a per-section
-    /// transport flag (see `SectionSettings::cloud_on`),
-    /// not a target. Disabled flag is reserved for
-    /// future use; today every configured Agent target
-    /// is pickable.
-    /// §8.5: returns a single `Stdout` row. §10 repaints this
-    /// with the cloud Agents list.
+    /// The picker list — one `TargetRow` per cloud Agent fetched
+    /// by `App::refresh_agents`. `Cloud` and the legacy `Stdout`
+    /// row are deliberately absent: cloud is a per-section
+    /// transport flag (`SectionSettings::cloud_on`), not a
+    /// picker destination; `Stdout` is the implicit routing
+    /// default applied by `start_section` when no Agent has
+    /// been picked (or when cloud is off entirely). Disabled
+    /// flag is reserved for future use; today every fetched
+    /// Agent is pickable.
     pub fn targets(&self) -> Vec<TargetRow> {
-        vec![TargetRow {
-            kind: TargetKind::Stdout,
-            disabled: false,
-        }]
+        self.agents
+            .iter()
+            .map(|a| TargetRow {
+                kind: TargetKind::Agent(a.id.clone()),
+                disabled: false,
+            })
+            .collect()
     }
     /// Resolve the currently focused Agents-pane row to a `Target`.
     /// Returns `None` if the cursor is parked on a disabled row or
@@ -744,25 +762,34 @@ impl App {
         })
     }
 
-    /// Set the focused slot's pending target from a `TargetKind`. The
-    /// value is consumed by the next `start_section` and applied
-    /// instead of the `cloud_on` heuristic. The resolved `Target`
-    /// (with a session id, for Agent) is returned so the caller can
-    /// surface it in a banner.
+    /// Set the focused slot's pending target from a `TargetKind`.
+    /// `TargetKind::Stdout` writes the routing `Target::Stdout`
+    /// override (legacy path, kept for the test-suite). `TargetKind::Agent(id)`
+    /// writes the cloud Agent id to `pending_agent_overrides`
+    /// instead — the on-disk routing stays at its current value.
+    /// The resolved `Target` is returned so the caller can surface
+    /// it in a banner.
     pub fn pick_target(&mut self, kind: TargetKind) -> Target {
         let slot = self.focused_slot;
-        // §8.5: `TargetKind::Agent` is gone. `pick_target` is now
-        // a thin wrapper around `Target::Stdout` and exists for
-        // call-site compatibility; §10's Agent picker replaces it.
-        let _ = kind;
-        let target = Target::Stdout;
-        // Queue the override so the next start_section
-        // consumes it. (Today this is the only signal
-        // the picker writes; start_section removes the
-        // override at start time and uses it as the
-        // section's target.)
-        self.pending_target_overrides.insert(slot, target.clone());
-        target
+        match kind {
+            TargetKind::Stdout => {
+                let target = Target::Stdout;
+                self.pending_target_overrides
+                    .insert(slot, target.clone());
+                target
+            }
+            TargetKind::Agent(id) => {
+                // Cloud Agent picks don't change the on-disk
+                // routing Target — local file persistence is
+                // still `Target::Stdout`. The picked id is
+                // recorded separately in
+                // `pending_agent_overrides` and consulted by
+                // `start_section` / the §11 `g` key handler
+                // when running the cloud prompt.
+                self.pending_agent_overrides.insert(slot, id);
+                Target::Stdout
+            }
+        }
     }
 
     /// Borrow the fetched cloud Agents list. Empty when the
@@ -773,10 +800,8 @@ impl App {
         &self.agents
     }
 
-
     /// Re-fetch the cloud Agents list from voicebird.app and
     /// store it on `self.agents`. No-op when:
-    ///   - `config.cloud_broadcast_enabled` is false, OR
     ///   - the user has no API key set, OR
     ///   - the server URL is empty / unparseable.
     /// On HTTP failure (4xx / 5xx / network error), `self.agents`
@@ -784,8 +809,29 @@ impl App {
     /// stale rows. The error is logged but not surfaced as a
     /// banner — picker emptiness is enough signal.
     pub fn refresh_agents(&mut self) {
-        // Stub in the red commit; the green commit wires the
-        // `cloud::agents::fetch` call.
+        if !self.config.cloud_broadcast_enabled
+            || self.config.voicebird_api_key.is_empty()
+            || self.config.voicebird_server_url.is_empty()
+        {
+            self.agents.clear();
+            return;
+        }
+        let base = voice_bird_cli::cloud::http::rest_base_url(
+            &self.config.voicebird_server_url,
+        );
+        match voice_bird_cli::cloud::agents::fetch(
+            &base,
+            &self.config.voicebird_api_key,
+        ) {
+            Ok(list) => {
+                log::info!("refresh_agents: fetched {} agents", list.len());
+                self.agents = list;
+            }
+            Err(e) => {
+                log::warn!("refresh_agents: fetch failed: {e}");
+                self.agents.clear();
+            }
+        }
     }
 
     /// Record `agent_id` as the focused slot's pending cloud Agent
@@ -795,11 +841,9 @@ impl App {
     /// still controls local file persistence.
     pub fn pick_agent(&mut self, agent_id: &str) {
         let slot = self.focused_slot;
-        // Stub in the red commit; the green commit inserts into
-        // `self.pending_agent_overrides`.
-        let _ = (slot, agent_id);
+        self.pending_agent_overrides
+            .insert(slot, agent_id.to_string());
     }
-
 
     /// Committed-transcript Arc for the focused section, or saved
     /// transcript, or an empty fallback when nothing is available.
