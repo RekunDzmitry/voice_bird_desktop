@@ -802,12 +802,14 @@ impl App {
 
     /// Re-fetch the cloud Agents list from voicebird.app and
     /// store it on `self.agents`. No-op when:
+    ///   - `config.cloud_broadcast_enabled` is false, OR
     ///   - the user has no API key set, OR
     ///   - the server URL is empty / unparseable.
     /// On HTTP failure (4xx / 5xx / network error), `self.agents`
     /// is cleared so the picker goes empty rather than showing
-    /// stale rows. The error is logged but not surfaced as a
-    /// banner — picker emptiness is enough signal.
+    /// stale rows, AND a banner is set explaining the failure —
+    /// picker emptiness alone is too quiet and looks identical
+    /// to "fetch hasn't run yet".
     pub fn refresh_agents(&mut self) {
         if !self.config.cloud_broadcast_enabled
             || self.config.voicebird_api_key.is_empty()
@@ -830,6 +832,16 @@ impl App {
             Err(e) => {
                 log::warn!("refresh_agents: fetch failed: {e}");
                 self.agents.clear();
+                // Surface the failure so an empty Agents pane
+                // doesn't look identical to "fetch hasn't run
+                // yet". Common causes: wrong API key for the
+                // configured server, or the voicebird_server_url
+                // points at a different host than the key was
+                // issued for.
+                self.banner = Some(format!(
+                    "Agents list unavailable: {e}. \
+                     Check the API key and voicebird_server_url."
+                ));
             }
         }
     }

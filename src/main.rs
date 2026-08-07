@@ -725,6 +725,13 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 if let Err(e) = app.config.save() {
                     log::error!("config save (cloud toggle): {e}");
                 }
+                // Re-fetch the cloud Agents list whenever cloud
+                // toggles. `refresh_agents()` no-ops (and clears
+                // `self.agents`) when the gate fails (cloud off,
+                // empty key, empty URL) and fetches when the gate
+                // passes — covers both the ON and OFF transitions
+                // without callers having to branch.
+                app.refresh_agents();
                 if on && app.config.voicebird_api_key.is_empty() {
                     // Cloud-enable gate. Esc reverts the just-toggled
                     // `cloud_broadcast_enabled` back to OFF (it was
@@ -889,7 +896,6 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                 // misleading. The cloud-enable gate (if this
                 // modal was opened as one) will re-trigger on
                 // the next recording because `key.is_empty()`
-                // and `cloud_broadcast_enabled` is unchanged.
                 let trimmed = buf.trim();
                 app.config.voicebird_api_key = trimmed.to_string();
                 if let Err(e) = app.config.save() {
@@ -897,9 +903,19 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                     app.banner = Some(format!("Save failed: {e}"));
                 } else if trimmed.is_empty() {
                     app.banner = Some("API key cleared".into());
+                    // Empty key: clear any stale agents list so the
+                    // picker doesn't keep showing entries from a
+                    // prior fetch.
+                    app.refresh_agents();
                 } else {
                     app.banner =
                         Some("API key saved — start a recording to verify".into());
+                    // New key just landed: re-fetch the Agents list
+                    // so the picker reflects what this key is
+                    // authorized to see. Without this the picker
+                    // stays empty until the next `App::new()`
+                    // (i.e. process restart).
+                    app.refresh_agents();
                 }
             }
             app.mode = AppMode::Normal;
