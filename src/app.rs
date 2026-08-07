@@ -404,6 +404,21 @@ pub struct App {
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
 
+    /// Cloud Agents fetched from `GET /api/agents`. Populated by
+    /// `App::refresh_agents` when the user has cloud on AND an API
+    /// key. The Agents picker renders one row per entry here —
+    /// `App::targets()` reads from this list, never from a
+    /// hard-coded `Stdout` row.
+    pub agents: Vec<voice_bird_cli::cloud::agents::Agent>,
+
+    /// Per-slot pending agent override. The Agents picker writes
+    /// to this when the user picks a row; `start_section` /
+    /// `pick_agent` consults it to resolve which cloud Agent the
+    /// `g` key (§11) should run. Distinct from
+    /// `pending_target_overrides`, which tracks the on-disk
+    /// `Target::Stdout` routing decision.
+    pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
+
     /// Rolling log of app events (verify ok/fail, push failures,
     /// dropped segments), newest at the back, capped at
     /// [`APP_EVENT_CAP`]. Behind an `Arc<PlMutex<...>>` so any
@@ -582,6 +597,8 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
             pending_target_overrides: std::collections::BTreeMap::new(),
+            agents: Vec::new(),
+            pending_agent_overrides: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
 
@@ -747,6 +764,42 @@ impl App {
         self.pending_target_overrides.insert(slot, target.clone());
         target
     }
+
+    /// Borrow the fetched cloud Agents list. Empty when the
+    /// fetch hasn't run yet, the user has cloud off, or the
+    /// request failed. The Agents picker reads through this
+    /// accessor — the storage lives on `self.agents`.
+    pub fn agents(&self) -> &[voice_bird_cli::cloud::agents::Agent] {
+        &self.agents
+    }
+
+
+    /// Re-fetch the cloud Agents list from voicebird.app and
+    /// store it on `self.agents`. No-op when:
+    ///   - `config.cloud_broadcast_enabled` is false, OR
+    ///   - the user has no API key set, OR
+    ///   - the server URL is empty / unparseable.
+    /// On HTTP failure (4xx / 5xx / network error), `self.agents`
+    /// is cleared so the picker goes empty rather than showing
+    /// stale rows. The error is logged but not surfaced as a
+    /// banner — picker emptiness is enough signal.
+    pub fn refresh_agents(&mut self) {
+        // Stub in the red commit; the green commit wires the
+        // `cloud::agents::fetch` call.
+    }
+
+    /// Record `agent_id` as the focused slot's pending cloud Agent
+    /// pick. Consumed by `start_section` (and the §11 `g` key
+    /// handler) to know which prompt template to run. No-op on
+    /// the routing `Target` axis — `pick_target(TargetKind::Stdout)`
+    /// still controls local file persistence.
+    pub fn pick_agent(&mut self, agent_id: &str) {
+        let slot = self.focused_slot;
+        // Stub in the red commit; the green commit inserts into
+        // `self.pending_agent_overrides`.
+        let _ = (slot, agent_id);
+    }
+
 
     /// Committed-transcript Arc for the focused section, or saved
     /// transcript, or an empty fallback when nothing is available.
@@ -2728,7 +2781,136 @@ mod tests {
         assert!(app.focused_tentative().lock().is_empty());
     }
 
-    // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
+    // ── cloud Agents pane (red: §10) ───────────────────────────────
+
+    /// `App::targets()` must never emit a `Stdout` row. The picker
+    /// shows cloud Agents only — local file persistence is the
+    /// implicit default routing when the user hasn't picked one.
+    /// Today this fails: `targets()` returns a single `Stdout`
+    /// row from `App::new()` (the §8.5 fallback).
+    #[test]
+    fn no_stdout_row_in_agents_pane() {
+        let app = App::new();
+        for row in app.targets() {
+            assert!(
+                !matches!(row.kind, TargetKind::Stdout),
+                "Stdout must never appear in the Agents pane; got {:?}",
+                row.kind
+            );
+        }
+    }
+
+    /// Default config (cloud off, no key) ⇒ empty Agents pane.
+    /// The user hasn't enabled cloud so there's nothing to fetch;
+    /// the picker should render zero rows, not a fallback `Stdout`.
+    /// Today this fails: `targets()` returns `[Stdout]`.
+    #[test]
+    fn agents_pane_empty_when_cloud_off_default() {
+        let app = App::new();
+        assert!(
+            app.targets().is_empty(),
+            "cloud off ⇒ empty Agents pane; got {} rows",
+            app.targets().len()
+        );
+    }
+
+    /// Cloud on but no API key ⇒ empty Agents pane (can't fetch).
+    /// The current code emits a `Stdout` row regardless of config,
+    /// so this assertion fails today.
+    #[test]
+    fn agents_pane_empty_when_no_api_key_with_cloud_on() {
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = true;
+        // voicebird_api_key stays empty (default).
+        app.refresh_agents();
+        assert!(
+            app.targets().is_empty(),
+            "cloud on + no key ⇒ empty Agents pane; got {} rows",
+            app.targets().len()
+        );
+    }
+
+    /// `App::refresh_agents()` against a stub server that returns two
+    /// Agents must populate `app.agents()` with both. Today this
+    /// fails: `refresh_agents()` is a no-op stub.
+    #[cfg(not(windows))]
+    #[test]
+    fn refresh_agents_with_cloud_on_populates_from_stub_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Serve a canned Agents response. Path is irrelevant —
+        // the server replies the same JSON to any request.
+        let server = std::thread::spawn(move || {
+            // Accept with a 2-second ceiling so the test can't
+            // hang forever if `refresh_agents` never reaches
+            // `fetch` (e.g. when the stub does nothing).
+            listener.set_nonblocking(true).ok();
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok(s) => break s.0,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            // Read & discard the request (don't bother parsing).
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
+            let body = r#"{"agents":[{"id":"note-taker","name":"Note taker","icon":"\u270d\ufe0f","prompt_template":"x"},{"id":"summarizer","name":"Summarizer","icon":"\u2728","prompt_template":"y"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use std::io::Write;
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let mut app = App::new();
+        app.config.cloud_broadcast_enabled = true;
+        app.config.voicebird_api_key = "test-key-abc123".into();
+        app.config.voicebird_server_url = format!("ws://{}/api/audio/stream", addr);
+        app.refresh_agents();
+        let _ = server.join();
+
+        assert_eq!(
+            app.agents().len(),
+            2,
+            "expected 2 agents from stub server, got {:?}",
+            app.agents()
+        );
+        assert_eq!(app.agents()[0].id, "note-taker");
+        assert_eq!(app.agents()[1].id, "summarizer");
+        // The picker should now reflect both rows.
+        assert_eq!(app.targets().len(), 2);
+    }
+
+    /// `pick_agent` records the agent id in the per-slot pending
+    /// map so `start_section` / §11 `g` key know which cloud
+    /// Agent to run. Today the stub does NOT record, so this
+    /// test fails.
+    #[test]
+    fn pick_agent_records_id_in_pending_map() {
+        let mut app = App::new();
+        let slot = app.focused_slot;
+        app.pick_agent("note-taker");
+        assert_eq!(
+            app.pending_agent_overrides.get(&slot).map(String::as_str),
+            Some("note-taker"),
+            "pick_agent must record the id in pending_agent_overrides"
+        );
+    }
+
     // ── resume_section state matrix (R key) ──────────────────────────
 
     /// An `Empty` slot must surface a banner-ready `Err` so the
