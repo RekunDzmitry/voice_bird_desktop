@@ -2922,7 +2922,7 @@ mod tests {
             let mut reader = std::io::BufReader::new(&stream);
             let mut buf = Vec::new();
             let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
-            let body = r#"{"agents":[{"id":"note-taker","name":"Note taker","icon":"\u270d\ufe0f","prompt_template":"x"},{"id":"summarizer","name":"Summarizer","icon":"\u2728","prompt_template":"y"}]}"#;
+            let body = r#"{"agents":[{"id":"note-taker","name":"Note taker","icon":"\u270d\ufe0f","promptTemplate":"x"},{"id":"summarizer","name":"Summarizer","icon":"\u2728","promptTemplate":"y"}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                 body.len(),
