@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::{slot_settings_key, AppConfig, SlotSettings};
+use voice_bird_cli::config::AppConfig;
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -26,16 +26,7 @@ pub enum AppMode {
     /// Centered overlay prompting the user to pick a local
     /// session output path. Opened with `p` from Normal mode.
     PathModal,
-    /// Multi-step "Add / Edit Agent target" funnel. The funnel
-    /// state is on `App::funnel`; this variant just signals the
-    /// dispatcher to route keys to `handle_agent_funnel`.
-    AgentFunnel,
-    /// Confirm-prompt overlay. Used today for "delete the focused
-    /// Agent target? [y/N]".
-    ConfirmDeleteAgentTarget {
-        id: String,
-    },
-}
+ }
 
 /// Languages offered in the cloud-mode language selector. Local mode
 /// always transcribes English regardless of this list — the selector
@@ -223,11 +214,6 @@ impl std::fmt::Debug for SlotKind {
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
-    /// Per-slot settings the user flips from the Mode panel.
-    /// Independent of `kind` — the same `SlotSettings` apply
-    /// whether the slot is Empty, Recording, or Saved. Two
-    /// slots can have different settings simultaneously.
-    pub settings: SlotSettings,
 }
 
 impl Slot {
@@ -235,7 +221,6 @@ impl Slot {
         Self {
             id,
             kind: SlotKind::Empty,
-            settings: SlotSettings::default(),
         }
     }
 
@@ -365,25 +350,6 @@ pub struct App {
     /// false, the model picker refuses to Esc-cancel — first run must pick.
     pub config_was_loaded_from_disk: bool,
 
-    /// Resolved on-disk path this `App` reads from and saves to.
-    /// `App::new` populates it from `AppConfig::config_path()`;
-    /// `App::new_with_config_path` lets tests inject a private
-    /// tempdir without touching the process-global env var.
-    ///
-    /// `None` when the path could not be resolved at all (no
-    /// `dirs::config_dir()`). The App still boots — from defaults,
-    /// in memory — and [`Self::save_config`] reports the failure
-    /// instead of panicking at startup.
-    pub config_path: Option<PathBuf>,
-
-    /// True when the on-disk config existed but failed to parse.
-    /// Latches for the process lifetime and makes every
-    /// [`Self::save_config`] refuse: booting from defaults is
-    /// recoverable, but writing those defaults back would destroy
-    /// the API key, devices, and agent targets the user still has
-    /// in the file. They fix or delete `config.toml` and restart.
-    pub config_load_failed: bool,
-
     /// In-flight text buffer for the API-key modal. `None` when the
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
@@ -429,18 +395,6 @@ pub struct App {
     empty_committed: Arc<PlMutex<Vec<CommittedLine>>>,
     empty_tentative: Arc<PlMutex<String>>,
 
-    /// Detected state of the user's agent runtime (today: oh-my-pi
-    /// / omp). `None` only on a configuration error during
-    /// `App::new`; the user-visible states are
-    /// `AgentStatus::Ready` (path + version) or
-    /// `AgentStatus::NotFound`. Used by the Targets pane to decide
-    /// whether the Agent chip is enabled, and by `App::new` to
-    /// wire the status-bar hint.
-    pub agent: voice_bird_cli::agent::AgentStatus,
-    /// Which detection source produced the agent runtime (env /
-    /// PATH / bun install). `None` iff detection failed.
-    /// Surfaced in the status bar.
-    pub agent_detection_source: Option<voice_bird_cli::agent::AgentDetectionSource>,
     /// Per-slot pending target override. The Targets picker writes
     /// to this when the user picks a row; the next `start_section`
     /// consults it and applies it instead of the default
@@ -448,100 +402,46 @@ pub struct App {
     /// `None`) by start_section so it only affects the very next
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
-    /// Legacy MCP-backed segment buffer for the `"default"`
-    /// Agent target. The segment-fan-out task (in `App`)
-    /// pushes into this same buffer when the focused slot's
-    /// target is `Target::Agent` with `session_id == "default"`,
-    /// so a single source of truth serves both the
-    /// in-process recorder and the out-of-process agent.
-    agent_state: voice_bird_cli::agent::mcp_server::ServerState,
 
-    /// User-configured Agent targets, keyed by their
-    /// `AgentTargetId`. Populated from `config.agent_targets` at
-    /// `App::new` time and updated whenever the funnel saves a
-    /// new target. The consumer task looks up the right impl by
-    /// `Target::Agent` (with its session_id) so the segment
-    /// fan-out matches the picker pick.
-    pub agent_targets:
-        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
-    /// Active funnel state. `Some` while the user is in
-    /// `AppMode::AgentFunnel`; `None` otherwise. Mutated by
-    /// `main.rs`'s key dispatcher and read by `ui.rs`'s modal
-    /// renderer.
-    pub funnel: Option<voice_bird_cli::agent_funnel::AgentFunnel>,
-
-    /// In-flight verify probe. Set by the Verify-step key
-    /// handler when the user runs a probe; drained by
-    /// `App::poll_funnel_verify` from the main event loop so
-    /// the TUI keeps drawing frames (and Esc keeps working)
-    /// while the probe is in flight.
-    pub verify_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<std::time::Duration>>>,
-
-    /// Wall-clock start of the in-flight verify probe, for
-    /// logging. Set alongside `verify_rx`; read by the poll
-    /// helper on completion.
-    pub verify_started: Option<std::time::Instant>,
-
-    /// Rolling log of Agent-related events (target saved,
-    /// verify ok/fail, push failures, dropped segments),
-    /// newest at the back, capped at [`AGENT_EVENT_CAP`].
-    /// Behind an `Arc<PlMutex<...>>` because the recording
-    /// consumer task appends from its own tokio task while
-    /// the render thread reads. Surfaced by the `t` status
-    /// overlay ([`AppMode::Status`]).
-    pub agent_events: Arc<PlMutex<VecDeque<AgentEvent>>>,
+    /// Rolling log of app events (verify ok/fail, push failures,
+    /// dropped segments), newest at the back, capped at
+    /// [`APP_EVENT_CAP`]. Behind an `Arc<PlMutex<...>>` so any
+    /// background task can append while the render thread reads.
+    /// Surfaced by the `t` status overlay ([`AppMode::Status`\]).
+    /// Renamed from `agent_events` in §8.
+    pub app_events: Arc<PlMutex<VecDeque<AppEvent>>>,
 }
 
 /// Cap on [`App::agent_events`]. Big enough to cover a long
 /// recording session's worth of incidents; small enough that the
 /// overlay and memory stay bounded.
-pub const AGENT_EVENT_CAP: usize = 50;
+pub const APP_EVENT_CAP: usize = 50;
 
 /// One row in the `t` status overlay.
 #[derive(Debug, Clone)]
-pub struct AgentEvent {
+pub struct AppEvent {
     /// Local wall-clock time the event was recorded.
     pub at: chrono::DateTime<chrono::Local>,
     pub message: String,
 }
 
 /// Append an event to the shared agent-event log, evicting the
-/// oldest entry past [`AGENT_EVENT_CAP`]. Free function (not a
+/// oldest entry past [`APP_EVENT_CAP`]. Free function (not a
 /// method) so the recording consumer task can call it on its
 /// cloned `Arc` without touching `App`.
-pub fn push_agent_event(events: &Arc<PlMutex<VecDeque<AgentEvent>>>, message: impl Into<String>) {
+pub fn push_app_event(events: &Arc<PlMutex<VecDeque<AppEvent>>>, message: impl Into<String>) {
     let mut buf = events.lock();
-    if buf.len() == AGENT_EVENT_CAP {
+    if buf.len() == APP_EVENT_CAP {
         buf.pop_front();
     }
-    buf.push_back(AgentEvent {
+    buf.push_back(AppEvent {
         at: chrono::Local::now(),
         message: message.into(),
     });
 }
 
-/// Record the outcome of one consumer-task dispatch into the agent
-/// event log. Only outcomes a user would act on become events —
-/// the happy paths (`Pushed`, `Default`, `NotAgent`) stay silent so
-/// the overlay isn't flooded at one row per segment.
-pub fn record_dispatch_event(
-    events: &Arc<PlMutex<VecDeque<AgentEvent>>>,
-    outcome: AgentDispatch,
-    session_id: &str,
-) {
-    match outcome {
-        AgentDispatch::PushFailed => push_agent_event(
-            events,
-            format!("push to Agent target '{session_id}' failed (broker error — see log)"),
-        ),
-        AgentDispatch::Dropped => push_agent_event(
-            events,
-            format!("Agent target '{session_id}' missing — segment dropped"),
-        ),
-        AgentDispatch::NotAgent | AgentDispatch::Default | AgentDispatch::Pushed => {}
-    }
-}
-/// A single row in the Targets picker. The picker renders
+/// A single row in the Targets picker.
+/// The picker renders
 /// one row per known target; rows that point at a target
 /// the user can't actually use (e.g. Agent when the
 /// runtime binary is missing) are tagged `disabled = true`.
@@ -551,160 +451,86 @@ pub struct TargetRow {
     pub kind: TargetKind,
     pub disabled: bool,
 }
-/// Picker-side classification of a target. We can't use `Target`
-/// directly because `Target::Agent` carries a session id that
-/// the user doesn't pick per-row — the row just means "route
-/// to the agent runtime with the current session".
+/// Picker-side classification of a target. Single-variant after §8.5
+/// — `Stdout` is the only routing choice. §10 replaces `TargetKind`
+/// with the cloud Characters list and the picker is rebuilt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Stdout,
-    /// One user-configured Agent target. The `id` is the stable
-    /// `AgentTargetId` from `AppConfig::agent_targets` and
-    /// resolves to a `KafkaTarget` (today) via
-    /// `App::agent_targets`. We don't reuse the old
-    /// unit-variant `Agent` form because picking the
-    /// "default" MCP-backed session is no longer surfaced in
-    /// the picker — the user adds their own targets via the
-    /// funnel instead.
-    Agent {
-        id: String,
-    },
 }
 impl App {
-    /// Create a new application instance.
-    ///
-    /// Resolves the config path through `AppConfig::config_path()`,
-    /// which honours the `VOICE_BIRD_TEST_CONFIG_PATH` env var in
-    /// tests. Tests that need a private tempdir should prefer
-    /// [`Self::new_with_config_path`] over the env-var dance — the
-    /// env var is process-global and races with parallel tests.
+    /// Create a new application instance
     pub fn new() -> Self {
-        // Test builds only. Two layers, both cfg(test)-gated because
-        // either one in production would make every launch boot from
-        // defaults and write settings into /tmp:
-        //
-        // 1. `INSTALL_TEST_CONFIG` redirects `AppConfig::config_path()`
-        //    at a process-wide tempdir, so anything still reading the
-        //    env var stays off the developer's real `config.toml`.
-        // 2. Each `App` then gets its OWN config file. `App` persists
-        //    the slot layout now (`add_slot`, `remove_focused_slot`),
-        //    so a single shared file would leak one test's slots into
-        //    the next test's `App::new()` and make slot ids depend on
-        //    execution order.
+        // Test builds only: install the process-local config
+        // tempdir before the first `AppConfig::load()`, so every
+        // test that constructs an `App` reads from and saves to
+        // the tempdir instead of the developer's real
+        // `config.toml`. The deref MUST be cfg(test)-gated:
+        // `INSTALL_TEST_CONFIG`'s init unconditionally redirects
+        // `AppConfig::config_path()` to a fresh empty tempdir, so
+        // running it in production would make every launch boot
+        // from defaults (API key, devices, agent targets all
+        // "gone") and write settings into /tmp.
         #[cfg(test)]
-        {
-            let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
-            Self::new_with_config_path(voice_bird_cli::test_utils::fresh_test_config_path())
-        }
-        // Resolve the path first so all load/save calls in this
-        // function (and every `self.save_config()` later) use the
-        // same target.
-        //
-        // An unresolvable path (no `dirs::config_dir()`) is not
-        // fatal: the App boots from defaults in memory and
-        // `save_config` reports the failure. Panicking here would
-        // turn a degraded boot into a crash on launch.
-        #[cfg(not(test))]
-        match AppConfig::config_path() {
-            Ok(p) => Self::new_with_config_path(p),
-            Err(e) => {
-                log::error!("config path unresolved, running from defaults: {e}");
-                Self::new_with_optional_config_path(None)
-            }
-        }
-    }
+        let _ = &*voice_bird_cli::test_utils::INSTALL_TEST_CONFIG;
+        let mut config = AppConfig::load().unwrap_or_default();
+        // Windows is cloud-only: force cloud on in memory
+        // regardless of what the on-disk config says. Covers
+        // configs copied from another OS or hand-edited;
+        // the on-disk format is unchanged.
+        enforce_cloud_only_platform(&mut config);
+        let config_path = AppConfig::config_path().ok();
+        let mut config_was_loaded_from_disk =
+            config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
-    /// Construct an `App` bound to a specific on-disk config path.
-    /// The path is the source of truth for every load and save the
-    /// `App` performs; the env-var override is not consulted. This
-    /// is the durable test fixture: each test constructs an `App`
-    /// against a private tempdir, with no shared state between
-    /// parallel tests.
-    pub fn new_with_config_path(config_path: PathBuf) -> Self {
-        Self::new_with_optional_config_path(Some(config_path))
-    }
-
-    /// Shared constructor. `None` means the config path could not be
-    /// resolved — the App runs entirely in memory and every save is
-    /// refused.
-    pub fn new_with_optional_config_path(config_path: Option<PathBuf>) -> Self {
-        // Track whether the load actually returned a parsed config.
-        // The previous flag (`config_path.exists()`) read the file
-        // system, but parse failure produces defaults that the next
-        // `config.save()` would happily overwrite the user's API key,
-        // devices, and agent targets with. So: only save defaults
-        // when the file was absent, and latch `config_load_failed`
-        // when it was present but unreadable so no later save can
-        // clobber it either.
-        let config_file_exists = config_path.as_ref().map(|p| p.exists()).unwrap_or(false);
-        let config_load_result = match (&config_path, config_file_exists) {
-            (Some(p), true) => AppConfig::load_from(p),
-            _ => Ok(AppConfig::default()),
-        };
-        let config_load_failed = config_load_result.is_err();
-        let mut config = match &config_load_result {
-            Ok(c) => c.clone(),
-            Err(e) => {
-                log::error!("config load failed, leaving the on-disk file untouched: {e}");
-                AppConfig::default()
+        // First launch: auto-pick a local model from system specs, persist
+        // immediately, and skip the manual model-picker overlay. The user
+        // can still override later with `m`. We treat the config as
+        // "loaded from disk" once it exists so the picker behaves like a
+        // normal navigation, not a first-run gate.
+        if !config_was_loaded_from_disk {
+            // No local models on cloud-only Windows — just persist the
+            // defaults; the API-key modal below replaces the model picker
+            // as the first-run gate.
+            #[cfg(not(windows))]
+            {
+                let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
+                log::info!("first run: auto-picked local model = {picked}");
+                config.default_model = picked.into();
             }
-        };
-        // "First run" means no file at all. A file that exists but
-        // failed to parse is NOT a first run — forcing the
-        // un-cancellable first-run model picker on top of a broken
-        // config would trap the user in a modal with no explanation.
-        let config_was_loaded_from_disk = config_file_exists;
-
-        // First-run auto-pick: the slot's settings already carry
-        // the auto-picked model (applied in fresh_slots_with_config
-        // below). The legacy global `default_model` is gone — when
-        // the file was absent (first run), persist the defaults so
-        // the next launch reads the same map. A failed parse keeps
-        // the original file untouched so the user can recover by
-        // hand; we boot from defaults in memory only.
-        let config_was_absent = config_path.is_some() && !config_file_exists;
-        // S5 migration: an existing user's pre-per-slot
-        // config.toml carries `default_model` / `language` /
-        // `session_dir` / `cloud_broadcast_enabled` on the
-        // global config. The lenient parser accepted them
-        // but the new schema dropped them silently. Lift them
-        // into slot 1's settings and save; the legacy fields are
-        // `skip_serializing`, so that save is what retires them.
-        if let Some((model, language, path, cloud_on)) = config.legacy_migration_source() {
-            let key = slot_settings_key(1);
-            let mut migrated = config.slot_settings.get(&key).cloned().unwrap_or_default();
-            migrated.model = model;
-            migrated.language = language;
-            migrated.path = path;
-            migrated.cloud_on = cloud_on;
-            config.slot_settings.insert(key, migrated);
-            config.complete_legacy_migration();
-            if let Some(p) = &config_path {
-                if let Err(e) = config.save_to(p) {
-                    log::warn!("config save (legacy migration): {e}");
-                }
-            }
-        }
-        // macOS screen-recording permission check. The block is
-        // gated on `cfg(target_os = "macos")` so the variable
-        // is only live on macOS — the cloud-on banner is
-        // computed after `app` is built below.
-        #[cfg(target_os = "macos")]
-        let macos_banner: Option<String> = {
-            use voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted;
-            if screen_recording_permission_granted() {
-                None
+            if let Err(e) = config.save() {
+                log::error!("config save (first run): {e}");
             } else {
-                Some(
+                config_was_loaded_from_disk = true;
+            }
+        }
+
+        // Only the macOS screen-recording check below mutates this.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut banner_on_launch: Option<String> =
+            if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
+                Some("Cloud is on but no API key — press 'c' to paste one".into())
+            } else {
+                None
+            };
+
+        // macOS: warn early if Screen Recording permission is missing.
+        // Without it, system-audio loopback and per-app capture both fail
+        // at start, and SCShareableContent returns a near-empty app list.
+        // TCC decisions don't propagate to a running process, so the
+        // remedy is "grant + restart".
+        #[cfg(target_os = "macos")]
+        {
+            if !voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted(
+            ) {
+                banner_on_launch = Some(
                     "Screen Recording permission required for system / per-app audio — \
                      System Settings → Privacy & Security → Screen Recording → enable \
                      your terminal (or voice-bird), then restart"
                         .into(),
-                )
+                );
             }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let macos_banner: Option<String> = None;
+        }
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -712,33 +538,6 @@ impl App {
             .build()
             .expect("tokio runtime");
 
-        // Build the initial slots BEFORE moving config into the
-        // struct — reads `config.slot_settings` and applies the
-        // auto-picked model on first run.
-        let initial_slots = Self::fresh_slots_with_config(&config);
-        // The next free id is one past the highest id we just
-        // rebuilt from `config.slot_settings`. Captured here, before
-        // `initial_slots` is moved into `slots`, so a freshly-added
-        // slot can never collide with a persisted one.
-        let next_slot_id = initial_slots.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
-        // First-run persistence: the slots above carry the
-        // auto-picked model on slot 1 (and any other propagated
-        // defaults). Mirror each slot's settings into
-        // `config.slot_settings` so the next launch reads the same
-        // map; only run on a true first run (file was absent) so
-        // existing users aren't silently re-seeded.
-        if config_was_absent {
-            for slot in &initial_slots {
-                config
-                    .slot_settings
-                    .insert(slot_settings_key(slot.id.0), slot.settings.clone());
-            }
-            if let Some(p) = &config_path {
-                if let Err(e) = config.save_to(p) {
-                    log::error!("config save (first run): {e}");
-                }
-            }
-        }
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut app = Self {
             mode: AppMode::Normal,
@@ -765,217 +564,38 @@ impl App {
             error_channel: Arc::new(Mutex::new(None)),
             log_path: None,
             rt,
-            slots: initial_slots,
+            slots: Self::fresh_slots(),
             focused_slot: SlotId(1),
-            next_slot_id,
+            // Slot 1 was created by `fresh_slots()`. The next id we
+            // hand out is 2.
+            next_slot_id: 2,
             picker: None,
             config_was_loaded_from_disk,
-            config_path,
-            config_load_failed,
             api_key_buf: None,
             api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
-            // Seeded with the macOS Screen-Recording warning (or
-            // `None`). The two higher-priority launch banners —
-            // unreadable config, cloud-on-with-no-key — are layered
-            // on after the struct is built, below.
-            banner: macos_banner,
+            banner: banner_on_launch,
             transcript_scroll: 0,
             transcript_follow: true,
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
-            agent: voice_bird_cli::agent::AgentStatus::NotFound,
-            agent_detection_source: None,
             pending_target_overrides: std::collections::BTreeMap::new(),
-            agent_state: voice_bird_cli::agent::mcp_server::ServerState::new(
-                voice_bird_cli::agent::AgentSessionId::default_session(),
-            ),
-            agent_targets: std::collections::HashMap::new(),
-            funnel: None,
-            verify_rx: None,
-            verify_started: None,
-            agent_events: Arc::new(PlMutex::new(VecDeque::new())),
+            app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
-        // Pin every slot's settings.cloud_on to the platform
-        // default. On Windows, every recording is cloud — set it
-        // on the slot's settings so the engine sees the right
-        // state. The on-disk format is unchanged.
-        enforce_cloud_only_platform_on_slots(&mut app.slots);
-        // On-launch banner: any slot with cloud_on + no key needs the
-        // user to paste a key. The cloud check is additive — when the
-        // macOS Screen-Recording permission is missing, that warning
-        // is already in `app.banner` and the cloud check must not
-        // clobber it. The cloud-on-no-key banner takes precedence
-        // because it requires an active user decision (paste a key);
-        // the permission banner is a passive nag.
-        let cloud_on_no_key =
-            app.slots[0].settings.cloud_on && app.config.voicebird_api_key.is_empty();
-        if cloud_on_no_key {
-            app.banner = Some("Cloud is on but no API key — press 'c' to paste one".into());
-        }
-        // Highest priority: the config exists but could not be read.
-        // The App is running from defaults and every save is refused
-        // (see `save_config`), so the user must be told — otherwise
-        // their settings appear to have silently vanished.
-        if app.config_load_failed {
-            app.banner = Some(
-                "config.toml could not be read — running from defaults and \
-                 NOT saving. Fix or delete it, then restart."
-                    .into(),
-            );
-        }
-        app.load_agent_targets_from_config();
-        // user must provide before recording.
-        #[cfg(windows)]
-        if app.config.voicebird_api_key.is_empty() {
-            app.open_api_key_modal(false);
-        }
-
-        // Probe for the local agent runtime (today: oh-my-pi /
-        // omp) so the status bar can surface "Agent found at
-        // <path> v<version>" (or "Agent not found" when the
-        // user hasn't installed an agent yet). Detection is
-        // intentionally best-effort and zero-cost on failure —
-        // we just enumerate three candidate locations.
-        match voice_bird_cli::agent::detect() {
-            Ok(det) => {
-                log::info!("agent detected: {} v{}", det.path.display(), det.version);
-                let det_path = det.path.clone();
-                let det_source = det.source.clone();
-                app.agent = voice_bird_cli::agent::AgentStatus::Ready {
-                    path: det.path,
-                    version: det.version,
-                };
-                app.agent_detection_source = Some(det.source);
-                // Auto-register this binary as an MCP server in
-                // ~/.omp/agent/mcp.json so the user's agent
-                // runtime picks voice-bird up on next launch.
-                // Best-effort: any error here just means the
-                // user has to run `voice-bird-cli --register`
-                // manually. Idempotent — repeated launches
-                // overwrite only the `voice-bird` key and leave
-                // other entries intact.
-                // Register THIS binary (voice-bird-cli), not the
-                // agent runtime's path. `det.path` is where the
-                // agent runtime lives; what the runtime needs
-                let home = voice_bird_cli::agent::register::register_home();
-                let binary = std::env::current_exe().unwrap_or_else(|_| det_path.clone());
-                match voice_bird_cli::agent::register::register(&binary, &home) {
-                    Ok(()) => log::info!(
-                        "registered MCP server in {}/agent/mcp.json (source: {:?})",
-                        home.display(),
-                        det_source,
-                    ),
-                    Err(e) => log::warn!(
-                        "could not register MCP server: {e} (source: {:?})",
-                        det_source,
-                    ),
-                }
-            }
-            Err(status) => {
-                app.agent = status;
-                app.agent_detection_source = None;
-            }
-        }
 
         app
     }
 
-    /// Save the current `AppConfig` to this `App`'s bound
-    /// `config_path`. The single chokepoint for every `config.save`
-    /// call in the runtime — replacing the previous
-    /// `self.save_config()` (which read the env-var path) with this
-    /// method routes every write through the path the `App` was
-    /// constructed with, so an `App::new_with_config_path(test_path)`
-    /// never writes the developer's real `config.toml`.
-    ///
-    /// Refuses in two cases, both of which would otherwise destroy
-    /// user data or write to an arbitrary location:
-    ///
-    /// * the on-disk config exists but failed to parse — the App is
-    ///   running from defaults, and persisting those defaults would
-    ///   discard the API key, devices, and agent targets that are
-    ///   still in the file. Gating only `App::new` is not enough:
-    ///   the very next `c` toggle or model pick would clobber it.
-    /// * no config path could be resolved at all.
-    pub fn save_config(&self) -> anyhow::Result<()> {
-        if self.config_load_failed {
-            anyhow::bail!(
-                "refusing to save: config.toml could not be read at launch; \
-                 fix or delete it, then restart"
-            );
-        }
-        let Some(path) = &self.config_path else {
-            anyhow::bail!("refusing to save: no config path could be resolved");
-        };
-        self.config.save_to(path)
-    }
-
     // -- Slot helpers -------------------------------------------------------
 
-    /// Build the initial slot Vec. The TUI starts with one slot per
-    /// persisted entry in `config.slot_settings`, in the original
-    /// id order — so a user who added slot 2 in a previous session
-    /// sees it back at the next launch. Slot 1 is always present
-    /// (created here if no entry exists). The id is stable across
-    /// the app's lifetime: appended slots get fresh ids from the
-    /// parent `App`'s `next_slot_id`, never renumbering the existing
+    /// Build the initial slot Vec. The TUI starts with a single empty
+    /// slot (id 1) — the user expands the workspace with `+`. The
+    /// id is stable across the app's lifetime: appended slots get
+    /// fresh ids from `next_slot_id`, never renumbering the existing
     /// ones, so any handle a caller is holding stays valid.
-    ///
-    /// Slot 1's settings are seeded from any persisted entry; on
-    /// first run the auto-pick model is applied on top of
-    /// `SlotSettings::default()`.
-    ///
-    /// Restore is capped at `MAX_SECTIONS`, the same cap `add_slot`
-    /// enforces. Without it a config carrying more entries (grown by
-    /// an older build that never pruned them, or hand-edited) would
-    /// open more panes at launch than the user could ever create with
-    /// `+`, each too narrow to read. The surplus entries are left in
-    /// the file — dropping them would be a destructive surprise.
-    fn fresh_slots_with_config(config: &AppConfig) -> Vec<Slot> {
-        // Collect the persisted ids in ascending order so the slot
-        // Vec mirrors the user's working layout.
-        let mut ids: Vec<u32> = config
-            .slot_settings
-            .keys()
-            .filter_map(|k| k.parse::<u32>().ok())
-            .collect();
-        ids.sort_unstable();
-        if !ids.contains(&1) {
-            ids.insert(0, 1);
-        }
-        if ids.len() > MAX_SECTIONS {
-            let dropped = &ids[MAX_SECTIONS..];
-            log::warn!(
-                "config carries {} slot entries, more than MAX_SECTIONS ({}); \
-                 not opening slots {:?} (their settings stay in config.toml)",
-                ids.len(),
-                MAX_SECTIONS,
-                dropped,
-            );
-            ids.truncate(MAX_SECTIONS);
-        }
-        ids.into_iter()
-            .map(|raw_id| {
-                let id = SlotId(raw_id);
-                let mut slot = Slot::empty(id);
-                if let Some(s) = config.slot_settings.get(&slot_settings_key(raw_id)) {
-                    slot.settings = s.clone();
-                } else if raw_id == 1 {
-                    // First-run: apply the auto-pick model on top of
-                    // the default settings so the local model picker
-                    // is pre-seeded with the recommended default.
-                    #[cfg(not(windows))]
-                    {
-                        let picked =
-                            voice_bird_cli::transcription::auto_select::pick_default_model();
-                        slot.settings.model = picked.into();
-                    }
-                }
-                slot
-            })
-            .collect()
+    fn fresh_slots() -> Vec<Slot> {
+        vec![Slot::empty(SlotId(1))]
     }
 
     /// Look up a slot's current Vec index from its stable id. Returns
@@ -989,10 +609,6 @@ impl App {
     /// Read-only access to a slot by id.
     fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
         self.slots.iter().find(|s| s.id == id)
-    }
-    /// Mutable access to a slot by id.
-    pub fn slot_by_id_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
-        self.slots.iter_mut().find(|s| s.id == id)
     }
 
     // -- Section accessors --------------------------------------------------
@@ -1039,30 +655,28 @@ impl App {
         self.focused().and_then(|s| s.cloud_reminder_until)
     }
 
-    /// Cloud on/off as displayed in the Mode panel: always the
-    /// focused slot's `settings.cloud_on`. The per-slot refactor
-    /// removes the global fallback — the panel always reflects
-    /// what the slot's next start would use.
+    /// Cloud on/off as displayed in the Mode panel: focused section's
+    /// setting if one is running, else the global config default.
     pub fn display_cloud_on(&self) -> bool {
-        self.slot_by_id(self.focused_slot)
+        self.focused()
             .map(|s| s.settings.cloud_on)
-            .unwrap_or(SlotSettings::default().cloud_on)
+            .unwrap_or(self.config.cloud_broadcast_enabled)
     }
 
-    /// Language as displayed in the Mode panel: the focused
-    /// slot's `settings.language`.
+    /// Language as displayed in the Mode panel: focused section's
+    /// setting if running, else the global config default.
     pub fn display_language(&self) -> String {
-        self.slot_by_id(self.focused_slot)
+        self.focused()
             .map(|s| s.settings.language.clone())
-            .unwrap_or_else(|| SlotSettings::default().language)
+            .unwrap_or_else(|| self.config.language.clone())
     }
 
-    /// Model id as displayed in the Mode panel: the focused
-    /// slot's `settings.model`.
+    /// Model id as displayed in the Mode panel: focused section's
+    /// setting if running, else the global config default.
     pub fn display_model(&self) -> String {
-        self.slot_by_id(self.focused_slot)
+        self.focused()
             .map(|s| s.settings.model.clone())
-            .unwrap_or_else(|| SlotSettings::default().model)
+            .unwrap_or_else(|| self.config.default_model.clone())
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -1090,20 +704,13 @@ impl App {
     /// not a target. Disabled flag is reserved for
     /// future use; today every configured Agent target
     /// is pickable.
+    /// §8.5: returns a single `Stdout` row. §10 repaints this
+    /// with the cloud Characters list.
     pub fn targets(&self) -> Vec<TargetRow> {
-        let mut rows =
-            Vec::with_capacity(1 + self.config.agent_targets.len());
-        rows.push(TargetRow {
+        vec![TargetRow {
             kind: TargetKind::Stdout,
             disabled: false,
-        });
-        for t in &self.config.agent_targets {
-            rows.push(TargetRow {
-                kind: TargetKind::Agent { id: t.id.clone() },
-                disabled: false,
-            });
-        }
-        rows
+        }]
     }
     /// Resolve the currently focused Targets-pane row to a `Target`.
     /// Returns `None` if the cursor is parked on a disabled row or
@@ -1126,10 +733,11 @@ impl App {
     /// surface it in a banner.
     pub fn pick_target(&mut self, kind: TargetKind) -> Target {
         let slot = self.focused_slot;
-        let target = match kind {
-            TargetKind::Stdout => Target::Stdout,
-            TargetKind::Agent { id } => Target::Agent { session_id: id },
-        };
+        // §8.5: `TargetKind::Agent` is gone. `pick_target` is now
+        // a thin wrapper around `Target::Stdout` and exists for
+        // call-site compatibility; §10's Character picker replaces it.
+        let _ = kind;
+        let target = Target::Stdout;
         // Queue the override so the next start_section
         // consumes it. (Today this is the only signal
         // the picker writes; start_section removes the
@@ -1182,15 +790,11 @@ impl App {
     }
 
     /// Open the output-path modal, seeding the buffer with the
-    /// focused slot's `settings.path`. Local-only concept — the 'p'
+    /// current `session_dir` from config. Local-only concept — the 'p'
     /// key doesn't exist on cloud-only Windows.
     #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
-        self.path_buf = Some(
-            self.slot_by_id(self.focused_slot)
-                .map(|s| s.settings.path.clone())
-                .unwrap_or_else(|| SlotSettings::default().path),
-        );
+        self.path_buf = Some(self.config.session_dir.clone());
         self.mode = AppMode::PathModal;
     }
 
@@ -1201,9 +805,10 @@ impl App {
     /// cloud-only Windows.
     #[cfg(not(windows))]
     pub fn export_transcript(&mut self) {
-        // Every exit path below sets `export_banner`, so there is
-        // nothing to clear up front.
-        let base_dir = self.slot_path_expanded(self.focused_slot);
+        // Clear any previous export banner
+        self.export_banner = None;
+
+        let base_dir = self.config.session_dir_expanded();
         let base = std::path::Path::new(&base_dir);
 
         // Find the most recent session that has a transcript.json.
@@ -1428,25 +1033,8 @@ impl App {
         }
         let id = SlotId(self.next_slot_id);
         self.next_slot_id += 1;
-        // Seed the new slot's settings from the currently focused
-        // slot so a `+` press gives the user a slot that behaves
-        // like the one they were just looking at. Subsequent
-        // `c` / `l` / `m` / `p` flips on the new slot do not
-        // affect the source slot; the two diverge from this point.
-        let seed = self
-            .slot_by_id(self.focused_slot)
-            .map(|s| s.settings.clone())
-            .unwrap_or_default();
-        let mut new_slot = Slot::empty(id);
-        new_slot.settings = seed;
-        self.slots.push(new_slot);
+        self.slots.push(Slot::empty(id));
         self.focused_slot = id;
-        // Persist immediately. Restore rebuilds the workspace from
-        // `config.slot_settings`, so a slot that is never persisted
-        // silently disappears at the next launch — a `+` press
-        // followed by no `c`/`l`/`m`/`p` flip would be forgotten.
-        // Removal saves too, so the map tracks the live layout.
-        self.persist_focused_slot_settings();
         Some(id)
     }
 
@@ -1468,16 +1056,6 @@ impl App {
             return false;
         }
         self.slots.remove(pos);
-        // Drop any persisted per-slot settings for the removed id
-        // so a future slot with the same id (we never reuse them,
-        // but a hand-edited config could) doesn't pick up the
-        // stale settings. Then save — without the save, the row
-        // survives on disk and the next launch reads settings for
-        // a slot the user deleted.
-        self.config.slot_settings.remove(&slot_settings_key(id.0));
-        if let Err(e) = self.save_config() {
-            log::error!("config save (slot remove): {e}");
-        }
         // If the focused slot also had a pending target override,
         // drop it — the slot id is gone from the Vec and we don't
         // want the override to silently re-apply to a future slot.
@@ -1794,10 +1372,9 @@ impl App {
             .cloned()
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout);
-        Some(match t {
-            Target::Stdout => TargetKind::Stdout,
-            Target::Agent { session_id } => TargetKind::Agent { id: session_id },
-        })
+        // §8.5: `Target::Agent` is gone. The picker only ever returns
+        // `Stdout` until §10 repaints the pane with Characters.
+        Some(TargetKind::Stdout)
     }
 
     /// Update duration from start time
@@ -1830,39 +1407,30 @@ impl App {
     /// intentionally not implemented; we surface the error as a red
     /// banner and let the user press `r` to retry.
     pub fn check_engine_error(&mut self) {
-        // Drain all sections, but only one banner — the most recent
-        // error wins (last write of multiple in the same tick
-        // survives). The failing slot's id is captured alongside
-        // the message so the post-drain decisions (which `cloud_on`
-        // to read, whether to pop the API-key modal) target the
-        // slot that actually broke, not whichever slot the user
-        // happens to be looking at.
-        let mut drained: Option<(SlotId, String)> = None;
+        // Drain all sections, but only one banner — the most recent error
+        // wins (last write of multiple in the same tick survives).
+        let mut drained: Option<String> = None;
         for slot in self.slots.iter() {
             if let SlotKind::Recording { section } = &slot.kind {
                 if let Ok(mut err) = section.engine_error_channel.lock() {
                     if let Some(msg) = err.take() {
-                        drained = Some((slot.id, msg));
+                        drained = Some(msg);
                     }
                 }
             }
         }
-        if let Some((failing_slot, msg)) = drained {
+        if let Some(msg) = drained {
             let auth_failure = looks_like_auth_error(&msg);
             self.banner = Some(msg.clone());
             self.status = RecordingStatus::Error(msg);
-            // Server rejected the saved key — surface the paste
-            // modal on the slot that raised the error so the user
-            // can replace the bad key. Reading the failing slot's
-            // `cloud_on` (not the focused slot's) is what surfaces
-            // the modal for the right place: a rejected key on
-            // slot 2 is no longer swallowed when the user is
-            // looking at a local-only slot 1.
-            let failing_slot_cloud = self
-                .slot_by_id(failing_slot)
-                .map(|s| s.settings.cloud_on)
-                .unwrap_or(false);
-            if auth_failure && failing_slot_cloud {
+            // Server rejected the saved key — surface the paste modal
+            // immediately so the user can replace it without hunting
+            // for a key binding.
+            if auth_failure && self.config.cloud_broadcast_enabled {
+                // `false`: the user already has Cloud ON and a key
+                // on disk — they just need to replace the bad
+                // key. Cancelling the modal leaves Cloud ON (the
+                // next recording will re-trigger the auth guard).
                 self.open_api_key_modal(false);
             }
         }
@@ -1886,52 +1454,65 @@ impl App {
         };
     }
 
-    /// Per-slot replacement for the legacy `effective_settings_for`.
-    /// Reads the slot's `SlotSettings` directly — no per-source
-    /// merge, no global fallback. The slot's settings are the
-    /// source of truth at start time.
-    ///
-    /// Returns `None` when the slot id is not currently in the
-    /// workspace (caller's bug). Callers that have already
-    /// validated the slot can use `.unwrap()`.
-    pub fn slot_settings_for(&self, slot: SlotId) -> Option<SectionSettings> {
-        self.slot_by_id(slot).map(|s| SectionSettings {
-            cloud_on: s.settings.cloud_on,
-            language: s.settings.language.clone(),
-            model: s.settings.model.clone(),
-        })
-    }
-
-    /// Expand `~` in a slot's `settings.path`. Pulled out so the
-    /// session_dir resolution in `start_section` and the export
-    /// base dir in `export_transcript` share one contract.
-    pub fn slot_path_expanded(&self, slot: SlotId) -> String {
-        let raw = self
-            .slot_by_id(slot)
-            .map(|s| s.settings.path.clone())
-            .unwrap_or_else(|| SlotSettings::default().path);
-        if let Some(rest) = raw.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(rest).to_string_lossy().into_owned();
-            }
+    /// Resolve the effective settings for a given source. Prefers a
+    /// device-specific override (keyed on the actual selected device
+    /// name + kind) over the generic Microphone/System fallback.
+    pub fn effective_settings_for(&self, source: &SessionSource) -> SectionSettings {
+        let key = self.source_key_for(source);
+        let ov = self.config.effective_override(&key);
+        SectionSettings {
+            cloud_on: ov.cloud_on,
+            language: ov.language,
+            model: ov.model,
         }
-        raw
     }
 
-    /// Persist the focused slot's `SlotSettings` into
-    /// `config.slot_settings` under the slot's id, then save. The
-    /// next `App::new` reloads the same map. The live engine
-    /// snapshot on `Section` is taken at `start_section` time and
-    /// updated alongside the slot's settings; mid-flight engine
-    /// rebuild is still Stage 3+ work.
-    pub fn persist_focused_slot_settings(&mut self) {
-        let Some(slot) = self.slot_by_id(self.focused_slot) else {
+    /// Compute the persistence key for a section's source. Device
+    /// sections key on the actual selected device name + kind so two
+    /// physical devices never collide; app sections key on app name +
+    /// paired device so "Zoom on Speakers" and "Zoom on AirPods" don't
+    /// share overrides.
+    pub fn source_key_for(&self, source: &SessionSource) -> String {
+        use voice_bird_cli::config::{device_source_id, source_id, AudioSessionKind};
+        match source {
+            SessionSource::Microphone | SessionSource::System => {
+                if let (Some(name), Some(kind)) = (
+                    self.config.input_device.as_deref(),
+                    self.config.input_device_kind,
+                ) {
+                    return device_source_id(name, kind);
+                }
+                source_id(
+                    source,
+                    self.config.input_device_kind.or(Some(match source {
+                        SessionSource::Microphone => AudioSessionKind::Input,
+                        _ => AudioSessionKind::Output,
+                    })),
+                )
+            }
+            SessionSource::App { .. } => source_id(source, None),
+        }
+    }
+
+    /// Update the focused section's settings AND persist the change as
+    /// a per-source override in `config.source_overrides`. The new value
+    /// applies to the running engine on next start; for live mutations
+    /// (toggling cloud while a section runs), Stage 3+ will rebuild
+    /// the engine. For now, the running engine is unaffected and the
+    /// new value is what the next start will use.
+    pub fn persist_focused_settings(&mut self) {
+        let Some(section) = self.focused() else {
             return;
         };
-        let key = slot_settings_key(slot.id.0);
-        self.config.slot_settings.insert(key, slot.settings.clone());
-        if let Err(e) = self.save_config() {
-            log::error!("config save (slot_settings): {e}");
+        let key = self.source_key_for(&section.source);
+        let ov = voice_bird_cli::config::SourceSettingsOverride {
+            cloud_on: section.settings.cloud_on,
+            language: section.settings.language.clone(),
+            model: section.settings.model.clone(),
+        };
+        self.config.upsert_source_override(key, ov);
+        if let Err(e) = self.config.save() {
+            log::error!("config save (per-source override): {e}");
         }
     }
 
@@ -1998,20 +1579,6 @@ impl App {
             .remove(&slot)
             .unwrap_or(Target::Stdout);
 
-        // recording from inheriting segments left by a previous
-        // session on the same slot.
-        if matches!(target, Target::Agent { .. }) {
-            // Truncate the per-slot live tail so a fresh recording
-            // does not pick up segments left by a previous session
-            // on the same slot. The id is passed through at full
-            // width: ids are never reused and now also come back
-            // from `config.slot_settings`, so narrowing to `u8`
-            // would let e.g. slot 999 and slot 1255 collide on one
-            // live file.
-            if let Err(e) = voice_bird_cli::agent::live::truncate_slot(slot.0) {
-                log::warn!("agent live truncate: {e}");
-            }
-        }
 
         let now = chrono::Utc::now();
         // Local-first persistence is a function of the *target*, not
@@ -2031,24 +1598,20 @@ impl App {
         // "should we keep a local copy?". The user-facing picker
         // for `Stdout + Cloud ON` reads as "transcript streamed to
         // the server + locally (from server)" — both, not either.
-        let session_dir: Option<std::path::PathBuf> = if matches!(target, Target::Stdout) {
-            // Per-slot path: take the live `slot.settings.path`
-            // (already validated by the path modal / `p` key).
-            // The global `config.session_dir` is no longer the
-            // source of truth — each slot has its own.
-            let base = self.slot_path_expanded(slot);
-            let dir = voice_bird_cli::session::layout::session_dir(
-                std::path::Path::new(&base),
-                now,
-                &source,
-            );
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                return Err(format!("create session dir: {e}"));
-            }
-            Some(dir)
-        } else {
-            None
-        };
+        let session_dir: Option<std::path::PathBuf> =
+            if matches!(target, Target::Stdout) {
+                let dir = voice_bird_cli::session::layout::session_dir(
+                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    now,
+                    &source,
+                );
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return Err(format!("create session dir: {e}"));
+                }
+                Some(dir)
+            } else {
+                None
+            };
 
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
@@ -2379,46 +1942,7 @@ impl App {
             }
         });
 
-        // --- 6. Consumer task: engine events → live state + JSONL ---
-        // Capture the section's target + the shared agent buffer
-        // so the consumer can fan a Committed segment into the
-        // MCP-server buffer when the user picked `Target::Agent`.
-        let target_for_consumer = target.clone();
-        let agent_state_for_consumer = self.agent_state.clone();
-        // Clone the per-session-id AgentTarget map so the
-        // consumer task can route a committed segment to
-        // the user-configured Kafka target the slot picked.
-        //
-        // Snapshot semantics: the map is cloned at section
-        // start. The clone owns its own `Arc<dyn AgentTarget>`
-        // values — `AgentTarget` itself is a cheap
-        // `Arc<KafkaTargetInner>` handle, so the broker
-        // connection + buffer are shared, but the dispatch
-        // map is independent of `self.agent_targets`.
-        //
-        // Concretely: both *edits* and *removals* made via
-        // the funnel (or via `App::remove_agent_target_*`)
-        // only take effect for the *next* section the user
-        // starts in this slot. The in-flight consumer keeps
-        // routing to the broker/topic it captured here, so
-        // removing a target mid-recording does NOT cut off
-        // production to that broker — the segment pipeline
-        // continues until the section ends. The
-        // "agent target not found; segment dropped" branch
-        // downstream is effectively unreachable from a
-        // mid-recording removal (the cloned map still has
-        // the entry); it can only fire if the target was
-        // never present in the first place.
-        //
-        // Sharing the live map via `Arc<RwLock<…>>` (so
-        // edits/removals apply mid-section) is filed as a
-        // follow-up — the current snapshot behaviour is
-        // correct for the 7-step funnel UX ("next section
-        // picks up the new target") but surprising if the
-        // user expects removal to take effect immediately.
-        let agent_targets_for_consumer = self.agent_targets.clone();
-        let agent_events_for_consumer = self.agent_events.clone();
-        let slot_for_consumer = slot;
+        // --- 6. Consumer task: engine events → committed lines ---
         let join = self.rt.spawn(async move {
             let mut writer = if let Some(p) = writer_path.as_ref() {
                 match voice_bird_cli::session::writer::SegmentWriter::open(p) {
@@ -2453,56 +1977,8 @@ impl App {
                             text: seg.text.clone(),
                         });
                         tentative_for_consumer.lock().clear();
-
-                        // Build the on-disk live record FIRST, before
-                        // any code path moves `seg` into the in-memory
-                        // buffer. The mirror write to `~/.voice-bird/live/`
-                        // runs after, but it just reads `&seg` again —
-                        // which is fine since we already extracted the
-                        // fields we need into `live_seg`.
-                        let idx = agent_state_for_consumer.snapshot_next_index();
-                        let session = match &target_for_consumer {
-                            Target::Agent { session_id } => {
-                                voice_bird_cli::agent::AgentSessionId(session_id.clone())
-                            }
-                            _ => voice_bird_cli::agent::AgentSessionId::default_session(),
-                        };
-                        let live_seg = if matches!(target_for_consumer, Target::Agent { .. }) {
-                            Some(voice_bird_cli::agent::live::LiveSegment::from_engine(
-                                &seg, idx, &session,
-                            ))
-                        } else {
-                            None
-                        };
-                        // Route into the agent buffer when the
-                        // slot's target is `Target::Agent`. See
-                        // `dispatch_segment_to_agent` for the
-                        // default / known-id / missing-id arms.
-                        let outcome = dispatch_segment_to_agent(
-                            &target_for_consumer,
-                            &seg,
-                            &agent_state_for_consumer,
-                            &agent_targets_for_consumer,
-                        )
-                        .await;
-                        if let Target::Agent { session_id } = &target_for_consumer {
-                            record_dispatch_event(&agent_events_for_consumer, outcome, session_id);
-                        }
-                        // Mirror to the on-disk live tail so the
-                        // MCP server process spawned by the agent
-                        // runtime sees the same segments. The
-                        // TUI's in-memory buffer is local to this
-                        // process; the live file is the
-                        // `pull_recent`.
-                        if let Some(live) = live_seg {
-                            if let Err(e) =
-                                voice_bird_cli::agent::live::append(slot_for_consumer.0, &live)
-                            {
-                                log::warn!("agent live append: {e}");
-                            }
-                        }
-                    }
-                    voice_bird_cli::transcription::EngineEvent::Error(e) => {
+                     }
+                     voice_bird_cli::transcription::EngineEvent::Error(e) => {
                         log::error!("engine error: {e}");
                         if let Ok(mut slot) = engine_error_for_consumer.lock() {
                             *slot = Some(e);
@@ -2792,7 +2268,7 @@ impl App {
         // the live values.
         let source = self.resolve_focused_source()?;
         let target = self.focused_pending_target();
-        let settings = self.slot_settings_for(slot).expect("slot exists");
+        let settings = self.effective_settings_for(&source);
         // Slot is Saved here (Empty and Recording both
         // returned above). Persist the new source, target,
         // and settings back to the saved snapshot so the
@@ -2924,6 +2400,7 @@ impl App {
             app_pick.as_ref().map(|a| (a.name.clone(), a.id.clone())),
         );
 
+        // Persist the selected device + last app id.
         let name_changed = self.config.input_device.as_deref() != Some(dev.name.as_str());
         let kind_changed = self.config.input_device_kind != Some(dev.kind);
         let app_id_changed =
@@ -2932,15 +2409,15 @@ impl App {
             self.config.input_device = Some(dev.name.clone());
             self.config.input_device_kind = Some(dev.kind);
             self.config.last_app_id = app_pick.as_ref().map(|a| a.id.clone());
-            if let Err(e) = self.save_config() {
+            if let Err(e) = self.config.save() {
                 log::error!("config save: {e}");
             }
         }
 
         // Start in the chosen slot; route through the
-        // per-section API so settings come from the
-        // focused slot's SlotSettings.
-        let settings = self.slot_settings_for(slot).expect("slot exists");
+        // per-section API so settings come from
+        // `effective_settings_for(source)`.
+        let settings = self.effective_settings_for(&source);
         self.focused_slot = slot;
         log::info!(
             "keys: Enter → resolved source={:?}; calling start_section[{}]",
@@ -3044,190 +2521,31 @@ impl App {
         }
 
         if done {
-            // Per-slot: the picked model applies to the focused
-            // slot's settings. The engine uses the snapshot on
-            // the next start; the slot's settings.model is the
-            // source of truth.
-            let slot_id = self.focused_slot;
-            let slot_pos = self.slot_index(slot_id);
-            if let Some(pos) = slot_pos {
-                self.slots[pos].settings.model = model_id.clone();
-                if let SlotKind::Recording { section } = &mut self.slots[pos].kind {
+            // If a section is focused, treat the picked model as a
+            // per-source override for that section (applies to its
+            // next start). Otherwise — idle path — update the global
+            // default so all unconfigured sources inherit it.
+            if self.focused().is_some() {
+                if let Some(section) = self.focused_mut() {
                     section.settings.model = model_id;
                 }
+                self.persist_focused_settings();
+            } else {
+                self.config.default_model = model_id;
+                if let Err(e) = self.config.save() {
+                    log::error!("config save: {e}");
+                    let mut g = progress_arc.lock();
+                    g.error = Some(format!("config save: {e}"));
+                    return;
+                }
             }
-            self.persist_focused_slot_settings();
             self.mode = AppMode::Normal;
             self.picker = None;
             self.config_was_loaded_from_disk = true;
         }
     }
-    /// Hydrate `agent_targets` from the on-disk config. Called
-    /// once at startup; subsequent funnel saves update both
-    /// the config and this map so a relaunch isn't needed.
-    pub fn load_agent_targets_from_config(&mut self) {
-        use voice_bird_cli::agent::AgentTarget;
-        use voice_bird_cli::config::AgentConnection;
-        self.agent_targets.clear();
-        for t in &self.config.agent_targets {
-            let session = voice_bird_cli::agent::AgentSessionId(t.id.clone());
-            let target: std::sync::Arc<dyn AgentTarget> = match &t.connection {
-                AgentConnection::Kafka(conn) => std::sync::Arc::new(
-                    voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
-                ),
-            };
-            self.agent_targets.insert(t.id.clone(), target);
-        }
-    }
 
-    /// Add or replace a user-configured Agent target in memory.
-    /// Updates `agent_targets` and the in-process config; does NOT
-    /// persist to disk. Use [`Self::upsert_agent_target`] for the
-    /// persisting variant.
-    /// Idempotent on `id`. Returns `Err` (and leaves both maps
-    /// untouched) if `id` is reserved for an internal Agent
-    /// destination (see
-    /// `voice_bird_cli::config::RESERVED_AGENT_TARGET_IDS`).
-    pub fn upsert_agent_target_in_memory(
-        &mut self,
-        config_target: voice_bird_cli::config::AgentTargetConfig,
-    ) -> anyhow::Result<()> {
-        self.config.upsert_agent_target(config_target.clone())?;
-        use voice_bird_cli::agent::AgentTarget;
-        let id = config_target.id.clone();
-        let session = voice_bird_cli::agent::AgentSessionId(id.clone());
-        let target: std::sync::Arc<dyn AgentTarget> = match &config_target.connection {
-            voice_bird_cli::config::AgentConnection::Kafka(conn) => std::sync::Arc::new(
-                voice_bird_cli::agent::kafka::KafkaTarget::new(session, conn.clone()),
-            ),
-        };
-        self.agent_targets.insert(id, target);
-        Ok(())
-    }
 
-    /// Add or replace a user-configured Agent target. Persists the
-    /// updated config to disk. Idempotent on `id`. Returns `Err`
-    /// (and does not persist) if `id` is reserved.
-    pub fn upsert_agent_target(
-        &mut self,
-        config_target: voice_bird_cli::config::AgentTargetConfig,
-    ) -> anyhow::Result<()> {
-        self.upsert_agent_target_in_memory(config_target)?;
-        self.save_config().map_err(|e| {
-            log::error!("config save (upsert agent target): {e}");
-            self.banner = Some(format!("Save failed: {e}"));
-            e
-        })
-    }
-
-    /// Remove a user-configured Agent target in memory. Drops the
-    /// in-process handle and clears any pending target overrides
-    /// that pointed at it so the slot doesn't carry a stale
-    /// `Target::Agent` (with a now-removed `session_id`) into the
-    /// next recording start. Does NOT persist to disk; use
-    /// [`Self::remove_agent_target`] for the persisting variant.
-    pub fn remove_agent_target_in_memory(&mut self, id: &str) {
-        self.agent_targets.remove(id);
-        self.config.remove_agent_target(id);
-        for (_, t) in self.pending_target_overrides.iter_mut() {
-            if let Target::Agent { session_id } = t {
-                if session_id == id {
-                    *t = Target::Stdout;
-                }
-            }
-        }
-    }
-
-    /// Remove a user-configured Agent target. Persists the updated
-    /// config to disk.
-    pub fn remove_agent_target(&mut self, id: &str) {
-        self.remove_agent_target_in_memory(id);
-        if let Err(e) = self.save_config() {
-            log::error!("config save (remove agent target): {e}");
-            self.banner = Some(format!("Save failed: {e}"));
-        }
-    }
-
-    /// Drain the in-flight verify probe's result channel
-    /// (non-blocking) and update the active funnel's
-    /// `VerifyOutcome`. Called from the main event loop on
-    /// every tick so the TUI keeps drawing frames (and Esc
-    /// keeps working) while a probe runs in the background.
-    pub fn poll_funnel_verify(&mut self) {
-        let Some(rx) = self.verify_rx.as_ref() else {
-            return;
-        };
-        // Peek first: try_recv returns Err(Empty) until the
-        // worker thread sends its result. We only want to
-        // commit when the value has actually arrived.
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // The worker thread panicked or the channel
-                // was otherwise torn down. Surface that as a
-                // verify error so the user isn't stuck on
-                // "Verifying…" forever.
-                self.verify_rx = None;
-                self.verify_started = None;
-                if let Some(f) = self.funnel.as_mut() {
-                    f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
-                        message: "verify worker disconnected unexpectedly".into(),
-                    };
-                }
-                return;
-            }
-        };
-        // Probe finished — record the outcome and drop the
-        // channel. The user can re-run verify by re-pressing
-        // Enter on the Verify step.
-        let started = self.verify_started.take();
-        self.verify_rx = None;
-        let Some(f) = self.funnel.as_mut() else {
-            return;
-        };
-        match result {
-            Ok(elapsed) => {
-                push_agent_event(
-                    &self.agent_events,
-                    format!(
-                        "verify OK for '{}' in {}ms",
-                        f.endpoint.trim(),
-                        elapsed.as_millis()
-                    ),
-                );
-                f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed };
-            }
-            Err(e) => {
-                if let Some(started) = started {
-                    log::warn!("funnel: verify failed after {:?}: {e}", started.elapsed());
-                }
-                push_agent_event(
-                    &self.agent_events,
-                    format!("verify FAILED for '{}': {e}", f.endpoint.trim()),
-                );
-                f.verify = voice_bird_cli::agent_funnel::VerifyOutcome::Err {
-                    message: format!("{e}"),
-                };
-            }
-        }
-    }
-
-    /// Open the funnel for adding a brand-new Agent target.
-    pub fn open_add_agent_funnel(&mut self) {
-        self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_add());
-        self.mode = AppMode::AgentFunnel;
-    }
-
-    /// Open the funnel pre-filled with an existing Agent target.
-    pub fn open_edit_agent_funnel(&mut self, id: &str) {
-        if let Some(t) = self.config.agent_target_by_id(id).cloned() {
-            self.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_edit(&t));
-            self.mode = AppMode::AgentFunnel;
-        } else {
-            self.banner = Some(format!("Agent target {id} not found"));
-        }
-    }
 }
 
 /// Build the column-title label for a section (or "(empty)" / "(paused)"
@@ -3283,87 +2601,22 @@ impl Default for App {
     }
 }
 
-// ── Agent segment dispatch ─────────────────────────────────────────────
-
-/// What [`dispatch_segment_to_agent`] did with a segment. Returned so
-/// tests (and future status surfaces) can assert routing without a
-/// live recording pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDispatch {
-    /// The slot's target is not `Target::Agent`; nothing was routed.
-    NotAgent,
-    /// Routed to the legacy MCP `agent_state` buffer (`"default"` id).
-    Default,
-    /// Pushed to the mapped user-configured `AgentTarget`.
-    Pushed,
-    /// The mapped target's `push_segment` failed; error logged.
-    PushFailed,
-    /// No target with that id (removed mid-recording); segment
-    /// dropped with a warning — NOT silently routed to default.
-    Dropped,
-}
-
-/// Route one committed segment to its Agent destination. The default
-/// MCP-backed target (`session_id == "default"`, see
-/// `voice_bird_cli::config::RESERVED_AGENT_TARGET_IDS`) goes through
-/// `agent_state` for backward compatibility with the
-/// `voice_bird__pull_recent` MCP tool; user-configured ids resolve
-/// through `agent_targets`. Called from the recording consumer task
-/// in `App::start_section`. Async since #32: the consumer task
-/// awaits the target's `push_segment` future directly on its own
-/// runtime instead of bridging through a per-call thread.
-async fn dispatch_segment_to_agent(
-    target: &Target,
-    seg: &voice_bird_cli::transcription::Segment,
-    agent_state: &voice_bird_cli::agent::mcp_server::ServerState,
-    agent_targets: &std::collections::HashMap<
-        String,
-        std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
-    >,
-) -> AgentDispatch {
-    let Target::Agent { session_id } = target else {
-        return AgentDispatch::NotAgent;
-    };
-    if session_id == "default" {
-        agent_state.push(seg.clone());
-        AgentDispatch::Default
-    } else if let Some(agent) = agent_targets.get(session_id) {
-        match agent.push_segment(seg).await {
-            Ok(()) => AgentDispatch::Pushed,
-            Err(e) => {
-                log::warn!("agent target push_segment ({session_id}): {e}");
-                AgentDispatch::PushFailed
-            }
-        }
-    } else {
-        // Target was removed mid-recording. Drop the segment —
-        // better than silently routing to the default MCP target.
-        log::warn!("agent target {session_id} not found; segment dropped");
-        AgentDispatch::Dropped
-    }
-}
-
 // ── Platform invariants ────────────────────────────────────────────────
 
-/// Windows is cloud-only: force cloud on every slot's settings
-/// regardless of what the config or persisted slot settings say.
-/// `cfg!` (rather than an attribute) keeps the body compiled and
-/// testable on every target. Called from `App::new` only;
-/// `clamp_section_settings_for_platform` is the per-recording
-/// choke point that guards the engine-visible snapshot.
-fn enforce_cloud_only_platform_on_slots(slots: &mut [Slot]) {
+
+/// Windows is cloud-only: force cloud on in memory regardless of what the
+/// config says (covers configs copied from another OS or hand-edited). The
+/// on-disk format stays identical across platforms. `cfg!` (rather than an
+/// attribute) keeps the body compiled and testable on every target.
+fn enforce_cloud_only_platform(config: &mut AppConfig) {
     if cfg!(windows) {
-        for slot in slots {
-            slot.settings.cloud_on = true;
-        }
+        config.cloud_broadcast_enabled = true;
     }
 }
 
-/// Windows is cloud-only: clamp the per-recording `SectionSettings`
-/// snapshot at the one choke point every recording passes through
-/// (`start_section`). Covers stale cloud_on=false settings persisted
-/// by a pre-0.4.0 config. The slot's settings are the source of
-/// truth; this clamp applies to the engine-visible snapshot.
+/// Windows is cloud-only: clamp the per-source setting at the one choke
+/// point every recording passes through (`start_section`). Covers stale
+/// cloud_on=false overrides persisted by a pre-0.4.0 config.
 fn clamp_section_settings_for_platform(settings: &mut SectionSettings) {
     if cfg!(windows) {
         settings.cloud_on = true;
@@ -3458,116 +2711,10 @@ mod tests {
     /// The Targets pane's `pick_target` writes the focused slot's
     /// pending target, which `start_section` consumes on the next
     /// start. Each call returns the resolved `Target` (with a
-    /// session id for Agent) so the caller can surface a banner.
-    #[test]
-    fn pick_target_writes_pending_override_for_focused_slot() {
-        use crate::app::TargetKind;
-        let mut app = App::new();
-        let first = app.pick_target(TargetKind::Stdout);
-        assert_eq!(first, Target::Stdout);
-        assert_eq!(
-            app.pending_target_overrides.get(&SlotId(1)).cloned(),
-            Some(Target::Stdout)
-        );
-        let omp = app.pick_target(TargetKind::Agent {
-            id: "session-x".into(),
-        });
-        assert!(matches!(omp, Target::Agent { session_id } if session_id == "session-x"));
-        // Switching back to Stdout overwrites the prior override.
-        let stdout = app.pick_target(TargetKind::Stdout);
-        assert_eq!(stdout, Target::Stdout);
-    }
-
-    /// Targets list grows past three rows once the user adds a
     /// second Agent target. ↑/↓ must walk onto the saved row
     /// instead of leaving it stranded behind a hardcoded cap.
     /// Regression for the screenshot where `Agent: prod-events`
     /// rendered in the pane but the ▶ cursor couldn't reach it.
-    #[test]
-    fn select_next_advances_past_first_agent_target() {
-        use crate::app::{PickerFocus, TargetKind};
-        use voice_bird_cli::config::{
-            AgentConnection, AgentTargetConfig, KafkaAgentConnection,
-        };
-
-        fn seed(id: &str, name: &str) -> AgentTargetConfig {
-            AgentTargetConfig {
-                id: id.into(),
-                name: name.into(),
-                connection: AgentConnection::Kafka(KafkaAgentConnection {
-                    endpoint: "localhost:9092".into(),
-                    topic: "voice-bird".into(),
-                    client_id: None,
-                    acks: Default::default(),
-                    security_protocol: Default::default(),
-                    sasl_mechanism: None,
-                    sasl_username: None,
-                    sasl_password_env: None,
-                }),
-            }
-        }
-
-        // App::new() loads the real on-disk config, which on a
-        // developer machine already contains Agent rows whose ids
-        // could collide with the hardcoded "uuid-prod" / "uuid-events"
-        // used here (causing upsert_agent_target_in_memory to take
-        // the replace path instead of append and skewing every
-        // assertion below). Wipe both the config vector and the
-        // runtime map before we seed our own rows so the test is
-        // fully deterministic regardless of the host's config state.
-        let mut app = App::new();
-        app.config.agent_targets.clear();
-        app.agent_targets.clear();
-        app.upsert_agent_target_in_memory(seed("uuid-prod", "prod"))
-            .expect("upsert prod");
-        app.upsert_agent_target_in_memory(seed("uuid-events", "prod-events"))
-            .expect("upsert prod-events");
-
-        // Sanity: the only Agent rows in the list are the two we
-        // just appended, in upsert order. Catches future regressions
-        // in App::targets() without depending on host state.
-        let kinds: Vec<_> = app.targets().into_iter().map(|r| r.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                TargetKind::Stdout,
-                TargetKind::Agent { id: "uuid-prod".into() },
-                TargetKind::Agent { id: "uuid-events".into() },
-            ]
-        );
-        let prod_idx = 1usize;
-        let events_idx = 2usize;
-
-        // Focus the Targets pane and walk the cursor down from the
-        // top. Each ↓ must move one row, regardless of how many
-        // Agent rows the user has configured.
-        app.picker_focus = PickerFocus::Targets;
-        app.selected_target_index = Some(0);
-
-        // Step down until we land on `prod`, then one more step
-        // must land on `prod-events`.
-        for _ in 0..prod_idx {
-            app.select_next();
-        }
-        assert_eq!(app.selected_target_index, Some(prod_idx));
-        assert_eq!(
-            app.focused_target_kind(),
-            Some(TargetKind::Agent { id: "uuid-prod".into() })
-        );
-
-        // This ↓ is the one that was a no-op before the fix.
-        app.select_next();
-        assert_eq!(app.selected_target_index, Some(events_idx));
-        assert_eq!(
-            app.focused_target_kind(),
-            Some(TargetKind::Agent { id: "uuid-events".into() })
-        );
-
-        // Past the end, ↓ is a no-op (not an underflow into None).
-        app.select_next();
-        assert_eq!(app.selected_target_index, Some(events_idx));
-    }
-
     #[test]
     fn fresh_app_has_no_active_sections() {
         let app = App::new();
@@ -3576,294 +2723,8 @@ mod tests {
         assert_eq!(app.focused_engine_kind(), "");
         assert!(!app.focused_cloud_active());
         // Empty fallbacks for the focused-* Arcs.
+        assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
-    }
-
-    // ── Per-slot settings on Slot / App (commit 2) ─────────────────
-    //
-    // These pin the App-side lifecycle of the new SlotSettings.
-    // Commit 1 added the storage layer; commit 2 makes the
-    // App-level runtime own the same settings and persist them on
-    // every mutation.
-
-    /// A fresh `App` ships with one slot (id 1) whose settings
-    /// match `SlotSettings::default()`. The user has not yet
-    /// pressed any keys, so cloud is off, language is "en",
-    /// model is the default-pick, and path is the default
-    /// sessions directory.
-    #[test]
-    fn fresh_app_slot_has_default_slot_settings() {
-        let app = App::new();
-        let s = &app.slots[0].settings;
-        assert!(!s.cloud_on);
-        assert_eq!(s.language, "en");
-        assert_eq!(s.model, "distil-small.en");
-        assert_eq!(s.path, "~/voice-bird/sessions");
-    }
-
-    /// `add_slot` seeds the new slot's settings from the focused
-    /// slot's settings. Two slots can thus diverge over time —
-    /// adding a slot does not reset either to defaults.
-    #[test]
-    fn add_slot_seeds_settings_from_focused_slot() {
-        let mut app = App::new();
-        // Flip the focused slot's settings away from defaults.
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "ru".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/seeded".into(),
-        };
-        let new_id = app.add_slot().expect("add_slot under MAX_SECTIONS");
-        let new_slot = app.slots.iter().find(|s| s.id == new_id).unwrap();
-        assert!(new_slot.settings.cloud_on);
-        assert_eq!(new_slot.settings.language, "ru");
-        assert_eq!(new_slot.settings.model, "tiny.en");
-        assert_eq!(new_slot.settings.path, "~/voice-bird/seeded");
-    }
-
-    /// `remove_focused_slot` drops the slot's entry from
-    /// `config.slot_settings` so a future slot minted with the
-    /// same id (we never reuse ids, but the file might be
-    /// hand-edited) does not pick up stale settings.
-    #[test]
-    fn remove_focused_slot_drops_persisted_settings() {
-        let mut app = App::new();
-        // Per-slot settings saved via `persist_focused_slot_settings`.
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "ru".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/seeded".into(),
-        };
-        app.persist_focused_slot_settings();
-        let slot_id = app.slots[0].id;
-        let key = voice_bird_cli::config::slot_settings_key(slot_id.0);
-        assert!(app.config.slot_settings.contains_key(&key));
-        // Need a second slot to allow removal.
-        let _ = app.add_slot();
-        // Focus back on slot 1 and remove it.
-        app.focused_slot = slot_id;
-        assert!(app.remove_focused_slot());
-        assert!(
-            !app.config.slot_settings.contains_key(&key),
-            "removed slot's settings should not linger in config"
-        );
-    }
-
-    /// `persist_focused_slot_settings` writes the focused slot's
-    /// current settings into `config.slot_settings` and saves
-    /// the config to disk. The next launch reloads the same map.
-    #[test]
-    fn persist_focused_slot_settings_writes_to_config() {
-        let mut app = App::new();
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "ru".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/persisted".into(),
-        };
-        app.persist_focused_slot_settings();
-        let key = voice_bird_cli::config::slot_settings_key(app.slots[0].id.0);
-        let saved = &app.config.slot_settings[&key];
-        assert!(saved.cloud_on);
-        assert_eq!(saved.language, "ru");
-        assert_eq!(saved.model, "tiny.en");
-        assert_eq!(saved.path, "~/voice-bird/persisted");
-    }
-
-    // ── Per-slot settings drive start_section (commit 3) ──────────
-    //
-    // These tests pin the runtime cutover: the four corners of
-    // start_section (cloud/language/model/path) now read from
-    // the slot's own `settings`, not from a per-source merge
-    // over the global config. Two slots can record with
-    // independent settings.
-
-    /// Slot 1's settings drive the running section. cloud_on,
-    /// language, and model come from `slot.settings`; the
-    /// recording pipeline never reads `config.cloud_broadcast_enabled`
-    /// or `config.language` / `config.default_model`.
-    ///
-    /// The contract is "the slot's settings are the source of
-    /// truth at start time". The Section inside a running slot
-    /// carries a snapshot (so the engine sees a stable value
-    /// during the recording); the resume test below exercises
-    /// the snapshot machinery. Here we only need to confirm
-    /// start_section reads the slot's settings, not the global
-    /// config — which we pin by setting the two to disagree
-    /// and asserting the slot survives.
-    #[test]
-    fn start_section_uses_focused_slot_settings() {
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let mut app = App::new();
-        // Slot 1: cloud on, Polish, tiny.en.
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "pl".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/slot-one".into(),
-        };
-        // The global config used to hold default_model / language /
-        // cloud_broadcast_enabled. Those fields are gone — the
-        // slot's settings are the source of truth. The test
-        // continues to set the API key (a non-legacy field) so
-        // `start_section` doesn't refuse on the missing-key guard.
-        app.config.voicebird_api_key = "sk-test".into();
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        let slot = app.slots[0].id;
-        let saved = SavedTranscript {
-            committed: Arc::new(PlMutex::new(Vec::new())),
-            refined: Arc::new(PlMutex::new(Vec::new())),
-            label: "mic · cloud:ON".into(),
-            target: Target::Stdout,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: true,
-                language: "pl".into(),
-                model: "tiny.en".into(),
-            },
-        };
-        app.slots[0].kind = SlotKind::Saved { saved };
-        let _ = app.resume_section(slot);
-        // The slot survives the resume attempt and its
-        // settings are unchanged. The global config stays
-        // untouched — the runtime never consulted it.
-        assert!(app.slots[0].settings.cloud_on);
-        assert_eq!(app.slots[0].settings.language, "pl");
-        // The legacy global config fields are gone — there's no
-        // `cloud_broadcast_enabled` / `language` to assert against.
-        // The slot's settings above are the contract.
-    }
-
-    /// Slot's `settings.path` is the path used for the session
-    /// directory. The global `config.session_dir` is irrelevant.
-    #[test]
-    fn start_section_uses_focused_slot_path_for_session_dir() {
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new();
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "en".into(),
-            model: "tiny.en".into(),
-            path: dir.path().to_string_lossy().into_owned(),
-        };
-        app.config.voicebird_api_key = "sk-test".into();
-        // Nothing else points at this tempdir. If start_section
-        // reads a path other than the slot's, the assertion
-        // below fires.
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        let slot = app.slots[0].id;
-        let saved = SavedTranscript {
-            committed: Arc::new(PlMutex::new(Vec::new())),
-            refined: Arc::new(PlMutex::new(Vec::new())),
-            label: "mic · cloud:ON".into(),
-            target: Target::Stdout,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: true,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        };
-        app.slots[0].kind = SlotKind::Saved { saved };
-        let _ = app.resume_section(slot);
-        // The session must be created under the slot's dir,
-        // not under the global config.session_dir.
-        let slot_entries: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(
-            slot_entries.len(),
-            1,
-            "exactly one session directory must be created under the slot's path; got {slot_entries:?}",
-        );
-    }
-
-    /// Two slots can record with independent settings. The slot's
-    /// own settings — not the global config — drive each Section.
-    #[test]
-    fn two_slots_have_independent_settings_at_start() {
-        let mut app = App::new();
-        app.add_slot().expect("add_slot");
-        // Slot 1: cloud off, English, distil-small.en.
-        app.slots[0].settings = SlotSettings {
-            cloud_on: false,
-            language: "en".into(),
-            model: "distil-small.en".into(),
-            path: "~/voice-bird/slot-one".into(),
-        };
-        // Slot 2: cloud on, Polish, tiny.en.
-        app.slots[1].settings = SlotSettings {
-            cloud_on: true,
-            language: "pl".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/slot-two".into(),
-        };
-        // The two slots' settings are independent: each
-        // carries its own cloud/language/model/path.
-        assert!(!app.slots[0].settings.cloud_on);
-        assert!(app.slots[1].settings.cloud_on);
-        assert_ne!(
-            app.slots[0].settings.language,
-            app.slots[1].settings.language,
-        );
-        assert_ne!(app.slots[0].settings.model, app.slots[1].settings.model);
-        assert_ne!(app.slots[0].settings.path, app.slots[1].settings.path);
-    }
-
-    /// Resume reapplies the slot's LIVE settings, not the saved
-    /// snapshot. A user who flips cloud OFF after stopping
-    /// gets a resumed section that uses cloud OFF.
-    #[test]
-    fn resume_reapplies_focused_slot_settings_not_saved_snapshot() {
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let mut app = App::new();
-        app.config.voicebird_api_key = "sk-test".into();
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        let slot = app.slots[0].id;
-        // Saved snapshot says cloud ON, English, distil.
-        let saved = SavedTranscript {
-            committed: Arc::new(PlMutex::new(Vec::new())),
-            refined: Arc::new(PlMutex::new(Vec::new())),
-            label: "mic · cloud:ON".into(),
-            target: Target::Stdout,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: true,
-                language: "en".into(),
-                model: "distil-small.en".into(),
-            },
-        };
-        app.slots[0].kind = SlotKind::Saved { saved };
-        // Live slot settings say cloud OFF, Russian, tiny.
-        app.slots[0].settings = SlotSettings {
-            cloud_on: false,
-            language: "ru".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/slot-one".into(),
-        };
-        let _ = app.resume_section(slot);
-        // The slot's settings are the source of truth.
-        assert!(!app.slots[0].settings.cloud_on);
-        assert_eq!(app.slots[0].settings.language, "ru");
     }
 
     // ── consumer-dispatch arms (dispatch_segment_to_agent) ───────────
@@ -4028,12 +2889,20 @@ mod tests {
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
-        // Per-slot: simulate the user pressing `l` to cycle
-        // the language to Russian and `c` to flip cloud on
-        // *after* stopping. The handlers mutate the
-        // focused slot's settings directly now.
-        app.slots[0].settings.cloud_on = true;
-        app.slots[0].settings.language = "ru".into();
+        // Simulate the user pressing `l` to cycle the
+        // language to Russian and `c` to flip cloud on
+        // *after* stopping. The c/l handlers update the
+        // global config and per-source override when no
+        // section is focused (the post-stop case). Persist
+        // the override the same way persist_focused_settings
+        // does so the test reflects production state.
+        app.config.cloud_broadcast_enabled = true;
+        app.config.language = "ru".into();
+        let key = app.source_key_for(&SessionSource::Microphone);
+        let mut ov = app.config.effective_override(&key);
+        ov.cloud_on = true;
+        ov.language = "ru".into();
+        app.config.upsert_source_override(key, ov);
 
         // Resume. The result is pipeline-dependent
         // (capture may succeed or fail in the test env),
@@ -4153,107 +3022,6 @@ mod tests {
     /// to `Recording` (capture succeeds). Both outcomes
     /// are acceptable; the assertion reads source/target
     /// off whichever variant the slot ended up in.
-    #[test]
-    fn resume_section_picks_up_source_and_target_changed_after_stop() {
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let mut app = App::new();
-        // Seed a Saved variant as if a section was
-        // recorded from the MacBook mic to Stdout.
-        let committed: Arc<PlMutex<Vec<CommittedLine>>> =
-            Arc::new(PlMutex::new(Vec::new()));
-        let refined: Arc<PlMutex<Vec<CommittedLine>>> =
-            Arc::new(PlMutex::new(Vec::new()));
-        let slot = app.slots[0].id;
-        let saved = SavedTranscript {
-            committed: committed.clone(),
-            refined: refined.clone(),
-            label: "MacBook Pro Microphone -> Stdout".into(),
-            target: Target::Stdout,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: false,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        };
-        app.slots[0].kind = SlotKind::Saved { saved };
-
-        // Now the user changes the picker state after
-        // pressing s:
-        //   - Devices cursor moves to EPOS (Output)
-        //   - Apps cursor moves to Chrome
-        //   - Targets pane picks Cloud
-        app.devices = vec![
-            AudioDevice {
-                name: "MacBook Pro Microphone".into(),
-                kind: AudioSessionKind::Input,
-            },
-            AudioDevice {
-                name: "EPOS PC 8 USB".into(),
-                kind: AudioSessionKind::Output,
-            },
-        ];
-        app.apps = vec![AppSession {
-            id: "chrome".into(),
-            name: "Google Chrome".into(),
-            process_id: 12345,
-        }];
-        app.selected_device_index = 1; // EPOS
-        app.selected_app_index = Some(0); // Chrome
-        // Queue the next-start target override for
-        // this slot (mirrors what the Targets
-        // picker's Enter handler does). Use a
-        // user-configured Agent target since Cloud
-        // is no longer a target.
-        app.pending_target_overrides
-            .insert(slot, Target::Agent { session_id: "kafka-1".into() });
-
-        let _ = app.resume_section(slot);
-
-        // Pull source + target off whichever variant the
-        // slot ended up in. Both must reflect the
-        // post-stop picker state.
-        let (applied_source, applied_target): (
-            &SessionSource,
-            &Target,
-        ) = match &app.slots[0].kind {
-            SlotKind::Saved { saved } => (&saved.source, &saved.target),
-            SlotKind::Recording { section } => {
-                (&section.source, &section.target)
-            }
-            SlotKind::Empty => panic!(
-                "resume must not empty the slot on a successful Saved path"
-            ),
-        };
-
-        // Source: must be App { chrome, Google Chrome,
-        // EPOS PC 8 USB } — the post-stop pick, not the
-        // saved Microphone.
-        match applied_source {
-            SessionSource::App {
-                id,
-                name,
-                device_name,
-            } => {
-                assert_eq!(id, "chrome");
-                assert_eq!(name, "Google Chrome");
-                assert_eq!(device_name, "EPOS PC 8 USB");
-            }
-            other => panic!(
-                "resume must apply the post-stop source (App/chrome/EPOS); got: {other:?}"
-            ),
-        }
-
-        // Target: must be the queued Agent override
-        // — the pending override is consumed by
-        // start_section.
-        assert_eq!(
-            applied_target,
-            &Target::Agent { session_id: "kafka-1".into() },
-            "resume must apply the post-stop target (Agent); got: {applied_target:?}"
-        );
-    }
 
     // ── try_start_new_section state matrix (Enter key) ───────────
 
@@ -4375,31 +3143,6 @@ mod tests {
     /// Currently red: `targets()` returns
     /// `2 + N agent_rows` (Stdout + Cloud + agents).
     /// After the fix it returns `1 + N agent_rows`.
-    #[test]
-    fn targets_picker_no_longer_offers_cloud_target() {
-        use crate::app::TargetKind;
-
-        let app = App::new();
-        let rows = app.targets();
-        let agent_count = app.config.agent_targets.len();
-        assert_eq!(
-            rows.len(),
-            1 + agent_count,
-            "targets picker should offer Stdout + N agent rows only"
-        );
-        // Every row must be a recognized destination
-        // variant. Today the row at index 1 is Cloud,
-        // which fails this check; after the fix only
-        // Stdout and Agent remain.
-        for r in &rows {
-            assert!(
-                matches!(r.kind, TargetKind::Stdout)
-                    || matches!(r.kind, TargetKind::Agent { .. }),
-                "unexpected target kind: {:?} — Cloud must not be a target",
-                r.kind
-            );
-        }
-    }
     /// Resume a Saved slot whose saved target is
     /// Stdout but whose saved `cloud_on` is true
     /// (the user wants server streaming for a
@@ -4414,11 +3157,6 @@ mod tests {
     /// cloud_on=true on a Stdout session is
     /// silently forced to false on resume. The
     /// fix drops the clobber line.
-    /// Under the per-slot model, the saved slot's settings
-    /// already carry cloud_on=true — the slot is the source of
-    /// truth, not a per-source override. The resume path must
-    /// honor the saved snapshot's target (Stdout) while leaving
-    /// the cloud transport alone.
     #[test]
     fn resume_honors_cloud_on_even_when_saved_target_is_stdout() {
         use voice_bird_cli::config::AudioSessionKind;
@@ -4431,10 +3169,32 @@ mod tests {
         }];
         app.selected_device_index = 0;
         let slot = app.slots[0].id;
-        // The slot's settings already say cloud_on=true — the
-        // per-slot model means the slot is the source of truth.
-        app.slots[0].settings.cloud_on = true;
-        // Saved as: target=Stdout, cloud_on=true.
+        // Per-source override for the microphone must read
+        // `cloud_on = true` — that's the source the picker
+        // resolves to, and the resume path derives
+        // `effective_settings_for` from the per-source
+        // override first. Without this, the resume would
+        // fall back to the global default
+        // (`cloud_broadcast_enabled = false` in the test
+        // tempdir) and the assertion below would trip.
+        // (Pre-test-overlay this assertion passed only
+        // because the developer's real config happened to
+        // have `cloud_broadcast_enabled = true` and no
+        // per-source override — implicit test data.)
+        let source = SessionSource::Microphone;
+        let key = app.source_key_for(&source);
+        use voice_bird_cli::config::SourceSettingsOverride;
+        app.config.source_overrides.insert(
+            key,
+            SourceSettingsOverride {
+                cloud_on: true,
+                language: "en".into(),
+                model: "tiny.en".into(),
+            },
+        );
+        // Saved as: target=Stdout, cloud_on=true
+        // (user wants server streaming + local
+        // files).
         let saved = SavedTranscript {
             committed: Arc::new(PlMutex::new(Vec::new())),
             refined: Arc::new(PlMutex::new(Vec::new())),
@@ -4496,7 +3256,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
-        app.slots[0].settings.path = dir.path().to_string_lossy().into_owned();
+        app.config.session_dir = dir.path().to_string_lossy().into_owned();
         app.config.voicebird_api_key = "sk-test".into();
         // Devices picker so `resolve_focused_source` returns
         // `Microphone` and the session slug picks the `-mic`
@@ -4551,218 +3311,25 @@ mod tests {
              source; got {name:?}",
         );
     }
-    /// fails the push when `fail` is set.
-    struct SpyTarget {
-        pushed: Arc<PlMutex<Vec<String>>>,
-        fail: bool,
-    }
 
-    #[async_trait::async_trait]
-    impl voice_bird_cli::agent::AgentTarget for SpyTarget {
-        fn session_id(&self) -> voice_bird_cli::agent::AgentSessionId {
-            voice_bird_cli::agent::AgentSessionId("spy".into())
-        }
-        async fn push_segment(
-            &self,
-            segment: &voice_bird_cli::transcription::Segment,
-        ) -> anyhow::Result<()> {
-            if self.fail {
-                anyhow::bail!("spy push_segment failure");
-            }
-            self.pushed.lock().push(segment.text.clone());
-            Ok(())
-        }
-        fn pull_recent(&self, _limit: usize) -> Vec<voice_bird_cli::transcription::Segment> {
-            Vec::new()
-        }
-    }
 
-    fn dispatch_seg(text: &str) -> voice_bird_cli::transcription::Segment {
-        voice_bird_cli::transcription::Segment {
-            t_start: std::time::Duration::from_millis(0),
-            t_end: std::time::Duration::from_millis(500),
-            text: text.into(),
-            tokens: Vec::new(),
-        }
-    }
-
-    fn dispatch_fixture(
-        fail: bool,
-    ) -> (
-        voice_bird_cli::agent::mcp_server::ServerState,
-        std::collections::HashMap<String, std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>>,
-        Arc<PlMutex<Vec<String>>>,
-    ) {
-        let state = voice_bird_cli::agent::mcp_server::ServerState::new(
-            voice_bird_cli::agent::AgentSessionId::default_session(),
-        );
-        let pushed = Arc::new(PlMutex::new(Vec::new()));
-        let mut targets: std::collections::HashMap<
-            String,
-            std::sync::Arc<dyn voice_bird_cli::agent::AgentTarget>,
-        > = std::collections::HashMap::new();
-        targets.insert(
-            "known-id".into(),
-            std::sync::Arc::new(SpyTarget {
-                pushed: pushed.clone(),
-                fail,
-            }),
-        );
-        (state, targets, pushed)
-    }
-
-    #[tokio::test]
-    async fn dispatch_default_id_routes_to_legacy_mcp_buffer() {
-        let (state, targets, pushed) = dispatch_fixture(false);
-        let out = dispatch_segment_to_agent(
-            &Target::Agent {
-                session_id: "default".into(),
-            },
-            &dispatch_seg("hello"),
-            &state,
-            &targets,
-        ).await;
-        assert_eq!(out, AgentDispatch::Default);
-        let buf = state.pull(10);
-        assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].text, "hello");
-        // The user-configured target must NOT see the segment.
-        assert!(pushed.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_known_id_pushes_to_mapped_target() {
-        let (state, targets, pushed) = dispatch_fixture(false);
-        let out = dispatch_segment_to_agent(
-            &Target::Agent {
-                session_id: "known-id".into(),
-            },
-            &dispatch_seg("routed"),
-            &state,
-            &targets,
-        ).await;
-        assert_eq!(out, AgentDispatch::Pushed);
-        assert_eq!(*pushed.lock(), vec!["routed".to_string()]);
-        // The legacy MCP buffer must stay empty.
-        assert!(state.pull(10).is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_missing_id_drops_segment_not_default() {
-        let (state, targets, pushed) = dispatch_fixture(false);
-        let out = dispatch_segment_to_agent(
-            &Target::Agent {
-                session_id: "removed-mid-recording".into(),
-            },
-            &dispatch_seg("lost"),
-            &state,
-            &targets,
-        ).await;
-        assert_eq!(out, AgentDispatch::Dropped);
-        // Dropped means dropped: neither the legacy buffer nor any
-        // configured target receives the segment.
-        assert!(state.pull(10).is_empty());
-        assert!(pushed.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_push_failure_is_reported_not_rerouted() {
-        let (state, targets, pushed) = dispatch_fixture(true);
-        let out = dispatch_segment_to_agent(
-            &Target::Agent {
-                session_id: "known-id".into(),
-            },
-            &dispatch_seg("boom"),
-            &state,
-            &targets,
-        ).await;
-        assert_eq!(out, AgentDispatch::PushFailed);
-        assert!(state.pull(10).is_empty());
-        assert!(pushed.lock().is_empty());
-    }
-
-    /// `push_agent_event` caps the log at AGENT_EVENT_CAP by
-    /// evicting the oldest entry, and `record_dispatch_event`
-    /// only records the outcomes a user would act on.
-    #[test]
-    fn agent_event_log_caps_and_records_failures_only() {
-        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
-        for i in 0..(AGENT_EVENT_CAP + 5) {
-            push_agent_event(&events, format!("e{i}"));
-        }
-        let buf = events.lock();
-        assert_eq!(buf.len(), AGENT_EVENT_CAP);
-        assert_eq!(buf.front().unwrap().message, "e5");
-        assert_eq!(
-            buf.back().unwrap().message,
-            format!("e{}", AGENT_EVENT_CAP + 4)
-        );
-        drop(buf);
-
-        let events: Arc<PlMutex<VecDeque<AgentEvent>>> = Arc::new(PlMutex::new(VecDeque::new()));
-        // Happy paths stay silent — one row per segment would
-        // flood the overlay.
-        record_dispatch_event(&events, AgentDispatch::Pushed, "id");
-        record_dispatch_event(&events, AgentDispatch::Default, "id");
-        record_dispatch_event(&events, AgentDispatch::NotAgent, "id");
-        assert!(events.lock().is_empty());
-        // Failure paths are recorded with the target id.
-        record_dispatch_event(&events, AgentDispatch::PushFailed, "prod-a");
-        record_dispatch_event(&events, AgentDispatch::Dropped, "prod-b");
-        let buf = events.lock();
-        assert_eq!(buf.len(), 2);
-        assert!(buf[0].message.contains("prod-a"));
-        assert!(buf[1].message.contains("prod-b"));
-        assert!(buf[1].message.contains("dropped"));
-    }
-
-    /// `?` is help-only and `t` owns the status overlay — the two
-    /// modes toggle independently and neither writes a banner.
-    #[test]
-    fn help_and_status_keys_toggle_independent_modes() {
-        let mut app = App::new();
-        app.toggle_help();
-        assert_eq!(app.mode, AppMode::Help);
-        assert!(app.banner.is_none(), "help must not surface a banner");
-        app.toggle_help();
-        assert_eq!(app.mode, AppMode::Normal);
-
-        app.toggle_status();
-        assert_eq!(app.mode, AppMode::Status);
-        assert!(app.banner.is_none(), "status must not surface a banner");
-        app.toggle_status();
-        assert_eq!(app.mode, AppMode::Normal);
-    }
-
-    #[tokio::test]
-    async fn dispatch_non_agent_targets_route_nothing() {
-        let (state, targets, pushed) = dispatch_fixture(false);
-        for target in [Target::Stdout] {
-            let out = dispatch_segment_to_agent(&target, &dispatch_seg("skip"), &state, &targets).await;
-            assert_eq!(out, AgentDispatch::NotAgent);
-        }
-        assert!(state.pull(10).is_empty());
-        assert!(pushed.lock().is_empty());
-    }
-
-    // Runs on every platform: asserts the platform clamp pins
-    // cloud_on to true on Windows and leaves it alone elsewhere.
-    // The clamp operates on the focused slot's settings, not the
-    // legacy `config.cloud_broadcast_enabled` (which is on its
-    // way out in commit 6).
+    // Runs on every platform: asserts the forcing on Windows and the
+    // no-op everywhere else, since the helpers branch on cfg! at runtime.
     #[test]
     fn cloud_only_platform_invariants() {
-        let mut slots = vec![Slot::empty(SlotId(1))];
-        enforce_cloud_only_platform_on_slots(&mut slots);
-        assert_eq!(slots[0].settings.cloud_on, cfg!(windows));
+        let mut config = AppConfig::default();
+        config.cloud_broadcast_enabled = false;
+        enforce_cloud_only_platform(&mut config);
+        assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
 
-        let mut section = SectionSettings {
-            cloud_on: false,
-            language: "en".into(),
-            model: "distil-small.en".into(),
+        let mut settings = SectionSettings {
+            cloud_on: config.cloud_broadcast_enabled,
+            language: config.language.clone(),
+            model: config.default_model.clone(),
         };
-        clamp_section_settings_for_platform(&mut section);
-        assert_eq!(section.cloud_on, cfg!(windows));
+        settings.cloud_on = false;
+        clamp_section_settings_for_platform(&mut settings);
+        assert_eq!(settings.cloud_on, cfg!(windows));
     }
 
     // Everything below exercises the local-session export path
@@ -4950,7 +3517,7 @@ mod tests {
         fn export_banner_no_sessions() {
             let dir = tempfile::tempdir().unwrap();
             let mut app = App::new();
-            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -4973,7 +3540,7 @@ mod tests {
             std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
 
             let mut app = App::new();
-            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -5110,7 +3677,7 @@ mod tests {
 
         fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
             let mut app = App::new();
-            app.slots[0].settings.path = dir.path().to_string_lossy().to_string();
+            app.config.session_dir = dir.path().to_string_lossy().to_string();
             app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
             app.config.voicebird_api_key = "test-key-abc123".into();
             app
@@ -5314,503 +3881,5 @@ mod tests {
                 Some("Exported \u{2713} \u{2014} newest")
             );
         }
-    }
-}
-
-// ── Per-slot refactor: review contracts ───────────────────────────────
-//
-// These tests pin the blocking / should-fix findings from the review of
-// the per-slot settings refactor — each one is the executable statement
-// of a contract the refactor broke or left unfinished. They landed RED
-// and are green as of the fixes in this branch. See the review list for
-// the numbering (B1-B3 blocking, S4-S9 should-fix).
-//
-// Config isolation: the per-App config path is injectable via
-// `App::new_with_config_path`, so each test here gets its own private
-// tempdir. `ConfigFileGuard` just owns that tempdir for the test's
-// lifetime — no process-global `VOICE_BIRD_TEST_CONFIG_PATH` mutation,
-// so parallel tests never race on one shared config file.
-#[cfg(test)]
-mod per_slot_review_contracts {
-    use super::*;
-    use voice_bird_cli::config::{slot_settings_key, AppConfig, SlotSettings};
-
-    /// A private tempdir tied to the test's lifetime. Tests build
-    /// an `App` with `new_with_config_path(self.path().to_path_buf())`
-    /// so no env-var mutation is involved and parallel tests do
-    /// not race.
-    struct ConfigFileGuard {
-        _dir: tempfile::TempDir,
-        path: PathBuf,
-    }
-
-    impl ConfigFileGuard {
-        fn new() -> Self {
-            let dir = tempfile::TempDir::new().expect("private config tempdir");
-            let path = dir.path().join("config.toml");
-            Self { _dir: dir, path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    /// A config body that parses: only the four fields without a serde
-    /// default are mandatory. `extra` is appended verbatim.
-    fn config_toml(extra: &str) -> String {
-        format!(
-            "hop_ms = 750\n\
-             min_window_ms = 1000\n\
-             engine_prefer = \"auto\"\n\
-             audio_default_source = \"microphone\"\n\
-             refinement_window_ms = 20000\n\
-             refinement_beam_size = 5\n\
-             {extra}"
-        )
-    }
-
-    // ── B1 ────────────────────────────────────────────────────────────
-    /// A config that fails to parse must NOT be overwritten with
-    /// defaults. `App::new` does `AppConfig::load().unwrap_or_default()`
-    /// and then saves unconditionally, so one malformed value (a
-    /// half-written file, a hand-edit typo) silently destroys the user's
-    /// API key, saved devices, and agent targets on the next launch.
-    /// The old code only saved when no config existed on disk.
-    #[test]
-    fn unparseable_config_is_not_overwritten_with_defaults() {
-        let guard = ConfigFileGuard::new();
-        // `hop_ms` is a u32 — a string here is a hard parse error, so
-        // `load()` returns Err and the caller falls back to defaults.
-        let original = config_toml("voicebird_api_key = \"sk-users-real-key\"\n")
-            .replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
-        std::fs::write(guard.path(), &original).unwrap();
-
-        let _app = App::new_with_config_path(guard.path().to_path_buf());
-
-        let after = std::fs::read_to_string(guard.path()).unwrap();
-        assert_eq!(
-            after, original,
-            "a config that failed to parse must be left on disk untouched — \
-             saving defaults over it discards the user's API key, devices, \
-             and agent targets"
-        );
-    }
-
-    // ── B2 ────────────────────────────────────────────────────────────
-    /// The macOS Screen-Recording warning must survive launch. `App::new`
-    /// computes it into `macos_banner`, seeds `app.banner` with it, then
-    /// unconditionally reassigns `app.banner` from the cloud-key check —
-    /// whose `else` arm is `None`. With cloud off (the default) the
-    /// permission warning is always thrown away, and system / per-app
-    /// capture then fails at start with no explanation.
-    ///
-    /// Skipped when the permission IS granted: the banner is legitimately
-    /// absent then, and there's no in-process way to revoke TCC.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_permission_banner_is_not_clobbered_by_the_cloud_key_check() {
-        if voice_bird_cli::audio::loopback::loopback_macos::screen_recording_permission_granted() {
-            eprintln!("skipping: Screen Recording is granted, so no banner is expected");
-            return;
-        }
-        let guard = ConfigFileGuard::new();
-        // Cloud off + no key: the cloud branch contributes nothing, so
-        // the macOS banner is the only candidate.
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-        assert!(
-            app.banner
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Screen Recording"),
-            "the Screen Recording permission warning must survive the \
-             cloud-key check; got {:?}",
-            app.banner
-        );
-    }
-
-    // ── B3 ────────────────────────────────────────────────────────────
-    /// The first-run auto-picked model must reach disk. `App::new` saves
-    /// the config BEFORE `fresh_slots_with_config` computes the pick, and
-    /// the pick only ever lands on `slot.settings` — never in
-    /// `config.slot_settings`. So the map written on first run is empty
-    /// and the "next launch reads the same map" comment is false.
-    #[test]
-    fn first_run_persists_the_auto_picked_model_for_slot_one() {
-        let guard = ConfigFileGuard::new();
-        // No file at the path: this is a genuine first run.
-        assert!(!guard.path().exists());
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-        let key = slot_settings_key(app.slots[0].id.0);
-
-        let on_disk = AppConfig::load_from(guard.path()).expect("first run must write a config");
-        let saved = on_disk.slot_settings.get(&key).expect(
-            "first run must persist slot 1's settings, including the \
-             auto-picked model",
-        );
-        assert_eq!(
-            saved.model, app.slots[0].settings.model,
-            "the model on disk must match the one the slot booted with",
-        );
-    }
-
-    // ── S4 ────────────────────────────────────────────────────────────
-    /// Every persisted slot must be restored, not just slot 1.
-    /// `persist_focused_slot_settings` writes an entry for whichever slot
-    /// is focused, but `fresh_slots_with_config` only ever rebuilds slot
-    /// 1 — so a user who configures slot 2 loses it at the next launch
-    /// and the orphaned entry accumulates in `config.toml` forever.
-    #[test]
-    fn every_persisted_slot_is_restored_at_launch() {
-        let guard = ConfigFileGuard::new();
-        let mut c = AppConfig::default();
-        c.slot_settings.insert(
-            slot_settings_key(1),
-            SlotSettings {
-                cloud_on: false,
-                language: "en".into(),
-                model: "distil-small.en".into(),
-                path: "~/voice-bird/slot-one".into(),
-            },
-        );
-        c.slot_settings.insert(
-            slot_settings_key(2),
-            SlotSettings {
-                cloud_on: true,
-                language: "ru".into(),
-                model: "tiny.en".into(),
-                path: "~/voice-bird/slot-two".into(),
-            },
-        );
-        c.save_to(guard.path()).unwrap();
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-
-        assert_eq!(
-            app.slots.len(),
-            2,
-            "both persisted slots must come back; got {:?}",
-            app.slots.iter().map(|s| s.id.0).collect::<Vec<_>>(),
-        );
-        let slot_two = app
-            .slots
-            .iter()
-            .find(|s| s.id == SlotId(2))
-            .expect("slot 2 must be restored from config.slot_settings");
-        assert!(slot_two.settings.cloud_on);
-        assert_eq!(slot_two.settings.language, "ru");
-        assert_eq!(slot_two.settings.model, "tiny.en");
-        assert_eq!(slot_two.settings.path, "~/voice-bird/slot-two");
-    }
-
-    // ── S5 ────────────────────────────────────────────────────────────
-    /// An existing user's settings must migrate into slot 1. The refactor
-    /// deleted `default_model` / `language` / `session_dir` /
-    /// `cloud_broadcast_enabled` without a migration, and the lenient TOML
-    /// parser drops unknown keys silently — so on upgrade every user is
-    /// quietly reset to `~/voice-bird/sessions` + `distil-small.en` + en +
-    /// cloud off, with no error to explain it.
-    #[test]
-    fn legacy_global_settings_migrate_into_slot_one() {
-        let guard = ConfigFileGuard::new();
-        let legacy = config_toml(
-            "default_model = \"large-v3-turbo\"\n\
-             language = \"ru\"\n\
-             session_dir = \"~/legacy-sessions\"\n\
-             cloud_broadcast_enabled = true\n",
-        );
-        std::fs::write(guard.path(), legacy).unwrap();
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-        let s = &app.slots[0].settings;
-
-        assert_eq!(
-            s.model, "large-v3-turbo",
-            "the legacy default_model must carry over to slot 1"
-        );
-        assert_eq!(
-            s.language, "ru",
-            "the legacy language must carry over to slot 1"
-        );
-        assert_eq!(
-            s.path, "~/legacy-sessions",
-            "the legacy session_dir must carry over to slot 1"
-        );
-        assert!(
-            s.cloud_on,
-            "the legacy cloud_broadcast_enabled must carry over to slot 1"
-        );
-    }
-
-    // ── S6 ────────────────────────────────────────────────────────────
-    /// An auth failure must open the key modal for the slot that FAILED,
-    /// not for whichever slot happens to be focused.
-    /// `check_engine_error` drains every recording slot's error channel
-    /// but then reads `cloud_on` off `self.focused_slot`, so a rejected
-    /// key on slot 2 is swallowed whenever the user is looking at a
-    /// local-only slot 1 — the recording dies with a banner and no way
-    /// to paste a replacement key.
-    ///
-    /// Skipped when the capture pipeline can't start in this environment
-    /// (no input device / no permission), matching the tolerance the
-    /// other `resume_section` tests use.
-    #[test]
-    fn auth_failure_opens_the_key_modal_for_the_failing_slot() {
-        use crate::platform::AudioDevice;
-        use voice_bird_cli::config::AudioSessionKind;
-
-        let guard = ConfigFileGuard::new();
-        let mut app = App::new_with_config_path(guard.path().to_path_buf());
-        app.config.voicebird_api_key = "sk-stale".into();
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-
-        // Slot 2 is the cloud slot that will hit the auth failure.
-        let slot_two = app.add_slot().expect("add_slot under MAX_SECTIONS");
-        app.slot_by_id_mut(slot_two).unwrap().settings.cloud_on = true;
-        let saved = SavedTranscript {
-            committed: Arc::new(PlMutex::new(Vec::new())),
-            refined: Arc::new(PlMutex::new(Vec::new())),
-            label: "mic · cloud:ON".into(),
-            target: Target::Stdout,
-            source: SessionSource::Microphone,
-            settings: SectionSettings {
-                cloud_on: true,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        };
-        app.slot_by_id_mut(slot_two).unwrap().kind = SlotKind::Saved { saved };
-        let _ = app.resume_section(slot_two);
-
-        let Some(pos) = app.slot_index(slot_two) else {
-            eprintln!("skipping: slot 2 vanished");
-            return;
-        };
-        let SlotKind::Recording { section } = &app.slots[pos].kind else {
-            eprintln!("skipping: capture did not start in this environment");
-            return;
-        };
-        // The server rejects the saved key on slot 2's connection.
-        *section.engine_error_channel.lock().unwrap() =
-            Some("Unauthorized: invalid API key".into());
-
-        // The user is looking at slot 1, which is local-only.
-        let slot_one = app.slots[0].id;
-        app.focused_slot = slot_one;
-        app.slot_by_id_mut(slot_one).unwrap().settings.cloud_on = false;
-
-        app.check_engine_error();
-
-        assert_eq!(
-            app.mode,
-            AppMode::ApiKeyModal,
-            "the rejected key belongs to the slot that raised the error; \
-             the modal must open regardless of which slot is focused",
-        );
-    }
-
-    // ── S8 ────────────────────────────────────────────────────────────
-    /// Removing a slot must persist the removal. `remove_focused_slot`
-    /// drops the entry from the in-memory map but never saves, so the
-    /// row survives on disk and the next launch reads settings for a
-    /// slot the user deleted.
-    #[test]
-    fn removing_a_slot_persists_the_dropped_settings() {
-        let guard = ConfigFileGuard::new();
-        let mut app = App::new_with_config_path(guard.path().to_path_buf());
-        app.slots[0].settings = SlotSettings {
-            cloud_on: true,
-            language: "ru".into(),
-            model: "tiny.en".into(),
-            path: "~/voice-bird/doomed".into(),
-        };
-        app.persist_focused_slot_settings();
-        let doomed = app.slots[0].id;
-        let key = slot_settings_key(doomed.0);
-        assert!(
-            AppConfig::load_from(guard.path())
-                .unwrap()
-                .slot_settings
-                .contains_key(&key),
-            "setup: the slot's settings must be on disk before removal",
-        );
-
-        // A second slot so the last-slot guard allows the removal.
-        let _ = app.add_slot();
-        app.focused_slot = doomed;
-        assert!(app.remove_focused_slot());
-
-        let on_disk = AppConfig::load_from(guard.path()).unwrap();
-        assert!(
-            !on_disk.slot_settings.contains_key(&key),
-            "removing a slot must save the config — otherwise the deleted \
-             slot's settings come back at the next launch",
-        );
-    }
-
-    // ── Second-round review fixes ─────────────────────────────────
-    //
-    // Contracts added after the review of the fixes themselves.
-
-    /// B1, the half that the first fix missed. `App::new` no longer
-    /// overwrites an unparseable config, but the protection has to
-    /// outlive construction: the very next action that persists (a
-    /// `c` toggle, a model pick, a device selection) called
-    /// `save_config` and wrote defaults over the file. Gating only
-    /// the constructor moved the data loss one keystroke away.
-    #[test]
-    fn a_later_save_also_refuses_to_clobber_an_unparseable_config() {
-        let guard = ConfigFileGuard::new();
-        let original = config_toml("voicebird_api_key = \"sk-users-real-key\"\n")
-            .replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
-        std::fs::write(guard.path(), &original).unwrap();
-
-        let mut app = App::new_with_config_path(guard.path().to_path_buf());
-        assert!(app.config_load_failed, "setup: the load must have failed");
-
-        // The user flips cloud on slot 1 — a normal, persisting action.
-        app.slots[0].settings.cloud_on = true;
-        app.persist_focused_slot_settings();
-        assert!(
-            app.save_config().is_err(),
-            "save_config must refuse while the on-disk config is unreadable",
-        );
-
-        let after = std::fs::read_to_string(guard.path()).unwrap();
-        assert_eq!(
-            after, original,
-            "a save after launch must leave the unreadable config alone too — \
-             otherwise the constructor guard just delays the data loss",
-        );
-    }
-
-    /// The user has to be told. An unreadable config means the App is
-    /// running from defaults and refusing to save; without a banner
-    /// the settings simply appear to have vanished, and the next
-    /// launch looks the same.
-    #[test]
-    fn an_unreadable_config_is_surfaced_in_the_launch_banner() {
-        let guard = ConfigFileGuard::new();
-        let broken = config_toml("").replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
-        std::fs::write(guard.path(), broken).unwrap();
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-
-        let banner = app.banner.as_deref().unwrap_or_default();
-        assert!(
-            banner.contains("config.toml"),
-            "the launch banner must name the unreadable config; got {banner:?}",
-        );
-    }
-
-    /// An unreadable config is not a first run. Treating it as one
-    /// flips `config_was_loaded_from_disk` to false, which makes the
-    /// model picker refuse to Esc-cancel — trapping the user in a
-    /// modal because of a file they were never told about.
-    #[test]
-    fn an_unreadable_config_is_not_treated_as_a_first_run() {
-        let guard = ConfigFileGuard::new();
-        let broken = config_toml("").replace("hop_ms = 750", "hop_ms = \"seven-fifty\"");
-        std::fs::write(guard.path(), broken).unwrap();
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-
-        assert!(
-            app.config_was_loaded_from_disk,
-            "a config file that exists but fails to parse is not a first run",
-        );
-    }
-
-    /// An unresolvable config path must not panic the launch.
-    /// `App::new` previously `expect`ed the path, turning a missing
-    /// `dirs::config_dir()` into a crash on startup instead of a
-    /// degraded in-memory session.
-    #[test]
-    fn an_unresolvable_config_path_boots_instead_of_panicking() {
-        let app = App::new_with_optional_config_path(None);
-        assert!(app.config_path.is_none());
-        assert_eq!(app.slots.len(), 1, "the App still boots with slot 1");
-        assert!(
-            app.save_config().is_err(),
-            "with nowhere to save, save_config must report it rather than \
-             silently succeed",
-        );
-    }
-
-    /// Restore is capped at `MAX_SECTIONS`. A config carrying more
-    /// entries — grown by an older build, or hand-edited — must not
-    /// open more panes than `add_slot` would ever allow, each too
-    /// narrow to read.
-    #[test]
-    fn restore_is_capped_at_max_sections() {
-        let guard = ConfigFileGuard::new();
-        let mut c = AppConfig::default();
-        for id in 1..=(MAX_SECTIONS as u32 + 4) {
-            c.slot_settings.insert(
-                slot_settings_key(id),
-                SlotSettings {
-                    cloud_on: false,
-                    language: "en".into(),
-                    model: "tiny.en".into(),
-                    path: format!("~/voice-bird/slot-{id}"),
-                },
-            );
-        }
-        c.save_to(guard.path()).unwrap();
-
-        let app = App::new_with_config_path(guard.path().to_path_buf());
-
-        assert_eq!(
-            app.slots.len(),
-            MAX_SECTIONS,
-            "restore must honour the same cap as add_slot",
-        );
-        // The surplus entries stay in the file — dropping a user's
-        // settings on read would be a destructive surprise.
-        let on_disk = AppConfig::load_from(guard.path()).unwrap();
-        assert_eq!(on_disk.slot_settings.len(), MAX_SECTIONS + 4);
-    }
-
-    /// `add_slot` persists the new slot. Restore rebuilds the
-    /// workspace from `config.slot_settings`, so a slot that is never
-    /// persisted disappears at the next launch — pressing `+` and
-    /// then changing nothing would silently lose the slot.
-    #[test]
-    fn add_slot_persists_so_the_layout_survives_a_relaunch() {
-        let guard = ConfigFileGuard::new();
-        let mut app = App::new_with_config_path(guard.path().to_path_buf());
-        let added = app.add_slot().expect("add_slot under MAX_SECTIONS");
-
-        let on_disk = AppConfig::load_from(guard.path()).unwrap();
-        assert!(
-            on_disk
-                .slot_settings
-                .contains_key(&slot_settings_key(added.0)),
-            "a `+` press must reach disk even with no settings flip",
-        );
-
-        // Relaunch against the same file: the layout comes back.
-        let relaunched = App::new_with_config_path(guard.path().to_path_buf());
-        assert_eq!(relaunched.slots.len(), 2);
-        assert!(relaunched.slots.iter().any(|s| s.id == added));
-    }
-
-    /// Slot ids reach the agent live tail at full width. They are
-    /// never reused and now also come back from `config.slot_settings`,
-    /// so narrowing to `u8` would let two slots (e.g. 999 and 1255)
-    /// alias one live file and cross-feed each other's segments.
-    #[test]
-    fn agent_live_paths_do_not_alias_across_wide_slot_ids() {
-        let a = voice_bird_cli::agent::live::live_path(999);
-        let b = voice_bird_cli::agent::live::live_path(999 + 256);
-        assert_ne!(
-            a, b,
-            "slot ids 256 apart must not share a live file: {a:?} vs {b:?}",
-        );
     }
 }

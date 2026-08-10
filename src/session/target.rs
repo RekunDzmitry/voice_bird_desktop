@@ -9,6 +9,12 @@
 //! Pairing `cloud_on = true` with `Target::Stdout` is valid: the
 //! local files are produced AND the audio is streamed to
 //! voicebird.app.
+//!
+//! The previous `Agent { session_id }` variant (MCP stdio routing
+//! to a local oh-my-pi runtime) is gone. Agents are now Characters
+//! at voicebird.app, and the run path lives in
+//! `src/cloud/run.rs`. The enum stays as a single variant so the
+//! `meta.json` on-disk format keeps parsing.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,15 +29,6 @@ pub enum Target {
     /// round-trip back into the same local writer). Stdout
     /// guarantees a copy on disk in either case.
     Stdout,
-    /// Transcript segments are pushed into the user's agent
-    /// session (today: oh-my-pi / omp) via MCP stdio JSON-RPC.
-    /// The session id is opaque today
-    /// (`AgentSessionId::default_session()` for the single App
-    /// process); multi-session support is left for Phase B.
-    /// The user-facing label is "Agent" so the picker reads
-    /// as a generic routing choice rather than tying itself
-    /// to the current MCP-backed runtime.
-    Agent { session_id: String },
 }
 
 impl Default for Target {
@@ -42,10 +39,7 @@ impl Default for Target {
 
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Target::Agent { .. } => f.write_str("Agent"),
-            Target::Stdout => f.write_str("Stdout"),
-        }
+        f.write_str("Stdout")
     }
 }
 
@@ -61,19 +55,12 @@ mod tests {
     #[test]
     fn display_is_user_readable() {
         assert_eq!(Target::Stdout.to_string(), "Stdout");
-        assert_eq!(
-            Target::Agent { session_id: "x".into() }.to_string(),
-            "Agent"
-        );
     }
 
     #[test]
-    fn agent_round_trips_omp_session_id() {
-        let original = Target::Agent {
-            session_id: "abc".into(),
-        };
-        let json = serde_json::to_string(&original).unwrap();
+    fn round_trips_through_json() {
+        let json = serde_json::to_string(&Target::Stdout).unwrap();
         let back: Target = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, original);
+        assert_eq!(back, Target::Stdout);
     }
 }

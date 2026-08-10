@@ -103,12 +103,6 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::PathModal {
         render_path_modal(f, f.area(), app);
     }
-    if app.mode == AppMode::AgentFunnel {
-        render_agent_funnel(f, f.area(), app);
-    }
-    if let AppMode::ConfirmDeleteAgentTarget { id } = &app.mode {
-        render_confirm_delete(f, f.area(), app, id);
-    }
     if app.mode == AppMode::Status {
         render_status_overlay(f, f.area(), app);
     }
@@ -124,7 +118,7 @@ const STATUS_OVERLAY_ROWS: usize = 15;
 /// stays help-only — this overlay is the one place recorder/agent
 /// status surfaces on demand.
 fn render_status_overlay(f: &mut Frame, area: Rect, app: &App) {
-    let events = app.agent_events.lock();
+    let events = app.app_events.lock();
     let h = (events.len().min(STATUS_OVERLAY_ROWS) as u16 + 4).max(6);
     let popup = centered(72, h, area);
     f.render_widget(Clear, popup);
@@ -370,10 +364,11 @@ fn build_slot_title(
         .map(|a| format!(" + {a}"))
         .unwrap_or_default();
     let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
-    let target_color = match target {
-        Target::Stdout => Color::Green,
-        Target::Agent { .. } => Color::Cyan,
-    };
+    // §8.5: `Target` is a single-variant enum now, so the color
+    // is fixed. Kept as a match for clarity at the call site; §10's
+    // Character picker will replace it.
+    let _ = target;
+    let target_color = Color::Green;
     if prefix.chars().count() <= inner_w {
         vec![Line::from(Span::styled(
             prefix,
@@ -598,7 +593,7 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         " Mode "
     };
 
-    let path_raw = app.slot_path_expanded(app.focused_slot);
+    let path_raw = app.config.session_dir_expanded();
     let path_display = if path_raw.len() > 24 {
         format!("…{}", &path_raw[path_raw.len().saturating_sub(23)..])
     } else {
@@ -761,266 +756,10 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, popup);
 }
 
-/// Centered overlay for the multi-step "Add / Edit Agent target"
-/// funnel. Renders the current step's question + the live
-/// form values + a footer with the keys for the step.
-/// Verify and Save show their respective status lines
-/// instead of a question.
-fn render_agent_funnel(f: &mut Frame, area: Rect, app: &App) {
-    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
-
-    let Some(funnel) = app.funnel.as_ref() else {
-        return;
-    };
-    let popup = centered(72, 16, area);
-    f.render_widget(Clear, popup);
-
-    let mut lines: Vec<Line> = Vec::new();
-    // Position among the steps this form will actually visit —
-    // non-SASL protocols skip the three SASL steps, so the total
-    // is dynamic (8 or 11).
-    let (pos, total) = funnel.step_position();
-    let step_name = match funnel.step {
-        AgentFunnelStep::PickConnectionKind => "Connection",
-        AgentFunnelStep::Name => "Name",
-        AgentFunnelStep::Endpoint => "Broker endpoint",
-        AgentFunnelStep::Topic => "Topic",
-        AgentFunnelStep::Acks => "Acknowledgement level",
-        AgentFunnelStep::Security => "Security",
-        AgentFunnelStep::SaslMechanism => "SASL mechanism",
-        AgentFunnelStep::SaslUsername => "SASL username",
-        AgentFunnelStep::SaslPasswordEnv => "SASL password env var",
-        AgentFunnelStep::Verify => "Verify",
-        AgentFunnelStep::Save => "Save",
-    };
-    lines.push(Line::from(Span::styled(
-        format!(" {pos}/{total} — {step_name} "),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    match funnel.step {
-        AgentFunnelStep::PickConnectionKind => {
-            lines.push(Line::from("Which connection?"));
-            for (i, k) in voice_bird_cli::config::AgentConnectionKind::ALL
-                .iter()
-                .enumerate()
-            {
-                lines.push(Line::from(Span::styled(
-                    format!("  [{}] {}", i + 1, k.label()),
-                    Style::default().fg(Color::White),
-                )));
-            }
-        }
-        AgentFunnelStep::Name => {
-            lines.push(Line::from("Target name (e.g. prod-events):"));
-            lines.push(input_line(&funnel.name));
-        }
-        AgentFunnelStep::Endpoint => {
-            lines.push(Line::from("Broker endpoint (host:port, comma-separated):"));
-            lines.push(input_line(&funnel.endpoint));
-        }
-        AgentFunnelStep::Topic => {
-            lines.push(Line::from("Topic name:"));
-            lines.push(input_line(&funnel.topic));
-        }
-        AgentFunnelStep::Acks => {
-            lines.push(Line::from("Acknowledgement level:"));
-            let opts = [
-                (voice_bird_cli::config::KafkaAcks::All, "[1] All (safe)"),
-                (voice_bird_cli::config::KafkaAcks::One, "[2] One (fast)"),
-                (
-                    voice_bird_cli::config::KafkaAcks::Zero,
-                    "[3] Zero (fire-and-forget)",
-                ),
-            ];
-            for (val, label) in opts {
-                let marker = if funnel.acks == val { "● " } else { "  " };
-                let color = if funnel.acks == val {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{marker}{label}"),
-                    Style::default().fg(color),
-                )));
-            }
-        }
-        AgentFunnelStep::Security => {
-            lines.push(Line::from("Security protocol:"));
-            for (i, proto) in voice_bird_cli::config::KafkaSecurityProtocol::ALL
-                .iter()
-                .enumerate()
-            {
-                let selected = funnel.security_protocol == *proto;
-                let marker = if selected { "● " } else { "  " };
-                let color = if selected { Color::Yellow } else { Color::Gray };
-                lines.push(Line::from(Span::styled(
-                    format!("{marker}[{}] {}", i + 1, proto.label()),
-                    Style::default().fg(color),
-                )));
-            }
-        }
-        AgentFunnelStep::SaslMechanism => {
-            lines.push(Line::from("SASL mechanism:"));
-            for (i, mech) in voice_bird_cli::config::KafkaSaslMechanism::ALL
-                .iter()
-                .enumerate()
-            {
-                let selected = funnel.sasl_mechanism == *mech;
-                let marker = if selected { "● " } else { "  " };
-                let color = if selected { Color::Yellow } else { Color::Gray };
-                lines.push(Line::from(Span::styled(
-                    format!("{marker}[{}] {}", i + 1, mech.as_str()),
-                    Style::default().fg(color),
-                )));
-            }
-        }
-        AgentFunnelStep::SaslUsername => {
-            lines.push(Line::from("SASL username:"));
-            lines.push(input_line(&funnel.sasl_username));
-        }
-        AgentFunnelStep::SaslPasswordEnv => {
-            lines.push(Line::from(
-                "NAME of the env var holding the SASL password:",
-            ));
-            lines.push(input_line(&funnel.sasl_password_env));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "The password itself is read from that variable at connect",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "time and is never written to config.toml.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        AgentFunnelStep::Verify => {
-            lines.push(Line::from(Span::styled(
-                "Press [Enter] to verify the connection",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(""));
-            match &funnel.verify {
-                VerifyOutcome::Pending => {
-                    lines.push(Line::from(Span::styled(
-                        "(not yet verified)",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                VerifyOutcome::InProgress => {
-                    lines.push(Line::from(Span::styled(
-                        "Verifying…",
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                VerifyOutcome::Ok { elapsed } => {
-                    lines.push(Line::from(Span::styled(
-                        format!("OK — round trip in {elapsed:?}"),
-                        Style::default().fg(Color::Green),
-                    )));
-                }
-                VerifyOutcome::Err { message } => {
-                    lines.push(Line::from(Span::styled(
-                        format!("FAILED: {message}"),
-                        Style::default().fg(Color::Red),
-                    )));
-                }
-            }
-        }
-        AgentFunnelStep::Save => {
-            lines.push(Line::from(Span::styled(
-                "Save this Agent target?",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("name     : {}", funnel.name),
-                Style::default().fg(Color::White),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("endpoint : {}", funnel.endpoint),
-                Style::default().fg(Color::White),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("topic    : {}", funnel.topic),
-                Style::default().fg(Color::White),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("acks     : {}", funnel.acks.as_str()),
-                Style::default().fg(Color::White),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("security : {}", funnel.security_protocol.as_str()),
-                Style::default().fg(Color::White),
-            )));
-            if funnel.security_protocol.uses_sasl() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "sasl     : {} as {} (password from ${})",
-                        funnel.sasl_mechanism.as_str(),
-                        funnel.sasl_username,
-                        funnel.sasl_password_env,
-                    ),
-                    Style::default().fg(Color::White),
-                )));
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    let footer = match funnel.step {
-        AgentFunnelStep::Verify => "[Enter] run verify  [Esc] cancel",
-        AgentFunnelStep::Save => "[Enter] save  [Esc] cancel",
-        _ => "[Enter] next  [Esc] cancel",
-    };
-    let back_hint = "  [←] back";
-    lines.push(Line::from(Span::styled(
-        format!("{footer}{back_hint}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Agent target ")
-        .style(Style::default().fg(Color::White));
-    let p = Paragraph::new(lines).block(block);
-    f.render_widget(p, popup);
-}
-
-/// Centered overlay for the "delete this Agent target?" confirm
-/// prompt. `y` confirms; any other key cancels. Implemented as
-/// a single-line modal so it doesn't pull focus away from the
-/// Targets pane for long.
-fn render_confirm_delete(f: &mut Frame, area: Rect, app: &App, id: &str) {
-    let popup = centered(60, 3, area);
-    f.render_widget(Clear, popup);
-    // Show the target's *name* (not its raw UUID) so the user
-    // can tell which row they're about to delete. Fall back
-    // to the id only if the config was edited out from under
-    // us between prompt-open and prompt-render.
-    let name = app
-        .config
-        .agent_target_by_id(id)
-        .map(|t| t.name.clone())
-        .unwrap_or_else(|| id.to_string());
-    let lines = vec![Line::from(Span::styled(
-        format!("Delete Agent target '{name}'? [y/N]"),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    ))];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Confirm delete ")
-        .style(Style::default().fg(Color::White));
-    let p = Paragraph::new(lines).block(block);
-    f.render_widget(p, popup);
-}
-
 /// Render a single text-input line with a yellow caret at the
-/// end. Used by the funnel's Name / Endpoint / Topic steps.
+/// end. Used by the funnel's Name / Endpoint / Topic steps
+/// (now removed in §8.2 — the helper stays because future text
+/// modals will want the same yellow caret convention).
 fn input_line(value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -1067,11 +806,11 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
 /// `App::focused_target_kind`). This keeps the visible state and
 /// the pickable state in agreement.
 fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
-    
 
     let focused = app.picker_focus == PickerFocus::Targets;
+    // §8.5: `app.targets()` returns just the Stdout row.
     let rows = app.targets();
-    // The row that's actually wired to the focused slot's
+    let picked = app.picked_target_kind();
     // pending-or-last target. Highlights survive the pane's focus
     // state — even when Targets isn't focused, the user can see
     // which row is the live choice.
@@ -1099,14 +838,10 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
             // on `row` ends before the next iteration's call.
             let is_picked = picked.as_ref() == Some(&row.kind) && !row.disabled;
             let marker = if is_cursor { "▶ " } else { "  " };
-            // Look up the agent target's name so the row label
-            // reads as "Agent: <name>" instead of a bare "Agent".
-            let name = match &row.kind {
-                crate::app::TargetKind::Agent { id } => {
-                    app.config.agent_target_by_id(id).map(|t| t.name.clone())
-                }
-                _ => None,
-            };
+            // §8.5: `TargetKind` is single-variant (`Stdout`) now.
+            // The agent-name lookup and the Agent arm of the match
+            // are gone; the name is always `None`.
+            let name: Option<String> = None;
             let (label, style, hint) =
                 target_row_style(row.kind.clone(), row.disabled, name.as_deref());
             // The picked row gets its base color bumped to Yellow
@@ -1163,17 +898,10 @@ fn target_row_style(
     name: Option<&str>,
 ) -> (String, Style, String) {
     use crate::app::TargetKind;
-    let base_color = match &kind {
-        TargetKind::Stdout => Color::Green,
-        TargetKind::Agent { .. } => Color::Cyan,
-    };
-    let label = match &kind {
-        TargetKind::Stdout => "Stdout".to_string(),
-        TargetKind::Agent { .. } => match name {
-            Some(n) => format!("Agent: {n}"),
-            None => "Agent".to_string(),
-        },
-    };
+    // §8.5: `TargetKind` is single-variant. `base_color` fixed.
+    let _ = name;
+    let label = String::from("Stdout");
+    let base_color = Color::Green;
     if disabled {
         (
             label,
@@ -1181,10 +909,6 @@ fn target_row_style(
             "  (not installed)".into(),
         )
     } else {
-        // Agent is rendered the same as Stdout — no
-        // trailing hint, same row geometry. The disabled
-        // case (above) carries the "(not installed)" hint
-        // since the row exists but can't be picked.
         let s = Style::default().fg(base_color).add_modifier(Modifier::BOLD);
         (label, s, String::new())
     }
@@ -1597,16 +1321,10 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
                 lines.push(hotkey_line("[m]", "model"));
                 lines.push(hotkey_line("[p]", "path"));
             }
-            // Agent CRUD keys live on the Targets pane only —
-            // they don't collide with the Devices/Apps `l`,
-            // `m`, `e` shortcuts. `e` is overloaded: in the
-            // Targets pane it opens the edit funnel; in any
-            // other pane (today: Devices) it exports.
-            if app.picker_focus == crate::app::PickerFocus::Targets {
-                lines.push(hotkey_line("[a]", "add agent"));
-                lines.push(hotkey_line("[e]", "edit agent"));
-                lines.push(hotkey_line("[d]", "delete agent"));
-            } else if local_keys {
+            // `[a]`/`[e]`/`[d]` Agent CRUD keys removed in §8.
+            // `[e]` exports a recording from the Devices pane;
+            // the Targets pane will be repurposed for Characters in §10.
+            if app.picker_focus != crate::app::PickerFocus::Targets && local_keys {
                 lines.push(hotkey_line("[e]", "export"));
             }
             lines
@@ -1741,8 +1459,8 @@ mod tests {
         assert!(out.contains("Agent status"), "overlay title missing:\n{out}");
         assert!(out.contains("(no agent events yet)"));
 
-        crate::app::push_agent_event(&app.agent_events, "saved Agent target 'prod'");
-        crate::app::push_agent_event(&app.agent_events, "verify OK for 'b:9092' in 42ms");
+        crate::app::push_app_event(&app.app_events, "saved Agent target 'prod'");
+        crate::app::push_app_event(&app.app_events, "verify OK for 'b:9092' in 42ms");
         let out = render_to_string(&app, 100, 30);
         assert!(out.contains("saved Agent target 'prod'"), "event missing:\n{out}");
         assert!(out.contains("verify OK for 'b:9092' in 42ms"));
@@ -1883,7 +1601,7 @@ mod tests {
     #[test]
     fn mode_panel_off_shows_language_locked() {
         let mut app = App::new();
-        app.slots[0].settings.cloud_on = false;
+        app.config.cloud_broadcast_enabled = false;
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("Mode"), "mode panel title missing:\n{out}");
         assert!(out.contains("[OFF]"), "cloud-off label missing:\n{out}");
@@ -1895,8 +1613,8 @@ mod tests {
     #[test]
     fn mode_panel_on_shows_language_cycle_hint() {
         let mut app = App::new();
-        app.slots[0].settings.cloud_on = true;
-        app.slots[0].settings.language = "ru".into();
+        app.config.cloud_broadcast_enabled = true;
+        app.config.language = "ru".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("[ON]"), "cloud-on label missing:\n{out}");
         // `ru` appears in the language line; the (l) hint accompanies it.
@@ -2001,9 +1719,9 @@ mod tests {
     /// The mode panel shows the model name (auto-picked or user-chosen)
     /// so the user can see what's loaded without leaving the main screen.
     #[test]
-    fn mode_panel_shows_the_model_name() {
+    fn mode_panel_shows_model_name() {
         let mut app = App::new();
-        app.slots[0].settings.model = "tiny.en".into();
+        app.config.default_model = "tiny.en".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
@@ -2122,50 +1840,6 @@ mod tests {
     /// per-section transport flag in the Mode panel).
     /// The active pick is tagged with "(active)" next to
     /// the focused slot's current target.
-    #[test]
-    fn targets_pane_lists_stdout_and_agent_in_order() {
-        // The default Agent row is gone — the user has to
-        // add their own via the funnel. Plant one in the
-        // config so the row renders in the expected order.
-        let mut app = App::new();
-        app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
-            id: "test-uuid".into(),
-            name: "prod".into(),
-            connection: voice_bird_cli::config::AgentConnection::Kafka(
-                voice_bird_cli::config::KafkaAgentConnection {
-                    endpoint: "localhost:9092".into(),
-                    topic: "voice-bird".into(),
-                    client_id: None,
-                    acks: Default::default(),
-                    security_protocol: Default::default(),
-                    sasl_mechanism: None,
-                    sasl_username: None,
-                    sasl_password_env: None,
-                },
-            ),
-        })
-        .expect("upsert test agent target");
-        let out = render_to_string(&app, 180, 40);
-        // Pane header (focused variant — Devices is the
-        // default focus, so the targets pane shows the
-        // unfocused title).
-        assert!(out.contains("Targets"), "targets pane missing:\n{out}");
-        // Two rows in the fixed order: Stdout first, Agent
-        // last. The cloud toggle lives in the Mode panel,
-        // not here.
-        let stdout_pos = out.find("Stdout").expect("Stdout row missing");
-        let agent_pos = out.find("Agent:").expect("Agent row missing");
-        assert!(
-            stdout_pos < agent_pos,
-            "Stdout must come before Agent"
-        );
-        // The Cloud-as-target row must be gone.
-        assert!(
-            !out.contains("→ Cloud"),
-            "the '→ Cloud' target must not appear in the targets pane; got:\n{out}"
-        );
-    }
-    /// When the focused slot has been used before, the row matching
     /// the current target gets a "(active)" tag — without it the user
     /// has no way to tell at a glance which row is the active pick
     /// across multiple slots.
@@ -2182,37 +1856,6 @@ mod tests {
             !out.contains("(active)"),
             "no section has started yet — active tag should be absent:\n{out}"
         );
-    }
-
-    /// `target_row_style` (the helper behind the Targets pane rows)
-    /// returns the Agent row in dark gray and tagged as
-    /// "not installed" when the runtime binary is missing. The
-    /// base helper is pure — no real agent-runtime detection
-    /// required.
-    #[test]
-    fn target_row_style_agent_is_dim_when_disabled() {
-        use crate::app::TargetKind;
-        let (label, style, hint) =
-            target_row_style(TargetKind::Agent { id: "any".into() }, true, None);
-        assert_eq!(label, "Agent");
-        assert_eq!(style.fg, Some(Color::DarkGray));
-        assert!(hint.contains("not installed"));
-    }
-    /// When Agent is enabled, the row is rendered with the same
-    /// shape as Stdout / Cloud — no trailing hint text, so the
-    /// three rows share identical geometry and the pin glyph
-    #[test]
-    fn target_row_style_agent_is_cyan_when_enabled() {
-        use crate::app::TargetKind;
-        let (label, style, hint) = target_row_style(
-            TargetKind::Agent { id: "any".into() },
-            false,
-            Some("prod-events"),
-        );
-        assert_eq!(label, "Agent: prod-events");
-        assert_eq!(style.fg, Some(Color::Cyan));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(hint, "", "enabled Agent must not carry a trailing hint");
     }
     /// Enabled Stdout also carries no hint — pinning the
     /// invariant that every picker row shares a single
@@ -2335,221 +1978,6 @@ mod tests {
     /// app, and target picked-row pins in the picker pointing at
     /// the *focused* slot's pick.
     #[test]
-    fn multi_slot_round_trip_keeps_picked_pins_on_focused_slot() {
-        use crate::app::{RecordingStatus, SavedTranscript, SectionSettings, SlotKind};
-        use std::sync::Arc;
-        use voice_bird_cli::session::target::Target;
-
-        let mut app = App::new();
-        // Add a user-configured Agent target so the Targets
-        // pane has a non-default row to pin. Cloud is no
-        // longer a target; the multi-pin exercise now
-        // uses an Agent target the user added via the
-        // funnel.
-        app.upsert_agent_target_in_memory(voice_bird_cli::config::AgentTargetConfig {
-            id: "uuid-zoom".into(),
-            name: "zoom-bridge".into(),
-            connection: voice_bird_cli::config::AgentConnection::Kafka(
-                voice_bird_cli::config::KafkaAgentConnection {
-                    endpoint: "localhost:9092".into(),
-                    topic: "voice-bird".into(),
-                    client_id: None,
-                    acks: Default::default(),
-                    security_protocol: Default::default(),
-                    sasl_mechanism: None,
-                    sasl_username: None,
-                    sasl_password_env: None,
-                },
-            ),
-        })
-        .expect("upsert test agent target");
-        // Seed the picker state so each pane is non-trivial
-        // — otherwise the picked pin would land on a
-        // single vacant row and the test wouldn't catch
-        // ordering bugs.
-        app.devices = vec![
-            AudioDevice {
-                name: "MacBook Pro Microphone".into(),
-                kind: AudioSessionKind::Input,
-            },
-            AudioDevice {
-                name: "Mac mini Speakers".into(),
-                kind: AudioSessionKind::Output,
-            },
-            AudioDevice {
-                name: "EPOS PC 8 USB".into(),
-                kind: AudioSessionKind::Output,
-            },
-        ];
-        app.apps = vec![
-            fake_app("chrome", "Google Chrome"),
-            fake_app("zoom", "Zoom"),
-            fake_app("terminal", "Terminal"),
-        ];
-        app.selected_device_index = 2; // EPOS PC 8 USB
-        app.selected_app_index = Some(0); // Chrome
-        app.selected_target_index = Some(1); // Agent: zoom-bridge
-        // slot 1 starts as the only slot (id 1). Mark
-        // it as a saved recording on the user-configured
-        // Agent target so the device + target pick are
-        // non-default. Bypassing `start_section` keeps
-        // the test free of audio / cpal / tokio runtime
-        // needs.
-        let saved_target =
-            Target::Agent { session_id: "uuid-zoom".into() };
-        app.slots[0] = crate::app::Slot {
-            id: crate::app::SlotId(1),
-            settings: voice_bird_cli::config::SlotSettings::default(),
-            kind: SlotKind::Saved {
-                saved: SavedTranscript {
-                    committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    refined: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    label: "EPOS PC 8 USB + Chrome -> Agent: zoom-bridge".into(),
-                    target: saved_target.clone(),
-                    source: voice_bird_cli::session::layout::SessionSource::App {
-                        id: "chrome".into(),
-                        name: "Chrome".into(),
-                        device_name: "EPOS PC 8 USB".into(),
-                    },
-                    settings: SectionSettings {
-                        cloud_on: false,
-                        language: "en".into(),
-                        model: "tiny.en".into(),
-                    },
-                },
-            },
-        };
-        // Move focus explicitly to slot 1 (already is, by
-        // construction).
-        app.focused_slot = crate::app::SlotId(1);
-        app.status = RecordingStatus::Idle;
-
-        // ---- Step 0: focus on slot 1 ----
-        // Confirm we start on slot 1 and the picks
-        // resolve to the right rows in every pane.
-        assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        assert_eq!(app.picked_device_idx(), Some(2));
-        assert_eq!(app.picked_app_idx(), Some(1)); // Chrome at apps[0] + synthetic offset 1
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() })
-        );
-        let out0 = render_to_string(&app, 180, 40);
-        // The picked Device row ('EPOS PC 8 USB' at index
-        // 2) must glow yellow + carry the '●' pin.
-        assert!(
-            out0.lines()
-                .any(|l| l.contains("EPOS PC 8 USB") && l.contains('●')),
-            "slot-1 step 0: device row missing '●' pin:\n{out0}"
-        );
-        assert!(
-            out0.lines()
-                .any(|l| l.contains("Chrome") && l.contains('●')),
-            "slot-1 step 0: app row missing '●' pin:\n{out0}"
-        );
-        // Helper: locate a Targets-pane row by its label
-        // and report whether the row carries the
-        // trailing '●' pin.
-        let target_pin_present = |out: &str, label: &str| -> bool {
-            let pinned_text = format!("{label} \u{25CF}");
-            out.contains(&pinned_text)
-        };
-        // ---- Step 1: + adds a second slot ----
-        let added = app.add_slot();
-        assert_eq!(added, Some(crate::app::SlotId(2)));
-        assert_eq!(app.slots.len(), 2);
-        // `add_slot` advances focused_slot to the new slot.
-        assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        // Empty slot 2 picks fall back to the global
-        // cursor positions and the per-slot Stdout
-        // default (Target).
-        assert_eq!(app.picked_device_idx(), Some(2));
-        assert_eq!(app.picked_app_idx(), Some(1));
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Stdout)
-        );
-        let out1 = render_to_string(&app, 180, 40);
-        assert!(
-            target_pin_present(&out1, "Stdout"),
-            "step 1: Stdout must be pinned on slot 2:\n{out1}"
-        );
-        assert!(
-            !target_pin_present(&out1, "Agent: zoom-bridge"),
-            "step 1: the saved Agent pin must NOT leak from slot 1 to slot 2:\n{out1}"
-        );
-        assert!(out1.contains("[1]"), "slot 1 title missing:\n{out1}");
-        assert!(out1.contains("[2]"), "slot 2 title missing:\n{out1}");
-
-        // ---- Step 2: focus_prev takes us back to slot 1 ----
-        app.focus_prev();
-        assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
-            "back on slot 1: picked target should be the saved Agent"
-        );
-        assert_eq!(app.picked_device_idx(), Some(2));
-        assert_eq!(app.picked_app_idx(), Some(1));
-        let out2 = render_to_string(&app, 180, 40);
-        // Returning to slot 1 must re-pin the saved Agent
-        // on Targets — and must NOT leave Stdout pinned.
-        assert!(
-            target_pin_present(&out2, "Agent: zoom-bridge"),
-            "back on slot 1: Agent must be pinned:\n{out2}"
-        );
-        assert!(
-            !target_pin_present(&out2, "Stdout"),
-            "back on slot 1: Stdout must not be pinned:\n{out2}"
-        );
-
-        // ---- Step 3: focus_next takes us back to slot 2 ----
-        app.focus_next();
-        assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        // Empty slot 2 falls back to Stdout again.
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Stdout),
-            "forward on slot 2: picked target should be Stdout fallback"
-        );
-        let out3 = render_to_string(&app, 180, 40);
-        assert!(
-            target_pin_present(&out3, "Stdout"),
-            "back on slot 2: Stdout must be pinned:\n{out3}"
-        );
-        assert!(
-            !target_pin_present(&out3, "Agent: zoom-bridge"),
-            "back on slot 2: saved Agent must not be pinned:\n{out3}"
-        );
-
-        // ---- Bonus: queue a pending Agent pick on slot
-        // 2 and verify the override is per-slot. ----
-        app.pending_target_overrides.insert(
-            crate::app::SlotId(2),
-            Target::Agent { session_id: "uuid-zoom".into() },
-        );
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
-            "after queueing Agent on slot 2, target picks Agent"
-        );
-        app.focus_prev();
-        assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        // Slot 1's pick is independent of slot 2's
-        // pending override: still the saved Agent.
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
-            "slot 1 must keep its own target pick across slot 2's override"
-        );
-        app.focus_next();
-        assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        assert_eq!(
-            app.picked_target_kind(),
-            Some(crate::app::TargetKind::Agent { id: "uuid-zoom".into() }),
-            "slot 2 picks Agent back after forward navigation"
-        );
-    }
     /// A paused (Saved) slot's bottom hint must make the
     /// Enter/R distinction explicit: R resumes the focused
     /// slot in place, x clears it, Enter starts a brand-new
@@ -2625,24 +2053,25 @@ mod tests {
             "non-focused paused slot A must keep the clear-only hint (no [R]); got:\n{out_unfocused}"
         );
     }
-    /// R7 (PR #31 round-3 review): the funnel footer must
-    /// advertise the [←] back key. main.rs binds KeyCode::Left
-    /// to AgentFunnel::back(), but every step footer still reads
-    /// "[Enter] …  [Esc] cancel" — the escape hatch from a failed
-    /// Verify is invisible exactly where it's needed.
-    #[test]
-    fn funnel_footer_advertises_back_key() {
-        let mut app = App::new();
-        app.funnel = Some(voice_bird_cli::agent_funnel::AgentFunnel::new_add());
-        app.mode = crate::app::AppMode::AgentFunnel;
-        let out = render_to_string(&app, 120, 40);
-        let footers: Vec<&str> = out
-            .lines()
-            .filter(|l| l.contains("[Enter]"))
-            .collect();
-        assert!(
-            out.contains("[←] back"),
-            "funnel footer must advertise the [←] back key (R7); rendered footer(s): {footers:?}"
-        );
-    }
+    //
+    //
+    //
+    //
+    // Test removed in §8.3 (AgentFunnel state deleted).
 }
+
+// Removed in §8.3:
+// - `targets_pane_lists_stdout_and_agent_in_order`
+// - `target_row_style_agent_is_dim_when_disabled`
+// - `target_row_style_agent_is_cyan_when_enabled`
+// - `multi_slot_round_trip_keeps_picked_pins_on_focused_slot`
+// - `paused_slot_hint_advertises_resume_and_enter_contrast`
+// - `funnel_footer_advertises_back_key`
+// - `agent_event_log_caps_and_records_failures_only`
+// - `dispatch_default_id_routes_to_legacy_mcp_buffer`
+// - `dispatch_known_id_pushes_to_mapped_target`
+// - `dispatch_missing_id_drops_segment_not_default`
+// - `dispatch_push_failure_is_reported_not_rerouted`
+// - `dispatch_non_agent_targets_route_nothing`
+// - `select_next_advances_past_first_agent_target`
+// - `agent_state_event_log_caps_at_50_entries`

@@ -124,8 +124,7 @@ The interface is split into source panes (microphones, system output, running ap
 | `e` | Export the latest local transcript |
 | `p` | Change local session path |
 | `x` | Clear stopped transcript slot |
-| `t` | Status overlay — recent agent events (target saved, verify results, broker errors, dropped segments) with timestamps |
-| `q` | Quit |
+| `t` | Status overlay — recent app events (verify, push, run) with timestamps |
 | `?` | Help |
 
 On Windows, `c` opens the API-key dialog (cloud is always on), and the local-only keys `m`, `e`, and `p` are not available.
@@ -171,52 +170,18 @@ Settings live in a single TOML file:
 
 The Voice Bird API key is stored in plaintext in `config.toml`; on Unix the app sets the file to `0600` best-effort. Don't commit or share this file.
 
-## Agent targets (Kafka)
-
-Committed transcript segments can be fanned out to a Kafka topic so a downstream agent can consume them live. Add a target from the Targets pane (`a` to add, `e` to edit, `d` to delete) — a step-by-step form collects the broker endpoint, topic, `acks` level, and security settings, then verifies the connection with a produce/consume round trip before saving.
-
-Targets are stored in `config.toml` as `[[agent_targets]]` rows:
-
-```toml
-[[agent_targets]]
-id = "b9c1…"                      # minted by the TUI
-name = "prod-events"
-kind = "kafka"
-endpoint = "broker-1:9093,broker-2:9093"
-topic = "voice-bird-events"
-acks = "all"                      # all | one | zero
-security_protocol = "sasl_ssl"    # plaintext | ssl | sasl_plaintext | sasl_ssl
-sasl_mechanism = "scram-sha-256"  # plain | scram-sha-256 | scram-sha-512
-sasl_username = "svc-voicebird"
-sasl_password_env = "VOICE_BIRD_KAFKA_PASSWORD"
-```
-
-Voice transcripts are sensitive — use `sasl_ssl` (or at least `ssl`) for any broker that isn't localhost. The SASL password is **never stored in the config file**: `sasl_password_env` names an environment variable, and the password is read from it when the connection is opened. Export it before launching:
-
-```bash
-export VOICE_BIRD_KAFKA_PASSWORD=…
-voice-bird-cli
-```
-
-`security_protocol` defaults to `plaintext` when omitted, which keeps configs from older versions working unchanged. GSSAPI/Kerberos is not supported (it would require a system libsasl2 and break the self-contained static binary); librdkafka is linked statically with vendored OpenSSL, so TLS and SASL work without any Homebrew/system packages.
 
 ## Development
 
-Before a release, the Kafka Agent-target path can be exercised end to end against a real broker (started via Docker if `localhost:9092` is empty). The script drives the actual TUI binary through the Add-Agent funnel — including the produce/consume verify probe — and prints a one-line summary:
-
 ```bash
-./scripts/demo-kafka.sh              # standalone
-./scripts/release.sh all --with-kafka  # as a release gate
-```
-
+cargo build            # debug build
 ```bash
 cargo build            # debug build
 cargo test             # unit + integration tests (mock engines, no downloads)
 cargo test --features engine-smoke   # real-engine smoke tests (downloads tiny.en)
 cargo run -p xtask -- build-sidecar  # build the macOS WhisperKit sidecar
-```
 
-Issues and questions are welcome on the [issue tracker](https://github.com/RekunDzmitry/voice_bird_desktop/issues).
+## Development
 
 ## License
 
