@@ -420,18 +420,13 @@ pub struct App {
     pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
 
     /// Rolling log of app events (verify ok/fail, push failures,
-    /// dropped segments), newest at the back, capped at
-    /// [`APP_EVENT_CAP`]. Behind an `Arc<PlMutex<...>>` so any
-    /// background task can append while the render thread reads.
-    /// Surfaced by the `t` status overlay ([`AppMode::Status`\]).
-    /// Renamed from `agent_events` in §8.
+    /// dropped segments), newest at the back. Behind an
+    /// `Arc<PlMutex<...>>` so any background task can
+    /// append while the render thread reads. Surfaced by the
+    /// `t` status overlay ([`AppMode::Status`\]). Renamed
+    /// from `agent_events` in §8.
     pub app_events: Arc<PlMutex<VecDeque<AppEvent>>>,
 }
-
-/// Cap on [`App::agent_events`]. Big enough to cover a long
-/// recording session's worth of incidents; small enough that the
-/// overlay and memory stay bounded.
-pub const APP_EVENT_CAP: usize = 50;
 
 /// One row in the `t` status overlay.
 #[derive(Debug, Clone)]
@@ -439,21 +434,6 @@ pub struct AppEvent {
     /// Local wall-clock time the event was recorded.
     pub at: chrono::DateTime<chrono::Local>,
     pub message: String,
-}
-
-/// Append an event to the shared agent-event log, evicting the
-/// oldest entry past [`APP_EVENT_CAP`]. Free function (not a
-/// method) so the recording consumer task can call it on its
-/// cloned `Arc` without touching `App`.
-pub fn push_app_event(events: &Arc<PlMutex<VecDeque<AppEvent>>>, message: impl Into<String>) {
-    let mut buf = events.lock();
-    if buf.len() == APP_EVENT_CAP {
-        buf.pop_front();
-    }
-    buf.push_back(AppEvent {
-        at: chrono::Local::now(),
-        message: message.into(),
-    });
 }
 
 /// A single row in the Agents picker.
@@ -846,16 +826,6 @@ impl App {
         }
     }
 
-    /// Record `agent_id` as the focused slot's pending cloud Agent
-    /// pick. Consumed by `start_section` (and the §11 `g` key
-    /// handler) to know which prompt template to run. No-op on
-    /// the routing `Target` axis — `pick_target(TargetKind::Stdout)`
-    /// still controls local file persistence.
-    pub fn pick_agent(&mut self, agent_id: &str) {
-        let slot = self.focused_slot;
-        self.pending_agent_overrides
-            .insert(slot, agent_id.to_string());
-    }
 
     /// Committed-transcript Arc for the focused section, or saved
     /// transcript, or an empty fallback when nothing is available.
@@ -1472,18 +1442,14 @@ impl App {
         None
     }
 
-    /// Picked-target kind for the focused slot. Falls through to
-    /// the last-saved target if no pending override is queued. The
-    /// Agents pane uses this to mark the active row.
+    /// Picked-target kind for the focused slot. The Agents
+    /// pane uses this to mark the active row. §8.5 collapsed
+    /// `Target` to a single `Stdout` variant; with no
+    /// `Agent` routing axis to consult, the function is a
+    /// stub until §10 repopulates the picker with cloud
+    /// Agents and the picker starts reading
+    /// `pending_agent_overrides` instead.
     pub fn picked_target_kind(&self) -> Option<TargetKind> {
-        let t = self
-            .pending_target_overrides
-            .get(&self.focused_slot)
-            .cloned()
-            .or_else(|| self.focused_target())
-            .unwrap_or(Target::Stdout);
-        // §8.5: `Target::Agent` is gone. The picker only ever returns
-        // `Stdout` until §10 repaints the pane with Agents.
         Some(TargetKind::Stdout)
     }
 
@@ -2951,19 +2917,21 @@ mod tests {
         assert_eq!(app.targets().len(), 2);
     }
 
-    /// `pick_agent` records the agent id in the per-slot pending
-    /// map so `start_section` / §11 `g` key know which cloud
-    /// Agent to run. Today the stub does NOT record, so this
-    /// test fails.
+    /// `pick_target(TargetKind::Agent(id))` records the agent id
+    /// in the per-slot pending map so `start_section` / §11
+    /// `g` key know which cloud Agent to run. The local
+    /// routing `Target` axis stays `Stdout` — only the
+    /// agent override is updated.
     #[test]
-    fn pick_agent_records_id_in_pending_map() {
+    fn pick_target_with_agent_kind_records_id_in_pending_map() {
         let mut app = App::new();
         let slot = app.focused_slot;
-        app.pick_agent("note-taker");
+        app.pick_target(TargetKind::Agent("note-taker".into()));
         assert_eq!(
             app.pending_agent_overrides.get(&slot).map(String::as_str),
             Some("note-taker"),
-            "pick_agent must record the id in pending_agent_overrides"
+            "pick_target(TargetKind::Agent(id)) must record the id in \
+             pending_agent_overrides"
         );
     }
 

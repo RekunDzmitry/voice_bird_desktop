@@ -8,7 +8,6 @@ use ratatui::{
 use std::time::Instant;
 
 use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind};
-use voice_bird_cli::session::target::Target;
 
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
@@ -756,22 +755,6 @@ fn render_path_modal(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, popup);
 }
 
-/// Render a single text-input line with a yellow caret at the
-/// end. Used by the funnel's Name / Endpoint / Topic steps
-/// (now removed in §8.2 — the helper stays because future text
-/// modals will want the same yellow caret convention).
-fn input_line(value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            value.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("▏", Style::default().fg(Color::Yellow)),
-    ])
-}
-
 /// Top-row picker. Three panes side by side: Devices (physical I/O),
 /// Apps (per-application capture), and Agents (cloud-prompt picker —
 /// today a single `Stdout` row while the cloud list lands in §10).
@@ -811,12 +794,11 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.picker_focus == PickerFocus::Agents;
     // §8.5: `app.targets()` returns just the Stdout row.
     let rows = app.targets();
+    // Pending-or-last target — the Agents pane reads this
+    // to mark the active row, including when the pane is
+    // unfocused (the user can still see which row is the
+    // live choice from the sidebar).
     let picked = app.picked_target_kind();
-    // pending-or-last target. Highlights survive the pane's focus
-    // state — even when Agents isn't focused, the user can see
-    // which row is the live choice.
-    let picked = app.picked_target_kind();
-
     let title = if focused {
         " Agents ▸ [↑/↓] pick  [←] apps  [Enter] start "
     } else {
@@ -1485,8 +1467,23 @@ mod tests {
         assert!(out.contains("Agent status"), "overlay title missing:\n{out}");
         assert!(out.contains("(no agent events yet)"));
 
-        crate::app::push_app_event(&app.app_events, "saved Agent target 'prod'");
-        crate::app::push_app_event(&app.app_events, "verify OK for 'b:9092' in 42ms");
+        // Push events directly via the shared field. The
+        // legacy `push_app_event` free fn was removed with
+        // §8.3+§8.4's consumer task — the caller used to be
+        // the agent runtime, which no longer ships in the
+        // desktop. The overlay render path is unchanged.
+        {
+            let now = chrono::Local::now();
+            let mut buf = app.app_events.lock();
+            buf.push_back(crate::app::AppEvent {
+                at: now,
+                message: "saved Agent target 'prod'".into(),
+            });
+            buf.push_back(crate::app::AppEvent {
+                at: now,
+                message: "verify OK for 'b:9092' in 42ms".into(),
+            });
+        }
         let out = render_to_string(&app, 100, 30);
         assert!(out.contains("saved Agent target 'prod'"), "event missing:\n{out}");
         assert!(out.contains("verify OK for 'b:9092' in 42ms"));
@@ -2048,14 +2045,6 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &out).unwrap();
     }
-    /// Multi-slot round-trip — drove directly from a reported
-    /// scenario: user starts a recording on slot 1, adds a second
-    /// slot with `+`, navigates back to slot 1 with Shift-Tab,
-    /// navigates forward to slot 2 with Tab. Each focus step must
-    /// (a) succeed without surprising state, (b) keep the device,
-    /// app, and target picked-row pins in the picker pointing at
-    /// the *focused* slot's pick.
-    #[test]
     /// A paused (Saved) slot's bottom hint must make the
     /// Enter/R distinction explicit: R resumes the focused
     /// slot in place, x clears it, Enter starts a brand-new
