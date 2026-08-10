@@ -20,33 +20,14 @@ pub struct Agent {
     pub is_built_in: bool,
 }
 
-/// Wire shape returned by `GET /api/agents`. Built-in
-/// agents come from application code on the server; custom
-/// agents come from the user's `ai_agents` table. The
-/// desktop treats them identically.
+/// Wire shape returned by `GET /api/agents`. The web app
+/// emits fields with the same names we declare here
+/// (`id`, `name`, `description`, `icon`) so no rename is
+/// needed. The fields the desktop doesn't read (`kind`,
+/// `isBuiltIn`, `createdAt`, `updatedAt`, `promptTemplate`)
+/// are silently dropped on parse — the struct has no
+/// matching field, so serde ignores them.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ServerKind {
-    #[allow(dead_code)]
-    #[serde(rename = "custom")]
-    Custom,
-    #[serde(rename = "built-in")]
-    BuiltIn,
-}
-
-/// Wire shape returned by `GET /api/agents`. The web app is
-/// TypeScript and emits camelCase (`isBuiltIn`, `promptTemplate`,
-/// `createdAt`, …); serde's `rename_all = "camelCase"` translates
-/// the snake_case Rust fields to the wire field names so a
-/// straightforward `serde_json::from_str` parses the response.
-/// Without this rename, `reqwest`'s `json()` deserializer fails
-/// on the first camelCase field and the caller surfaces
-/// "response was not JSON" — which is misleading because the
-/// body IS JSON, it just doesn't match the schema. The fields
-/// the desktop doesn't read (`kind`, `isBuiltIn`, `createdAt`,
-/// `updatedAt`) are silently dropped on parse.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ServerAgent {
     id: String,
     name: String,
@@ -54,7 +35,6 @@ struct ServerAgent {
     description: Option<String>,
     #[serde(default)]
     icon: Option<String>,
-    prompt_template: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,15 +89,17 @@ pub fn fetch(base_url: &str, api_key: &str) -> anyhow::Result<Vec<Agent>> {
 mod tests {
     use super::*;
 
-    /// The web app emits camelCase (`promptTemplate`, `isBuiltIn`,
-    /// …) — without `#[serde(rename_all = "camelCase")]` on
-    /// `ServerAgent`, the `prompt_template` field deserializes
-    /// from `null` and serde reports a parse error. This test
-    /// pins the wire format so a future refactor that drops
-    /// the rename surfaces here, not as a silent "Agents list
+    /// The wire-response JSON contains fields the desktop
+    /// doesn't read (`kind`, `isBuiltIn`, `createdAt`,
+    /// `updatedAt`, `promptTemplate`). They're silently
+    /// dropped on parse — the struct has no matching field.
+    /// This test pins the wire format so a future server
+    /// refactor that drops one of the *read* fields
+    /// (`id`, `name`, `description`, `icon`) surfaces here
+    /// as a serde error, not as a silent "Agents list
     /// unavailable" banner in production.
     #[test]
-    fn parses_camelcase_wire_response() {
+    fn parses_wire_response_with_unknown_fields_dropped() {
         let body = r#"{
             "agents": [
                 {
@@ -139,17 +121,14 @@ mod tests {
             ]
         }"#;
         let parsed: AgentsResponse = serde_json::from_str(body)
-            .expect("camelCase wire response must parse");
+            .expect("wire response with unknown fields must parse");
         assert_eq!(parsed.agents.len(), 2);
         assert_eq!(parsed.agents[0].icon.as_deref(), Some("🦷"));
         assert_eq!(parsed.agents[0].name, "Dentist");
-
-        assert_eq!(
-            parsed.agents[0].prompt_template,
-            "You are a dental assistant."
-        );
-        // Fields the desktop doesn't read are silently dropped —
-        // assert optional fields default correctly.
+        // Unknown fields are silently dropped — assert
+        // optional fields default correctly so a wire
+        // response that omits `description` or `icon`
+        // doesn't surface as a parse error.
         assert_eq!(
             parsed.agents[1].description, None,
             "missing description must default to None"
@@ -160,26 +139,4 @@ mod tests {
         );
     }
 
-    /// Regression: before the camelCase rename, this same body
-    /// failed to deserialize (prompt_template was missing).
-    /// Pinned here so the wrong-shaped response surfaces as a
-    /// clear serde error at fetch time, not as a confusing
-    /// "response was not JSON" wrapper.
-    #[test]
-    fn snake_case_wire_response_is_rejected() {
-        let body = r#"{
-            "agents": [
-                {
-                    "id": "dentist",
-                    "name": "Dentist",
-                    "prompt_template": "..."
-                }
-            ]
-        }"#;
-        let parsed: Result<AgentsResponse, _> = serde_json::from_str(body);
-        assert!(
-            parsed.is_err(),
-            "snake_case wire format must not silently match the camelCase struct"
-        );
-    }
 }

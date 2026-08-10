@@ -245,7 +245,7 @@ impl AppConfig {
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
-        let mut cfg: Self = toml::from_str(&s)?;
+        let cfg: Self = toml::from_str(&s)?;
         Ok(cfg)
     }
 
