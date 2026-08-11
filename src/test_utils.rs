@@ -79,32 +79,6 @@ pub static INSTALL_TEST_CONFIG: LazyLock<PathBuf> = LazyLock::new(|| {
     path
 });
 
-/// A fresh, unshared `config.toml` path under a new tempdir.
-///
-/// `App::new()` uses this in test builds so every constructed `App`
-/// starts from its own empty config. The shared
-/// [`INSTALL_TEST_CONFIG`] tempdir keeps the developer's real config
-/// safe, but it is one file for the whole binary — once `App` began
-/// persisting the slot layout (`add_slot` / `remove_focused_slot`),
-/// one test's slots leaked into the next test's `App::new()` and the
-/// resulting slot ids depended on test execution order.
-///
-/// Like the shared tempdir, these are intentionally not deleted:
-/// the process exits and the OS reclaims them.
-pub fn fresh_test_config_path() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("voice-bird-app-pid{pid}-n{nanos}-c{n}"));
-    std::fs::create_dir_all(&dir).expect("create per-App test config tempdir");
-    dir.join("config.toml")
-}
-
 /// The real `config.toml` path, IGNORING the
 /// `VOICE_BIRD_TEST_CONFIG_PATH` env var. Used by tests that
 /// want to verify "did the production code touch the

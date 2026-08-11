@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::layout::SessionSource;
+
 /// Lives in lib so both `platform::AudioSession` (in the bin crate) and
 /// `AppConfig` (in the lib crate) can reference it.
 ///
@@ -18,47 +20,63 @@ pub enum AudioSessionKind {
     App,
 }
 
-/// Per-slot settings the user can flip from the Mode panel: Cloud
-/// on/off, transcription language (cloud-only), local model, and
-/// the on-disk session output path. Each slot owns its own copy and
-/// changes to one slot do not affect any other — two slots can record
-/// with different cloud/language/model/path simultaneously.
-///
-/// Persisted in `AppConfig::slot_settings` keyed by [`slot_settings_key`]
-/// (the slot's numeric id as a decimal string). The key type is `String`
-/// instead of `SlotId` so this module stays free of the binary's
-/// `app::SlotId` definition — `config.rs` is in the lib crate, `app.rs`
-/// is in the bin crate, and the slot identifier is the only field
-/// the two modules need to share.
+/// Settings that can be overridden per source. Stored in
+/// `AppConfig::source_overrides` keyed by `source_id`. When a section
+/// starts, the effective settings are computed by merging the saved
+/// override (if any) over the global defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SlotSettings {
+pub struct SourceSettingsOverride {
     pub cloud_on: bool,
     pub language: String,
     pub model: String,
-    pub path: String,
 }
 
-impl Default for SlotSettings {
-    fn default() -> Self {
-        Self {
-            cloud_on: false,
-            language: "en".into(),
-            model: "distil-small.en".into(),
-            path: "~/voice-bird/sessions".into(),
+/// Stable identifier for a source used to key `source_overrides`. Format:
+/// `device:input:<name>` / `device:output:<name>` /
+/// `app:<bundle-or-name>@device:<device>`.
+pub fn source_id(source: &SessionSource, kind: Option<AudioSessionKind>) -> String {
+    match source {
+        SessionSource::Microphone => format!(
+            "device:{}:default",
+            kind_str(kind.unwrap_or(AudioSessionKind::Input))
+        ),
+        SessionSource::System => format!(
+            "device:{}:default",
+            kind_str(kind.unwrap_or(AudioSessionKind::Output))
+        ),
+        SessionSource::App {
+            name, device_name, ..
+        } => {
+            if device_name.is_empty() {
+                format!("app:{name}")
+            } else {
+                format!("app:{name}@device:{device_name}")
+            }
         }
     }
 }
 
-/// String key for one slot's row in `AppConfig::slot_settings`. Stable
-/// across the slot's lifetime — `app::SlotId(2)` is always "2" here.
-/// Kept as a free function (not a method on `SlotSettings`) so the
-/// lib crate can format it without depending on the binary's `SlotId`.
-pub fn slot_settings_key(slot_id: u32) -> String {
-    slot_id.to_string()
+/// Variant of [`source_id`] keyed by an explicit device name. Preferred
+/// over [`source_id`] when the actual selected device is known (the
+/// generic Microphone/System variants collapse multiple devices to
+/// `default`, which would conflate per-device overrides).
+pub fn device_source_id(name: &str, kind: AudioSessionKind) -> String {
+    format!("device:{}:{}", kind_str(kind), name)
+}
+
+fn kind_str(kind: AudioSessionKind) -> &'static str {
+    match kind {
+        AudioSessionKind::Input => "input",
+        AudioSessionKind::Output => "output",
+        AudioSessionKind::App => "app",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
+    pub default_model: String,
+    pub language: String,
+    pub session_dir: String,
     pub hop_ms: u32,
     pub min_window_ms: u32,
     #[serde(rename = "engine_prefer")]
@@ -96,340 +114,54 @@ pub struct AppConfig {
     pub voicebird_api_key: String,
 
     /// WebSocket URL of the Voice Bird Web `/api/audio/stream` endpoint
-    /// the desktop client streams to when a slot's `cloud_on` is
+    /// the desktop client streams to when `cloud_broadcast_enabled` is
     /// true. Defaults to the hosted production server.
     #[serde(default = "default_voicebird_server_url")]
     pub voicebird_server_url: String,
 
-    /// Decimal `slot_id` → `SlotSettings`. The runtime layer
-    /// (`App::new`) seeds slot 1 with any persisted entry, falling
-    /// back to `SlotSettings::default()` on first run.
+    /// When true, recordings stream PCM to `voicebird_server_url` and
+    /// transcripts are produced by the cloud model. The local Whisper
+    /// engine is bypassed and no session files are written to disk —
+    /// the recording lives entirely on the user's voicebird.app
+    /// account. When false (default), the local engine runs and writes
+    /// `~/voice-bird/sessions/<ts>/`.
     #[serde(default)]
-    pub slot_settings: BTreeMap<String, SlotSettings>,
+    pub cloud_broadcast_enabled: bool,
 
-    /// User-configured Agent targets. Each entry carries the
-    /// `Connection` (e.g. Kafka broker + topic) the TUI uses when
-    /// pushing committed transcript segments. The built-in
-    /// oh-my-pi / MCP target lives on `App::agent` instead — these
-    /// are additively user-defined.
+    /// Per-source setting overrides. Key is the result of [`source_id`]
+    /// or [`device_source_id`]; value carries the cloud/language/model
+    /// to use when starting a section for that source. When absent for
+    /// a given source, [`effective_settings`] falls back to the global
+    /// fields above.
     #[serde(default)]
-    pub agent_targets: Vec<AgentTargetConfig>,
+    pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
 
-    // ── Legacy migration fields ─────────────────────────────────
-    //
-    // The pre-per-slot refactor put Cloud/Language/Model/Path on
-    // the global config. Existing users still have these fields
-    // in their config.toml (the lenient TOML parser used to
-    // accept them; the new schema drops them silently). Read
-    // them with `#[serde(default)]` so old configs still parse,
-    // copy them into slot 1's settings on first encounter, and
-    // never write them back (`skip_serializing`).
-    #[serde(default, rename = "default_model", skip_serializing)]
-    pub legacy_default_model: Option<String>,
-    #[serde(default, rename = "language", skip_serializing)]
-    pub legacy_language: Option<String>,
-    #[serde(default, rename = "session_dir", skip_serializing)]
-    pub legacy_session_dir: Option<String>,
-    #[serde(default, rename = "cloud_broadcast_enabled", skip_serializing)]
-    pub legacy_cloud_broadcast_enabled: Option<bool>,
+    /// Per-slot override for which cloud Agent to run on `g`.
+    /// Keyed by `SlotId` (so the picker picks persist per slot).
+    /// When absent, the picker cursor in §10 falls back to the
+    /// most recently used agent (`last_character_id`).
+    #[serde(default)]
+    pub character_overrides: BTreeMap<String, String>,
+
+    /// Most recently used Agent id, persisted between sessions.
+    /// The §11 `g` key handler uses this as the default when a
+    /// slot has no override.
+    #[serde(default)]
+    pub last_character_id: Option<String>,
+
+    /// Set to `true` after the user accepts the one-time consent
+    /// modal (§11) that asks before sending transcripts that came
+    /// from a `cloud_on = false` recording. The flag sticks across
+    /// launches — once accepted, the `g` key fires immediately
+    /// for every future recording on every slot.
+    #[serde(default)]
+    pub dont_ask_character_upload: bool,
 }
-
-impl AppConfig {
-    /// Read the four legacy migration fields. Returns
-    /// `Some((model, language, path, cloud_on))` when at least one
-    /// legacy field is present; `None` when the config is either
-    /// fresh or already migrated.
-    ///
-    /// No separate "migration done" latch is needed: the legacy
-    /// fields are `skip_serializing`, so the first successful save
-    /// after a migration drops them from the file and the next
-    /// launch sees nothing to migrate. If that save fails the
-    /// migration simply runs again next launch, which is the
-    /// behaviour we want.
-    pub fn legacy_migration_source(&self) -> Option<(String, String, String, bool)> {
-        let any_legacy = self.legacy_default_model.is_some()
-            || self.legacy_language.is_some()
-            || self.legacy_session_dir.is_some()
-            || self.legacy_cloud_broadcast_enabled.is_some();
-        if !any_legacy {
-            return None;
-        }
-        let defaults = SlotSettings::default();
-        Some((
-            self.legacy_default_model.clone().unwrap_or(defaults.model),
-            self.legacy_language.clone().unwrap_or(defaults.language),
-            self.legacy_session_dir.clone().unwrap_or(defaults.path),
-            self.legacy_cloud_broadcast_enabled.unwrap_or(false),
-        ))
-    }
-
-    /// Clear the legacy fields once they have been copied into a
-    /// slot. The next save no longer writes them and the next read
-    /// finds no migration to run.
-    pub fn complete_legacy_migration(&mut self) {
-        self.legacy_default_model = None;
-        self.legacy_language = None;
-        self.legacy_session_dir = None;
-        self.legacy_cloud_broadcast_enabled = None;
-    }
-}
-
-/// Stable identifier for a user-configured Agent target. The TUI
-/// mints one when the user picks `a`dd; the value is a UUIDv4.
-pub type AgentTargetId = String;
 
 /// Ids that the segment dispatcher in the consumer task
 /// inside `App::start_section` compares against as a
 /// special case (e.g. `"default"` routes to the legacy
 /// MCP-backed `ServerState`). Letting a user-configured
-/// target claim the same id would silently route its
-/// segments to the wrong destination, so we reject both
-/// hand-edited config rows and funnel-saved configs that
-/// use them.
-pub const RESERVED_AGENT_TARGET_IDS: &[&str] = &["default"];
-
-pub fn is_reserved_agent_target_id(id: &str) -> bool {
-    RESERVED_AGENT_TARGET_IDS.contains(&id)
-}
-
-/// Transport the user-configured Agent target uses to
-/// publish committed segments. Today only Kafka is wired;
-/// the enum is open so the funnel
-/// ("1. Kafka  2. ...  3. ...") keeps working when we add more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentConnectionKind {
-    Kafka,
-}
-
-impl AgentConnectionKind {
-    /// Every variant of `AgentConnectionKind`. The funnel
-    /// iterates this to render the "Connection kind" picker
-    /// and to decide what transport a saved config row
-    /// referred to.
-    pub const ALL: [Self; 1] = [Self::Kafka];
-
-    /// Human-readable label rendered in the funnel.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Kafka => "Kafka",
-        }
-    }
-}
-/// `acks` mode passed to librdkafka. We default to `All` so a
-/// committed segment is durable before `push_segment` returns `Ok`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum KafkaAcks {
-    /// No broker ack (fire-and-forget). Fastest, but can lose
-    /// segments on broker failure. Not recommended for transcript.
-    Zero,
-    /// Leader-only ack. Survives leader re-election; loses
-    /// messages on leader crash before replication.
-    One,
-    /// Wait for all in-sync replicas. Default.
-    All,
-}
-
-impl Default for KafkaAcks {
-    fn default() -> Self {
-        KafkaAcks::All
-    }
-}
-
-impl KafkaAcks {
-    /// librdkafka string form (`"0"`, `"1"`, `"all"`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KafkaAcks::Zero => "0",
-            KafkaAcks::One => "1",
-            KafkaAcks::All => "all",
-        }
-    }
-}
-
-/// Wire security for a Kafka Agent target, mapping 1:1 onto
-/// librdkafka's `security.protocol`. Voice transcripts are
-/// sensitive — anything but a localhost broker should run at
-/// least `ssl`. Defaults to `plaintext` for backward
-/// compatibility with configs written before this field existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum KafkaSecurityProtocol {
-    /// No encryption, no authentication. Only sane for localhost
-    /// or an otherwise-trusted network.
-    #[default]
-    Plaintext,
-    /// TLS-encrypted, no client authentication.
-    Ssl,
-    /// SASL authentication over an unencrypted connection.
-    /// Credentials AND transcripts travel in the clear — prefer
-    /// `sasl_ssl` unless the network is trusted.
-    SaslPlaintext,
-    /// SASL authentication over TLS. The right choice for any
-    /// non-localhost broker.
-    SaslSsl,
-}
-
-impl KafkaSecurityProtocol {
-    /// Every variant, in the order the funnel's picker renders.
-    pub const ALL: [Self; 4] = [
-        Self::Plaintext,
-        Self::Ssl,
-        Self::SaslPlaintext,
-        Self::SaslSsl,
-    ];
-
-    /// librdkafka `security.protocol` string form.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Plaintext => "plaintext",
-            Self::Ssl => "ssl",
-            Self::SaslPlaintext => "sasl_plaintext",
-            Self::SaslSsl => "sasl_ssl",
-        }
-    }
-
-    /// Human-readable label rendered in the funnel.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Plaintext => "Plaintext (localhost only)",
-            Self::Ssl => "SSL/TLS",
-            Self::SaslPlaintext => "SASL over plaintext",
-            Self::SaslSsl => "SASL over SSL/TLS (recommended)",
-        }
-    }
-
-    /// Whether this protocol needs SASL credentials
-    /// (mechanism + username + password).
-    pub fn uses_sasl(self) -> bool {
-        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
-    }
-}
-
-/// SASL mechanism for the `sasl_*` security protocols. PLAIN and
-/// SCRAM are built into librdkafka; GSSAPI/Kerberos is deliberately
-/// not offered (it would drag in a system libsasl2 dependency and
-/// break the static, self-contained binary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum KafkaSaslMechanism {
-    /// Username/password in the clear inside the SASL exchange —
-    /// pair with `sasl_ssl` so TLS covers it.
-    #[default]
-    Plain,
-    // Explicit renames: derived kebab-case would give
-    // "scram-sha256"; pin the canonical mechanism spelling.
-    #[serde(rename = "scram-sha-256")]
-    ScramSha256,
-    #[serde(rename = "scram-sha-512")]
-    ScramSha512,
-}
-
-impl KafkaSaslMechanism {
-    /// Every variant, in the order the funnel's picker renders.
-    pub const ALL: [Self; 3] = [Self::Plain, Self::ScramSha256, Self::ScramSha512];
-
-    /// librdkafka `sasl.mechanism` string form.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Plain => "PLAIN",
-            Self::ScramSha256 => "SCRAM-SHA-256",
-            Self::ScramSha512 => "SCRAM-SHA-512",
-        }
-    }
-}
-
-/// Connection details for a Kafka-flavoured Agent target. Endpoint
-/// is a librdkafka bootstrap list (e.g. `"localhost:9092"` or
-/// `"broker-1:9092,broker-2:9092"`); topic is the destination
-/// partition key the segment JSON lines get published to.
-///
-/// The SASL password is referenced by environment-variable NAME
-/// (`sasl_password_env`), never stored in `config.toml` — the config
-/// file syncs/backs up too easily to hold a secret.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KafkaAgentConnection {
-    pub endpoint: String,
-    pub topic: String,
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub acks: KafkaAcks,
-    #[serde(default)]
-    pub security_protocol: KafkaSecurityProtocol,
-    /// Only consulted when `security_protocol` uses SASL; `None`
-    /// there means [`KafkaSaslMechanism::Plain`].
-    #[serde(default)]
-    pub sasl_mechanism: Option<KafkaSaslMechanism>,
-    #[serde(default)]
-    pub sasl_username: Option<String>,
-    /// NAME of the environment variable that holds the SASL
-    /// password (e.g. `VOICE_BIRD_KAFKA_PASSWORD`). Resolved when
-    /// the producer/consumer is built, so the secret itself never
-    /// touches the config file.
-    #[serde(default)]
-    pub sasl_password_env: Option<String>,
-}
-
-impl KafkaAgentConnection {
-    /// Validate the SASL field combination. `Ok(())` for non-SASL
-    /// protocols regardless of the (ignored) SASL fields, so old
-    /// configs and hand-edits stay loadable.
-    pub fn validate_security(&self) -> anyhow::Result<()> {
-        if !self.security_protocol.uses_sasl() {
-            return Ok(());
-        }
-        let proto = self.security_protocol.as_str();
-        if self
-            .sasl_username
-            .as_deref()
-            .is_none_or(|u| u.trim().is_empty())
-        {
-            anyhow::bail!("security protocol '{proto}' requires sasl_username");
-        }
-        if self
-            .sasl_password_env
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
-        {
-            anyhow::bail!(
-                "security protocol '{proto}' requires sasl_password_env \
-                 (the NAME of an environment variable holding the password)"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// One user-configured Agent target. `id` is the stable key
-/// referenced by the TUI's Targets list cursor and by
-/// `App::agent_targets`; `name` is the user-facing label rendered
-/// in the picker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentTargetConfig {
-    pub id: AgentTargetId,
-    pub name: String,
-    #[serde(flatten)]
-    pub connection: AgentConnection,
-}
-
-/// Tagged union of every Agent transport. `#[serde(tag = "kind")]`
-/// so the TOML reads as
-/// `[[agent_targets]]` / `kind = "kafka"` / `endpoint = "..."`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum AgentConnection {
-    Kafka(KafkaAgentConnection),
-}
-
-impl AgentConnection {
-    pub fn kind(&self) -> AgentConnectionKind {
-        match self {
-            AgentConnection::Kafka(_) => AgentConnectionKind::Kafka,
-        }
-    }
-}
 
 fn default_voicebird_server_url() -> String {
     "wss://voicebird.app/api/audio/stream".into()
@@ -446,6 +178,9 @@ fn default_refinement_beam_size() -> u8 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            default_model: "distil-small.en".into(),
+            language: "en".into(),
+            session_dir: "~/voice-bird/sessions".into(),
             hop_ms: 750,
             min_window_ms: 1000,
             engine_prefer: "auto".into(),
@@ -458,12 +193,11 @@ impl Default for AppConfig {
             refinement_beam_size: default_refinement_beam_size(),
             voicebird_api_key: String::new(),
             voicebird_server_url: default_voicebird_server_url(),
-            slot_settings: BTreeMap::new(),
-            agent_targets: Vec::new(),
-            legacy_default_model: None,
-            legacy_language: None,
-            legacy_session_dir: None,
-            legacy_cloud_broadcast_enabled: None,
+            cloud_broadcast_enabled: false,
+            source_overrides: BTreeMap::new(),
+            character_overrides: BTreeMap::new(),
+            last_character_id: None,
+            dont_ask_character_upload: false,
         }
     }
 }
@@ -511,33 +245,7 @@ impl AppConfig {
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
-        let mut cfg: Self = toml::from_str(&s)?;
-        // Drop any agent_target rows whose id collides with
-        // an internal destination (e.g. `"default"`) — letting
-        // one through would silently route its segments to
-        // the legacy MCP buffer instead of the configured
-        // broker. Log a warning so the user can fix the TOML
-        // by hand.
-        let before = cfg.agent_targets.len();
-        cfg.agent_targets.retain(|t| {
-            let keep = !is_reserved_agent_target_id(&t.id);
-            if !keep {
-                log::warn!("config: dropping agent_target with reserved id {:?}", t.id);
-            }
-            keep
-        });
-        if cfg.agent_targets.len() != before {
-            // Persist the cleaned config so the user can see
-            // what was dropped. Best-effort: a save failure
-            // here is non-fatal — the in-memory cfg is still
-            // correct for this session.
-            if let Err(e) = cfg.save_to(path) {
-                log::warn!(
-                    "config: failed to persist cleaned config ({} agent_targets dropped): {e}",
-                    before - cfg.agent_targets.len(),
-                );
-            }
-        }
+        let cfg: Self = toml::from_str(&s)?;
         Ok(cfg)
     }
 
@@ -563,47 +271,35 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Look up an Agent target by its stable id. Returns `None` if
-    /// no target with that id has been configured (the user removed
-    /// it, or the config file was hand-edited and lost the row).
-    pub fn agent_target_by_id(&self, id: &str) -> Option<&AgentTargetConfig> {
-        self.agent_targets.iter().find(|t| t.id == id)
-    }
-
-    /// Mutable variant of [`Self::agent_target_by_id`].
-    pub fn agent_target_by_id_mut(&mut self, id: &str) -> Option<&mut AgentTargetConfig> {
-        self.agent_targets.iter_mut().find(|t| t.id == id)
-    }
-
-    /// Insert-or-replace by id. Caller is responsible for minting
-    /// the id on the add path; this method just enforces uniqueness
-    /// so two targets can't share a session, and rejects reserved
-    /// ids (e.g. `"default"`) so a user-configured target can't
-    /// silently shadow the legacy MCP-backed session.
-    /// Returns `Err` on a reserved id; the caller is expected to
-    /// surface the failure to the user.
-    pub fn upsert_agent_target(&mut self, target: AgentTargetConfig) -> anyhow::Result<()> {
-        if is_reserved_agent_target_id(&target.id) {
-            return Err(anyhow::anyhow!(
-                "agent target id {:?} is reserved for an internal destination",
-                target.id
-            ));
+    pub fn session_dir_expanded(&self) -> String {
+        if let Some(rest) = self.session_dir.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest).to_string_lossy().into_owned();
+            }
         }
-        if let Some(slot) = self.agent_targets.iter_mut().find(|t| t.id == target.id) {
-            *slot = target;
-        } else {
-            self.agent_targets.push(target);
-        }
-        Ok(())
+        self.session_dir.clone()
     }
 
-    /// Drop the target with the given id. Returns true if anything
-    /// was removed.
-    pub fn remove_agent_target(&mut self, id: &str) -> bool {
-        let before = self.agent_targets.len();
-        self.agent_targets.retain(|t| t.id != id);
-        self.agent_targets.len() != before
+    /// Effective per-source settings: the saved override for `key` if
+    /// present, else the global defaults from this config. The returned
+    /// override carries the `cloud_on`, `language`, `model` triple a
+    /// section actually uses at start time.
+    pub fn effective_override(&self, key: &str) -> SourceSettingsOverride {
+        if let Some(o) = self.source_overrides.get(key) {
+            return o.clone();
+        }
+        SourceSettingsOverride {
+            cloud_on: self.cloud_broadcast_enabled,
+            language: self.language.clone(),
+            model: self.default_model.clone(),
+        }
     }
+
+    /// Convenience: persist or update one source's override and save.
+    pub fn upsert_source_override(&mut self, key: String, ov: SourceSettingsOverride) {
+        self.source_overrides.insert(key, ov);
+    }
+
 }
 
 #[cfg(test)]
@@ -614,11 +310,9 @@ mod tests {
     #[test]
     fn defaults_when_file_missing() {
         let c = AppConfig::default();
+        assert_eq!(c.default_model, "distil-small.en");
         assert_eq!(c.hop_ms, 750);
         assert_eq!(c.engine_prefer, "auto");
-        // The slot settings map is empty on first run; the runtime
-        // seeds slot 1 from SlotSettings::default() on construction.
-        assert!(c.slot_settings.is_empty());
     }
 
     #[test]
@@ -638,10 +332,13 @@ mod tests {
     fn missing_voicebird_fields_deserialize_to_defaults() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        // Write a minimal config without the optional fields.
+        // Write an old-style config without the new fields.
         std::fs::write(
             &path,
             r#"
+default_model = "distil-small.en"
+language = "en"
+session_dir = "~/voice-bird/sessions"
 hop_ms = 750
 min_window_ms = 1000
 engine_prefer = "auto"
@@ -654,9 +351,7 @@ refinement_beam_size = 5
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.voicebird_api_key, "");
         assert_eq!(loaded.voicebird_server_url, default_voicebird_server_url());
-        // The legacy global fields are gone; the dropped keys are
-        // silently ignored by the lenient TOML parser.
-        assert!(loaded.slot_settings.is_empty());
+        assert!(!loaded.cloud_broadcast_enabled);
     }
 
     #[test]
@@ -702,6 +397,9 @@ refinement_beam_size = 5
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let c = AppConfig {
+            default_model: "large-v3-turbo".into(),
+            language: "auto".into(),
+            session_dir: "~/foo".into(),
             hop_ms: 600,
             min_window_ms: 800,
             engine_prefer: "whisperkit".into(),
@@ -714,383 +412,181 @@ refinement_beam_size = 5
             refinement_beam_size: 5,
             voicebird_api_key: "vb-test".into(),
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
-            slot_settings: BTreeMap::new(),
-            agent_targets: Vec::new(),
-            legacy_default_model: None,
-            legacy_language: None,
-            legacy_session_dir: None,
-            legacy_cloud_broadcast_enabled: None,
+            cloud_broadcast_enabled: true,
+            source_overrides: BTreeMap::new(),
+            character_overrides: BTreeMap::new(),
+            last_character_id: None,
+            dont_ask_character_upload: false,
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded, c);
     }
 
-    /// `agent_targets` survives a save/load round trip.
-    /// The TOML form uses `[[agent_targets]]` with a
-    /// tagged `kind = "kafka"` field; the parser must
-    /// reconstruct the `AgentConnection::Kafka` variant
-    /// exactly, including the `acks` enum string.
     #[test]
-    fn agent_targets_round_trip_through_toml() {
-        use crate::config::{AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection};
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
+    fn effective_override_falls_back_to_globals_when_unset() {
         let mut c = AppConfig::default();
-        c.agent_targets.push(AgentTargetConfig {
-            id: "abc-123".into(),
-            name: "prod".into(),
-            connection: AgentConnection::Kafka(KafkaAgentConnection {
-                endpoint: "broker-1:9092,broker-2:9092".into(),
-                topic: "voice-bird-events".into(),
-                client_id: Some("svc".into()),
-                acks: KafkaAcks::All,
-                security_protocol: Default::default(),
-                sasl_mechanism: None,
-                sasl_username: None,
-                sasl_password_env: None,
-            }),
-        });
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.agent_targets, c.agent_targets);
-        // The `acks` string is the on-disk wire format —
-        // pin it so a future refactor that changes
-        // `KafkaAcks::as_str` doesn't silently break
-        // existing config.toml files.
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains("acks = \"all\""),
-            "acks wire format drift: {body}"
-        );
+        c.cloud_broadcast_enabled = true;
+        c.language = "ru".into();
+        c.default_model = "tiny.en".into();
+        let eff = c.effective_override("device:input:not-saved");
+        assert!(eff.cloud_on);
+        assert_eq!(eff.language, "ru");
+        assert_eq!(eff.model, "tiny.en");
     }
 
-    /// A SASL-secured target round-trips through TOML with all
-    /// four security fields intact, and the wire strings are
-    /// pinned (librdkafka gets them verbatim via `as_str`, but
-    /// the config file uses the serde snake/kebab-case forms).
     #[test]
-    fn sasl_agent_target_round_trips_through_toml() {
-        use crate::config::{
-            AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection,
-            KafkaSaslMechanism, KafkaSecurityProtocol,
-        };
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
+    fn effective_override_uses_saved_entry_when_present() {
         let mut c = AppConfig::default();
-        c.agent_targets.push(AgentTargetConfig {
-            id: "sec-1".into(),
-            name: "secure".into(),
-            connection: AgentConnection::Kafka(KafkaAgentConnection {
-                endpoint: "broker:9093".into(),
-                topic: "events".into(),
-                client_id: None,
-                acks: KafkaAcks::All,
-                security_protocol: KafkaSecurityProtocol::SaslSsl,
-                sasl_mechanism: Some(KafkaSaslMechanism::ScramSha256),
-                sasl_username: Some("svc-user".into()),
-                sasl_password_env: Some("VB_KAFKA_PW".into()),
-            }),
-        });
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.agent_targets, c.agent_targets);
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains("security_protocol = \"sasl_ssl\""),
-            "security_protocol wire format drift: {body}"
-        );
-        assert!(
-            body.contains("sasl_mechanism = \"scram-sha-256\""),
-            "sasl_mechanism wire format drift: {body}"
-        );
-        // The password itself must never appear — only the env
-        // var NAME is stored.
-        assert!(
-            body.contains("sasl_password_env = \"VB_KAFKA_PW\""),
-            "sasl_password_env missing: {body}"
-        );
-    }
-
-    /// Configs written before the security fields existed load
-    /// with plaintext defaults (backward compatibility).
-    #[test]
-    fn pre_security_config_rows_default_to_plaintext() {
-        use crate::config::KafkaSecurityProtocol;
-        let toml_row = r#"
-            [[agent_targets]]
-            id = "old-1"
-            name = "legacy"
-            kind = "kafka"
-            endpoint = "localhost:9092"
-            topic = "voice-bird"
-        "#;
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            agent_targets: Vec<AgentTargetConfig>,
-        }
-        let w: Wrapper = toml::from_str(toml_row).unwrap();
-        let AgentConnection::Kafka(k) = &w.agent_targets[0].connection;
-        assert_eq!(k.security_protocol, KafkaSecurityProtocol::Plaintext);
-        assert!(k.sasl_mechanism.is_none());
-        assert!(k.sasl_username.is_none());
-        assert!(k.sasl_password_env.is_none());
-    }
-
-    /// `validate_security` rejects SASL protocols missing a
-    /// username or password env-var name, and ignores stale SASL
-    /// fields on non-SASL protocols.
-    #[test]
-    fn validate_security_enforces_sasl_fields() {
-        use crate::config::{KafkaSaslMechanism, KafkaSecurityProtocol};
-        let base = KafkaAgentConnection {
-            endpoint: "b:9093".into(),
-            topic: "t".into(),
-            client_id: None,
-            acks: KafkaAcks::All,
-            security_protocol: KafkaSecurityProtocol::SaslSsl,
-            sasl_mechanism: Some(KafkaSaslMechanism::Plain),
-            sasl_username: Some("u".into()),
-            sasl_password_env: Some("PW_ENV".into()),
-        };
-        assert!(base.validate_security().is_ok());
-
-        let mut no_user = base.clone();
-        no_user.sasl_username = None;
-        assert!(no_user.validate_security().is_err());
-        let mut blank_user = base.clone();
-        blank_user.sasl_username = Some("  ".into());
-        assert!(blank_user.validate_security().is_err());
-
-        let mut no_pw = base.clone();
-        no_pw.sasl_password_env = None;
-        assert!(no_pw.validate_security().is_err());
-
-        // Missing mechanism is fine — it defaults to PLAIN.
-        let mut no_mech = base.clone();
-        no_mech.sasl_mechanism = None;
-        assert!(no_mech.validate_security().is_ok());
-
-        // Plaintext ignores half-filled SASL fields entirely.
-        let mut plain = base.clone();
-        plain.security_protocol = KafkaSecurityProtocol::Plaintext;
-        plain.sasl_username = None;
-        assert!(plain.validate_security().is_ok());
-    }
-
-    /// `upsert_agent_target` updates in place when the id
-    /// matches, and appends otherwise. Pin both branches.
-    #[test]
-    fn upsert_agent_target_replaces_by_id() {
-        use crate::config::{AgentConnection, AgentTargetConfig, KafkaAcks, KafkaAgentConnection};
-        let mut c = AppConfig::default();
-        let target = AgentTargetConfig {
-            id: "id-1".into(),
-            name: "first".into(),
-            connection: AgentConnection::Kafka(KafkaAgentConnection {
-                endpoint: "b1:9092".into(),
-                topic: "t1".into(),
-                client_id: None,
-                acks: KafkaAcks::All,
-                security_protocol: Default::default(),
-                sasl_mechanism: None,
-                sasl_username: None,
-                sasl_password_env: None,
-            }),
-        };
-        c.upsert_agent_target(target.clone()).unwrap();
-        assert_eq!(c.agent_targets.len(), 1);
-        // Mutate, then upsert with the same id; the row
-        // should be replaced, not appended.
-        let mut updated = target.clone();
-        updated.name = "renamed".into();
-        c.upsert_agent_target(updated).unwrap();
-        assert_eq!(c.agent_targets.len(), 1);
-        assert_eq!(c.agent_targets[0].name, "renamed");
-        // Removing by id should clear the slot.
-        assert!(c.remove_agent_target("id-1"));
-        assert!(c.agent_targets.is_empty());
-        // Removing a missing id is a no-op that returns false.
-        assert!(!c.remove_agent_target("missing"));
-    }
-
-    #[test]
-    fn upsert_agent_target_rejects_reserved_id() {
-        // The consumer-dispatch branch in
-        // `App::start_section_consumer_task` treats
-        // `session_id == "default"` as a special case
-        // (route to the legacy MCP buffer) and any other
-        // unknown id as "drop with a warning". Letting a
-        // user-configured target claim `"default"` would
-        // silently route its segments to the MCP buffer
-        // — so `upsert_agent_target` must reject it.
-        let mut c = AppConfig::default();
-        let bad = AgentTargetConfig {
-            id: "default".into(),
-            name: "evil".into(),
-            connection: AgentConnection::Kafka(KafkaAgentConnection {
-                endpoint: "b1:9092".into(),
-                topic: "t1".into(),
-                client_id: None,
-                acks: KafkaAcks::All,
-                security_protocol: Default::default(),
-                sasl_mechanism: None,
-                sasl_username: None,
-                sasl_password_env: None,
-            }),
-        };
-        assert!(c.upsert_agent_target(bad).is_err());
-        // And nothing was inserted.
-        assert!(c.agent_targets.is_empty());
-        // Non-reserved ids still go through.
-        let good = AgentTargetConfig {
-            id: "real-uuid".into(),
-            name: "ok".into(),
-            connection: AgentConnection::Kafka(KafkaAgentConnection {
-                endpoint: "b1:9092".into(),
-                topic: "t1".into(),
-                client_id: None,
-                acks: KafkaAcks::All,
-                security_protocol: Default::default(),
-                sasl_mechanism: None,
-                sasl_username: None,
-                sasl_password_env: None,
-            }),
-        };
-        assert!(c.upsert_agent_target(good).is_ok());
-        assert_eq!(c.agent_targets.len(), 1);
-    }
-
-    #[test]
-    fn load_from_drops_reserved_id_rows() {
-        // A hand-edited config with `id = "default"` would
-        // silently shadow the MCP-backed session if it
-        // loaded cleanly. `load_from` must filter it out
-        // and persist the cleaned config so the user can
-        // see what was dropped.
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        let body = "\
-hop_ms = 750\n\
-min_window_ms = 1000\n\
-engine_prefer = \"auto\"\n\
-audio_default_source = \"microphone\"\n\
-refinement_window_ms = 20000\n\
-refinement_beam_size = 5\n\
-voicebird_api_key = \"\"\n\
-voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
-\n\
-[[agent_targets]]\n\
-id = \"default\"\n\
-name = \"evil\"\n\
-kind = \"kafka\"\n\
-endpoint = \"b1:9092\"\n\
-topic = \"t1\"\n\
-acks = \"all\"\n\
-\n\
-[[agent_targets]]\n\
-id = \"real-uuid\"\n\
-name = \"ok\"\n\
-kind = \"kafka\"\n\
-endpoint = \"b1:9092\"\n\
-topic = \"t1\"\n\
-acks = \"all\"\n\
-";
-        std::fs::write(&path, body).unwrap();
-        let c = AppConfig::load_from(&path).unwrap();
-        // The reserved row was dropped; the real one survived.
-        assert_eq!(c.agent_targets.len(), 1);
-        assert_eq!(c.agent_targets[0].id, "real-uuid");
-        // The on-disk config was rewritten without the
-        // reserved row.
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(!on_disk.contains("id = \"default\""));
-        assert!(on_disk.contains("id = \"real-uuid\""));
-    }
-
-    // ── Per-slot settings (SlotSettings, slot_settings map) ─────────────
-    //
-    // These pin the storage layer for the per-slot settings refactor:
-    // each slot owns its own Cloud/Language/Model/Path settings, and
-    // AppConfig persists them in a `slot_settings` map keyed by SlotId.
-    // `slot_settings` is the new source of truth for runtime code.
-
-    #[test]
-    fn slot_settings_default_matches_legacy_appconfig_defaults() {
-        let s = SlotSettings::default();
-        // Cloud off, English, auto-pickable default model, default path.
-        assert!(!s.cloud_on);
-        assert_eq!(s.language, "en");
-        assert_eq!(s.model, "distil-small.en");
-        assert_eq!(s.path, "~/voice-bird/sessions");
-    }
-
-    #[test]
-    fn slot_settings_round_trips_through_toml() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.slot_settings.insert(
-            slot_settings_key(2),
-            SlotSettings {
+        // Globals: local + en.
+        c.cloud_broadcast_enabled = false;
+        c.language = "en".into();
+        c.default_model = "tiny.en".into();
+        // Override for the EPOS device: cloud + Polish + base.en.
+        c.source_overrides.insert(
+            "device:input:EPOS PC 8 USB".into(),
+            SourceSettingsOverride {
                 cloud_on: true,
-                language: "ru".into(),
-                model: "tiny.en".into(),
-                path: "~/voice-bird/slot-two".into(),
+                language: "pl".into(),
+                model: "base.en".into(),
             },
         );
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.slot_settings.len(), 1);
-        let saved = &loaded.slot_settings[&slot_settings_key(2)];
-        assert!(saved.cloud_on);
-        assert_eq!(saved.language, "ru");
-        assert_eq!(saved.model, "tiny.en");
-        assert_eq!(saved.path, "~/voice-bird/slot-two");
+        let eff = c.effective_override("device:input:EPOS PC 8 USB");
+        assert!(eff.cloud_on);
+        assert_eq!(eff.language, "pl");
+        assert_eq!(eff.model, "base.en");
+        // Other devices still get global defaults.
+        let other = c.effective_override("device:input:Other");
+        assert!(!other.cloud_on);
     }
 
     #[test]
-    fn slot_settings_keeps_each_slot_independent() {
-        // Two slots, two distinct settings. Editing one must not
-        // touch the other.
+    fn source_id_distinguishes_kind_and_app_variants() {
+        // Microphone with explicit Input kind:
+        let mic = source_id(&SessionSource::Microphone, Some(AudioSessionKind::Input));
+        assert_eq!(mic, "device:input:default");
+        // System with explicit Output kind:
+        let sys = source_id(&SessionSource::System, Some(AudioSessionKind::Output));
+        assert_eq!(sys, "device:output:default");
+        // App variant ignores the kind argument; key includes device pairing.
+        let zoom = source_id(
+            &SessionSource::App {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                device_name: "MacBook Pro Speakers".into(),
+            },
+            None,
+        );
+        assert_eq!(zoom, "app:Zoom@device:MacBook Pro Speakers");
+        // Device-specific keys via device_source_id:
+        let epos = device_source_id("EPOS PC 8 USB", AudioSessionKind::Input);
+        assert_eq!(epos, "device:input:EPOS PC 8 USB");
+    }
+
+    #[test]
+    fn app_source_key_separates_same_app_on_different_devices() {
+        let zoom_speakers = source_id(
+            &SessionSource::App {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                device_name: "MacBook Pro Speakers".into(),
+            },
+            None,
+        );
+        let zoom_airpods = source_id(
+            &SessionSource::App {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                device_name: "AirPods Pro".into(),
+            },
+            None,
+        );
+        assert_ne!(zoom_speakers, zoom_airpods);
+    }
+
+    #[test]
+    fn source_overrides_round_trip_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let mut c = AppConfig::default();
-        c.slot_settings.insert(
-            slot_settings_key(1),
-            SlotSettings {
+        c.source_overrides.insert(
+            "device:input:EPOS PC 8 USB".into(),
+            SourceSettingsOverride {
+                cloud_on: true,
+                language: "pl".into(),
+                model: "base.en".into(),
+            },
+        );
+        c.source_overrides.insert(
+            "app:Zoom".into(),
+            SourceSettingsOverride {
                 cloud_on: false,
                 language: "en".into(),
-                model: "distil-small.en".into(),
-                path: "~/voice-bird/slot-one".into(),
-            },
-        );
-        c.slot_settings.insert(
-            slot_settings_key(2),
-            SlotSettings {
-                cloud_on: true,
-                language: "ru".into(),
                 model: "tiny.en".into(),
-                path: "~/voice-bird/slot-two".into(),
             },
         );
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
-        assert!(!loaded.slot_settings[&slot_settings_key(1)].cloud_on);
-        assert!(loaded.slot_settings[&slot_settings_key(2)].cloud_on);
-        assert_ne!(
-            loaded.slot_settings[&slot_settings_key(1)].path,
-            loaded.slot_settings[&slot_settings_key(2)].path,
+        assert_eq!(loaded.source_overrides.len(), 2);
+        assert_eq!(
+            loaded.source_overrides["device:input:EPOS PC 8 USB"].language,
+            "pl"
         );
+        assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
     }
 
+    /// §9b: per-slot Agent override + last-used agent id +
+    /// `dont_ask_character_upload` consent flag must all survive a
+    /// save/load round trip. Old config.toml files written before
+    /// these fields existed must still parse — the
+    /// `#[serde(default)]` attributes give every missing field its
+    /// default.
     #[test]
-    fn slot_settings_absent_entry_returns_default() {
-        // A slot not yet in the map gets the default settings.
-        // The runtime layer (App) supplies this via
-        // SlotSettings::default(); the storage layer only
-        // round-trips existing entries.
-        let c = AppConfig::default();
-        assert!(c.slot_settings.is_empty());
+    fn character_run_fields_round_trip_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = AppConfig::default();
+        c.character_overrides
+            .insert("2".into(), "uuid-prod-events".into());
+        c.character_overrides
+            .insert("3".into(), "uuid-zoom-bridge".into());
+        c.last_character_id = Some("uuid-zoom-bridge".into());
+        c.dont_ask_character_upload = true;
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.character_overrides.len(), 2);
+        assert_eq!(
+            loaded.character_overrides.get("2").map(String::as_str),
+            Some("uuid-prod-events")
+        );
+        assert_eq!(loaded.last_character_id.as_deref(), Some("uuid-zoom-bridge"));
+        assert!(loaded.dont_ask_character_upload);
+    }
+
+    /// Old config.toml files (pre-§9b) load with the new fields
+    /// at their defaults — `#[serde(default)]` makes the missing
+    /// keys behave like absent.
+    #[test]
+    fn character_run_fields_default_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_model = \"tiny.en\"\nlanguage = \"en\"\n\
+             session_dir = \"~/sessions\"\n\
+             hop_ms = 750\n\
+             min_window_ms = 1000\n\
+             engine_prefer = \"auto\"\n\
+             audio_default_source = \"microphone\"\n\
+             voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
+             voicebird_api_key = \"\"\n\
+             cloud_broadcast_enabled = false\n\
+             source_overrides = {}\n",
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(loaded.character_overrides.is_empty());
+        assert!(loaded.last_character_id.is_none());
+        assert!(!loaded.dont_ask_character_upload);
     }
 }

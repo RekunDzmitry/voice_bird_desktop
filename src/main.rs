@@ -18,7 +18,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use app::{App, AppMode, RecordingStatus, SlotKind};
+use app::{App, AppMode, RecordingStatus};
 
 /// When launched via macOS `open --args --tty <path>`, the process gets
 /// stdin from `open` which doesn't properly forward terminal input.
@@ -114,17 +114,14 @@ fn init_macos_app_event_handler() {
 }
 
 fn main() -> Result<()> {
-    // `--mcp-server` runs voice-bird as a stdio MCP server for the
-    // agent runtime. Disables the TUI; blocks on stdin/stdout
-    // JSON-RPC. We intentionally check this before any TTY setup
-    // so the parent runtime gets a clean pipe instead of a
-    // raw-mode terminal.
+    // `--mcp-server` and `--register` were the MCP-server and
+    // agent-runtime registration entry points. Both removed in §8
+    // along with `src/agent/mcp_server.rs` and
+    // `src/agent/register.rs`; the `omp` integration no longer
+    // exists. Users who need an LLM-backed Agent run the
+    // desktop, pick a Agent at voicebird.app, and press `g`
+    // (§11).
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--mcp-server") {
-        let session = voice_bird_cli::agent::mcp_server::resolve_initial_session_id(&args);
-        let state = voice_bird_cli::agent::mcp_server::ServerState::new(session);
-        return voice_bird_cli::agent::mcp_server::run_on_stdio(state);
-    }
     // Handle `--recover <dir>` before any TTY/terminal setup so it works
     // from non-TTY shells (e.g., piped or macOS `open` invocations).
     if let Some(pos) = args.iter().position(|a| a == "--recover") {
@@ -133,30 +130,6 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--recover requires a path"))?;
         voice_bird_cli::session::recover::recover(std::path::Path::new(dir))?;
         println!("Recovered transcripts in {}", dir);
-        return Ok(());
-    }
-
-    // `--register` writes this binary's path into
-    // ~/.omp/agent/mcp.json so the user's agent runtime picks
-    // up voice-bird as an MCP server on next launch.
-    // Idempotent: re-running updates the entry in place. The
-    // binary path defaults to current_exe(); pass a different
-    // one as the first arg to register a different build (e.g.,
-    // a release copy under ~/bin). Intended for users who never
-    // run the TUI (CI, sandboxed agent runs, or just to wire up
-    // MCP before launching the TUI for the first time).
-    if let Some(pos) = args.iter().position(|a| a == "--register") {
-        let binary = match args.get(pos + 1) {
-            Some(p) => std::path::PathBuf::from(p),
-            None => std::env::current_exe()?,
-        };
-        let home = voice_bird_cli::agent::register::register_home();
-        voice_bird_cli::agent::register::register(&binary, &home)?;
-        println!(
-            "registered {} in {}/agent/mcp.json",
-            binary.display(),
-            home.display(),
-        );
         return Ok(());
     }
     // `--debug-state-snapshot <path>` opts into a JSONL file where every
@@ -328,10 +301,6 @@ fn run_app<B: Backend>(
         // return to Normal mode.
         app.poll_picker_download();
 
-        // Drain any completed verify probe. Non-blocking; the
-        // TUI keeps drawing frames while the probe runs, so Esc
-        // is reachable and "Verifying…" actually renders.
-        app.poll_funnel_verify();
         // Draw UI
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -348,12 +317,7 @@ fn run_app<B: Backend>(
                             AppMode::Status => handle_status_mode(app, key.code),
                             AppMode::ApiKeyModal => handle_api_key_modal(app, &key),
                             AppMode::PathModal => handle_path_modal(app, key.code),
-                            AppMode::AgentFunnel => handle_agent_funnel(app, key.code),
-                            AppMode::ConfirmDeleteAgentTarget { id } => {
-                                let id = id.clone();
-                                handle_confirm_delete_agent_target(app, key.code, &id)
-                            }
-                        }
+                         }
                         if let Some(path) = debug_snapshot_path {
                             write_state_snapshot(app, &format!("{:?}", key.code), path);
                         }
@@ -456,7 +420,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             let next = match app.picker_focus {
                 Devices => Devices,
                 Apps => Devices,
-                Targets => Apps,
+                Agents => Apps,
             };
             app.picker_focus = next;
             log::info!("keys: Left → picker_focus = {:?}", next);
@@ -465,8 +429,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             use crate::app::PickerFocus::*;
             let next = match app.picker_focus {
                 Devices => Apps,
-                Apps => Targets,
-                Targets => Targets,
+                Apps => Agents,
+                Agents => Agents,
             };
             app.picker_focus = next;
             log::info!("keys: Right → picker_focus = {:?}", next);
@@ -526,69 +490,21 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 );
             }
         }
-        // Agent CRUD keys — only meaningful in the Targets
-        // pane. `a` adds, `e` edits the focused Agent row,
-        // `d` confirms a delete. We no-op outside the pane
-        // so we don't shadow the export / language / model
-        // shortcuts in the other panes.
-        KeyCode::Char('a') | KeyCode::Char('A')
-            if app.picker_focus == crate::app::PickerFocus::Targets =>
-        {
-            app.open_add_agent_funnel();
-            log::info!("keys: a → opened add-agent funnel");
-        }
-        KeyCode::Char('e') | KeyCode::Char('E')
-            if app.picker_focus == crate::app::PickerFocus::Targets =>
-        {
-            // Edit the focused Agent row only. The cursor must
-            // be on an Agent row — if it's on Stdout / Cloud,
-            // the user hasn't actually selected a target, so
-            // don't fall back to "edit some random Agent
-            // target the user isn't pointing at" (the
-            // previous fallback made the wrong target easy to
-            // delete/mutate).
-            match app.focused_target_kind() {
-                Some(crate::app::TargetKind::Agent { id }) => {
-                    log::info!("keys: e → opened edit-agent funnel for {id}");
-                    app.open_edit_agent_funnel(&id);
-                }
-                _ => {
-                    app.banner = Some("No Agent target selected — press [a] to add one".into());
-                }
-            }
-        }
-        KeyCode::Char('d') | KeyCode::Char('D')
-            if app.picker_focus == crate::app::PickerFocus::Targets =>
-        {
-            // Delete the focused Agent row only. The cursor must
-            // be on an Agent row — falling back to "the first
-            // Agent target in the list" when the cursor is on
-            // Stdout / Cloud let users nuke a target they
-            // weren't pointing at. Same risk as the `e` arm
-            // above.
-            match app.focused_target_kind() {
-                Some(crate::app::TargetKind::Agent { id }) => {
-                    log::info!("keys: d → prompted delete for Agent {id}");
-                    app.mode = AppMode::ConfirmDeleteAgentTarget { id };
-                }
-                _ => {
-                    app.banner = Some("No Agent target selected".into());
-                }
-            }
-        }
+        // `a`/`e`/`d` agent CRUD keys removed in §8 — see plan §8.1.
+        // Their handler functions and `AppMode` variants are gone in §8.3.
         KeyCode::Enter => {
-            // When the Targets pane is focused, Enter first applies
+            // When the Agents pane is focused, Enter first applies
             // the picked target to the focused slot's
             // pending_target_overrides (so start_section consumes
             // it). The picked target may be disabled (e.g. Agent when
             // the binary is missing) — in that case we surface a
             // banner and abort; the user can press Down to land on
             // a pickable row.
-            if app.picker_focus == crate::app::PickerFocus::Targets {
+            if app.picker_focus == crate::app::PickerFocus::Agents {
                 if let Some(kind) = app.focused_target_kind() {
                     let target = app.pick_target(kind);
                     log::info!(
-                        "keys: Enter in Targets pane → picked {target:?} for slot {}",
+                        "keys: Enter in Agents pane → picked {target:?} for slot {}",
                         app.focused_slot.0
                     );
                 } else {
@@ -600,7 +516,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 }
             }
             // Hand the rest off to App::try_start_new_section. The
-            // Targets pick_target above is the only Enter-specific
+            // Agents pick_target above is the only Enter-specific
             // UI concern; everything else (slot pick, source
             // resolution, config persist, start_section) is shared
             // and lives in the App method so it can be unit-tested.
@@ -705,9 +621,9 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.open_api_key_modal(false);
         }
         KeyCode::Char('m') => {
-            // Manual model override. Seeds the picker at the
-            // current focused slot's settings.model so the user
-            // sees what's already chosen for that slot.
+            // Manual model override. Seeds the picker at the current
+            // displayed model (focused section's if running, else the
+            // global default) so the user sees what's already chosen.
             let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
             let current = app.display_model();
             let current_idx = catalog
@@ -735,73 +651,134 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // Cloud is always on. Esc just closes the modal.
             app.open_api_key_modal(false);
         }
-        // Toggle cloud transcription. Per-slot: a press of `c`
-        // flips the focused slot's `settings.cloud_on`. The
-        // running engine is untouched until the user stops and
-        // restarts; mid-flight engine rebuild is Stage 3+.
+        // Toggle cloud transcription. When idle, mutates the global
+        // config so the next-start defaults flip (and the mode panel
+        // updates). When a section is focused, mutates that section's
+        // settings AND persists a per-source override. The running
+        // engine itself is untouched until the user stops & restarts —
+        // mid-flight engine rebuild is Stage 3+.
         #[cfg(not(windows))]
         KeyCode::Char('c') => {
-            // When a section is focused, mutate the live
-            // section's settings (and the slot's settings must
-            // agree — SectionSettings is the snapshot the
-            // engine sees, slot.settings is the source of
-            // truth for the next start). When idle, just flip
-            // the focused slot's settings; the Mode panel
-            // gets the same value.
-            let slot_id = app.focused_slot;
-            let slot_pos = app.slot_index(slot_id);
-            let on = if let Some(pos) = slot_pos {
-                let current = app.slots[pos].settings.cloud_on;
-                let next = !current;
-                app.slots[pos].settings.cloud_on = next;
-                if let SlotKind::Recording { section } = &mut app.slots[pos].kind {
-                    section.settings.cloud_on = next;
+            if let Some(section) = app.focused_mut() {
+                section.settings.cloud_on = !section.settings.cloud_on;
+                let on = section.settings.cloud_on;
+                app.persist_focused_settings();
+                app.banner = Some(if on {
+                    "Cloud: ON for focused section (applies on next start)".into()
+                } else {
+                    "Cloud: OFF for focused section (applies on next start)".into()
+                });
+            } else {
+                // Idle: no section is focused. The Mode panel
+                // advertises the GLOBAL flag
+                // (`cloud_broadcast_enabled`); a press of `c`
+                // must visibly flip the advertised state. Seed
+                // the flip from the displayed value (not from
+                // any stale per-source override) and write the
+                // result to BOTH the per-source override AND
+                // the global flag so they stay in lockstep —
+                // the panel, the next-start state, and the
+                // banner all agree on the new value.
+                //
+                // Pre-this-commit the seed was
+                // `!ov.cloud_on` (per-source override's
+                // current value). When the override was stale
+                // — a prior session left it at OFF while the
+                // global is now ON — the first press of `c`
+                // was a visible no-op: panel said ON, user
+                // pressed `c` expecting OFF, both values
+                // landed on ON. Reproduces the bug screenshot
+                // from #48 review.
+                let source = app.resolve_picker_source();
+                let key = source
+                    .as_ref()
+                    .map(|s| app.source_key_for(s));
+                // Displayed value → flip target. The per-source
+                // override is rewritten to match (so the
+                // next start sees the new state), and the
+                // global is rewritten to match (so the panel
+                // and the next-start default see the new
+                // state).
+                let on = !app.config.cloud_broadcast_enabled;
+                let ov = voice_bird_cli::config::SourceSettingsOverride {
+                    cloud_on: on,
+                    // Preserve the other dimensions of the
+                    // per-source override when one exists, so
+                    // this toggle doesn't clobber a user's
+                    // per-source language/model preferences
+                    // when they flip Cloud.
+                    language: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.language.clone())
+                        .unwrap_or_else(|| app.config.language.clone()),
+                    model: key
+                        .as_ref()
+                        .and_then(|k| app.config.source_overrides.get(k))
+                        .map(|existing| existing.model.clone())
+                        .unwrap_or_else(|| app.config.default_model.clone()),
+                };
+                if let Some(k) = key {
+                    app.config.upsert_source_override(k, ov);
                 }
-                next
-            } else {
-                false
-            };
-            // Persist the focused slot's settings (the new
-            // value applies on the next start).
-            app.persist_focused_slot_settings();
-            let banner = format!(
-                "Cloud: {} for slot {} (applies on next start)",
-                if on { "ON" } else { "OFF" },
-                slot_id
-            );
-            if on && app.config.voicebird_api_key.is_empty() {
-                // Cloud-enable gate. Esc reverts the just-toggled
-                // slot's settings.cloud_on back to OFF.
-                app.open_api_key_modal(true);
-            } else {
-                app.banner = Some(banner);
+                app.config.cloud_broadcast_enabled = on;
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (cloud toggle): {e}");
+                }
+                // Re-fetch the cloud Agents list whenever cloud
+                // toggles. `refresh_agents()` no-ops (and clears
+                // `self.agents`) when the gate fails (cloud off,
+                // empty key, empty URL) and fetches when the gate
+                // passes — covers both the ON and OFF transitions
+                // without callers having to branch.
+                app.refresh_agents();
+                if on && app.config.voicebird_api_key.is_empty() {
+                    // Cloud-enable gate. Esc reverts the just-toggled
+                    // `cloud_broadcast_enabled` back to OFF (it was
+                    // OFF before this `c` press — the user just
+                    // flipped it). Without this, the user could
+                    // press `c` to enable Cloud, then change their
+                    // mind and `Esc` out of the modal — and be left
+                    // with Cloud ON, no key, and no way to start a
+                    // recording until they re-toggle `c` OFF.
+                    app.open_api_key_modal(true);
+                } else {
+                    app.banner = Some(if on {
+                        "Cloud: ON (next recording streams to voicebird.app)".into()
+                    } else {
+                        "Cloud: OFF (next recording is local-only)".into()
+                    });
+                }
             }
         }
-        // Cycle the cloud language. Per-slot: a press of `l`
-        // cycles the focused slot's `settings.language`. The
-        // legacy global config field is gone. The cycle is a
-        // no-op when the focused slot's cloud is off, mirroring
-        // the previous focused-section behavior.
+        // Cycle the cloud language. When idle, mutates the global config
+        // (and is hidden when cloud is off). When focused-section
+        // recording, cycles that section's language and persists the
+        // override.
         KeyCode::Char('l') => {
             let langs = crate::app::CLOUD_LANGUAGES;
-            let slot_id = app.focused_slot;
-            let slot_pos = app.slot_index(slot_id);
-            let Some(pos) = slot_pos else {
-                return;
-            };
-            if !app.slots[pos].settings.cloud_on {
-                return;
+            if let Some(section) = app.focused_mut() {
+                if !section.settings.cloud_on {
+                    return;
+                }
+                let i = langs
+                    .iter()
+                    .position(|&l| l == section.settings.language)
+                    .unwrap_or(0);
+                let next = (i + 1) % langs.len();
+                section.settings.language = langs[next].into();
+                app.persist_focused_settings();
+            } else if app.config.cloud_broadcast_enabled {
+                let i = langs
+                    .iter()
+                    .position(|&l| l == app.config.language)
+                    .unwrap_or(0);
+                let next = (i + 1) % langs.len();
+                app.config.language = langs[next].into();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (lang cycle): {e}");
+                }
             }
-            let current = app.slots[pos].settings.language.clone();
-            let i = langs.iter().position(|&l| l == current).unwrap_or(0);
-            let next = (i + 1) % langs.len();
-            let next_str: String = langs[next].into();
-            app.slots[pos].settings.language = next_str.clone();
-            // Keep the live section's snapshot in sync.
-            if let SlotKind::Recording { section } = &mut app.slots[pos].kind {
-                section.settings.language = next_str;
-            }
-            app.persist_focused_slot_settings();
         }
         // Export the most recent local transcript to the cloud.
         // Idempotent — second press is a no-op once .uploaded exists.
@@ -818,10 +795,10 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             app.open_path_modal();
         }
         // The O / S / A target-cycle keys have been replaced by the
-        // Targets picker pane — the user picks a target with the
+        // Agents picker pane — the user picks a target with the
         // same arrow / Enter pattern as Devices and Apps. The change
         // is queued in `pending_target_overrides` by the Enter
-        // handler when the Targets pane is focused.
+        // handler when the Agents pane is focused.
         _ => {}
     }
 }
@@ -834,21 +811,16 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
         }
         KeyCode::Enter => {
             if let Some(buf) = app.path_buf.take() {
-                // Per-slot: the path modal writes to the focused
-                // slot's settings. The global config.session_dir
-                // is gone (commit 6).
-                let path = buf.trim().to_string();
-                let slot_id = app.focused_slot;
-                let slot_pos = app.slot_index(slot_id);
-                let saved_msg = if let Some(pos) = slot_pos {
-                    app.slots[pos].settings.path = path.clone();
-                    app.persist_focused_slot_settings();
-                    let exp = app.slot_path_expanded(slot_id);
-                    format!("Output path → {} (slot {})", exp, slot_id)
+                app.config.session_dir = buf.trim().to_string();
+                if let Err(e) = app.config.save() {
+                    log::error!("config save (path modal): {e}");
+                    app.banner = Some(format!("Save failed: {e}"));
                 } else {
-                    "Output path → (no focused slot)".into()
-                };
-                app.banner = Some(saved_msg);
+                    app.banner = Some(format!(
+                        "Output path → {}",
+                        app.config.session_dir_expanded()
+                    ));
+                }
             }
             app.mode = AppMode::Normal;
         }
@@ -879,25 +851,18 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
             // to fix the key) or not in play (first run / peek).
             //
             // The cloud-enable funnel is the one path that
-            // flipped the focused slot's `cloud_on` from false to
+            // flipped `cloud_broadcast_enabled` from false to
             // true just before opening the modal; cancelling the
             // modal there must unwind that flip or the user is
             // stuck with Cloud ON + no key + no way to start a
             // recording. (The pre-R-key world had no other exit.)
             if app.api_key_modal_reverts_cloud {
-                // Cloud-only Windows never reverts — the `c`
-                // toggle that sets `reverts_cloud` isn't even
-                // compiled there, and unsetting `cloud_on` would
-                // break the platform invariant.
                 #[cfg(not(windows))]
                 {
-                    // Per-slot: revert the focused slot's cloud flag
-                    // (the modal was opened from a cloud toggle on
-                    // it). `persist_focused_slot_settings` saves.
-                    if let Some(slot) = app.slot_by_id_mut(app.focused_slot) {
-                        slot.settings.cloud_on = false;
+                    app.config.cloud_broadcast_enabled = false;
+                    if let Err(e) = app.config.save() {
+                        log::error!("config save (modal cancel): {e}");
                     }
-                    app.persist_focused_slot_settings();
                     app.banner =
                         Some("Cloud: OFF (cancelled API key entry)".into());
                 }
@@ -931,17 +896,26 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                 // misleading. The cloud-enable gate (if this
                 // modal was opened as one) will re-trigger on
                 // the next recording because `key.is_empty()`
-                // and `cloud_broadcast_enabled` is unchanged.
                 let trimmed = buf.trim();
                 app.config.voicebird_api_key = trimmed.to_string();
-                if let Err(e) = app.save_config() {
+                if let Err(e) = app.config.save() {
                     log::error!("config save (modal save): {e}");
                     app.banner = Some(format!("Save failed: {e}"));
                 } else if trimmed.is_empty() {
                     app.banner = Some("API key cleared".into());
+                    // Empty key: clear any stale agents list so the
+                    // picker doesn't keep showing entries from a
+                    // prior fetch.
+                    app.refresh_agents();
                 } else {
                     app.banner =
                         Some("API key saved — start a recording to verify".into());
+                    // New key just landed: re-fetch the Agents list
+                    // so the picker reflects what this key is
+                    // authorized to see. Without this the picker
+                    // stays empty until the next `App::new()`
+                    // (i.e. process restart).
+                    app.refresh_agents();
                 }
             }
             app.mode = AppMode::Normal;
@@ -970,161 +944,6 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
             }
         }
         _ => {}
-    }
-}
-/// Key handler for the multi-step "Add / Edit Agent target"
-/// funnel. Steps share a `KeyCode::Enter` advance and
-/// `KeyCode::Esc` cancel; text-input steps also accept
-/// `KeyCode::Char` and `KeyCode::Backspace`. Verify is the
-/// one step that hits the network — every other step is
-/// pure form state.
-fn handle_agent_funnel(app: &mut App, key: KeyCode) {
-    use voice_bird_cli::agent::kafka::KafkaTarget;
-    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
-    let Some(funnel) = app.funnel.as_mut() else {
-        app.mode = AppMode::Normal;
-        return;
-    };
-    match key {
-        KeyCode::Esc => {
-            app.funnel = None;
-            app.verify_rx = None;
-            app.verify_started = None;
-            app.mode = AppMode::Normal;
-            app.banner = Some("Add Agent: cancelled".into());
-        }
-        KeyCode::Backspace => funnel.backspace(),
-        // Step the funnel back without losing form values —
-        // useful when the Verify step fails and the user
-        // wants to fix the broker endpoint, topic name, etc.
-        // Esc would throw away the whole form, so ← is the
-        // non-destructive alternative. Bound to Left (matches
-        // the help-overlay convention for "go back").
-        KeyCode::Left => funnel.back(),
-        KeyCode::Enter => match funnel.step {
-            AgentFunnelStep::Verify => {
-                // Enter on a green probe advances to Save.
-                // Pending/InProgress/Err re-spawns the probe
-                // (the previous probe has already drained or
-                // never started; always replace the in-flight
-                // channel and start a fresh one). The TUI
-                // event loop polls `verify_rx` each tick, so
-                // we don't block here.
-                if matches!(funnel.verify, VerifyOutcome::Ok { .. }) {
-                    funnel.advance();
-                } else {
-                    funnel.verify = VerifyOutcome::InProgress;
-                    let conn = funnel.kafka_connection();
-                    let target = KafkaTarget::new(
-                        voice_bird_cli::agent::AgentSessionId::default_session(),
-                        conn.clone(),
-                    );
-                    // Drive verify on the App's own tokio runtime —
-                    // the event loop keeps polling `verify_rx`, so
-                    // nothing blocks. (Pre-#32 this spawned a
-                    // dedicated thread + one-shot runtime.)
-                    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::time::Duration>>();
-                    app.rt.spawn(async move {
-                        let _ = tx.send(target.verify().await);
-                    });
-                    app.verify_rx = Some(rx);
-                    app.verify_started = Some(std::time::Instant::now());
-                }
-            }
-            AgentFunnelStep::Save => {
-                let config = funnel.to_config();
-                let name = config.name.clone();
-                // Funnel mints a fresh UUID on Save, so a
-                // reserved-id rejection would indicate a bug
-                // in the id minter. Surface it instead of
-                // silently dropping the user's target.
-                match app.upsert_agent_target(config) {
-                    Ok(()) => {
-                        app.funnel = None;
-                        app.verify_rx = None;
-                        app.verify_started = None;
-                        app.mode = AppMode::Normal;
-                        crate::app::push_agent_event(
-                            &app.agent_events,
-                            format!("saved Agent target '{name}'"),
-                        );
-                        app.banner = Some(format!("Saved Agent target '{name}'"));
-                    }
-                    Err(e) => {
-                        log::error!("funnel: save failed: {e}");
-                        crate::app::push_agent_event(
-                            &app.agent_events,
-                            format!("save FAILED for Agent target '{name}': {e}"),
-                        );
-                        app.banner = Some(format!("Save failed: {e}"));
-                    }
-                }
-            }
-            _ => {
-                if funnel.can_advance() {
-                    funnel.advance();
-                } else {
-                    app.banner = Some("Fill the form before advancing".into());
-                }
-            }
-        },
-        KeyCode::Char('1') if funnel.step == AgentFunnelStep::Acks => {
-            funnel.acks = voice_bird_cli::config::KafkaAcks::All;
-            funnel.verify = VerifyOutcome::Pending;
-        }
-        KeyCode::Char('2') if funnel.step == AgentFunnelStep::Acks => {
-            funnel.acks = voice_bird_cli::config::KafkaAcks::One;
-            funnel.verify = VerifyOutcome::Pending;
-        }
-        KeyCode::Char('3') if funnel.step == AgentFunnelStep::Acks => {
-            funnel.acks = voice_bird_cli::config::KafkaAcks::Zero;
-            funnel.verify = VerifyOutcome::Pending;
-        }
-        // Security-protocol picker: 1-4 map onto
-        // KafkaSecurityProtocol::ALL in render order.
-        KeyCode::Char(ch @ '1'..='4') if funnel.step == AgentFunnelStep::Security => {
-            let idx = (ch as u8 - b'1') as usize;
-            funnel.security_protocol = voice_bird_cli::config::KafkaSecurityProtocol::ALL[idx];
-            funnel.verify = VerifyOutcome::Pending;
-        }
-        // SASL-mechanism picker: 1-3 map onto
-        // KafkaSaslMechanism::ALL in render order.
-        KeyCode::Char(ch @ '1'..='3') if funnel.step == AgentFunnelStep::SaslMechanism => {
-            let idx = (ch as u8 - b'1') as usize;
-            funnel.sasl_mechanism = voice_bird_cli::config::KafkaSaslMechanism::ALL[idx];
-            funnel.verify = VerifyOutcome::Pending;
-        }
-        KeyCode::Char(ch) => funnel.type_char(ch),
-        _ => {}
-    }
-}
-
-/// Confirm-prompt for deleting a user-configured Agent target.
-/// `y` confirms; anything else (incl. `n`, `Esc`, `Enter`)
-/// cancels.
-fn handle_confirm_delete_agent_target(app: &mut App, key: KeyCode, id: &str) {
-    match key {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            // Look up the name before the row goes away so the
-            // banner can refer to it by name (same rationale as
-            // the confirm modal: the user can't read a UUID).
-            let name = app
-                .config
-                .agent_target_by_id(id)
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| id.to_string());
-            app.remove_agent_target(id);
-            app.mode = AppMode::Normal;
-            crate::app::push_agent_event(
-                &app.agent_events,
-                format!("deleted Agent target '{name}'"),
-            );
-            app.banner = Some(format!("Deleted Agent target '{name}'"));
-        }
-        _ => {
-            app.mode = AppMode::Normal;
-            app.banner = Some("Delete cancelled".into());
-        }
     }
 }
 
@@ -1240,40 +1059,14 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
     };
     let api_key_buf_len = app.api_key_buf.as_ref().map(|s| s.len()).unwrap_or(0);
 
-    // Funnel state so a harness (e.g. scripts/demo-kafka.sh) can
-    // drive the Add-Agent form step by step and wait for the
-    // verify probe instead of sleeping blind.
-    let funnel_step = app
-        .funnel
-        .as_ref()
-        .map(|f| format!("{:?}", f.step))
-        .unwrap_or_default();
-    let funnel_verify = app
-        .funnel
-        .as_ref()
-        .map(|f| match &f.verify {
-            voice_bird_cli::agent_funnel::VerifyOutcome::Pending => "Pending".to_string(),
-            voice_bird_cli::agent_funnel::VerifyOutcome::InProgress => "InProgress".to_string(),
-            voice_bird_cli::agent_funnel::VerifyOutcome::Ok { elapsed } => {
-                format!("Ok:{}ms", elapsed.as_millis())
-            }
-            voice_bird_cli::agent_funnel::VerifyOutcome::Err { message } => {
-                format!("Err:{message}")
-            }
-        })
-        .unwrap_or_default();
-
     let snap = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "last_key": last_key,
-        "mode": format!("{:?}", app.mode),
         "status": status,
-        // Per-slot: the snapshot reflects the focused slot's
-        // settings (the source of truth), not a vestigial global.
-        "cloud_broadcast_enabled": app.display_cloud_on(),
         "cloud_broadcast_active": app.focused_cloud_active(),
-        "language": app.display_language(),
-        "default_model": app.display_model(),
+        "cloud_broadcast_enabled": app.config.cloud_broadcast_enabled,
+        "language": app.config.language,
+        "default_model": app.config.default_model,
         "engine_kind": app.focused_engine_kind(),
         "duration_secs": app.duration,
         "banner": app.banner,
@@ -1285,8 +1078,6 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         "selected_app_index": app.selected_app_index,
         "selected_app_name": selected_app_name,
         "picker_focus": format!("{:?}", app.picker_focus),
-        "funnel_step": funnel_step,
-        "funnel_verify": funnel_verify,
         "voicebird_api_key_masked": api_key_masked,
         "api_key_buf_len": api_key_buf_len,
         "committed_count": committed_count,
@@ -1307,106 +1098,12 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
     }
 }
 
-#[cfg(test)]
-mod funnel_dispatch_tests {
-    use super::*;
-    use crate::app::{App, AppMode};
-    use voice_bird_cli::agent_funnel::{AgentFunnelStep, VerifyOutcome};
-
-    fn type_str(app: &mut App, text: &str) {
-        for ch in text.chars() {
-            handle_agent_funnel(app, KeyCode::Char(ch));
-        }
-    }
-
-    /// #33: `?` is help-only and never surfaces a status banner,
-    /// even right after an agent event landed; `t` opens the
-    /// status overlay through the real key path and the usual
-    /// dismiss keys close it.
-    #[test]
-    fn question_mark_is_help_only_and_t_owns_status() {
-        let mut app = App::new();
-        // Reset per-slot settings so prior tests in the same
-        // process can't leave a cloud_on=true/cloud-bare-key
-        // banner set up by App::new (the banner test depends
-        // on no banner being present at start).
-        app.config.slot_settings.clear();
-        app.slots[0].settings.cloud_on = false;
-        app.banner = None;
-        // Seed an agent event as if the recorder just reported one.
-        crate::app::push_agent_event(&app.agent_events, "verify OK for 'broker:9092' in 12ms");
-        handle_normal_mode(&mut app, KeyCode::Char('?'));
-        assert_eq!(app.mode, AppMode::Help, "? must open the help overlay");
-        assert!(
-            app.banner.is_none(),
-            "? must never surface a status banner (D7 bridge removed)"
-        );
-        handle_help_mode(&mut app, KeyCode::Char('?'));
-        assert_eq!(app.mode, AppMode::Normal);
-
-        handle_normal_mode(&mut app, KeyCode::Char('t'));
-        assert_eq!(app.mode, AppMode::Status, "t must open the status overlay");
-        handle_status_mode(&mut app, KeyCode::Esc);
-        assert_eq!(app.mode, AppMode::Normal);
-    }
-
-    /// R4 (PR #31 round-3 review): after a green Verify, Enter must
-    /// advance to the Save step. Today the Verify arm of the Enter
-    /// handler unconditionally re-spawns the probe, the
-    /// `_ => can_advance/advance` arm excludes Verify, and nothing
-    /// else advances — so step 7/7 is unreachable and the funnel
-    /// can never save a target through the dispatcher, on both the
-    /// Add and Edit paths.
-    ///
-    /// The test walks the real key path (the funnel unit tests call
-    /// `advance()` directly, which is why they never caught this),
-    /// simulates the probe coming back green the same way
-    /// `App::poll_funnel_verify` would, then presses Enter once.
-    #[test]
-    fn enter_after_verify_ok_advances_to_save() {
-        let mut app = App::new();
-        app.open_add_agent_funnel();
-        assert_eq!(app.mode, AppMode::AgentFunnel);
-
-        // 1/8 connection kind (Kafka is preselected)
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 2/8 name
-        type_str(&mut app, "prod");
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 3/8 broker endpoint
-        type_str(&mut app, "localhost:19092");
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 4/8 topic
-        type_str(&mut app, "voice-bird-events");
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 5/8 acks (keep the default: All)
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        // 6/8 security (keep the default: plaintext, which skips
-        // the three SASL steps entirely)
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.funnel.as_ref().unwrap().step,
-            AgentFunnelStep::Verify,
-            "sanity: the form walk must land on the Verify step"
-        );
-
-        // Simulate the round-trip probe coming back green — this is
-        // exactly what poll_funnel_verify() writes on success.
-        app.funnel.as_mut().unwrap().verify = VerifyOutcome::Ok {
-            elapsed: std::time::Duration::from_millis(42),
-        };
-
-        // Enter after a green probe must move on to Save.
-        handle_agent_funnel(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.funnel.as_ref().unwrap().step,
-            AgentFunnelStep::Save,
-            "Enter after VerifyOutcome::Ok must advance to Save (R4); \
-             re-spawning the probe forever makes step 7/7 unreachable \
-             and the funnel can never save a target"
-        );
-    }
-}
+/// Regression tests for the cloud toggle (PR #48 review item 8):
+/// toggling Cloud while the focused slot is empty must also write
+/// to the per-source override so the next start agrees with what
+/// the toggle just advertised. The previous `funnel_dispatch_tests`
+/// module that drove the agent-funnel key path is removed with
+/// `--mcp-server` / `--register` / the funnel in §8.
 
 // Bug: toggling Cloud (`c`) while the focused slot is empty
 // only updates the global `cloud_broadcast_enabled` default,
@@ -1426,14 +1123,21 @@ mod cloud_toggle_dispatch_tests {
     use super::*;
     use crate::platform::{AppSession, AudioDevice};
     use voice_bird_cli::config::AudioSessionKind;
+    use voice_bird_cli::session::layout::SessionSource;
 
-    /// `c` toggled while no section is focused must flip the
-    /// focused slot's `settings.cloud_on`. The legacy
-    /// per-source override / global `cloud_broadcast_enabled`
-    /// path is gone — slots are the source of truth under the
-    /// per-slot settings refactor.
+    /// `c` toggled while no section is focused must update the
+    /// per-source override for the source the picker resolves
+    /// to on Enter. Today (pre-fix) the `else` branch in
+    /// `handle_normal_mode` only flips the global
+    /// `cloud_broadcast_enabled`, leaving a stale per-source
+    /// override `cloud_on = false` in place. The next start
+    /// reads the per-source override first, so the section
+    /// starts with `cloud_on = false` even though the user
+    /// just clicked Cloud ON.
     #[test]
-    fn c_toggle_when_no_section_focused_updates_focused_slot_settings() {
+    fn c_toggle_when_no_section_focused_updates_per_source_override() {
+        use voice_bird_cli::config::SourceSettingsOverride;
+
         let mut app = App::new();
         app.config.voicebird_api_key = "sk-test".into();
 
@@ -1453,40 +1157,63 @@ mod cloud_toggle_dispatch_tests {
         app.config.input_device = Some("EPOS PC 8 USB".into());
         app.config.input_device_kind = Some(AudioSessionKind::Output);
 
-        // No section is focused — the toggle takes the idle branch.
+        // Stale per-source override: this combo last recorded
+        // with Cloud OFF. The toggle target is the SAME source
+        // so the override must be updated.
+        let source = SessionSource::App {
+            id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+            device_name: "EPOS PC 8 USB".into(),
+        };
+        let key = app.source_key_for(&source);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+        // Global default is also OFF today. The toggle should
+        // flip BOTH the per-source override AND the global
+        // default so the Mode panel ("Cloud: ON") and the
+        // next-start state agree.
+        app.config.cloud_broadcast_enabled = false;
+
+        // Sanity: no Recording/Saved section is focused, so the
+        // toggle must take the `else` branch in main.rs.
         assert!(app.focused().is_none(), "setup must have no focused section");
-        // Pin the pre-condition to the default. App::new() reloads
-        // any persisted slot 1 settings, so an earlier test in
-        // the same process might have left cloud_on=true; the
-        // test wants to assert the cloud_on=false → true flip.
-        app.slots[0].settings.cloud_on = false;
-        assert!(!app.slots[0].settings.cloud_on);
 
         // The user presses `c`.
         #[cfg(not(windows))]
         {
             handle_normal_mode(&mut app, KeyCode::Char('c'));
 
-            // Assert 1: focused slot's settings.cloud_on flipped.
+            // Assert 1: the per-source override was flipped.
+            // This is the contract that picks up the toggle and
+            // matches what `start_section` reads via
+            // `effective_settings_for(source)`.
+            let ov = app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("per-source override must exist after toggle");
             assert!(
-                app.slots[0].settings.cloud_on,
+                ov.cloud_on,
                 "toggling Cloud ON while no section is focused must \
-                 flip the focused slot's settings.cloud_on; otherwise \
-                 the next start silently uses the stale cloud_on=false"
+                 update the per-source override for the picker-resolved \
+                 source; otherwise the next start silently uses the stale \
+                 cloud_on=false. Override key: {key}"
             );
 
-            // Assert 2: the toggle is persisted to config.slot_settings.
-            let key = voice_bird_cli::config::slot_settings_key(app.slots[0].id.0);
-            let saved = app
-                .config
-                .slot_settings
-                .get(&key)
-                .expect("per-slot settings must be persisted after toggle");
-            assert!(saved.cloud_on);
-
-            // Assert 3: under the per-slot model, the per-source
-            // override map is gone — there's nothing to check for
-            // absence. The slot's settings above are the contract.
+            // Assert 2: the global default also flipped, so the
+            // Mode panel agrees with the next-start state.
+            assert!(
+                app.config.cloud_broadcast_enabled,
+                "toggling Cloud ON must also flip the global default \
+                 so the Mode panel (which reads cloud_broadcast_enabled \
+                 when no section is focused) advertises the new state"
+            );
         }
     }
 }
@@ -1525,7 +1252,7 @@ mod api_key_modal_ctrl_u_tests {
     fn plain_u_typing_into_api_key_buffer_works_when_control_held_is_false() {
         // Regression sentinel: Ctrl+U must NOT eat the printable 'u'
         // keystroke when no modifier is held. The handler still has a
-        // normal-character typing path.
+        // normal-agent typing path.
         let mut app = App::new();
         app.mode = AppMode::ApiKeyModal;
         app.api_key_buf = Some(String::new());
@@ -1578,7 +1305,7 @@ mod api_key_modal_ctrl_u_tests {
 
 /// `K` (uppercase) opens the API-key modal from Normal mode, regardless
 /// of whether a section is focused. The lowercase `k` keystroke must
-/// still be a regular character typed into nothing (we don't bind it),
+/// still be a regular agent typed into nothing (we don't bind it),
 /// because crossterm encodes Ctrl+K the same as a plain 'k' - the
 /// uppercase letter is the discoverable, conflict-free shortcut.
 #[cfg(test)]
@@ -1633,6 +1360,9 @@ mod api_key_dispatcher_uppercase_k_tests {
 #[cfg(not(windows))]
 mod pr48_review_regression_tests {
     use super::*;
+    use crate::platform::AudioDevice;
+    use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+    use voice_bird_cli::session::layout::SessionSource;
 
     /// Snapshot of the developer's real `config.toml`, restored on
     /// drop (including panic unwind). With config-path injection in
@@ -1699,9 +1429,7 @@ mod pr48_review_regression_tests {
     fn esc_after_k_peek_must_not_disable_cloud() {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
-        // Per-slot: the focused slot's settings.cloud_on is the
-        // source of truth. Seed the cluster with cloud on.
-        app.slots[0].settings.cloud_on = true;
+        app.config.cloud_broadcast_enabled = true;
 
         // The user peeks at the saved key via K…
         handle_normal_mode(&mut app, KeyCode::Char('K'));
@@ -1713,7 +1441,7 @@ mod pr48_review_regression_tests {
 
         assert_eq!(app.mode, AppMode::Normal, "Esc must close the modal");
         assert!(
-            app.slots[0].settings.cloud_on,
+            app.config.cloud_broadcast_enabled,
             "Esc from a K-opened (peek) modal must NOT disable cloud — \
              the cancel-reverts-cloud behaviour only makes sense when the \
              modal was opened by the cloud-enable flow that needs a key"
@@ -1751,92 +1479,58 @@ mod pr48_review_regression_tests {
         );
     }
 
-    /// Regression guard (review item 8, retargeted for per-slot).
+    /// Regression guard (review item 8; was RED, fixed in 25ae726).
     ///
-    /// The Mode panel displays the focused slot's settings.cloud_on
-    /// (the per-slot refactor moved the global flag out of the
-    /// loop). The idle `c` toggle must flip the slot's settings
-    /// from whatever value they currently carry — pre-this-commit
-    /// the toggle seeded from `config.cloud_broadcast_enabled`,
-    /// which is now a vestigial field that still defaults to the
-    /// test seed. The test pins the new contract: the slot's
-    /// `settings.cloud_on` flips on every press of `c`, regardless
-    /// of what the legacy global flag says.
+    /// The idle Mode panel displays the GLOBAL flag
+    /// (`cloud_broadcast_enabled`), and the idle `c` toggle used to
+    /// seed its flip from the per-source OVERRIDE's current value —
+    /// when the two disagreed (stale override), the first press was
+    /// a visible no-op. The toggle now seeds from the displayed
+    /// (global) value and writes it to both the global flag and the
+    /// per-source override, so one press always flips the
+    /// advertised state.
     #[test]
-    fn idle_c_toggle_must_flip_the_focused_slot_settings() {
+    fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
 
-        // Per-slot: the focused slot's settings are the source
-        // of truth. The legacy global flag is gone; the toggle
-        // seeds from the slot's current display state.
-        app.slots[0].settings.cloud_on = true;
+        // Panel says ON (global flag)…
+        app.config.cloud_broadcast_enabled = true;
+        // …but a stale per-source override says OFF for the source
+        // the picker currently resolves to.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        let key = app.source_key_for(&SessionSource::Microphone);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
 
         // The user sees "Cloud: ON" and presses `c` to turn it OFF.
         handle_normal_mode(&mut app, KeyCode::Char('c'));
 
         assert!(
-            !app.slots[0].settings.cloud_on,
-            "the toggle must flip the focused slot's settings.cloud_on \
-             from its current value (true → false), not consult the \
-             legacy global flag"
+            !app.config.cloud_broadcast_enabled,
+            "the toggle must flip the DISPLAYED state: panel showed ON, so \
+             one press of `c` must land on OFF — seeding the flip from the \
+             stale override (OFF→ON) makes the first press a visible no-op"
         );
-        // The slot's settings are persisted on the toggle.
-        let key = voice_bird_cli::config::slot_settings_key(app.slots[0].id.0);
-        let saved = app
-            .config
-            .slot_settings
-            .get(&key)
-            .expect("per-slot settings must be persisted after toggle");
         assert!(
-            !saved.cloud_on,
-            "the persisted per-slot settings must reflect the new value"
-        );
-    }
-}
-
-// ── Per-slot refactor: review contract (RED) ──────────────────────────
-//
-// S9 from the review of the per-slot settings refactor. Expected to FAIL
-// against the current code.
-#[cfg(test)]
-mod per_slot_review_contracts {
-    use super::*;
-
-    /// The state snapshot must keep publishing `cloud_broadcast_active`.
-    /// The refactor dropped that key while repointing the others at the
-    /// focused slot, but it is a consumed contract, not a vestigial
-    /// field: `e2e_human`'s `read_voice_bird_state` tool reads it, and
-    /// the harness's agents justify phase completion with
-    /// "status='Recording' and cloud_broadcast_active=true". Without the
-    /// key the start_recording / stop_recording phases can no longer
-    /// tell a live cloud transport from an idle one.
-    ///
-    /// Note it is NOT the same value as `cloud_broadcast_enabled`:
-    /// "enabled" is the slot's next-start setting, "active" is whether a
-    /// cloud engine is transmitting right now.
-    #[test]
-    fn state_snapshot_still_publishes_cloud_broadcast_active() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let app = App::new();
-
-        write_state_snapshot(&app, "<startup>", &path);
-
-        let raw = std::fs::read_to_string(&path).expect("snapshot written");
-        let json: serde_json::Value = serde_json::from_str(&raw).expect("snapshot is JSON");
-        let active = json.get("cloud_broadcast_active").unwrap_or_else(|| {
-            panic!(
-                "the e2e_human harness reads `cloud_broadcast_active`; \
-                 dropping it breaks the recording phases. Snapshot keys: {:?}",
-                json.as_object().map(|o| o.keys().collect::<Vec<_>>()),
-            )
-        });
-        assert_eq!(
-            active.as_bool(),
-            Some(app.focused_cloud_active()),
-            "`cloud_broadcast_active` must report the live transport \
-             (`focused_cloud_active`), not the slot's next-start setting",
+            !app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("override must survive the toggle")
+                .cloud_on,
+            "the per-source override must agree with the newly displayed \
+             state (OFF) after the toggle"
         );
     }
 }
