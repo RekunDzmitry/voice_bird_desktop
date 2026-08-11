@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::AppConfig;
+use voice_bird_cli::config::{AppConfig, SourceSettingsOverride};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -380,6 +380,15 @@ pub struct App {
     /// to `false` when the modal closes.
     pub api_key_modal_reverts_cloud: bool,
 
+    /// Pending undo state for the idle `c` toggle when it opened
+    /// the API-key modal. Stores the per-source override key the
+    /// toggle just wrote (or `None` if it didn't write one) and
+    /// the value it had BEFORE the toggle. Esc with
+    /// `api_key_modal_reverts_cloud = true` restores this value
+    /// (or deletes the override if it didn't exist before).
+    /// Cleared when the modal closes (Enter or Esc).
+    pub pending_c_revert: Option<(String, Option<SourceSettingsOverride>)>,
+
     /// In-flight text buffer for the output-path modal. `None` when
     /// the modal isn't open. Pre-filled with `config.session_dir`.
     pub path_buf: Option<String>,
@@ -608,6 +617,7 @@ impl App {
             config_was_loaded_from_disk,
             api_key_buf: None,
             api_key_modal_reverts_cloud: false,
+            pending_c_revert: None,
             path_buf: None,
             export_banner: None,
             banner: banner_on_launch,
