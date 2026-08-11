@@ -265,6 +265,19 @@ pub enum PickerFocus {
     Agents,
 }
 
+/// Per-slot memo of the picker cursor. The Devices / Apps cursors on
+/// `App` always reflect the FOCUSED slot's state; this struct holds
+/// the last cursor position seen for a slot that's not currently
+/// focused, so Tab/Shift-Tab back to it shows what was last selected.
+/// Created on first focus, updated on every Tab-away from the slot.
+/// In-memory only — not persisted across restarts.
+#[derive(Debug, Clone)]
+pub struct PickerSelection {
+    pub device_idx: usize,
+    pub app_idx: Option<usize>,
+    pub focus: PickerFocus,
+}
+
 /// Main application state
 pub struct App {
     /// Current mode
@@ -296,6 +309,7 @@ pub struct App {
     pub device_scroll: u16,
     pub app_scroll: u16,
     pub target_scroll: u16,
+
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
     pub status: RecordingStatus,
@@ -418,6 +432,18 @@ pub struct App {
     /// `pending_target_overrides`, which tracks the on-disk
     /// `Target::Stdout` routing decision.
     pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
+
+    /// Per-slot memo of the picker cursor (Devices / Apps / focus).
+    /// `App::selected_device_index`, `selected_app_index`, and
+    /// `picker_focus` always reflect the FOCUSED slot's state. When
+    /// the user Tabs to a different slot, the current cursor is
+    /// saved here under the outgoing slot id, and the incoming
+    /// slot's memo is loaded back into the cursor fields. This way
+    /// each slot remembers the last device + app it was parked on,
+    /// even if the user never pressed Enter to start a recording.
+    /// Entries are pruned when a slot is removed (its id is
+    /// never reused). In-memory only — not persisted across restarts.
+    pub slot_picker_memo: std::collections::BTreeMap<SlotId, PickerSelection>,
 
     /// Rolling log of app events (verify ok/fail, push failures,
     /// dropped segments), newest at the back. Behind an
@@ -592,6 +618,7 @@ impl App {
             pending_target_overrides: std::collections::BTreeMap::new(),
             agents: Vec::new(),
             pending_agent_overrides: std::collections::BTreeMap::new(),
+            slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
 
@@ -1097,7 +1124,14 @@ impl App {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
             let next_idx = (idx + 1) % n;
-            self.focused_slot = self.slots[next_idx].id;
+            let next_slot = self.slots[next_idx].id;
+            // Save the outgoing slot's cursor state so Tab-back
+            // restores it. Restore the incoming slot's memoized
+            // cursor (or keep the current one if no memo yet —
+            // first focus inherits whatever the cursor is at).
+            self.memoize_picker_for(self.focused_slot);
+            self.focused_slot = next_slot;
+            self.restore_picker_for(next_slot);
         }
     }
 
@@ -1107,10 +1141,12 @@ impl App {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
             let prev_idx = (idx + n - 1) % n;
-            self.focused_slot = self.slots[prev_idx].id;
+            let prev_slot = self.slots[prev_idx].id;
+            self.memoize_picker_for(self.focused_slot);
+            self.focused_slot = prev_slot;
+            self.restore_picker_for(prev_slot);
         }
     }
-
     /// Pick the first Empty slot, or `None` if every existing slot
     /// is busy. Callers that need to grow past `len()` should call
     /// `add_slot` instead — this stays narrow on purpose.
@@ -1125,12 +1161,19 @@ impl App {
     /// Returns the new slot's id. Refuses (and returns `None`) when
     /// the slot count is already at `MAX_SECTIONS` — the cap exists
     /// to keep the screen readable, not as a feature limitation.
+    /// The new slot inherits the focused slot's current picker
+    /// cursor (so `+` followed by Enter records from the same
+    /// device/app) — memoize the outgoing slot first so Tab back
+    /// to it still works.
     pub fn add_slot(&mut self) -> Option<SlotId> {
         if self.slots.len() >= MAX_SECTIONS {
             return None;
         }
         let id = SlotId(self.next_slot_id);
         self.next_slot_id += 1;
+        // Snapshot the current cursor under the outgoing slot so
+        // Tab back to it after `+` restores its state.
+        self.memoize_picker_for(self.focused_slot);
         self.slots.push(Slot::empty(id));
         self.focused_slot = id;
         Some(id)
@@ -1154,30 +1197,108 @@ impl App {
             return false;
         }
         self.slots.remove(pos);
-        // If the focused slot also had a pending target override,
-        // drop it — the slot id is gone from the Vec and we don't
-        // want the override to silently re-apply to a future slot.
+        // Drop the focused slot's per-slot state — the slot id is
+        // gone and `next_slot_id` won't reuse it, so the memo would
+        // otherwise be leaked for the rest of the session.
         self.pending_target_overrides.remove(&id);
+        self.slot_picker_memo.remove(&id);
         // Land focus on the nearest remaining slot. Prefer the slot
         // to the left of the removed one, else the new rightmost.
         let new_idx = if pos > 0 { pos - 1 } else { 0 };
         if let Some(s) = self.slots.get(new_idx) {
             self.focused_slot = s.id;
+            // Restore the new focused slot's memoized cursor so
+            // `-` doesn't accidentally reset the cursor to what
+            // the removed slot was showing.
+            self.restore_picker_for(s.id);
         }
         true
     }
 
+    /// Snapshot the current picker cursor under the given slot id.
+    /// Called immediately before focus moves away from that slot.
+    /// The cursor fields on `App` keep holding the slot's state
+    /// until the caller switches `focused_slot`, at which point
+    /// `restore_picker_for` loads the next slot's memo back in.
+    fn memoize_picker_for(&mut self, slot: SlotId) {
+        self.slot_picker_memo.insert(
+            slot,
+            PickerSelection {
+                device_idx: self.selected_device_index,
+                app_idx: self.selected_app_index,
+                focus: self.picker_focus,
+            },
+        );
+    }
+
+    /// Load the memoized picker cursor for the given slot id into
+    /// the cursor fields on `App`. No-op if the slot has no memo
+    /// (first time the user Tabs to it) — the cursor simply keeps
+    /// whatever value it had, which is the natural "first focus
+    /// inherits current state" behavior.
+    fn restore_picker_for(&mut self, slot: SlotId) {
+        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
+            // Clamp the restored indices against the current
+            // inventory — a refresh may have shrunk `devices` /
+            // `apps` between Tab-away and Tab-back.
+            let dev_idx = if self.devices.is_empty() {
+                0
+            } else {
+                p.device_idx.min(self.devices.len() - 1)
+            };
+            let app_idx = p.app_idx.and_then(|i| {
+                if self.apps.is_empty() {
+                    None
+                } else {
+                    Some(i.min(self.apps.len() - 1))
+                }
+            });
+            self.selected_device_index = dev_idx;
+            self.selected_app_index = app_idx;
+            self.picker_focus = p.focus;
+        }
+    }
+
     /// Refresh both panes' inventory. Preserves cursors by name when the
-    /// previously-cursored entries still exist after refresh.
+    /// previously-cursored entries still exist after refresh. The
+    /// focused slot's cursor is re-resolved in place; per-slot
+    /// memos for non-focused slots are also re-resolved so a later
+    /// Tab back to them lands on the same device/app the user
+    /// picked, even if the OS audio inventory reordered (e.g. a
+    /// USB headset reappearing at a different index).
     pub fn refresh_inventory(&mut self) {
-        let prior_device = self
+        use voice_bird_cli::config::AudioSessionKind;
+         // Snapshot the focused slot's current device/app names
+        // BEFORE replacing `devices` / `apps`, plus the per-slot
+        // memo's device/app names for every other slot. Both are
+        // re-resolved by name after the rebuild.
+        let focused_prior_device = self
             .devices
             .get(self.selected_device_index)
             .map(|d| (d.name.clone(), d.kind));
-        let prior_app = self
+        let focused_prior_app = self
             .selected_app_index
             .and_then(|i| self.apps.get(i))
             .map(|a| a.id.clone());
+        let memo_priors: std::collections::BTreeMap<
+            SlotId,
+            (Option<(String, AudioSessionKind)>, Option<String>),
+        > = self
+            .slot_picker_memo
+            .iter()
+            .filter(|(slot, _)| **slot != self.focused_slot)
+            .map(|(slot, sel)| {
+                let dev = self
+                    .devices
+                    .get(sel.device_idx)
+                    .map(|d| (d.name.clone(), d.kind));
+                let app = sel
+                    .app_idx
+                    .and_then(|i| self.apps.get(i))
+                    .map(|a| a.id.clone());
+                (*slot, (dev, app))
+            })
+            .collect();
 
         match crate::platform::enumerate_audio_inventory() {
             Ok(inv) => {
@@ -1185,11 +1306,13 @@ impl App {
                 self.apps = inv.apps;
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed to enumerate audio inventory: {}", e));
+                self.status_message =
+                    Some(format!("Failed to enumerate audio inventory: {}", e));
             }
         }
 
-        if let Some((name, kind)) = prior_device {
+        // Re-resolve focused slot.
+        if let Some((name, kind)) = focused_prior_device {
             if let Some(i) = self
                 .devices
                 .iter()
@@ -1200,10 +1323,31 @@ impl App {
                 self.selected_device_index = self.devices.len().saturating_sub(1);
             }
         }
-
-        self.selected_app_index = prior_app
+        self.selected_app_index = focused_prior_app
             .as_deref()
             .and_then(|id| self.apps.iter().position(|a| a.id == id));
+
+        // Re-resolve each non-focused slot's memo by name.
+        for (slot, (dev, app)) in memo_priors {
+            if let Some(sel) = self.slot_picker_memo.get_mut(&slot) {
+                if let Some((name, kind)) = dev {
+                    if let Some(i) = self
+                        .devices
+                        .iter()
+                        .position(|d| d.name == name && d.kind == kind)
+                    {
+                        sel.device_idx = i;
+                    }
+                    // If the device disappeared, leave the index
+                    // alone — `restore_picker_for` clamps against
+                    // the new `devices.len()`.
+                }
+                if let Some(id) = app {
+                    sel.app_idx = self.apps.iter().position(|a| a.id == id);
+                    // Same clamping story for apps.
+                }
+            }
+        }
 
         self.clamp_scrolls(usize::MAX);
     }
@@ -3426,6 +3570,170 @@ mod tests {
                 "fresh App must not see the 'all 3' message; got: {err}"
             );
         }
+    }
+
+    /// Pre-fix bug: `App::selected_device_index` and
+    /// `selected_app_index` were single global fields shared by
+    /// every slot. Tabbing between slots changed the cursor once
+    /// and every slot saw the same value — the picker state wasn't
+    /// slot-specific.
+    ///
+    /// Post-fix: each slot memoizes its last picker cursor in
+    /// `slot_picker_memo`. `focus_next` saves the outgoing slot's
+    /// state and restores the incoming slot's memo. `+` inherits
+    /// the current cursor; `-` cleans up the removed slot's memo
+    /// and restores the new focused slot's.
+    #[cfg(not(windows))]
+    #[test]
+    fn focus_next_memoizes_picker_state_per_slot() {
+        use crate::platform::{AppSession, AudioDevice};
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+
+        // Seed inventory with two devices and two apps so the
+        // cursor can land on either.
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "USB Headset".into(),
+                kind: AudioSessionKind::Input,
+            },
+        ];
+        app.apps = vec![
+            AppSession {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                process_id: 1,
+            },
+            AppSession {
+                id: "com.google.Chrome".into(),
+                name: "Google Chrome".into(),
+                process_id: 2,
+            },
+        ];
+
+        // Default: slot 1 focused, cursor at device 0, no app.
+        let slot_a = app.focused_slot;
+        app.selected_device_index = 0;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+
+        // Add slot B and put the cursor on a different device+app.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        app.selected_device_index = 1;
+        app.selected_app_index = Some(1);
+        app.picker_focus = PickerFocus::Apps;
+
+        // Tab back to slot A — the cursor must restore to
+        // whatever slot A had when we left it (device 0, no app).
+        app.focus_next();
+        assert_eq!(
+            app.focused_slot, slot_a,
+            "Tab from slot B must focus slot A"
+        );
+        assert_eq!(
+            app.selected_device_index, 0,
+            "slot A's memoized device must be restored; got {}",
+            app.selected_device_index
+        );
+        assert_eq!(
+            app.selected_app_index, None,
+            "slot A's memoized app must be restored (None); got {:?}",
+            app.selected_app_index
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Devices,
+            "slot A's memoized pane focus must be restored"
+        );
+
+        // Tab forward again to slot B — the cursor must restore
+        // to whatever slot B had (device 1, app 1, Apps pane).
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_b);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memoized device must be restored; got {}",
+            app.selected_device_index
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be restored; got {:?}",
+            app.selected_app_index
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Apps,
+            "slot B's memoized pane focus must be restored"
+        );
+
+        // Independence check: change slot A's cursor while focused
+        // on A, then Tab to B (B's memo was captured before this
+        // change) and assert B is untouched, then Tab back to A
+        // and assert A kept the new value.
+        // After the prior round-trip, focused_slot is slot_b —
+        // Tab back to slot A first.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_a);
+        // Now mutate slot A's cursor.
+        app.selected_device_index = 1;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+        // Tab to B — slot B's memo must restore to whatever it
+        // was at the previous Tab-away (device 1, app Some(1),
+        // Apps pane), NOT slot A's just-edited values.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_b);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memoized device must be unchanged after slot A edits"
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be unchanged after slot A edits"
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Apps,
+            "slot B's memoized pane focus must be unchanged"
+        );
+        // Tab back to A — slot A's NEW cursor must survive.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_a);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot A's NEW device must survive Tab round-trip"
+        );
+        assert_eq!(
+            app.selected_app_index, None,
+            "slot A's NEW app selection (None) must survive Tab round-trip"
+        );
+        // Removing slot A must drop its memo, leave slot B
+        // focused with its own memo restored.
+        app.remove_focused_slot();
+        assert_eq!(
+            app.focused_slot, slot_b,
+            "removing slot A must focus slot B"
+        );
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memo must be restored after slot A removal"
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be restored after slot A removal"
+        );
+        assert!(
+            !app.slot_picker_memo.contains_key(&slot_a),
+            "removed slot's memo must be dropped (not leaked)"
+        );
     }
 
     // ── Cloud-target refactor: cloud is a transport, not a target ──
