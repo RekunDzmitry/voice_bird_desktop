@@ -1226,14 +1226,19 @@ mod cloud_toggle_dispatch_tests {
                  source; otherwise the next start silently uses the stale \
                  cloud_on=false. Override key: {key}"
             );
-
-            // Assert 2: the global default also flipped, so the
-            // Mode panel agrees with the next-start state.
+            // Assert 2: the global flag must STAY OFF — idle
+            // `c` is per-slot (writes the per-source override
+            // for the focused slot's resolved source) and must
+            // NOT leak into the global default. Other idle
+            // slots that read the global as a fallback would
+            // otherwise see this toggle.
             assert!(
-                app.config.cloud_broadcast_enabled,
-                "toggling Cloud ON must also flip the global default \
-                 so the Mode panel (which reads cloud_broadcast_enabled \
-                 when no section is focused) advertises the new state"
+                !app.config.cloud_broadcast_enabled,
+                "idle `c` toggle must NOT flip the global flag — \
+                 slot independence: other slots' display reads the \
+                 global as a fallback and would otherwise leak this \
+                 toggle. global was {} before, must remain {}",
+                false, false,
             );
         }
     }
@@ -1291,6 +1296,98 @@ mod cloud_toggle_dispatch_tests {
                  displayed per-source OFF state"
             );
         }
+    }
+
+    /// Pre-fix bug: the idle `c` toggle wrote to BOTH the
+    /// per-source override AND the global \`cloud_broadcast_enabled\`
+    /// flag. With two idle slots routed to different sources, the
+    /// global flip leaked into slot 2's display — even though slot
+    /// 2's per-source override was untouched, \`display_cloud_on\`
+    /// for slot 2 fell back to the (just-changed) global and
+    /// showed the slot 1 flip.
+    ///
+    /// Post-fix: the idle `c` toggle writes ONLY to the focused
+    /// slot's per-source override. The global flag stays as the
+    /// fallback default — slot 2's display reads its per-source
+    /// override (untouched), falls back to the unchanged global.
+    #[test]
+    fn idle_c_toggle_does_not_leak_into_other_idle_slots() {
+        use voice_bird_cli::config::SourceSettingsOverride;
+
+        let mut app = App::new();
+        app.add_slot();
+
+        // Two input devices so each slot's picker-resolved
+        // source is distinct. The picker cursors are global;
+        // the per-slot memo seeds each slot's effective source.
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "USB Headset".into(),
+                kind: AudioSessionKind::Input,
+            },
+        ];
+        // Slot 1's memo: device 0 (MacBook Pro Mic).
+        // Slot 2's memo: device 1 (USB Headset).
+        // The user can flip each independently.
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(2),
+            crate::app::PickerSelection {
+                device_idx: 1,
+                app_idx: None,
+                focus: crate::app::PickerFocus::Devices,
+            },
+        );
+
+        // Global default ON; no per-source overrides yet.
+        app.config.cloud_broadcast_enabled = true;
+        let key_slot1 = app.source_key_for(&SessionSource::Microphone);
+        // (resolve_picker_source for slot 1 reads the focused
+        // slot's memo; with no memo for slot 1, it falls back
+        // to the global cursor — device 0 — and slot 1 resolves
+        // to Microphone.)
+        assert!(app.config.source_overrides.get(&key_slot1).is_none());
+
+        // Focus slot 1, press `c`.
+        app.focused_slot = crate::app::SlotId(1);
+        #[cfg(not(windows))]
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+        // Slot 1's per-source override must have been created
+        // with the new (flipped) value.
+        let ov_slot1 = app
+            .config
+            .source_overrides
+            .get(&key_slot1)
+            .expect("slot 1's per-source override must be created by `c`");
+        assert!(
+            !ov_slot1.cloud_on,
+            "slot 1's per-source override must be flipped OFF; got {}",
+            ov_slot1.cloud_on
+        );
+
+        // Global flag MUST stay ON — pressing `c` while slot 1
+        // is idle must not affect what other slots fall back
+        // to.
+        assert!(
+            app.config.cloud_broadcast_enabled,
+            "idle `c` toggle must NOT flip the global flag (slot \
+             independence: other slots' display reads the global as \
+             a fallback and would otherwise leak this toggle)"
+        );
+
+        // Now Tab to slot 2 — its display reads the global
+        // (unchanged) + its own per-source override (still
+        // absent) → must still show ON.
+        app.focus_next();
+        assert!(
+            app.display_cloud_on(),
+            "slot 2 must show Cloud ON (no override + unchanged global); \
+             got OFF because slot 1's toggle leaked into the global"
+        );
     }
 }
 
