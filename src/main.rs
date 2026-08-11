@@ -1233,6 +1233,61 @@ mod cloud_toggle_dispatch_tests {
             );
         }
     }
+
+    /// Regression guard for the follow-up display-helper change: when the
+    /// idle Mode panel reads from a per-source override, `c` must flip that
+    /// displayed value, not the global default. Otherwise a source showing
+    /// Cloud OFF with global Cloud ON remains OFF after one key press.
+    #[test]
+    fn idle_c_toggle_flips_per_source_displayed_cloud_state() {
+        use voice_bird_cli::config::SourceSettingsOverride;
+
+        let mut app = App::new();
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        app.apps.clear();
+        app.selected_app_index = None;
+
+        let key = app.source_key_for(&SessionSource::Microphone);
+        app.config.source_overrides.insert(
+            key.clone(),
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+        app.config.cloud_broadcast_enabled = true;
+
+        assert!(
+            !app.display_cloud_on(),
+            "setup must show the per-source Cloud OFF state"
+        );
+
+        #[cfg(not(windows))]
+        {
+            handle_normal_mode(&mut app, KeyCode::Char('c'));
+
+            let ov = app
+                .config
+                .source_overrides
+                .get(&key)
+                .expect("per-source override must survive the toggle");
+            assert!(
+                ov.cloud_on,
+                "pressing `c` while the idle UI displays per-source Cloud OFF \
+                 must toggle that displayed state to ON"
+            );
+            assert!(
+                app.display_cloud_on(),
+                "the Mode panel must show Cloud ON after toggling from the \
+                 displayed per-source OFF state"
+            );
+        }
+    }
 }
 
 /// `handle_api_key_modal` must clear the in-progress paste buffer when

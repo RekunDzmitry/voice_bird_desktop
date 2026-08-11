@@ -3079,6 +3079,89 @@ mod tests {
         assert_eq!(app.targets().len(), 2);
     }
 
+    /// If the picker-resolved source is effectively cloud-enabled via its
+    /// per-source override, refreshing Agents should fetch even when the
+    /// global cloud default is off. This is the same effective state that
+    /// `display_cloud_on()` and `start_section` use.
+    #[cfg(not(windows))]
+    #[test]
+    fn refresh_agents_uses_effective_source_cloud_state_not_only_global_default() {
+        use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+        use voice_bird_cli::session::layout::SessionSource;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok(s) => break s.0,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
+            let body = r#"{"agents":[{"id":"interviewee","name":"Interviewee","icon":null,"promptTemplate":"x"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use std::io::Write;
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let mut app = App::new();
+        app.devices = vec![crate::platform::AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        app.apps.clear();
+        app.selected_app_index = None;
+        app.config.cloud_broadcast_enabled = false;
+        app.config.voicebird_api_key = "test-key-abc123".into();
+        app.config.voicebird_server_url =
+            format!("ws://{}/api/audio/stream", addr);
+        let key = app.source_key_for(&SessionSource::Microphone);
+        app.config.source_overrides.insert(
+            key,
+            SourceSettingsOverride {
+                cloud_on: true,
+                language: "en".into(),
+                model: "base.en".into(),
+            },
+        );
+
+        assert!(
+            app.display_cloud_on(),
+            "setup must be effectively cloud-on via the per-source override"
+        );
+
+        app.refresh_agents();
+        let _ = server.join();
+
+        assert_eq!(
+            app.agents().len(),
+            1,
+            "refresh_agents must fetch when the selected source is effectively \
+             cloud-on even if the global default is off"
+        );
+        assert_eq!(app.agents()[0].id, "interviewee");
+    }
+
     /// Pre-fix bug: when no section was focused, `display_cloud_on`,
     /// `display_language`, and `display_model` fell through to the
     /// GLOBAL config default, ignoring the per-source override that
