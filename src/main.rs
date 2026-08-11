@@ -534,19 +534,28 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 }
             }
         }
-        // 'r' refreshes the inventory; refresh_inventory preserves
-        // both cursors by name when the previously-cursored
-        // entries still exist after refresh.
+        // 'r' refreshes both inventories: local audio (devices + apps)
+        // and the cloud Agents list. Local refresh preserves cursor
+        // positions by name; cloud refresh replaces `self.agents` with
+        // whatever `GET /api/agents` returns (or clears it + sets a
+        // banner on error). Pre-this-commit, `r` only refreshed local
+        // audio, so newly-created custom Agents on voicebird.app never
+        // appeared in the picker until process restart / `c` toggle /
+        // API-key re-save.
         KeyCode::Char('r') => {
             let before_d = app.devices.len();
             let before_a = app.apps.len();
+            let before_ag = app.agents().len();
             app.refresh_inventory();
+            app.refresh_agents();
             log::info!(
-                "keys: r refresh_inventory: devices {} → {}, apps {} → {}",
+                "keys: r refresh: devices {} → {}, apps {} → {}, agents {} → {}",
                 before_d,
                 app.devices.len(),
                 before_a,
-                app.apps.len()
+                app.apps.len(),
+                before_ag,
+                app.agents().len()
             );
         }
         // 's' stops the focused section (no-op if its slot is empty).
@@ -663,6 +672,14 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 section.settings.cloud_on = !section.settings.cloud_on;
                 let on = section.settings.cloud_on;
                 app.persist_focused_settings();
+                // Re-fetch the cloud Agents list so the picker reflects
+                // what the just-toggled per-section flag is authorized
+                // to see. The idle `c` branch already does this; the
+                // focused-section branch was missing it — so creating a
+                // custom agent on voicebird.app and then pressing `c`
+                // while a section was focused left the picker stale
+                // until the next process restart.
+                app.refresh_agents();
                 app.banner = Some(if on {
                     "Cloud: ON for focused section (applies on next start)".into()
                 } else {
