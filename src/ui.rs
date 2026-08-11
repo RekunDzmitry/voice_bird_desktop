@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind};
 
-use voice_bird_cli::session::target::Target;
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
         render_model_picker(f, f.area(), app);
@@ -358,44 +357,36 @@ fn build_slot_title(
         .map(|d| d.name.clone())
         .or_else(|| app.config.input_device.clone());
     let app_pick = app.slot_app(slot_id).map(|a| a.name.clone());
-    let target = if let Some(s) = section {
-        s.target.clone()
-    } else {
-        app.pending_target_overrides
-            .get(&slot_id)
-            .cloned()
-            .unwrap_or(Target::Stdout)
-    };
+    let _ = section;
+    let _ = saved;
     let device_label = device.as_deref().unwrap_or("(no device)");
     let app_str = app_pick
         .as_deref()
         .map(|a| format!(" + {a}"))
         .unwrap_or_default();
-    let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
-    // §8.5: `Target` is a single-variant enum now, so the color
-    // is fixed. Kept as a match for clarity at the call site; §10's
-    // Agent picker will replace it.
-    let _ = target;
-    let target_color = Color::Green;
+    // Title is ` [N] {device} + {app} ` — no target suffix. The
+    // routing target (Stdout / Cloud Agent) is picked in the
+    // Agents pane, not declared in the slot title. §8.5 retired
+    // Stdout as a routing decision; today every slot implicitly
+    // routes Stdout, so the old `→ Stdout` arrow was dead text
+    // the user saw on every slot.
+    let prefix = format!(" [{n}] {device_label}{app_str} ");
     if prefix.chars().count() <= inner_w {
         vec![Line::from(Span::styled(
             prefix,
             Style::default().add_modifier(Modifier::BOLD),
         ))]
     } else {
-        let prefix_short = truncate_for_two_line(&prefix, inner_w);
-        vec![
-            Line::from(Span::styled(
-                prefix_short,
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!(" → {target} "),
-                Style::default()
-                    .fg(target_color)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ]
+        // When the picker prefix alone exceeds the column width,
+        // ellipsize the device/app name to fit one line. (The
+        // legacy two-line layout reserved a second line for the
+        // target suffix — that line is gone now, so we just
+        // truncate instead.)
+        let prefix_short = truncate_with_ellipsis(&prefix, inner_w);
+        vec![Line::from(Span::styled(
+            prefix_short,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))]
     }
 }
 
@@ -408,29 +399,6 @@ fn slot_has_picker_pick(app: &App, slot_id: crate::app::SlotId) -> bool {
     app.config.input_device.is_some()
         || app.slot_app(slot_id).is_some()
         || app.pending_target_overrides.contains_key(&slot_id)
-}
-
-/// slot they're on and which target was picked.
-fn truncate_for_two_line(prefix: &str, inner_w: usize) -> String {
-    // The target suffix is appended as a separate line in the
-    // caller, so we only need to make the prefix (everything up to
-    // " → ") fit. The arrow + target is always its own second line.
-    if let Some(idx) = prefix.rfind(" → ") {
-        let head = &prefix[..idx + 1];
-        if head.chars().count() <= inner_w {
-            return prefix.to_string();
-        }
-        if let Some(bracket_end) = head.find("] ") {
-            let start = &head[..bracket_end + 2];
-            let rest = &head[bracket_end + 2..head.len() - 1];
-            let avail = inner_w.saturating_sub(start.chars().count() + 1);
-            if avail >= 3 {
-                let trimmed = truncate_with_ellipsis(rest, avail);
-                return format!("{start}{trimmed}…");
-            }
-        }
-    }
-    prefix.to_string()
 }
 
 /// Truncate `s` to `max` columns, appending "…" if anything was
