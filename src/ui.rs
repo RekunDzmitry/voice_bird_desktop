@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind};
 
+use voice_bird_cli::session::target::Target;
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
         render_model_picker(f, f.area(), app);
@@ -342,20 +343,28 @@ fn build_slot_title(
     inner_w: usize,
 ) -> Vec<Line<'static>> {
     let n = slot.id.0;
+    let slot_id = slot.id;
 
-    if section.is_none() && saved.is_none() && !slot_has_picker_pick(app) {
+    if section.is_none() && saved.is_none() && !slot_has_picker_pick(app, slot_id) {
         return vec![Line::from(format!(" [{n}] (empty) "))];
     }
 
+    // Per-slot device + app: focused slot reads the live cursor;
+    // non-focused slots read their memo so the title stays FROZEN
+    // while the user moves the cursor elsewhere. Tab back to the
+    // slot to see the live cursor resume.
     let device = app
-        .focused_device()
+        .slot_device(slot_id)
         .map(|d| d.name.clone())
         .or_else(|| app.config.input_device.clone());
-    let app_pick = app.focused_app().map(|a| a.name.clone());
+    let app_pick = app.slot_app(slot_id).map(|a| a.name.clone());
     let target = if let Some(s) = section {
         s.target.clone()
     } else {
-        app.focused_pending_target()
+        app.pending_target_overrides
+            .get(&slot_id)
+            .cloned()
+            .unwrap_or(Target::Stdout)
     };
     let device_label = device.as_deref().unwrap_or("(no device)");
     let app_str = app_pick
@@ -395,10 +404,10 @@ fn build_slot_title(
 /// picker selection that hasn't been turned into a recording yet —
 /// i.e. a device name in config OR a non-None focused app OR a
 /// pending target override for this slot.
-fn slot_has_picker_pick(app: &App) -> bool {
+fn slot_has_picker_pick(app: &App, slot_id: crate::app::SlotId) -> bool {
     app.config.input_device.is_some()
-        || app.focused_app().is_some()
-        || app.pending_target_overrides.contains_key(&app.focused_slot)
+        || app.slot_app(slot_id).is_some()
+        || app.pending_target_overrides.contains_key(&slot_id)
 }
 
 /// slot they're on and which target was picked.

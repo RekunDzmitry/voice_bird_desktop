@@ -1502,12 +1502,45 @@ impl App {
         self.devices.get(self.selected_device_index)
     }
 
-    /// Currently focused (Apps pane) entry, if any. Returns `None` when
+    /// Per-slot Devices pane entry. For the focused slot, returns
+    /// the live cursor (same as [`focused_device`]). For a
+    /// non-focused slot, returns the device the slot's
+    /// `slot_picker_memo` points at — the one that will be
+    /// restored when the user Tabs back. This is what the slot
+    /// title renders, so non-focused slots stay frozen at their
+    /// last pick while the user moves the cursor elsewhere.
+    pub fn slot_device(&self, slot_id: SlotId) -> Option<&AudioDevice> {
+        let idx = if slot_id == self.focused_slot {
+            self.selected_device_index
+        } else {
+            self.slot_picker_memo
+                .get(&slot_id)
+                .map(|p| p.device_idx)
+                .unwrap_or(self.selected_device_index)
+        };
+        self.devices.get(idx)
+    }
+
     /// the user has cleared the selection or no apps are available.
     pub fn focused_app(&self) -> Option<&AppSession> {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
+    /// Per-slot Apps pane entry. For the focused slot, returns the
+    pub fn slot_app(&self, slot_id: SlotId) -> Option<&AppSession> {
+        let idx = if slot_id == self.focused_slot {
+            self.selected_app_index
+        } else {
+            // Non-focused slot with no memo: fall back to the
+            // global cursor (i.e. the first focus on this slot
+            // inherits whatever the cursor is currently on).
+            self.slot_picker_memo
+                .get(&slot_id)
+                .and_then(|p| p.app_idx)
+                .or(self.selected_app_index)
+        };
+        idx.and_then(|i| self.apps.get(i))
+    }
     /// Resolve the source the focused Devices + Apps pickers
     /// would resolve to on Enter. Wraps `resolve_picker_source`
     /// (the canonical picker→source match) with the error
