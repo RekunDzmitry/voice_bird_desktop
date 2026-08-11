@@ -668,27 +668,45 @@ impl App {
     }
 
     /// Cloud on/off as displayed in the Mode panel: focused section's
-    /// setting if one is running, else the global config default.
+    /// setting if one is running, else the per-source override for
+    /// the picker-resolved source (so the badge reflects what would
+    /// actually take effect if the user pressed Enter on this slot),
+    /// else the global config default. Falls through to global only
+    /// when no picker source can be resolved.
     pub fn display_cloud_on(&self) -> bool {
-        self.focused()
-            .map(|s| s.settings.cloud_on)
-            .unwrap_or(self.config.cloud_broadcast_enabled)
+        if let Some(s) = self.focused() {
+            return s.settings.cloud_on;
+        }
+        if let Some(src) = self.resolve_picker_source() {
+            return self.effective_settings_for(&src).cloud_on;
+        }
+        self.config.cloud_broadcast_enabled
     }
 
     /// Language as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// setting if running, else the per-source override for the
+    /// picker-resolved source, else the global config default.
     pub fn display_language(&self) -> String {
-        self.focused()
-            .map(|s| s.settings.language.clone())
-            .unwrap_or_else(|| self.config.language.clone())
+        if let Some(s) = self.focused() {
+            return s.settings.language.clone();
+        }
+        if let Some(src) = self.resolve_picker_source() {
+            return self.effective_settings_for(&src).language;
+        }
+        self.config.language.clone()
     }
 
     /// Model id as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// setting if running, else the per-source override for the
+    /// picker-resolved source, else the global config default.
     pub fn display_model(&self) -> String {
-        self.focused()
-            .map(|s| s.settings.model.clone())
-            .unwrap_or_else(|| self.config.default_model.clone())
+        if let Some(s) = self.focused() {
+            return s.settings.model.clone();
+        }
+        if let Some(src) = self.resolve_picker_source() {
+            return self.effective_settings_for(&src).model;
+        }
+        self.config.default_model.clone()
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -2915,6 +2933,81 @@ mod tests {
         assert_eq!(app.agents()[1].id, "summarizer");
         // The picker should now reflect both rows.
         assert_eq!(app.targets().len(), 2);
+    }
+
+    /// Pre-fix bug: when no section was focused, `display_cloud_on`,
+    /// `display_language`, and `display_model` fell through to the
+    /// GLOBAL config default, ignoring the per-source override that
+    /// `c` writes to. Switching focus between two empty slots routed
+    /// to different sources showed the same badge value even when
+    /// their per-source overrides differed — the Mode panel didn't
+    /// reflect what would actually take effect on Enter.
+    ///
+    /// Post-fix: with no section focused, the helpers resolve the
+    /// picker-resolved source and return the per-source override for
+    /// that source. The global default is only the fallback when no
+    /// picker source can be resolved (e.g. empty Devices pane).
+    #[cfg(not(windows))]
+    #[test]
+    fn display_helpers_resolve_per_source_override_when_no_section_focused() {
+        use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+        use voice_bird_cli::session::layout::SessionSource;
+        use crate::platform::AudioDevice;
+
+        let mut app = App::new();
+
+        // Global defaults — what a fresh install would have.
+        app.config.cloud_broadcast_enabled = true;
+        app.config.language = "en".into();
+        app.config.default_model = "tiny.en".into();
+
+        // Picker parks on a specific input device.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        app.apps.clear();
+        app.selected_app_index = None;
+
+        // Per-source override DISAGREES with the global default —
+        // this is the exact scenario where the bug surfaced.
+        let source = SessionSource::Microphone;
+        let key = app.source_key_for(&source);
+        app.config.source_overrides.insert(
+            key,
+            SourceSettingsOverride {
+                cloud_on: false,
+                language: "ru".into(),
+                model: "base.en".into(),
+            },
+        );
+
+        // No section focused → helpers must read the per-source
+        // override, NOT the global default.
+        assert!(
+            app.focused().is_none(),
+            "test setup must have no focused section"
+        );
+        assert!(
+            !app.display_cloud_on(),
+            "display_cloud_on must read per-source override (off) \
+             even though global default is on; this is the fix for \
+             the slot-specific cloud toggle that was leaking via the \
+             global flag"
+        );
+        assert_eq!(
+            app.display_language(),
+            "ru",
+            "display_language must read per-source override (ru) \
+             not the global default (en)"
+        );
+        assert_eq!(
+            app.display_model(),
+            "base.en",
+            "display_model must read per-source override (base.en) \
+             not the global default (tiny.en)"
+        );
     }
 
     /// `pick_target(TargetKind::Agent(id))` records the agent id
