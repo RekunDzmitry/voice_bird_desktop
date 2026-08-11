@@ -1856,6 +1856,109 @@ mod tests {
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
     }
+
+    /// Pre-fix bug: every slot title read the GLOBAL cursor via
+    /// `app.focused_device()` / `app.focused_app()`. When the user
+    /// Tab'd between slots and pressed arrow keys with slot 1
+    /// focused, slots 2 and 3's titles also updated to whatever
+    /// slot 1 was on — even though their per-slot memo was
+    /// preserved. The user saw three slots all showing the same
+    /// "EPOS PC 8 USB + Safari" combination regardless of focus,
+    /// and only switching focus back to a slot "recovered" the
+    /// per-slot device+app they had picked earlier.
+    ///
+    /// Post-fix: the slot title is FROZEN for non-focused slots
+    /// and reads from the per-slot memo. The focused slot still
+    /// reflects the live cursor. Moving the cursor with slot 1
+    /// focused must leave slots 2 and 3's titles untouched.
+    #[test]
+    fn unfocused_slot_titles_are_frozen_when_focused_slot_cursor_moves() {
+        let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
+
+        // Seed inventory.
+        app.devices = vec![
+            input("MacBook Pro Microphone"),
+            input("USB Headset"),
+        ];
+        app.apps = vec![fake_app("us.zoom.xos", "Zoom")];
+
+        // Slot 2 (id=2) memoizes device 1 (USB Headset) + no app.
+        // Slot 3 (id=3) memoizes device 0 (MacBook Pro Mic) + app 0 (Zoom).
+        // We push these into `slot_picker_memo` directly (the
+        // public API is focus-driven; the test bypasses to keep
+        // the test focused on the render-path contract).
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(2),
+            crate::app::PickerSelection {
+                device_idx: 1,
+                app_idx: None,
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(3),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+
+        // Focus slot 1, set the LIVE cursor to a third
+        // device+app combo that's different from both memos.
+        app.focused_slot = crate::app::SlotId(1);
+        app.selected_device_index = 0;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+
+        // `slot_has_picker_pick` reads global state, so seed it
+        // enough to make the title path render (and exercise the
+        // per-slot device/app lookup the test is targeting). The
+        // real test fixture is the per-slot memo above.
+        app.config.input_device = Some("MacBook Pro Microphone".into());
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            voice_bird_cli::session::target::Target::Stdout,
+        );
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(3),
+            voice_bird_cli::session::target::Target::Stdout,
+        );
+
+        let out = render_to_string(&app, 180, 40);
+        let out = render_to_string(&app, 180, 40);
+
+        // Slot 1 title shows the live cursor (MacBook Pro Mic).
+        assert!(
+            out.contains("MacBook Pro Microphone"),
+            "focused slot 1 must show the live cursor device; rendered:\n{out}"
+        );
+
+        // Slot 2 title must be FROZEN at its memoized device
+        // (USB Headset) — must NOT reflect slot 1's cursor.
+        assert!(
+            out.contains("USB Headset"),
+            "unfocused slot 2 title must show its memoized device (USB Headset), \
+             not the live cursor (MacBook Pro Microphone); rendered:\n{out}"
+        );
+        // Slot 2's memoized app is None — must NOT show + Zoom.
+        assert!(
+            !out.contains("[2] MacBook Pro Microphone"),
+            "slot 2 title must NOT adopt slot 1's device; rendered:\n{out}"
+        );
+
+        // Slot 3 title must show its memoized combo (MacBook Pro Mic + Zoom),
+        // NOT slot 1's live state (no app).
+        // The exact rendering includes "[3] <device> + <app>"; assert on
+        // the substring that uniquely identifies slot 3's memoized pick.
+        assert!(
+            out.contains("MacBook Pro Microphone") && out.contains("Zoom"),
+            "unfocused slot 3 title must show its memoized device + app \
+             (MacBook Pro Microphone + Zoom); rendered:\n{out}"
+        );
+    }
     /// Agents pane renders as the third picker column. The
     /// header is " Agents " (focused variant carries the
     /// action hint). The two fixed rows are Stdout and
