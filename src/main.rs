@@ -716,7 +716,14 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 // global is rewritten to match (so the panel
                 // and the next-start default see the new
                 // state).
-                let on = !app.config.cloud_broadcast_enabled;
+                //
+                // Seed from the EFFECTIVE displayed state
+                // (`display_cloud_on`), not the bare global
+                // flag: a per-source override can make the
+                // panel show OFF while global is ON (or vice
+                // versa), and the user's first keypress must
+                // flip whatever the panel actually shows.
+                let on = !app.display_cloud_on();
                 let ov = voice_bird_cli::config::SourceSettingsOverride {
                     cloud_on: on,
                     // Preserve the other dimensions of the
@@ -739,9 +746,6 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     app.config.upsert_source_override(k, ov);
                 }
                 app.config.cloud_broadcast_enabled = on;
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (cloud toggle): {e}");
-                }
                 // Re-fetch the cloud Agents list whenever cloud
                 // toggles. `refresh_agents()` no-ops (and clears
                 // `self.agents`) when the gate fails (cloud off,
@@ -1551,25 +1555,21 @@ mod pr48_review_regression_tests {
         );
     }
 
-    /// Regression guard (review item 8; was RED, fixed in 25ae726).
+    /// Regression guard (review item 8).
     ///
-    /// The idle Mode panel displays the GLOBAL flag
-    /// (`cloud_broadcast_enabled`), and the idle `c` toggle used to
-    /// seed its flip from the per-source OVERRIDE's current value —
-    /// when the two disagreed (stale override), the first press was
-    /// a visible no-op. The toggle now seeds from the displayed
-    /// (global) value and writes it to both the global flag and the
-    /// per-source override, so one press always flips the
-    /// advertised state.
+    /// The idle Mode panel now reads the per-source override
+    /// (post the display-helper fix). The idle `c` toggle must
+    /// flip whatever the panel actually shows — not the bare
+    /// global flag and not the override's raw value in
+    /// isolation. One press must always invert the displayed
+    /// state, otherwise the first keypress is a visible no-op.
     #[test]
     fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
 
-        // Panel says ON (global flag)…
-        app.config.cloud_broadcast_enabled = true;
-        // …but a stale per-source override says OFF for the source
-        // the picker currently resolves to.
+        // Panel reads the per-source override (post
+        // display-helper fix). The user sees "Cloud: OFF"…
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
             kind: AudioSessionKind::Input,
@@ -1584,25 +1584,34 @@ mod pr48_review_regression_tests {
                 model: "base.en".into(),
             },
         );
+        // …while the global flag is still ON (stale — a prior
+        // session left the override OFF). The toggle must flip
+        // the displayed (OFF) state, NOT seed from the global
+        // (ON) flag — otherwise one press would land back on
+        // OFF and the user would see no change.
+        app.config.cloud_broadcast_enabled = true;
 
-        // The user sees "Cloud: ON" and presses `c` to turn it OFF.
+        // Sanity: the panel is showing OFF right now.
+        assert!(
+            !app.display_cloud_on(),
+            "setup must show per-source OFF (panel) with global ON underneath"
+        );
+
+        // The user presses `c` to flip OFF → ON.
         handle_normal_mode(&mut app, KeyCode::Char('c'));
 
         assert!(
-            !app.config.cloud_broadcast_enabled,
-            "the toggle must flip the DISPLAYED state: panel showed ON, so \
-             one press of `c` must land on OFF — seeding the flip from the \
-             stale override (OFF→ON) makes the first press a visible no-op"
+            app.display_cloud_on(),
+            "one press of `c` must flip the DISPLAYED state from OFF to ON"
         );
         assert!(
-            !app
-                .config
+            app.config
                 .source_overrides
                 .get(&key)
                 .expect("override must survive the toggle")
                 .cloud_on,
             "the per-source override must agree with the newly displayed \
-             state (OFF) after the toggle"
+             state (ON) after the toggle"
         );
     }
 }

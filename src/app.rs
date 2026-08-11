@@ -827,16 +827,24 @@ impl App {
 
     /// Re-fetch the cloud Agents list from voicebird.app and
     /// store it on `self.agents`. No-op when:
-    ///   - `config.cloud_broadcast_enabled` is false, OR
-    ///   - the user has no API key set, OR
-    ///   - the server URL is empty / unparseable.
+    ///   - the effective cloud state for the focused slot is OFF
+    ///     (per-source override > global default; falls back to
+    ///     global only when no picker source can be resolved),
+    ///   - OR the user has no API key set,
+    ///   - OR the server URL is empty / unparseable.
     /// On HTTP failure (4xx / 5xx / network error), `self.agents`
     /// is cleared so the picker goes empty rather than showing
     /// stale rows, AND a banner is set explaining the failure —
     /// picker emptiness alone is too quiet and looks identical
     /// to "fetch hasn't run yet".
     pub fn refresh_agents(&mut self) {
-        if !self.config.cloud_broadcast_enabled
+        // Gate on the effective cloud state, not the bare global
+        // flag — a per-source override can flip the displayed
+        // state to ON while `cloud_broadcast_enabled` stays OFF
+        // (e.g. the user enabled Cloud for one mic only). Pre-fix
+        // this gate ignored the override and the picker stayed
+        // empty until the user also flipped the global default.
+        if !self.display_cloud_on()
             || self.config.voicebird_api_key.is_empty()
             || self.config.voicebird_server_url.is_empty()
         {
