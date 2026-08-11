@@ -1968,6 +1968,83 @@ mod tests {
              (MacBook Pro Microphone + Zoom); rendered:\n{out}"
         );
     }
+
+    /// Pre-fix bug: the slot title template is
+    /// ` [N] {device} + {app} → Stdout `. Every slot shows
+    /// `→ Stdout` even though §8.5 retired Stdout as a routing
+    /// target — it's no longer in `Target::cloud`/`Target::agent`
+    /// decisions. The arrow + Stdout suffix is dead text the user
+    /// reads on every slot.
+    ///
+    /// Post-fix: title is ` [N] {device} + {app} ` with no
+    /// target suffix. The cloud Agent is selected elsewhere (the
+    /// Agents picker), not declared in the slot title.
+    #[test]
+    fn slot_title_does_not_include_stdout_suffix() {
+        let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
+
+        app.devices = vec![crate::platform::AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: voice_bird_cli::config::AudioSessionKind::Input,
+        }];
+        app.apps = vec![crate::platform::AppSession {
+            id: "us.zoom.xos".into(),
+            name: "Zoom".into(),
+            process_id: 0,
+        }];
+
+        // Seed each slot's memo so all three titles render the
+        // full `<device> + <app>` form (otherwise some slots
+        // would short-circuit to "(empty)" and never exercise
+        // the title template).
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(2),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(3),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.config.input_device = Some("MacBook Pro Microphone".into());
+
+        let out = render_to_string(&app, 180, 40);
+
+        // Assert the device+app is present so we know the title
+        // template fired (otherwise the absence of "Stdout" is
+        // meaningless — could just be that the slot stayed
+        // empty).
+        assert!(
+            out.contains("MacBook Pro Microphone") && out.contains("Zoom"),
+            "fixture must render the device+app title; got:\n{out}"
+        );
+
+        // The slot title must NOT contain the trailing
+        // `→ Stdout` arrow + label. Assert on each slot's full
+        // title shape so a regression in the template is
+        // pinned to the offending slot.
+        assert!(
+            !out.contains("[1] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 1 title must drop the Stdout suffix; got:\n{out}"
+        );
+        assert!(
+            !out.contains("[2] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 2 title must drop the Stdout suffix; got:\n{out}"
+        );
+        assert!(
+            !out.contains("[3] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 3 title must drop the Stdout suffix; got:\n{out}"
+        );
+    }
     /// Agents pane renders as the third picker column. The
     /// header is " Agents " (focused variant carries the
     /// action hint). The two fixed rows are Stdout and
