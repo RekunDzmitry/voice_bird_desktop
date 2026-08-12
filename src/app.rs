@@ -809,29 +809,36 @@ impl App {
     }
 
     /// Language as displayed in the Mode panel: focused section's
-    /// setting if running, else the per-source override for the
-    /// picker-resolved source, else the global config default.
+    /// Language as displayed in the Mode panel: focused
+    /// section's setting if running, else the focused slot's
+    /// customized `slot.config.language`, else the global
+    /// `default_slot_config.language`.
     pub fn display_language(&self) -> String {
         if let Some(s) = self.focused() {
             return s.settings.language.clone();
         }
-        if let Some(src) = self.resolve_picker_source() {
-            return self.effective_settings_for(&src).language;
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(lang) = &slot.config.language {
+                return lang.clone();
+            }
         }
-        self.config.language.clone()
+        self.default_slot_config.language.clone()
     }
 
-    /// Model id as displayed in the Mode panel: focused section's
-    /// setting if running, else the per-source override for the
-    /// picker-resolved source, else the global config default.
+    /// Model id as displayed in the Mode panel: focused
+    /// section's setting if running, else the focused slot's
+    /// customized `slot.config.model`, else the global
+    /// `default_slot_config.model`.
     pub fn display_model(&self) -> String {
         if let Some(s) = self.focused() {
             return s.settings.model.clone();
         }
-        if let Some(src) = self.resolve_picker_source() {
-            return self.effective_settings_for(&src).model;
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(m) = &slot.config.model {
+                return m.clone();
+            }
         }
-        self.config.default_model.clone()
+        self.default_slot_config.model.clone()
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -1025,7 +1032,13 @@ impl App {
     /// key doesn't exist on cloud-only Windows.
     #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
-        self.path_buf = Some(self.config.session_dir.clone());
+        // Pre-fill with the focused slot's customized path,
+        // or the default if the slot has no customization.
+        let initial = self
+            .slot_by_id(self.focused_slot)
+            .and_then(|s| s.config.path.clone())
+            .unwrap_or_else(|| self.default_slot_config.path.clone());
+        self.path_buf = Some(initial);
         self.mode = AppMode::PathModal;
     }
 
@@ -2898,23 +2911,22 @@ impl App {
         }
 
         if done {
-            // If a section is focused, treat the picked model as a
-            // per-source override for that section (applies to its
-            // next start). Otherwise — idle path — update the global
-            // default so all unconfigured sources inherit it.
+            // If a section is focused, treat the picked model
+            // as the section's customized model (applies on
+            // next start). Otherwise — idle path — update
+            // the focused slot's `slot.config.model` so
+            // other slots are untouched.
             if self.focused().is_some() {
                 if let Some(section) = self.focused_mut() {
                     section.settings.model = model_id;
                 }
                 self.persist_focused_settings();
-            } else {
-                self.config.default_model = model_id;
-                if let Err(e) = self.config.save() {
-                    log::error!("config save: {e}");
-                    let mut g = progress_arc.lock();
-                    g.error = Some(format!("config save: {e}"));
-                    return;
-                }
+            } else if let Some(slot) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.id == self.focused_slot)
+            {
+                slot.config.model = Some(model_id);
             }
             self.mode = AppMode::Normal;
             self.picker = None;
@@ -3317,18 +3329,16 @@ mod tests {
     /// that source. The global default is only the fallback when no
     /// picker source can be resolved (e.g. empty Devices pane).
     #[cfg(not(windows))]
-    #[test]
-    fn display_helpers_resolve_per_source_override_when_no_section_focused() {
-        use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
-        use voice_bird_cli::session::layout::SessionSource;
+    fn display_helpers_resolve_per_slot_customization_when_no_section_focused() {
+        use voice_bird_cli::config::AudioSessionKind;
         use crate::platform::AudioDevice;
 
         let mut app = App::new();
 
         // Global defaults — what a fresh install would have.
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "en".into();
-        app.config.default_model = "tiny.en".into();
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "en".into();
+        app.default_slot_config.model = "tiny.en".into();
 
         // Picker parks on a specific input device.
         app.devices = vec![AudioDevice {
@@ -3339,43 +3349,42 @@ mod tests {
         app.apps.clear();
         app.selected_app_index = None;
 
-        // Per-source override DISAGREES with the global default —
-        // this is the exact scenario where the bug surfaced.
-        let source = SessionSource::Microphone;
-        let key = app.source_key_for(&source);
-        app.config.source_overrides.insert(
-            key,
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "ru".into(),
-                model: "base.en".into(),
-            },
-        );
+        // The focused slot's customization DISAGREES with the
+        // global default — this is the exact scenario where
+        // the bug surfaced.
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(false);
+        slot.config.language = Some("ru".into());
+        slot.config.model = Some("base.en".into());
 
-        // No section focused → helpers must read the per-source
-        // override, NOT the global default.
+        // No section focused → helpers must read the
+        // focused slot's customization, NOT the default.
         assert!(
             app.focused().is_none(),
             "test setup must have no focused section"
         );
         assert!(
             !app.display_cloud_on(),
-            "display_cloud_on must read per-source override (off) \
-             even though global default is on; this is the fix for \
+            "display_cloud_on must read the focused slot's customization \
+             (off) even though the default is on; this is the fix for \
              the slot-specific cloud toggle that was leaking via the \
              global flag"
         );
         assert_eq!(
             app.display_language(),
             "ru",
-            "display_language must read per-source override (ru) \
-             not the global default (en)"
+            "display_language must read the focused slot's customization \
+             (ru) not the default (en)"
         );
         assert_eq!(
             app.display_model(),
             "base.en",
-            "display_model must read per-source override (base.en) \
-             not the global default (tiny.en)"
+            "display_model must read the focused slot's customization \
+             (base.en) not the default (tiny.en)"
         );
     }
 

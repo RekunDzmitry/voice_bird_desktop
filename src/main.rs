@@ -726,10 +726,11 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 }
             }
         }
-        // Cycle the cloud language. When idle, mutates the global config
-        // (and is hidden when cloud is off). When focused-section
-        // recording, cycles that section's language and persists the
-        // override.
+        // Cycle the cloud language. When idle, mutates the
+        // focused slot's `slot.config.language` (and is
+        // hidden when cloud is off). When focused-section
+        // recording, cycles that section's language and
+        // persists the override.
         KeyCode::Char('l') => {
             let langs = crate::app::CLOUD_LANGUAGES;
             if let Some(section) = app.focused_mut() {
@@ -743,15 +744,24 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 let next = (i + 1) % langs.len();
                 section.settings.language = langs[next].into();
                 app.persist_focused_settings();
-            } else if app.config.cloud_broadcast_enabled {
-                let i = langs
-                    .iter()
-                    .position(|&l| l == app.config.language)
-                    .unwrap_or(0);
-                let next = (i + 1) % langs.len();
-                app.config.language = langs[next].into();
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (lang cycle): {e}");
+            } else if app.display_cloud_on() {
+                // Idle: write to the focused slot's
+                // `slot.config.language`. Other slots are
+                // untouched. The slot is the single source
+                // of truth for per-slot language.
+                if let Some(slot) = app
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.id == app.focused_slot)
+                {
+                    let current = slot
+                        .config
+                        .language
+                        .clone()
+                        .unwrap_or_else(|| app.default_slot_config.language.clone());
+                    let i = langs.iter().position(|&l| l == current).unwrap_or(0);
+                    let next = (i + 1) % langs.len();
+                    slot.config.language = Some(langs[next].into());
                 }
             }
         }
@@ -786,16 +796,19 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
         }
         KeyCode::Enter => {
             if let Some(buf) = app.path_buf.take() {
-                app.config.session_dir = buf.trim().to_string();
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (path modal): {e}");
-                    app.banner = Some(format!("Save failed: {e}"));
-                } else {
-                    app.banner = Some(format!(
-                        "Output path → {}",
-                        app.config.session_dir_expanded()
-                    ));
+                let trimmed = buf.trim().to_string();
+                // Per-slot path: write to the focused slot's
+                // `slot.config.path`. Other slots are
+                // untouched. The slot is the single source
+                // of truth for per-slot output path.
+                if let Some(slot) = app
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.id == app.focused_slot)
+                {
+                    slot.config.path = Some(trimmed.clone());
                 }
+                app.banner = Some(format!("Output path → {trimmed}"));
             }
             app.mode = AppMode::Normal;
         }
@@ -1367,6 +1380,38 @@ mod cloud_toggle_dispatch_tests {
         assert_eq!(app.focused_slot, crate::app::SlotId(1));
         assert!(!app.display_cloud_on(), "slot 1 cloud OFF (customized)");
     }
+
+    /// Post-fix: idle `l` cycles the cloud language on the
+    /// focused slot only. Slot 2/3 are untouched. Tab back to
+    /// slot 1, the customized language is still in effect.
+    #[cfg(not(windows))]
+    #[test]
+    fn idle_l_toggle_is_per_slot_not_global() {
+        let mut app = App::new();
+        app.add_slot();
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "en".into();
+        app.config.voicebird_api_key = "sk-test".into();
+        app.focused_slot = crate::app::SlotId(1);
+
+        handle_normal_mode(&mut app, KeyCode::Char('l'));
+        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
+        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
+        assert!(
+            slot1.config.language.is_some(),
+            "slot 1 language must be customized; got {:?}",
+            slot1.config.language
+        );
+        assert_eq!(
+            slot2.config.language, None,
+            "slot 2 language must remain default (None)"
+        );
+        // Default must NOT change.
+        assert_eq!(
+            app.default_slot_config.language, "en",
+            "default language must stay unchanged"
+        );
+    }
 }
 
 /// `handle_api_key_modal` must clear the in-progress paste buffer when
@@ -1486,7 +1531,6 @@ mod api_key_dispatcher_uppercase_k_tests {
     #[allow(non_snake_case)]
     fn lowercase_k_is_NOT_an_api_key_shortcut_only_uppercase_K_is() {
         let mut app = App::new();
-        app.mode = AppMode::Normal;
         let evt = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
         handle_normal_mode(&mut app, evt.code);
         // We do not assert a specific behaviour for lowercase 'k'

@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn mode_panel_shows_model_name() {
         let mut app = App::new();
-        app.config.default_model = "tiny.en".into();
+        app.default_slot_config.model = "tiny.en".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
