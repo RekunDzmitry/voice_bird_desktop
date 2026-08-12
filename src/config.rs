@@ -181,55 +181,50 @@ pub struct AppConfig {
 /// non-default `default_slot_config`, the new shape wins
 /// (the user has upgraded explicitly).
 ///
-/// `LegacyAppConfig` mirrors `AppConfig` field-for-field but
-/// keeps the four legacy top-level fields. We don't
-/// `#[serde(flatten)]` an `AppConfig` because that would
-/// recurse through our custom `Deserialize` — instead the
-/// `From` impl builds the final `AppConfig` by hand.
+/// `LegacyAppConfig` mirrors `AppConfig` field-for-field. Every
+/// modern field is `Option<T>` so we can distinguish
+/// "absent from disk" (None) from "present and set to the
+/// zero/empty value" (Some(...)). The deserializer's own
+/// `#[serde(default)]` would otherwise fall through to
+/// Rust's zero/empty defaults for missing fields, masking
+/// the absence. The `From` impl below is then able to start
+/// from `AppConfig::default()` and override only the
+/// fields the user actually set, preserving the on-disk
+/// semantic defaults (e.g. `hop_ms = 750`,
+/// `min_window_ms = 1000`, `engine_prefer = "auto"`,
+/// `audio_default_source = "microphone"`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct LegacyAppConfig {
-    // Legacy top-level fields. Each is `Option` because an
-    // old config that uses any of them may have written to
-    // disk with the others absent (the deserializer tolerates
-    // missing fields and we need a presence signal, not the
-    // `Default` value).
+    // Legacy top-level fields. Each is `Option` so we can
+    // detect presence in the file — the migration only
+    // applies when the user actually wrote the legacy
+    // field, not when it's a deserializer default.
     cloud_broadcast_enabled: Option<bool>,
-    #[serde(default)]
     language: Option<String>,
-    #[serde(default)]
     default_model: Option<String>,
-    #[serde(default)]
     session_dir: Option<String>,
-    // Modern fields. Mirror AppConfig field-for-field.
-    // All `Option` or defaulted so a missing field
-    // gracefully falls through to `Default`.
-    hop_ms: u32,
-    min_window_ms: u32,
-    #[serde(rename = "engine_prefer", default)]
-    engine_prefer: String,
-    #[serde(default)]
-    audio_default_source: String,
+    // Modern fields — all Option to carry presence
+    // information. The `From` impl merges with
+    // `AppConfig::default()` so semantic defaults are
+    // preserved.
+    hop_ms: Option<u32>,
+    min_window_ms: Option<u32>,
+    #[serde(rename = "engine_prefer")]
+    engine_prefer: Option<String>,
+    audio_default_source: Option<String>,
     input_device: Option<String>,
     input_device_kind: Option<AudioSessionKind>,
     last_app_id: Option<String>,
     refinement_model: Option<String>,
-    #[serde(default = "default_refinement_window_ms")]
-    refinement_window_ms: u32,
-    #[serde(default = "default_refinement_beam_size")]
-    refinement_beam_size: u8,
-    #[serde(default)]
-    voicebird_api_key: String,
-    #[serde(default = "default_voicebird_server_url")]
-    voicebird_server_url: String,
-    #[serde(default)]
-    character_overrides: BTreeMap<String, String>,
-    #[serde(default)]
+    refinement_window_ms: Option<u32>,
+    refinement_beam_size: Option<u8>,
+    voicebird_api_key: Option<String>,
+    voicebird_server_url: Option<String>,
+    character_overrides: Option<BTreeMap<String, String>>,
     last_character_id: Option<String>,
-    #[serde(default)]
-    dont_ask_character_upload: bool,
-    #[serde(default)]
-    default_slot_config: DefaultSlotConfig,
+    dont_ask_character_upload: Option<bool>,
+    default_slot_config: Option<DefaultSlotConfig>,
 }
 
 impl From<LegacyAppConfig> for AppConfig {
@@ -256,49 +251,65 @@ impl From<LegacyAppConfig> for AppConfig {
             dont_ask_character_upload,
             default_slot_config,
         } = raw;
-        // Only migrate when the user hasn't already
-        // customized the new shape. A user who explicitly
-        // set `default_slot_config.cloud_on = true` in the
-        // new shape has an opinion — don't overwrite it
-        // with the old top-level flag.
+
+        // Start from the canonical defaults. The on-disk
+        // semantic defaults (750/1000/auto/microphone/etc.)
+        // are encoded in `AppConfig::default()` — the
+        // deserialization shim is thin, it doesn't
+        // re-define them.
+        let mut cfg = AppConfig::default();
+
+        // Override only the fields the file actually
+        // provided. Every modern field is `Option<T>`
+        // precisely so we can tell "absent" from
+        // "explicitly set".
+        if let Some(v) = hop_ms { cfg.hop_ms = v; }
+        if let Some(v) = min_window_ms { cfg.min_window_ms = v; }
+        if let Some(v) = engine_prefer { cfg.engine_prefer = v; }
+        if let Some(v) = audio_default_source { cfg.audio_default_source = v; }
+        if let Some(v) = input_device { cfg.input_device = Some(v); }
+        if let Some(v) = input_device_kind { cfg.input_device_kind = Some(v); }
+        if let Some(v) = last_app_id { cfg.last_app_id = Some(v); }
+        if let Some(v) = refinement_model { cfg.refinement_model = Some(v); }
+        if let Some(v) = refinement_window_ms { cfg.refinement_window_ms = v; }
+        if let Some(v) = refinement_beam_size { cfg.refinement_beam_size = v; }
+        if let Some(v) = voicebird_api_key { cfg.voicebird_api_key = v; }
+        if let Some(v) = voicebird_server_url { cfg.voicebird_server_url = v; }
+        if let Some(v) = character_overrides { cfg.character_overrides = v; }
+        if let Some(v) = last_character_id { cfg.last_character_id = Some(v); }
+        if let Some(v) = dont_ask_character_upload { cfg.dont_ask_character_upload = v; }
+
+        // Legacy migration: if the new `default_slot_config`
+        // is all-defaults AND any of the four legacy
+        // top-level fields is present, use the legacy
+        // values to seed the new shape. If the user
+        // already set `default_slot_config` explicitly,
+        // the modern shape wins (they upgraded; their
+        // choices are the source of truth).
         let new_is_default = default_slot_config
-            == DefaultSlotConfig::default();
+            .as_ref()
+            .map(|d| d == &DefaultSlotConfig::default())
+            .unwrap_or(true);
         let legacy_has_value = cloud_broadcast_enabled.is_some()
             || language.is_some()
             || default_model.is_some()
             || session_dir.is_some();
-        let default_slot_config = if new_is_default && legacy_has_value {
-            DefaultSlotConfig {
+        cfg.default_slot_config = match (default_slot_config, new_is_default, legacy_has_value) {
+            (Some(d), _, _) => d,
+            (None, _, true) => DefaultSlotConfig {
                 cloud_on: cloud_broadcast_enabled
-                    .unwrap_or(default_slot_config.cloud_on),
+                    .unwrap_or(cfg.default_slot_config.cloud_on),
                 language: language
-                    .unwrap_or_else(|| default_slot_config.language.clone()),
+                    .unwrap_or_else(|| cfg.default_slot_config.language.clone()),
                 model: default_model
-                    .unwrap_or_else(|| default_slot_config.model.clone()),
+                    .unwrap_or_else(|| cfg.default_slot_config.model.clone()),
                 path: session_dir
-                    .unwrap_or_else(|| default_slot_config.path.clone()),
-            }
-        } else {
-            default_slot_config
+                    .unwrap_or_else(|| cfg.default_slot_config.path.clone()),
+            },
+            (None, _, false) => cfg.default_slot_config,
         };
-        AppConfig {
-            hop_ms,
-            min_window_ms,
-            engine_prefer,
-            audio_default_source,
-            input_device,
-            input_device_kind,
-            last_app_id,
-            refinement_model,
-            refinement_window_ms,
-            refinement_beam_size,
-            voicebird_api_key,
-            voicebird_server_url,
-            character_overrides,
-            last_character_id,
-            dont_ask_character_upload,
-            default_slot_config,
-        }
+
+        cfg
     }
 }
 
