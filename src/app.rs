@@ -1021,19 +1021,16 @@ impl App {
 
         // Look in the focused slot's customized output path,
         // or the default slot's path if no customization.
-        let base_dir = self
-            .slot_by_id(self.focused_slot)
-            .and_then(|s| s.config.path.clone())
-            .unwrap_or_else(|| self.default_slot_config.path.clone());
-        let base_dir = if let Some(rest) = base_dir.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(rest).to_string_lossy().into_owned()
-            } else {
-                base_dir
-            }
-        } else {
-            base_dir
-        };
+        // `expand_tilde` resolves `~/` to the home dir so
+        // the default `~/voice-bird/sessions` lands at the
+        // user's actual home directory rather than a literal
+        // `./~/voice-bird/...` relative path.
+        let base_dir = voice_bird_cli::config::AppConfig::expand_tilde(
+            &self
+                .slot_by_id(self.focused_slot)
+                .and_then(|s| s.config.path.clone())
+                .unwrap_or_else(|| self.default_slot_config.path.clone()),
+        );
         let base = std::path::Path::new(&base_dir);
 
         // Find the most recent session that has a transcript.json.
@@ -1918,10 +1915,12 @@ impl App {
         // segments flow into the same consumer task and the same
         // Per-slot path: the focused slot's customized
         // output path, or the default if no customization.
-        let path_str = self
-            .slot_by_id(slot)
-            .and_then(|s| s.config.path.clone())
-            .unwrap_or_else(|| self.default_slot_config.path.clone());
+        let path_str = voice_bird_cli::config::AppConfig::expand_tilde(
+            &self
+                .slot_by_id(slot)
+                .and_then(|s| s.config.path.clone())
+                .unwrap_or_else(|| self.default_slot_config.path.clone()),
+        );
         let session_dir: Option<std::path::PathBuf> =
             if matches!(target, Target::Stdout) {
                 let dir = voice_bird_cli::session::layout::session_dir(

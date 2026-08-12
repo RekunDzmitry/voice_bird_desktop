@@ -89,7 +89,9 @@ impl Default for DefaultSlotConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// On-disk app config. Holds credentials and engine tuning.
+/// Per-slot settings live in [`DefaultSlotConfig`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppConfig {
     pub hop_ms: u32,
     pub min_window_ms: u32,
@@ -161,6 +163,150 @@ pub struct AppConfig {
     /// "default" means.
     #[serde(default)]
     pub default_slot_config: DefaultSlotConfig,
+}
+/// Pre-0.5.x on-disk shape: a `cloud_broadcast_enabled` /
+/// `language` / `default_model` / `session_dir` quartet of
+/// top-level fields. The 0.5.x per-slot refactor moved
+/// these into `default_slot_config`. A user with an old
+/// config whose top-level fields are non-default must have
+/// those values migrated into the new `default_slot_config`
+/// on first load — otherwise their settings silently fall
+/// back to the defaults (cloud off, English, distil-small,
+/// `~/voice-bird/sessions`).
+///
+/// The migration: if the file's `default_slot_config` is
+/// all-defaults AND any of the four legacy fields is
+/// non-default in the file, use the legacy values to seed
+/// `default_slot_config`. If the file already has a
+/// non-default `default_slot_config`, the new shape wins
+/// (the user has upgraded explicitly).
+///
+/// `LegacyAppConfig` mirrors `AppConfig` field-for-field but
+/// keeps the four legacy top-level fields. We don't
+/// `#[serde(flatten)]` an `AppConfig` because that would
+/// recurse through our custom `Deserialize` — instead the
+/// `From` impl builds the final `AppConfig` by hand.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct LegacyAppConfig {
+    // Legacy top-level fields. Each is `Option` because an
+    // old config that uses any of them may have written to
+    // disk with the others absent (the deserializer tolerates
+    // missing fields and we need a presence signal, not the
+    // `Default` value).
+    cloud_broadcast_enabled: Option<bool>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    session_dir: Option<String>,
+    // Modern fields. Mirror AppConfig field-for-field.
+    // All `Option` or defaulted so a missing field
+    // gracefully falls through to `Default`.
+    hop_ms: u32,
+    min_window_ms: u32,
+    #[serde(rename = "engine_prefer", default)]
+    engine_prefer: String,
+    #[serde(default)]
+    audio_default_source: String,
+    input_device: Option<String>,
+    input_device_kind: Option<AudioSessionKind>,
+    last_app_id: Option<String>,
+    refinement_model: Option<String>,
+    #[serde(default = "default_refinement_window_ms")]
+    refinement_window_ms: u32,
+    #[serde(default = "default_refinement_beam_size")]
+    refinement_beam_size: u8,
+    #[serde(default)]
+    voicebird_api_key: String,
+    #[serde(default = "default_voicebird_server_url")]
+    voicebird_server_url: String,
+    #[serde(default)]
+    character_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    last_character_id: Option<String>,
+    #[serde(default)]
+    dont_ask_character_upload: bool,
+    #[serde(default)]
+    default_slot_config: DefaultSlotConfig,
+}
+
+impl From<LegacyAppConfig> for AppConfig {
+    fn from(raw: LegacyAppConfig) -> Self {
+        let LegacyAppConfig {
+            cloud_broadcast_enabled,
+            language,
+            default_model,
+            session_dir,
+            hop_ms,
+            min_window_ms,
+            engine_prefer,
+            audio_default_source,
+            input_device,
+            input_device_kind,
+            last_app_id,
+            refinement_model,
+            refinement_window_ms,
+            refinement_beam_size,
+            voicebird_api_key,
+            voicebird_server_url,
+            character_overrides,
+            last_character_id,
+            dont_ask_character_upload,
+            default_slot_config,
+        } = raw;
+        // Only migrate when the user hasn't already
+        // customized the new shape. A user who explicitly
+        // set `default_slot_config.cloud_on = true` in the
+        // new shape has an opinion — don't overwrite it
+        // with the old top-level flag.
+        let new_is_default = default_slot_config
+            == DefaultSlotConfig::default();
+        let legacy_has_value = cloud_broadcast_enabled.is_some()
+            || language.is_some()
+            || default_model.is_some()
+            || session_dir.is_some();
+        let default_slot_config = if new_is_default && legacy_has_value {
+            DefaultSlotConfig {
+                cloud_on: cloud_broadcast_enabled
+                    .unwrap_or(default_slot_config.cloud_on),
+                language: language
+                    .unwrap_or_else(|| default_slot_config.language.clone()),
+                model: default_model
+                    .unwrap_or_else(|| default_slot_config.model.clone()),
+                path: session_dir
+                    .unwrap_or_else(|| default_slot_config.path.clone()),
+            }
+        } else {
+            default_slot_config
+        };
+        AppConfig {
+            hop_ms,
+            min_window_ms,
+            engine_prefer,
+            audio_default_source,
+            input_device,
+            input_device_kind,
+            last_app_id,
+            refinement_model,
+            refinement_window_ms,
+            refinement_beam_size,
+            voicebird_api_key,
+            voicebird_server_url,
+            character_overrides,
+            last_character_id,
+            dont_ask_character_upload,
+            default_slot_config,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AppConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = LegacyAppConfig::deserialize(d)?;
+        Ok(raw.into())
+    }
 }
 
 /// Ids that the segment dispatcher in the consumer task
@@ -338,6 +484,82 @@ refinement_beam_size = 5
         assert!(!loaded.default_slot_config.cloud_on);
     }
 
+    /// Pre-0.5.x user configs with the legacy top-level
+    /// `cloud_broadcast_enabled = true`,
+    /// `language = "ru"`, `default_model = "large-v3"`,
+    /// `session_dir = "~/sessions/custom"` MUST migrate
+    /// those values into `default_slot_config`. Pre-migration
+    /// the deserializer silently fell back to the
+    /// hard-coded defaults (cloud off, en, distil-small,
+    /// `~/voice-bird/sessions`) and the user lost their
+    /// settings without warning.
+    #[test]
+    fn legacy_top_level_settings_migrate_into_default_slot_config() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+cloud_broadcast_enabled = true
+language = "ru"
+default_model = "large-v3"
+session_dir = "~/sessions/custom"
+hop_ms = 750
+min_window_ms = 1000
+engine_prefer = "auto"
+audio_default_source = "microphone"
+refinement_window_ms = 20000
+refinement_beam_size = 5
+"#,
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(loaded.default_slot_config.cloud_on);
+        assert_eq!(loaded.default_slot_config.language, "ru");
+        assert_eq!(loaded.default_slot_config.model, "large-v3");
+        assert_eq!(loaded.default_slot_config.path, "~/sessions/custom");
+    }
+
+    /// If the user has BOTH legacy top-level fields AND a
+    /// non-default `default_slot_config`, the modern shape
+    /// wins. The legacy fields are stale (the user upgraded
+    /// explicitly) and we don't want to overwrite their
+    /// choices.
+    #[test]
+    fn explicit_default_slot_config_wins_over_legacy_top_level() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+cloud_broadcast_enabled = true
+language = "ru"
+default_model = "large-v3"
+session_dir = "~/sessions/custom"
+hop_ms = 750
+min_window_ms = 1000
+engine_prefer = "auto"
+audio_default_source = "microphone"
+refinement_window_ms = 20000
+refinement_beam_size = 5
+voicebird_api_key = ""
+voicebird_server_url = "wss://voicebird.app/api/audio/stream"
+
+[default_slot_config]
+cloud_on = false
+language = "pl"
+model = "tiny"
+path = "~/sessions/explicit"
+"#,
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        // The modern shape wins; legacy fields ignored.
+        assert!(!loaded.default_slot_config.cloud_on);
+        assert_eq!(loaded.default_slot_config.language, "pl");
+        assert_eq!(loaded.default_slot_config.model, "tiny");
+        assert_eq!(loaded.default_slot_config.path, "~/sessions/explicit");
+    }
     #[test]
     #[cfg(unix)]
     fn save_sets_0600_permissions() {
