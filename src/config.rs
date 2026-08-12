@@ -381,7 +381,7 @@ refinement_beam_size = 5
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("Contains secrets"));
     }
-
+    #[test]
     fn roundtrip_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");

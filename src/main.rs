@@ -1094,7 +1094,7 @@ mod cloud_toggle_dispatch_tests {
     /// override `cloud_on = false` in place. The next start
     /// reads the per-source override first, so the section
     /// starts with `cloud_on = false` even though the user
-    /// just clicked Cloud ON.
+    #[test]
     fn c_toggle_when_no_section_focused_updates_focused_slot() {
         // Three slots created. Focused slot has customized
         // cloud_on = false. Default cloud_on = false. Press `c`
@@ -1148,7 +1148,7 @@ mod cloud_toggle_dispatch_tests {
     /// Regression guard for the follow-up display-helper change: when the
     /// idle Mode panel reads from a per-source override, `c` must flip that
     /// displayed value, not the global default. Otherwise a source showing
-    /// Cloud OFF with global Cloud ON remains OFF after one key press.
+    #[test]
     fn idle_c_toggle_flips_focused_slot_cloud_on() {
         // Setup: focused slot customized to OFF, default ON.
         // The displayed cloud state = OFF (the per-slot

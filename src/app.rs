@@ -3277,6 +3277,7 @@ mod tests {
     /// picker-resolved source and return the per-source override for
     /// that source. The global default is only the fallback when no
     /// picker source can be resolved (e.g. empty Devices pane).
+    #[test]
     #[cfg(not(windows))]
     fn display_helpers_resolve_per_slot_customization_when_no_section_focused() {
         use voice_bird_cli::config::AudioSessionKind;

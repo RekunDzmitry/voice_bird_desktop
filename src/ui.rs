@@ -1616,6 +1616,7 @@ mod tests {
 
     /// With cloud on, the mode panel offers the (l) language cycle hint
     /// and shows the saved language code.
+    #[test]
     fn mode_panel_on_shows_language_cycle_hint() {
         let mut app = App::new();
         app.default_slot_config.cloud_on = true;
