@@ -484,6 +484,29 @@ refinement_beam_size = 5
         assert!(!loaded.default_slot_config.cloud_on);
     }
 
+    /// Missing core tuning fields must fall back to the real
+    /// `AppConfig::default()` values, not Rust's zero/empty
+    /// defaults from the legacy-deserialization shim.
+    #[test]
+    fn missing_core_fields_deserialize_to_app_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+voicebird_api_key = "vb-fake"
+"#,
+        )
+        .unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        let defaults = AppConfig::default();
+        assert_eq!(loaded.hop_ms, defaults.hop_ms);
+        assert_eq!(loaded.min_window_ms, defaults.min_window_ms);
+        assert_eq!(loaded.engine_prefer, defaults.engine_prefer);
+        assert_eq!(loaded.audio_default_source, defaults.audio_default_source);
+    }
+
     /// Pre-0.5.x user configs with the legacy top-level
     /// `cloud_broadcast_enabled = true`,
     /// `language = "ru"`, `default_model = "large-v3"`,
