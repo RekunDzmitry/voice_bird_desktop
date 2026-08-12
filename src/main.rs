@@ -686,107 +686,39 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     "Cloud: OFF for focused section (applies on next start)".into()
                 });
             } else {
-                // Idle: no section is focused. The Mode panel
-                // advertises the GLOBAL flag
-                // (`cloud_broadcast_enabled`); a press of `c`
-                // must visibly flip the advertised state. Seed
-                // the flip from the displayed value (not from
-                // any stale per-source override) and write the
-                // result to BOTH the per-source override AND
-                // the global flag so they stay in lockstep —
-                // the panel, the next-start state, and the
-                // banner all agree on the new value.
+                // Idle: no section is focused. The press of `c`
+                // writes ONLY to the focused slot's
+                // `slot.config.cloud_on`. Other slots are
+                // untouched. The slot is the single source of
+                // truth for per-slot cloud ON/OFF.
                 //
-                // Pre-this-commit the seed was
-                // `!ov.cloud_on` (per-source override's
-                // current value). When the override was stale
-                // — a prior session left it at OFF while the
-                // global is now ON — the first press of `c`
-                // was a visible no-op: panel said ON, user
-                // pressed `c` expecting OFF, both values
-                // landed on ON. Reproduces the bug screenshot
-                // from #48 review.
-                let source = app.resolve_picker_source();
-                let key = source
-                    .as_ref()
-                    .map(|s| app.source_key_for(s));
-                // Displayed value → flip target. The per-source
-                // override is rewritten to match (so the
-                // next start sees the new state), and the
-                // global is rewritten to match (so the panel
-                // and the next-start default see the new
-                // state).
-                //
-                // Seed from the EFFECTIVE displayed state
-                // (`display_cloud_on`), not the bare global
-                // flag: a per-source override can make the
-                // panel show OFF while global is ON (or vice
-                // versa), and the user's first keypress must
-                // flip whatever the panel actually shows.
-                let on = !app.display_cloud_on();
-                let ov = voice_bird_cli::config::SourceSettingsOverride {
-                    cloud_on: on,
-                    // Preserve the other dimensions of the
-                    // per-source override when one exists, so
-                    // this toggle doesn't clobber a user's
-                    // per-source language/model preferences
-                    // when they flip Cloud.
-                    language: key
-                        .as_ref()
-                        .and_then(|k| app.config.source_overrides.get(k))
-                        .map(|existing| existing.language.clone())
-                        .unwrap_or_else(|| app.config.language.clone()),
-                    model: key
-                        .as_ref()
-                        .and_then(|k| app.config.source_overrides.get(k))
-                        .map(|existing| existing.model.clone())
-                        .unwrap_or_else(|| app.config.default_model.clone()),
-                };
-                // Capture the previous override (if any) BEFORE
-                // writing the new one — used by the modal Esc
-                // handler to revert the toggle if the user
-                // cancels out.
-                let prev_override = key
-                    .as_ref()
-                    .and_then(|k| app.config.source_overrides.get(k).cloned());
-                if let Some(k) = key.clone() {
-                    let k_for_revert = k.clone();
-                    app.config.upsert_source_override(k, ov);
-                    app.pending_c_revert = Some((k_for_revert, prev_override));
+                // Pre-fix logic wrote to a per-source override
+                // map AND the global `cloud_broadcast_enabled`
+                // flag, which leaked into every other slot
+                // whose display fell back to the global. That's
+                // the bug we're eliminating.
+                if let Some(slot) = app
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.id == app.focused_slot)
+                {
+                    let current = slot
+                        .config
+                        .cloud_on
+                        .unwrap_or(app.default_slot_config.cloud_on);
+                    slot.config.cloud_on = Some(!current);
                 }
-                // Per-slot flip: only the per-source override
-                // for the picker-resolved source is touched.
-                // The global `cloud_broadcast_enabled` flag
-                // stays as the fallback default for sources
-                // without an override — flipping it here would
-                // leak the toggle into every other idle slot
-                // whose display falls back to the global.
-                //
-                // The pre-fix behavior also flipped the global
-                // (enshrined in commit fd7b55c's test), but
-                // that breaks slot independence: pressing `c`
-                // while idle on slot 1 silently flipped slot
-                // 2's display via the global fallback. The
-                // cloud-enable gate below now keys off the
-                // per-source override instead of the global.
-                // Re-fetch the cloud Agents list whenever cloud
-                // toggles. `refresh_agents()` gates on the
-                // EFFECTIVE state for the focused slot
-                // (`display_cloud_on`), which now correctly
-                // reads the per-source override we just wrote.
                 app.refresh_agents();
-                if on && app.config.voicebird_api_key.is_empty() {
-                    // Cloud-enable gate. Esc reverts the just-toggled
-                    // `cloud_broadcast_enabled` back to OFF (it was
-                    // OFF before this `c` press — the user just
-                    // flipped it). Without this, the user could
-                    // press `c` to enable Cloud, then change their
-                    // mind and `Esc` out of the modal — and be left
-                    // with Cloud ON, no key, and no way to start a
-                    // recording until they re-toggle `c` OFF.
-                    app.open_api_key_modal(true);
+                if app.display_cloud_on() && app.config.voicebird_api_key.is_empty() {
+                    // Cloud-enable gate. The modal opens with
+                    // the new (ON) cloud state visible. Esc
+                    // closes the modal — the slot already
+                    // records the OFF→ON flip; the user can
+                    // press `c` again to revert. No more
+                    // `pending_c_revert` bookkeeping.
+                    app.open_api_key_modal(false);
                 } else {
-                    app.banner = Some(if on {
+                    app.banner = Some(if app.display_cloud_on() {
                         "Cloud: ON (next recording streams to voicebird.app)".into()
                     } else {
                         "Cloud: OFF (next recording is local-only)".into()
@@ -1187,51 +1119,21 @@ mod cloud_toggle_dispatch_tests {
     /// reads the per-source override first, so the section
     /// starts with `cloud_on = false` even though the user
     /// just clicked Cloud ON.
-    #[test]
-    fn c_toggle_when_no_section_focused_updates_per_source_override() {
-        use voice_bird_cli::config::SourceSettingsOverride;
-
+    fn c_toggle_when_no_section_focused_updates_focused_slot() {
+        // Three slots created. Focused slot has customized
+        // cloud_on = false. Default cloud_on = false. Press `c`
+        // — the focused slot's cloud_on must flip to ON.
         let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
         app.config.voicebird_api_key = "sk-test".into();
-
-        // Picker is parked on EPOS PC 8 USB (output/loopback) +
-        // Google Chrome — the exact combo from the screenshot.
-        app.devices = vec![AudioDevice {
-            name: "EPOS PC 8 USB".into(),
-            kind: AudioSessionKind::Output,
-        }];
-        app.selected_device_index = 0;
-        app.apps = vec![AppSession {
-            id: "com.google.Chrome".into(),
-            name: "Google Chrome".into(),
-            process_id: 12345,
-        }];
-        app.selected_app_index = Some(0);
-        app.config.input_device = Some("EPOS PC 8 USB".into());
-        app.config.input_device_kind = Some(AudioSessionKind::Output);
-
-        // Stale per-source override: this combo last recorded
-        // with Cloud OFF. The toggle target is the SAME source
-        // so the override must be updated.
-        let source = SessionSource::App {
-            id: "com.google.Chrome".into(),
-            name: "Google Chrome".into(),
-            device_name: "EPOS PC 8 USB".into(),
-        };
-        let key = app.source_key_for(&source);
-        app.config.source_overrides.insert(
-            key.clone(),
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "en".into(),
-                model: "base.en".into(),
-            },
-        );
-        // Global default is also OFF today. The toggle should
-        // flip BOTH the per-source override AND the global
-        // default so the Mode panel ("Cloud: ON") and the
-        // next-start state agree.
-        app.config.cloud_broadcast_enabled = false;
+        app.default_slot_config.cloud_on = false;
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(false);
 
         // Sanity: no Recording/Saved section is focused, so the
         // toggle must take the `else` branch in main.rs.
@@ -1242,35 +1144,27 @@ mod cloud_toggle_dispatch_tests {
         {
             handle_normal_mode(&mut app, KeyCode::Char('c'));
 
-            // Assert 1: the per-source override was flipped.
-            // This is the contract that picks up the toggle and
-            // matches what `start_section` reads via
-            // `effective_settings_for(source)`.
-            let ov = app
-                .config
-                .source_overrides
-                .get(&key)
-                .expect("per-source override must exist after toggle");
-            assert!(
-                ov.cloud_on,
+            // Assert 1: the focused slot's cloud_on was flipped.
+            let slot = app
+                .slot_by_id(app.focused_slot)
+                .expect("focused slot must exist");
+            assert_eq!(
+                slot.config.cloud_on,
+                Some(true),
                 "toggling Cloud ON while no section is focused must \
-                 update the per-source override for the picker-resolved \
-                 source; otherwise the next start silently uses the stale \
-                 cloud_on=false. Override key: {key}"
+                 update the focused slot's cloud_on; otherwise the next \
+                 start silently uses the stale cloud_on=false."
             );
-            // Assert 2: the global flag must STAY OFF — idle
-            // `c` is per-slot (writes the per-source override
-            // for the focused slot's resolved source) and must
-            // NOT leak into the global default. Other idle
-            // slots that read the global as a fallback would
-            // otherwise see this toggle.
+            // Assert 2: the default flag must stay OFF — idle
+            // `c` is per-slot and must NOT leak into the
+            // default. Other slots that read the default as a
+            // fallback would otherwise see this toggle.
             assert!(
-                !app.config.cloud_broadcast_enabled,
-                "idle `c` toggle must NOT flip the global flag — \
+                !app.default_slot_config.cloud_on,
+                "idle `c` toggle must NOT flip the default flag — \
                  slot independence: other slots' display reads the \
-                 global as a fallback and would otherwise leak this \
-                 toggle. global was {} before, must remain {}",
-                false, false,
+                 default as a fallback and would otherwise leak this \
+                 toggle."
             );
         }
     }
@@ -1279,10 +1173,11 @@ mod cloud_toggle_dispatch_tests {
     /// idle Mode panel reads from a per-source override, `c` must flip that
     /// displayed value, not the global default. Otherwise a source showing
     /// Cloud OFF with global Cloud ON remains OFF after one key press.
-    #[test]
-    fn idle_c_toggle_flips_per_source_displayed_cloud_state() {
-        use voice_bird_cli::config::SourceSettingsOverride;
-
+    fn idle_c_toggle_flips_focused_slot_cloud_on() {
+        // Setup: focused slot customized to OFF, default ON.
+        // The displayed cloud state = OFF (the per-slot
+        // override wins). Pressing `c` must flip the slot's
+        // customization to ON.
         let mut app = App::new();
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
@@ -1291,41 +1186,36 @@ mod cloud_toggle_dispatch_tests {
         app.selected_device_index = 0;
         app.apps.clear();
         app.selected_app_index = None;
-
-        let key = app.source_key_for(&SessionSource::Microphone);
-        app.config.source_overrides.insert(
-            key.clone(),
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "en".into(),
-                model: "base.en".into(),
-            },
-        );
-        app.config.cloud_broadcast_enabled = true;
+        app.default_slot_config.cloud_on = true;
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(false);
 
         assert!(
             !app.display_cloud_on(),
-            "setup must show the per-source Cloud OFF state"
+            "setup must show the per-slot Cloud OFF state"
         );
 
         #[cfg(not(windows))]
         {
             handle_normal_mode(&mut app, KeyCode::Char('c'));
 
-            let ov = app
-                .config
-                .source_overrides
-                .get(&key)
-                .expect("per-source override must survive the toggle");
-            assert!(
-                ov.cloud_on,
-                "pressing `c` while the idle UI displays per-source Cloud OFF \
-                 must toggle that displayed state to ON"
+            let slot = app
+                .slot_by_id(app.focused_slot)
+                .expect("focused slot must exist");
+            assert_eq!(
+                slot.config.cloud_on,
+                Some(true),
+                "pressing `c` while the idle UI displays per-slot Cloud OFF \
+                 must toggle that customized value to ON"
             );
             assert!(
                 app.display_cloud_on(),
                 "the Mode panel must show Cloud ON after toggling from the \
-                 displayed per-source OFF state"
+                 displayed per-slot OFF state"
             );
         }
     }
@@ -1343,17 +1233,18 @@ mod cloud_toggle_dispatch_tests {
     /// fallback default — slot 2's display reads its per-source
     /// override (untouched), falls back to the unchanged global.
     #[test]
-    fn idle_c_toggle_does_not_flip_global_flag() {
-        // Pre-fix bug: the idle `c` toggle wrote to BOTH the
-        // per-source override AND the global `cloud_broadcast_enabled`
-        // flag. The global flip is the leak — `display_cloud_on` for
-        // any slot with no per-source override falls back to the
-        // global, so every such slot silently mirrored the toggle.
+    fn idle_c_toggle_does_not_flip_default_flag() {
+        // Pre-fix bug: the idle `c` toggle wrote to a
+        // per-source override map AND the global
+        // `cloud_broadcast_enabled` flag. The global flip
+        // leaked into every other slot whose display fell
+        // back to the global — every slot silently mirrored
+        // the toggle.
         //
         // Post-fix: the idle `c` toggle writes ONLY to the
-        // picker-resolved source's per-source override. The global
-        // flag stays as the fallback default for sources without an
-        // override.
+        // focused slot's `slot.config.cloud_on`. Other slots
+        // are untouched. The default stays as the fallback
+        // for slots without a customization.
         let mut app = App::new();
 
         app.devices = vec![AudioDevice {
@@ -1363,43 +1254,118 @@ mod cloud_toggle_dispatch_tests {
         app.selected_device_index = 0;
         app.apps.clear();
         app.selected_app_index = None;
-        app.config.input_device = Some("MacBook Pro Microphone".into());
-        app.config.input_device_kind = Some(AudioSessionKind::Input);
-
-        // Global default ON; no per-source override yet.
-        app.config.cloud_broadcast_enabled = true;
-        let key = app.source_key_for(&SessionSource::Microphone);
-        assert!(
-            app.config.source_overrides.get(&key).is_none(),
-            "setup must have no per-source override yet"
-        );
+        app.default_slot_config.cloud_on = true;
 
         // User presses `c` while idle (no section focused).
         #[cfg(not(windows))]
         handle_normal_mode(&mut app, KeyCode::Char('c'));
 
-        // Per-source override flipped to OFF.
-        let ov = app
-            .config
-            .source_overrides
-            .get(&key)
-            .expect("per-source override must be created by `c`");
-        assert!(
-            !ov.cloud_on,
-            "per-source override must be flipped to OFF; got {}",
-            ov.cloud_on
+        // Focused slot's cloud_on must be customized to OFF.
+        let slot = app
+            .slot_by_id(app.focused_slot)
+            .expect("focused slot must exist");
+        assert_eq!(
+            slot.config.cloud_on,
+            Some(false),
+            "focused slot cloud_on must be customized to OFF; got {:?}",
+            slot.config.cloud_on
         );
 
-        // Global flag MUST stay ON — the toggle was per-source.
-        // Flipping the global would leak into every other slot
-        // whose source has no override.
+        // Default cloud ON must stay ON — the toggle was
+        // per-slot. Flipping the default would leak into every
+        // other slot whose slot.config has no override.
         assert!(
-            app.config.cloud_broadcast_enabled,
-            "idle `c` toggle must NOT flip the global flag — \
-             slot independence: any other slot whose source has \
-             no override would inherit the global change. \
-             global was true, must remain true"
+            app.default_slot_config.cloud_on,
+            "idle `c` toggle must NOT flip the default flag — \
+             slot independence: any other slot whose slot.config has \
+             no override would inherit the default change. \
+             default was true, must remain true"
         );
+    }
+    /// Post-fix: each slot owns a `SlotConfig`; the idle `c`
+    /// toggle writes to the focused slot's `config.cloud_on`,
+    /// not to a global. Tab to another slot and the new slot
+    /// still uses its default (untouched). Tab back, the
+    /// previous slot's customized OFF is still in effect.
+    #[test]
+    fn idle_c_toggle_is_per_slot_not_global() {
+        let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
+        app.config.voicebird_api_key = "sk-test".into();
+
+        // Three slots; default cloud ON.
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "en".into();
+        app.default_slot_config.model = "distil-small.en".into();
+
+        // Slot 1 focused.
+        app.focused_slot = crate::app::SlotId(1);
+        assert!(app.display_cloud_on(), "slot 1 default cloud ON");
+
+        // Press c on slot 1 — only slot 1 should flip.
+        #[cfg(not(windows))]
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
+        assert_eq!(
+            slot1.config.cloud_on,
+            Some(false),
+            "slot 1 cloud must be customized OFF"
+        );
+        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
+        assert_eq!(
+            slot2.config.cloud_on, None,
+            "slot 2 cloud must remain default (None)"
+        );
+        let slot3 = app.slot_by_id(crate::app::SlotId(3)).unwrap();
+        assert_eq!(
+            slot3.config.cloud_on, None,
+            "slot 3 cloud must remain default (None)"
+        );
+        assert!(
+            app.default_slot_config.cloud_on,
+            "default cloud ON must not be flipped"
+        );
+
+        // Tab to slot 2 — its effective cloud must still be ON
+        // (defaulting through).
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(2));
+        assert!(
+            app.display_cloud_on(),
+            "slot 2 effective cloud must be ON (defaulting through)"
+        );
+
+        // Press c on slot 2 — only slot 2 flips.
+        #[cfg(not(windows))]
+        handle_normal_mode(&mut app, KeyCode::Char('c'));
+        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
+        assert_eq!(
+            slot2.config.cloud_on,
+            Some(false),
+            "slot 2 cloud must be customized OFF"
+        );
+        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
+        assert_eq!(
+            slot1.config.cloud_on,
+            Some(false),
+            "slot 1 cloud must remain its customized OFF"
+        );
+        let slot3 = app.slot_by_id(crate::app::SlotId(3)).unwrap();
+        assert_eq!(
+            slot3.config.cloud_on, None,
+            "slot 3 cloud must remain default"
+        );
+
+        // Tab to slot 3 — default ON.
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(3));
+        assert!(app.display_cloud_on(), "slot 3 cloud ON");
+
+        // Tab to slot 1 — its customized OFF is still in effect.
+        app.focus_next();
+        assert_eq!(app.focused_slot, crate::app::SlotId(1));
+        assert!(!app.display_cloud_on(), "slot 1 cloud OFF (customized)");
     }
 }
 
@@ -1673,37 +1639,34 @@ mod pr48_review_regression_tests {
     /// isolation. One press must always invert the displayed
     /// state, otherwise the first keypress is a visible no-op.
     #[test]
-    fn idle_c_toggle_must_flip_the_displayed_cloud_state() {
+    fn idle_c_toggle_must_flip_the_displayed_cloud_state_v2() {
         let _guard = RealConfigGuard::snapshot();
         let mut app = App::new();
 
-        // Panel reads the per-source override (post
-        // display-helper fix). The user sees "Cloud: OFF"…
+        // Panel reads the focused slot's customization. The
+        // user sees "Cloud: OFF"…
         app.devices = vec![AudioDevice {
             name: "MacBook Pro Microphone".into(),
             kind: AudioSessionKind::Input,
         }];
         app.selected_device_index = 0;
-        let key = app.source_key_for(&SessionSource::Microphone);
-        app.config.source_overrides.insert(
-            key.clone(),
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "en".into(),
-                model: "base.en".into(),
-            },
-        );
-        // …while the global flag is still ON (stale — a prior
-        // session left the override OFF). The toggle must flip
-        // the displayed (OFF) state, NOT seed from the global
-        // (ON) flag — otherwise one press would land back on
-        // OFF and the user would see no change.
-        app.config.cloud_broadcast_enabled = true;
+        // …while the default is ON (stale — a prior session
+        // left the slot's customization OFF). The toggle must
+        // flip the displayed (OFF) state, NOT seed from the
+        // default (ON) — otherwise one press would land back
+        // on OFF and the user would see no change.
+        app.default_slot_config.cloud_on = true;
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(false);
 
         // Sanity: the panel is showing OFF right now.
         assert!(
             !app.display_cloud_on(),
-            "setup must show per-source OFF (panel) with global ON underneath"
+            "setup must show per-slot OFF (panel) with default ON underneath"
         );
 
         // The user presses `c` to flip OFF → ON.
@@ -1713,13 +1676,13 @@ mod pr48_review_regression_tests {
             app.display_cloud_on(),
             "one press of `c` must flip the DISPLAYED state from OFF to ON"
         );
-        assert!(
-            app.config
-                .source_overrides
-                .get(&key)
-                .expect("override must survive the toggle")
-                .cloud_on,
-            "the per-source override must agree with the newly displayed \
+        let slot = app
+            .slot_by_id(app.focused_slot)
+            .expect("focused slot must exist");
+        assert_eq!(
+            slot.config.cloud_on,
+            Some(true),
+            "the slot's customization must agree with the newly displayed \
              state (ON) after the toggle"
         );
     }

@@ -72,6 +72,40 @@ fn kind_str(kind: AudioSessionKind) -> &'static str {
     }
 }
 
+/// Global default for a slot's per-slot settings. Every slot starts
+/// with `SlotConfig::default_passthrough()` and reads fields from
+/// here when the slot's field is `None`. The user customizes a
+/// slot by setting that field to `Some(value)`. The `AppConfig`
+/// holds one `DefaultSlotConfig`; the user can change defaults
+/// globally via a settings UI (not yet implemented) or by editing
+/// the config file directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DefaultSlotConfig {
+    pub cloud_on: bool,
+    pub language: String,
+    pub model: String,
+    pub path: String,
+    pub device: Option<String>,
+    pub device_kind: Option<AudioSessionKind>,
+    pub app: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl Default for DefaultSlotConfig {
+    fn default() -> Self {
+        Self {
+            cloud_on: false,
+            language: "en".into(),
+            model: "distil-small.en".into(),
+            path: "~/voice-bird/sessions".into(),
+            device: None,
+            device_kind: None,
+            app: None,
+            agent: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub default_model: String,
@@ -156,6 +190,14 @@ pub struct AppConfig {
     /// for every future recording on every slot.
     #[serde(default)]
     pub dont_ask_character_upload: bool,
+
+    /// Global default for a slot's per-slot settings. Each slot
+    /// reads unset fields from here. The user customizes a slot
+    /// by setting that field in the slot's `SlotConfig`; the
+    /// `DefaultSlotConfig` is the source of truth for what
+    /// "default" means.
+    #[serde(default)]
+    pub default_slot_config: DefaultSlotConfig,
 }
 
 /// Ids that the segment dispatcher in the consumer task
@@ -198,6 +240,7 @@ impl Default for AppConfig {
             character_overrides: BTreeMap::new(),
             last_character_id: None,
             dont_ask_character_upload: false,
+            default_slot_config: DefaultSlotConfig::default(),
         }
     }
 }
@@ -417,6 +460,7 @@ refinement_beam_size = 5
             character_overrides: BTreeMap::new(),
             last_character_id: None,
             dont_ask_character_upload: false,
+            default_slot_config: DefaultSlotConfig::default(),
         };
         c.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();

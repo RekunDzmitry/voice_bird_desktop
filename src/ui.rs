@@ -1610,11 +1610,10 @@ mod tests {
 
     /// With cloud on, the mode panel offers the (l) language cycle hint
     /// and shows the saved language code.
-    #[test]
     fn mode_panel_on_shows_language_cycle_hint() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "ru".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("[ON]"), "cloud-on label missing:\n{out}");
         // `ru` appears in the language line; the (l) hint accompanies it.

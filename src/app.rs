@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::{AppConfig, SourceSettingsOverride};
+use voice_bird_cli::config::{AppConfig, DefaultSlotConfig, SourceSettingsOverride};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -107,10 +107,57 @@ pub struct RecordingRuntime {
     /// model is configured or when it failed to load.
     pub refinement_join: Option<tokio::task::JoinHandle<()>>,
 }
+/// Per-slot settings. Every slot owns one; idle slots use these
+/// directly, recording slots snapshot them into `Section.settings`
+/// at start time. Each `Option` field is `None` = "use the
+/// global `DefaultSlotConfig`"; `Some(value)` = "this slot
+/// overrides the default". Picking a device, app, agent, or
+/// changing cloud/language/model/path on a slot customizes the
+/// relevant field — even without pressing Enter.
+#[derive(Debug, Clone)]
+pub struct SlotConfig {
+    pub cloud_on: Option<bool>,
+    pub language: Option<String>,
+    pub model: Option<String>,
+    pub path: Option<String>,
+    pub device: Option<String>,
+    pub device_kind: Option<voice_bird_cli::config::AudioSessionKind>,
+    pub app: Option<String>,
+    pub agent: Option<String>,
+}
 
-/// Settings snapshotted at section start. In Stage 1 these are seeded
-/// from the global `AppConfig`; in Stage 2 they will gain per-source
-/// override persistence in `AppConfig::source_overrides`.
+impl SlotConfig {
+    /// All-None = "uses every field from the default".
+    pub fn default_passthrough() -> Self {
+        Self {
+            cloud_on: None,
+            language: None,
+            model: None,
+            path: None,
+            device: None,
+            device_kind: None,
+            app: None,
+            agent: None,
+        }
+    }
+
+    /// True iff every field is `None` (the slot uses the
+    /// default for everything).
+    pub fn is_passthrough(&self) -> bool {
+        self.cloud_on.is_none()
+            && self.language.is_none()
+            && self.model.is_none()
+            && self.path.is_none()
+            && self.device.is_none()
+            && self.device_kind.is_none()
+            && self.app.is_none()
+            && self.agent.is_none()
+    }
+}
+
+/// Snapshot of the slot's `SlotConfig` taken at section start.
+/// Holds the EFFECTIVE values (after applying the default) so the
+/// running engine reads from a stable, non-defaulting view.
 #[derive(Debug, Clone)]
 pub struct SectionSettings {
     pub cloud_on: bool,
@@ -118,7 +165,23 @@ pub struct SectionSettings {
     pub model: String,
 }
 
-/// One running recording slot. Each section owns its own audio capture,
+impl SectionSettings {
+    /// Convert a (slot_config, default) into the effective
+    /// snapshot the section will use.
+    pub fn effective(slot: &SlotConfig, default: &DefaultSlotConfig) -> Self {
+        Self {
+            cloud_on: slot.cloud_on.unwrap_or(default.cloud_on),
+            language: slot
+                .language
+                .clone()
+                .unwrap_or_else(|| default.language.clone()),
+            model: slot
+                .model
+                .clone()
+                .unwrap_or_else(|| default.model.clone()),
+        }
+    }
+}
 /// engine, and transcript buffers — multiple sections can record in
 /// parallel, each with independent settings (Stage 2+).
 pub struct Section {
@@ -209,11 +272,16 @@ impl std::fmt::Debug for SlotKind {
     }
 }
 
-/// One TUI pane and its current state. The pane's `id` is stable; the
-/// position in `App::slots` is incidental.
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
+    /// Per-slot settings. Each slot starts with
+    /// `SlotConfig::default_passthrough()` (every field inherits
+    /// from `App::default_slot_config`). The c/l/m/P keys and the
+    /// device/app picker mutate the FOCUSED slot's config; idle
+    /// slots read it directly, recording slots snapshot it into
+    /// `Section.settings` at start time.
+    pub config: SlotConfig,
 }
 
 impl Slot {
@@ -221,6 +289,7 @@ impl Slot {
         Self {
             id,
             kind: SlotKind::Empty,
+            config: SlotConfig::default_passthrough(),
         }
     }
 
@@ -243,7 +312,6 @@ impl Slot {
         }
     }
 }
-
 impl std::fmt::Debug for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Slot")
@@ -461,6 +529,14 @@ pub struct App {
     /// `t` status overlay ([`AppMode::Status`\]). Renamed
     /// from `agent_events` in §8.
     pub app_events: Arc<PlMutex<VecDeque<AppEvent>>>,
+
+    /// Global default for a slot's per-slot settings. Each slot
+    /// reads unset fields from here. The c/l/m/P keys mutate
+    /// the focused slot's `SlotConfig`; this field is the
+    /// background defaults. The user can customize it directly
+    /// (settings UI not yet implemented) but per-slot writes
+    /// never mutate it.
+    pub default_slot_config: voice_bird_cli::config::DefaultSlotConfig,
 }
 
 /// One row in the `t` status overlay.
@@ -602,7 +678,8 @@ impl App {
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
             start_time: None,
-            config,
+            config: config.clone(),
+            default_slot_config: config.default_slot_config.clone(),
             should_quit: false,
             status_message: None,
             error_channel: Arc::new(Mutex::new(None)),
@@ -656,7 +733,7 @@ impl App {
     }
 
     /// Read-only access to a slot by id.
-    fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
+    pub fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
         self.slots.iter().find(|s| s.id == id)
     }
 
@@ -710,14 +787,25 @@ impl App {
     /// actually take effect if the user pressed Enter on this slot),
     /// else the global config default. Falls through to global only
     /// when no picker source can be resolved.
+    /// Cloud ON/OFF as displayed in the Mode panel.
+    ///
+    /// Resolution order:
+    /// 1. Focused recording section's `settings.cloud_on` (the
+    ///    value the running engine is using).
+    /// 2. Focused slot's `slot.config.cloud_on` if customized.
+    /// 3. Picker-resolved source's slot customizations (when
+    ///    no slot is focused, the source settles).
+    /// 4. `default_slot_config.cloud_on` (the global default).
     pub fn display_cloud_on(&self) -> bool {
         if let Some(s) = self.focused() {
             return s.settings.cloud_on;
         }
-        if let Some(src) = self.resolve_picker_source() {
-            return self.effective_settings_for(&src).cloud_on;
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(c) = slot.config.cloud_on {
+                return c;
+            }
         }
-        self.config.cloud_broadcast_enabled
+        self.default_slot_config.cloud_on
     }
 
     /// Language as displayed in the Mode panel: focused section's
@@ -3112,11 +3200,13 @@ mod tests {
         });
 
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
+        // Cloud is gated on the EFFECTIVE state for the
+        // focused slot. Default ON means fresh-install
+        // behavior; explicit OFF turns the panel off.
+        app.default_slot_config.cloud_on = true;
         app.config.voicebird_api_key = "test-key-abc123".into();
         app.config.voicebird_server_url = format!("ws://{}/api/audio/stream", addr);
         app.refresh_agents();
-        let _ = server.join();
 
         assert_eq!(
             app.agents().len(),
@@ -3182,23 +3272,24 @@ mod tests {
         app.selected_device_index = 0;
         app.apps.clear();
         app.selected_app_index = None;
-        app.config.cloud_broadcast_enabled = false;
+        // Global default OFF; the focused slot's customized
+        // cloud_on = true is what `display_cloud_on` returns.
+        app.default_slot_config.cloud_on = false;
         app.config.voicebird_api_key = "test-key-abc123".into();
         app.config.voicebird_server_url =
             format!("ws://{}/api/audio/stream", addr);
-        let key = app.source_key_for(&SessionSource::Microphone);
-        app.config.source_overrides.insert(
-            key,
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "en".into(),
-                model: "base.en".into(),
-            },
-        );
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(true);
+        slot.config.device = Some("MacBook Pro Microphone".into());
+        slot.config.device_kind = Some(AudioSessionKind::Input);
 
         assert!(
             app.display_cloud_on(),
-            "setup must be effectively cloud-on via the per-source override"
+            "setup must be effectively cloud-on via the focused slot's config"
         );
 
         app.refresh_agents();
