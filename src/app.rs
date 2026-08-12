@@ -107,23 +107,23 @@ pub struct RecordingRuntime {
     /// model is configured or when it failed to load.
     pub refinement_join: Option<tokio::task::JoinHandle<()>>,
 }
-/// Per-slot settings. Every slot owns one; idle slots use these
-/// directly, recording slots snapshot them into `Section.settings`
-/// at start time. Each `Option` field is `None` = "use the
-/// global `DefaultSlotConfig`"; `Some(value)` = "this slot
-/// overrides the default". Picking a device, app, agent, or
-/// changing cloud/language/model/path on a slot customizes the
-/// relevant field — even without pressing Enter.
+/// Per-slot settings. Every slot owns one; idle slots read
+/// these directly, recording slots snapshot them into
+/// `Section.settings` at start time. Each `Option` field is
+/// `None` = "use the global `DefaultSlotConfig`";
+/// `Some(value)` = "this slot overrides the default".
+/// Toggling cloud, cycling language, cycling model, or saving
+/// a custom output path on a slot customizes the relevant
+/// field. The picker cursor (device / app) and agent routing
+/// are stored separately in `slot_picker_memo` and
+/// `pending_agent_overrides` — they index into the live
+/// inventory rather than carry device names directly.
 #[derive(Debug, Clone)]
 pub struct SlotConfig {
     pub cloud_on: Option<bool>,
     pub language: Option<String>,
     pub model: Option<String>,
     pub path: Option<String>,
-    pub device: Option<String>,
-    pub device_kind: Option<voice_bird_cli::config::AudioSessionKind>,
-    pub app: Option<String>,
-    pub agent: Option<String>,
 }
 
 impl SlotConfig {
@@ -134,24 +134,7 @@ impl SlotConfig {
             language: None,
             model: None,
             path: None,
-            device: None,
-            device_kind: None,
-            app: None,
-            agent: None,
         }
-    }
-
-    /// True iff every field is `None` (the slot uses the
-    /// default for everything).
-    pub fn is_passthrough(&self) -> bool {
-        self.cloud_on.is_none()
-            && self.language.is_none()
-            && self.model.is_none()
-            && self.path.is_none()
-            && self.device.is_none()
-            && self.device_kind.is_none()
-            && self.app.is_none()
-            && self.agent.is_none()
     }
 }
 
@@ -3245,8 +3228,6 @@ mod tests {
             .find(|s| s.id == app.focused_slot)
             .unwrap();
         slot.config.cloud_on = Some(true);
-        slot.config.device = Some("MacBook Pro Microphone".into());
-        slot.config.device_kind = Some(AudioSessionKind::Input);
 
         assert!(
             app.display_cloud_on(),

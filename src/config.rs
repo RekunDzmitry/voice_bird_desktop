@@ -61,23 +61,21 @@ fn kind_str(kind: AudioSessionKind) -> &'static str {
     }
 }
 
-/// Global default for a slot's per-slot settings. Every slot starts
-/// with `SlotConfig::default_passthrough()` and reads fields from
-/// here when the slot's field is `None`. The user customizes a
-/// slot by setting that field to `Some(value)`. The `AppConfig`
-/// holds one `DefaultSlotConfig`; the user can change defaults
-/// globally via a settings UI (not yet implemented) or by editing
-/// the config file directly.
+/// Global default for a slot's per-slot settings. Every slot
+/// starts with `SlotConfig::default_passthrough()` and reads
+/// unset fields from here. The user can change defaults
+/// globally via a settings UI (not yet implemented) or by
+/// editing the config file directly. The picker cursor
+/// (device / app) and agent routing are stored per-slot
+/// (in `slot_picker_memo` / `pending_agent_overrides`) — they
+/// are not part of this default since they index into the
+/// live inventory rather than carry stable names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DefaultSlotConfig {
     pub cloud_on: bool,
     pub language: String,
     pub model: String,
     pub path: String,
-    pub device: Option<String>,
-    pub device_kind: Option<AudioSessionKind>,
-    pub app: Option<String>,
-    pub agent: Option<String>,
 }
 
 impl Default for DefaultSlotConfig {
@@ -87,10 +85,6 @@ impl Default for DefaultSlotConfig {
             language: "en".into(),
             model: "distil-small.en".into(),
             path: "~/voice-bird/sessions".into(),
-            device: None,
-            device_kind: None,
-            app: None,
-            agent: None,
         }
     }
 }
