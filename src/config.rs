@@ -20,17 +20,6 @@ pub enum AudioSessionKind {
     App,
 }
 
-/// Settings that can be overridden per source. Stored in
-/// `AppConfig::source_overrides` keyed by `source_id`. When a section
-/// starts, the effective settings are computed by merging the saved
-/// override (if any) over the global defaults.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceSettingsOverride {
-    pub cloud_on: bool,
-    pub language: String,
-    pub model: String,
-}
-
 /// Stable identifier for a source used to key `source_overrides`. Format:
 /// `device:input:<name>` / `device:output:<name>` /
 /// `app:<bundle-or-name>@device:<device>`.
@@ -108,9 +97,6 @@ impl Default for DefaultSlotConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub default_model: String,
-    pub language: String,
-    pub session_dir: String,
     pub hop_ms: u32,
     pub min_window_ms: u32,
     #[serde(rename = "engine_prefer")]
@@ -148,27 +134,10 @@ pub struct AppConfig {
     pub voicebird_api_key: String,
 
     /// WebSocket URL of the Voice Bird Web `/api/audio/stream` endpoint
-    /// the desktop client streams to when `cloud_broadcast_enabled` is
-    /// true. Defaults to the hosted production server.
+    /// the desktop client streams to. Defaults to the hosted production
+    /// server.
     #[serde(default = "default_voicebird_server_url")]
     pub voicebird_server_url: String,
-
-    /// When true, recordings stream PCM to `voicebird_server_url` and
-    /// transcripts are produced by the cloud model. The local Whisper
-    /// engine is bypassed and no session files are written to disk —
-    /// the recording lives entirely on the user's voicebird.app
-    /// account. When false (default), the local engine runs and writes
-    /// `~/voice-bird/sessions/<ts>/`.
-    #[serde(default)]
-    pub cloud_broadcast_enabled: bool,
-
-    /// Per-source setting overrides. Key is the result of [`source_id`]
-    /// or [`device_source_id`]; value carries the cloud/language/model
-    /// to use when starting a section for that source. When absent for
-    /// a given source, [`effective_settings`] falls back to the global
-    /// fields above.
-    #[serde(default)]
-    pub source_overrides: BTreeMap<String, SourceSettingsOverride>,
 
     /// Per-slot override for which cloud Agent to run on `g`.
     /// Keyed by `SlotId` (so the picker picks persist per slot).
@@ -220,9 +189,6 @@ fn default_refinement_beam_size() -> u8 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_model: "distil-small.en".into(),
-            language: "en".into(),
-            session_dir: "~/voice-bird/sessions".into(),
             hop_ms: 750,
             min_window_ms: 1000,
             engine_prefer: "auto".into(),
@@ -235,8 +201,6 @@ impl Default for AppConfig {
             refinement_beam_size: default_refinement_beam_size(),
             voicebird_api_key: String::new(),
             voicebird_server_url: default_voicebird_server_url(),
-            cloud_broadcast_enabled: false,
-            source_overrides: BTreeMap::new(),
             character_overrides: BTreeMap::new(),
             last_character_id: None,
             dont_ask_character_upload: false,
@@ -314,35 +278,18 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn session_dir_expanded(&self) -> String {
-        if let Some(rest) = self.session_dir.strip_prefix("~/") {
+    /// Expand `~/` in a path string to the user's home directory.
+    /// Pure string transform — no IO. Used by `App::export_transcript`
+    /// and `start_section` to resolve a per-slot path (or the
+    /// default) into an absolute filesystem path.
+    pub fn expand_tilde(path: &str) -> String {
+        if let Some(rest) = path.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
                 return home.join(rest).to_string_lossy().into_owned();
             }
         }
-        self.session_dir.clone()
+        path.to_string()
     }
-
-    /// Effective per-source settings: the saved override for `key` if
-    /// present, else the global defaults from this config. The returned
-    /// override carries the `cloud_on`, `language`, `model` triple a
-    /// section actually uses at start time.
-    pub fn effective_override(&self, key: &str) -> SourceSettingsOverride {
-        if let Some(o) = self.source_overrides.get(key) {
-            return o.clone();
-        }
-        SourceSettingsOverride {
-            cloud_on: self.cloud_broadcast_enabled,
-            language: self.language.clone(),
-            model: self.default_model.clone(),
-        }
-    }
-
-    /// Convenience: persist or update one source's override and save.
-    pub fn upsert_source_override(&mut self, key: String, ov: SourceSettingsOverride) {
-        self.source_overrides.insert(key, ov);
-    }
-
 }
 
 #[cfg(test)]
@@ -353,7 +300,7 @@ mod tests {
     #[test]
     fn defaults_when_file_missing() {
         let c = AppConfig::default();
-        assert_eq!(c.default_model, "distil-small.en");
+        assert_eq!(c.default_slot_config.model, "distil-small.en");
         assert_eq!(c.hop_ms, 750);
         assert_eq!(c.engine_prefer, "auto");
     }
@@ -394,7 +341,7 @@ refinement_beam_size = 5
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.voicebird_api_key, "");
         assert_eq!(loaded.voicebird_server_url, default_voicebird_server_url());
-        assert!(!loaded.cloud_broadcast_enabled);
+        assert!(!loaded.default_slot_config.cloud_on);
     }
 
     #[test]
@@ -435,14 +382,10 @@ refinement_beam_size = 5
         assert!(!text.contains("Contains secrets"));
     }
 
-    #[test]
     fn roundtrip_through_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let c = AppConfig {
-            default_model: "large-v3-turbo".into(),
-            language: "auto".into(),
-            session_dir: "~/foo".into(),
             hop_ms: 600,
             min_window_ms: 800,
             engine_prefer: "whisperkit".into(),
@@ -455,8 +398,6 @@ refinement_beam_size = 5
             refinement_beam_size: 5,
             voicebird_api_key: "vb-test".into(),
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
-            cloud_broadcast_enabled: true,
-            source_overrides: BTreeMap::new(),
             character_overrides: BTreeMap::new(),
             last_character_id: None,
             dont_ask_character_upload: false,
@@ -467,41 +408,23 @@ refinement_beam_size = 5
         assert_eq!(loaded, c);
     }
 
+    /// `default_slot_config` must round-trip through toml:
+    /// a non-default value is preserved on save + load.
     #[test]
-    fn effective_override_falls_back_to_globals_when_unset() {
+    fn default_slot_config_round_trips_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
         let mut c = AppConfig::default();
-        c.cloud_broadcast_enabled = true;
-        c.language = "ru".into();
-        c.default_model = "tiny.en".into();
-        let eff = c.effective_override("device:input:not-saved");
-        assert!(eff.cloud_on);
-        assert_eq!(eff.language, "ru");
-        assert_eq!(eff.model, "tiny.en");
-    }
-
-    #[test]
-    fn effective_override_uses_saved_entry_when_present() {
-        let mut c = AppConfig::default();
-        // Globals: local + en.
-        c.cloud_broadcast_enabled = false;
-        c.language = "en".into();
-        c.default_model = "tiny.en".into();
-        // Override for the EPOS device: cloud + Polish + base.en.
-        c.source_overrides.insert(
-            "device:input:EPOS PC 8 USB".into(),
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "pl".into(),
-                model: "base.en".into(),
-            },
-        );
-        let eff = c.effective_override("device:input:EPOS PC 8 USB");
-        assert!(eff.cloud_on);
-        assert_eq!(eff.language, "pl");
-        assert_eq!(eff.model, "base.en");
-        // Other devices still get global defaults.
-        let other = c.effective_override("device:input:Other");
-        assert!(!other.cloud_on);
+        c.default_slot_config.cloud_on = true;
+        c.default_slot_config.language = "pl".into();
+        c.default_slot_config.model = "large-v3-turbo".into();
+        c.default_slot_config.path = "~/sessions/team-A".into();
+        c.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(loaded.default_slot_config.cloud_on);
+        assert_eq!(loaded.default_slot_config.language, "pl");
+        assert_eq!(loaded.default_slot_config.model, "large-v3-turbo");
+        assert_eq!(loaded.default_slot_config.path, "~/sessions/team-A");
     }
 
     #[test]
@@ -547,36 +470,27 @@ refinement_beam_size = 5
         );
         assert_ne!(zoom_speakers, zoom_airpods);
     }
+    /// `expand_tilde` is a pure string transform — no IO.
+    /// It expands `~/foo` to `$HOME/foo` and leaves other
+    /// paths untouched. Tests cover both branches.
+    #[test]
+    fn expand_tilde_replaces_home_prefix() {
+        let path = AppConfig::expand_tilde("~/doc/sessions");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(path, home.join("doc/sessions").to_string_lossy());
+        } else {
+            // No HOME — graceful fallback.
+            assert_eq!(path, "~/doc/sessions");
+        }
+    }
 
     #[test]
-    fn source_overrides_round_trip_through_toml() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.source_overrides.insert(
-            "device:input:EPOS PC 8 USB".into(),
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "pl".into(),
-                model: "base.en".into(),
-            },
-        );
-        c.source_overrides.insert(
-            "app:Zoom".into(),
-            SourceSettingsOverride {
-                cloud_on: false,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        );
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.source_overrides.len(), 2);
+    fn expand_tilde_leaves_absolute_paths_alone() {
+        let abs = "/etc/voice-bird/sessions";
         assert_eq!(
-            loaded.source_overrides["device:input:EPOS PC 8 USB"].language,
-            "pl"
+            AppConfig::expand_tilde(abs),
+            abs
         );
-        assert_eq!(loaded.source_overrides["app:Zoom"].model, "tiny.en");
     }
 
     /// §9b: per-slot Agent override + last-used agent id +

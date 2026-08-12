@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::{AppConfig, DefaultSlotConfig, SourceSettingsOverride};
+use voice_bird_cli::config::{AppConfig, DefaultSlotConfig};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -437,28 +437,9 @@ pub struct App {
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
     pub api_key_buf: Option<String>,
-    /// Whether the currently-open API-key modal was opened as the
-    /// cloud-enable gate (i.e. the user just flipped Cloud ON with
-    /// no key, or the runtime detected `auth_failure` and needs a
-    /// key to recover). `true` ⇒ Esc cancels the cloud flip and
-    /// reverts `cloud_broadcast_enabled` to `false` (the pre-toggle
-    /// state); `false` ⇒ Esc just closes the modal without touching
-    /// cloud (e.g. `K` peeked at the saved key, or the modal was
-    /// opened as a first-run bootstrap). Set by the opener, reset
-    /// to `false` when the modal closes.
-    pub api_key_modal_reverts_cloud: bool,
-
-    /// Pending undo state for the idle `c` toggle when it opened
-    /// the API-key modal. Stores the per-source override key the
-    /// toggle just wrote (or `None` if it didn't write one) and
-    /// the value it had BEFORE the toggle. Esc with
-    /// `api_key_modal_reverts_cloud = true` restores this value
-    /// (or deletes the override if it didn't exist before).
-    /// Cleared when the modal closes (Enter or Esc).
-    pub pending_c_revert: Option<(String, Option<SourceSettingsOverride>)>,
-
     /// In-flight text buffer for the output-path modal. `None` when
-    /// the modal isn't open. Pre-filled with `config.session_dir`.
+    /// the modal isn't open. Pre-filled with the focused slot's
+    /// customized path, or the default if no customization.
     pub path_buf: Option<String>,
 
     /// Feedback banner for the transcript-export flow ("Exporting…",
@@ -616,7 +597,7 @@ impl App {
             {
                 let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
                 log::info!("first run: auto-picked local model = {picked}");
-                config.default_model = picked.into();
+                config.default_slot_config.model = picked.into();
             }
             if let Err(e) = config.save() {
                 log::error!("config save (first run): {e}");
@@ -628,7 +609,7 @@ impl App {
         // Only the macOS screen-recording check below mutates this.
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut banner_on_launch: Option<String> =
-            if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
+            if config.default_slot_config.cloud_on && config.voicebird_api_key.is_empty() {
                 Some("Cloud is on but no API key — press 'c' to paste one".into())
             } else {
                 None
@@ -693,8 +674,6 @@ impl App {
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
-            api_key_modal_reverts_cloud: false,
-            pending_c_revert: None,
             path_buf: None,
             export_banner: None,
             banner: banner_on_launch,
@@ -1020,10 +999,15 @@ impl App {
     ///    key (e.g. `K` peek, first-run bootstrap, auth-recovery
     ///    pre-flight). Esc closes the modal silently.
     ///
-    /// Used by the `c` toggle and by auth-error recovery.
-    pub fn open_api_key_modal(&mut self, reverts_cloud: bool) {
+    /// Capture the saved key into `api_key_buf` and transition
+    /// to `AppMode::ApiKeyModal`. The modal is the only text-input
+    /// flow in the TUI — opens for cloud-enable (after `c`)
+    /// and auth-error recovery alike. Esc closes the modal
+    /// without side effects; the slot's per-slot `cloud_on`
+    /// (or the default) keeps the user's last toggle, ready
+    /// to re-flip on next `c` press.
+    pub fn open_api_key_modal(&mut self) {
         self.api_key_buf = Some(self.config.voicebird_api_key.clone());
-        self.api_key_modal_reverts_cloud = reverts_cloud;
         self.mode = AppMode::ApiKeyModal;
     }
 
@@ -1052,7 +1036,21 @@ impl App {
         // Clear any previous export banner
         self.export_banner = None;
 
-        let base_dir = self.config.session_dir_expanded();
+        // Look in the focused slot's customized output path,
+        // or the default slot's path if no customization.
+        let base_dir = self
+            .slot_by_id(self.focused_slot)
+            .and_then(|s| s.config.path.clone())
+            .unwrap_or_else(|| self.default_slot_config.path.clone());
+        let base_dir = if let Some(rest) = base_dir.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(rest).to_string_lossy().into_owned()
+            } else {
+                base_dir
+            }
+        } else {
+            base_dir
+        };
         let base = std::path::Path::new(&base_dir);
 
         // Find the most recent session that has a transcript.json.
@@ -1816,12 +1814,18 @@ impl App {
             // Server rejected the saved key — surface the paste modal
             // immediately so the user can replace it without hunting
             // for a key binding.
-            if auth_failure && self.config.cloud_broadcast_enabled {
+            // Auth errors only happen when a recording was
+            // streaming to the cloud. The default slot
+            // config is the on-disk default — recorded
+            // sections may have had a per-slot override,
+            // but the auth failure happens during a
+            // recording, so the user is at least
+            // configured to WANT cloud. Open the modal.
+            if auth_failure && self.default_slot_config.cloud_on {
                 // `false`: the user already has Cloud ON and a key
                 // on disk — they just need to replace the bad
                 // key. Cancelling the modal leaves Cloud ON (the
-                // next recording will re-trigger the auth guard).
-                self.open_api_key_modal(false);
+                self.open_api_key_modal();
             }
         }
     }
@@ -1845,67 +1849,18 @@ impl App {
     }
 
     /// Resolve the effective settings for a given source. Prefers a
-    /// device-specific override (keyed on the actual selected device
-    /// name + kind) over the generic Microphone/System fallback.
+    /// Compute the effective settings for a section's source.
+    /// Per-slot: the section's slot owns the customization;
+    /// `slot.config` + `default_slot_config` is the single
+    /// source of truth. (Called with the focused slot's source
+    /// — see `start_section` / `resume_section`.)
     pub fn effective_settings_for(&self, source: &SessionSource) -> SectionSettings {
-        let key = self.source_key_for(source);
-        let ov = self.config.effective_override(&key);
-        SectionSettings {
-            cloud_on: ov.cloud_on,
-            language: ov.language,
-            model: ov.model,
-        }
+        let _ = source;
+        let slot = self
+            .slot_by_id(self.focused_slot)
+            .expect("focused slot must exist");
+        SectionSettings::effective(&slot.config, &self.default_slot_config)
     }
-
-    /// Compute the persistence key for a section's source. Device
-    /// sections key on the actual selected device name + kind so two
-    /// physical devices never collide; app sections key on app name +
-    /// paired device so "Zoom on Speakers" and "Zoom on AirPods" don't
-    /// share overrides.
-    pub fn source_key_for(&self, source: &SessionSource) -> String {
-        use voice_bird_cli::config::{device_source_id, source_id, AudioSessionKind};
-        match source {
-            SessionSource::Microphone | SessionSource::System => {
-                if let (Some(name), Some(kind)) = (
-                    self.config.input_device.as_deref(),
-                    self.config.input_device_kind,
-                ) {
-                    return device_source_id(name, kind);
-                }
-                source_id(
-                    source,
-                    self.config.input_device_kind.or(Some(match source {
-                        SessionSource::Microphone => AudioSessionKind::Input,
-                        _ => AudioSessionKind::Output,
-                    })),
-                )
-            }
-            SessionSource::App { .. } => source_id(source, None),
-        }
-    }
-
-    /// Update the focused section's settings AND persist the change as
-    /// a per-source override in `config.source_overrides`. The new value
-    /// applies to the running engine on next start; for live mutations
-    /// (toggling cloud while a section runs), Stage 3+ will rebuild
-    /// the engine. For now, the running engine is unaffected and the
-    /// new value is what the next start will use.
-    pub fn persist_focused_settings(&mut self) {
-        let Some(section) = self.focused() else {
-            return;
-        };
-        let key = self.source_key_for(&section.source);
-        let ov = voice_bird_cli::config::SourceSettingsOverride {
-            cloud_on: section.settings.cloud_on,
-            language: section.settings.language.clone(),
-            model: section.settings.model.clone(),
-        };
-        self.config.upsert_source_override(key, ov);
-        if let Err(e) = self.config.save() {
-            log::error!("config save (per-source override): {e}");
-        }
-    }
-
     /// Start recording a section in `slot` with explicit settings.
     /// Returns `Err(message)` for failures the UI should surface as a
     /// banner; `Ok(())` once the producer/consumer tasks are spawned.
@@ -1938,7 +1893,7 @@ impl App {
             // a key to start. Esc closes the modal and the banner
             // stays as "missing api key" — the user can press 'c'
             // to re-open or toggle cloud OFF.
-            self.open_api_key_modal(false);
+            self.open_api_key_modal();
             return Err("missing api key".into());
         }
 
@@ -1978,20 +1933,16 @@ impl App {
         // contract holds whether the ASR is local-Whisper or
         // cloud-Voice-Bird-Web, because the cloud engine's committed
         // segments flow into the same consumer task and the same
-        // local writer. `Target::Agent` is the one case where the
-        // agent runtime *is* the destination, so we skip the local
-        // tree entirely — the agent buffer (`~/.voice-bird/live/`)
-        // is the persistence layer there.
-        //
-        // Pre-this-commit, the decision was gated on `cloud_on`,
-        // which conflated "is the cloud engine the ASR?" with
-        // "should we keep a local copy?". The user-facing picker
-        // for `Stdout + Cloud ON` reads as "transcript streamed to
-        // the server + locally (from server)" — both, not either.
+        // Per-slot path: the focused slot's customized
+        // output path, or the default if no customization.
+        let path_str = self
+            .slot_by_id(slot)
+            .and_then(|s| s.config.path.clone())
+            .unwrap_or_else(|| self.default_slot_config.path.clone());
         let session_dir: Option<std::path::PathBuf> =
             if matches!(target, Target::Stdout) {
                 let dir = voice_bird_cli::session::layout::session_dir(
-                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    std::path::Path::new(&path_str),
                     now,
                     &source,
                 );
@@ -2002,7 +1953,6 @@ impl App {
             } else {
                 None
             };
-
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
         let (committed, refined) = match &self.slots[pos].kind {
@@ -2911,22 +2861,21 @@ impl App {
         }
 
         if done {
-            // If a section is focused, treat the picked model
-            // as the section's customized model (applies on
-            // next start). Otherwise — idle path — update
-            // the focused slot's `slot.config.model` so
-            // other slots are untouched.
-            if self.focused().is_some() {
-                if let Some(section) = self.focused_mut() {
-                    section.settings.model = model_id;
-                }
-                self.persist_focused_settings();
-            } else if let Some(slot) = self
+            // Mirror the picked model into the focused slot's
+            // customization so the next start sees the same
+            // value. The slot's `config` is the single source
+            // of truth for what the slot will use.
+            if let Some(slot) = self
                 .slots
                 .iter_mut()
                 .find(|s| s.id == self.focused_slot)
             {
-                slot.config.model = Some(model_id);
+                slot.config.model = Some(model_id.clone());
+            }
+            if self.focused().is_some() {
+                if let Some(section) = self.focused_mut() {
+                    section.settings.model = model_id;
+                }
             }
             self.mode = AppMode::Normal;
             self.picker = None;
@@ -2999,7 +2948,7 @@ impl Default for App {
 /// attribute) keeps the body compiled and testable on every target.
 fn enforce_cloud_only_platform(config: &mut AppConfig) {
     if cfg!(windows) {
-        config.cloud_broadcast_enabled = true;
+        config.default_slot_config.cloud_on = true;
     }
 }
 
@@ -3155,7 +3104,7 @@ mod tests {
     #[test]
     fn agents_pane_empty_when_no_api_key_with_cloud_on() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
+        app.default_slot_config.cloud_on = true;
         // voicebird_api_key stays empty (default).
         app.refresh_agents();
         assert!(
@@ -3239,7 +3188,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn refresh_agents_uses_effective_source_cloud_state_not_only_global_default() {
-        use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+        use voice_bird_cli::config::AudioSessionKind;
         use voice_bird_cli::session::layout::SessionSource;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3570,19 +3519,16 @@ mod tests {
         // Simulate the user pressing `l` to cycle the
         // language to Russian and `c` to flip cloud on
         // *after* stopping. The c/l handlers update the
-        // global config and per-source override when no
-        // section is focused (the post-stop case). Persist
-        // the override the same way persist_focused_settings
-        // does so the test reflects production state.
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
-        let key = app.source_key_for(&SessionSource::Microphone);
-        let mut ov = app.config.effective_override(&key);
-        ov.cloud_on = true;
-        ov.language = "ru".into();
-        app.config.upsert_source_override(key, ov);
-
-        // Resume. The result is pipeline-dependent
+        // focused slot's `slot.config` (the post-stop
+        // state) — that's the single source of truth for
+        // what the next start will see.
+        let slot_obj = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == slot)
+            .expect("focused slot must exist");
+        slot_obj.config.cloud_on = Some(true);
+        slot_obj.config.language = Some("ru".into());
         // (capture may succeed or fail in the test env),
         // so we only assert on the slot's post-call
         // settings — not on Ok/Err.
@@ -4011,29 +3957,15 @@ mod tests {
         }];
         app.selected_device_index = 0;
         let slot = app.slots[0].id;
-        // Per-source override for the microphone must read
-        // `cloud_on = true` — that's the source the picker
-        // resolves to, and the resume path derives
-        // `effective_settings_for` from the per-source
-        // override first. Without this, the resume would
-        // fall back to the global default
-        // (`cloud_broadcast_enabled = false` in the test
-        // tempdir) and the assertion below would trip.
-        // (Pre-test-overlay this assertion passed only
-        // because the developer's real config happened to
-        // have `cloud_broadcast_enabled = true` and no
-        // per-source override — implicit test data.)
-        let source = SessionSource::Microphone;
-        let key = app.source_key_for(&source);
-        use voice_bird_cli::config::SourceSettingsOverride;
-        app.config.source_overrides.insert(
-            key,
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        );
+        // The slot's customization says cloud_on = true.
+        // The new model: slot.config is the single source
+        // of truth, not a per-source override map.
+        let slot_obj = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == slot)
+            .expect("focused slot must exist");
+        slot_obj.config.cloud_on = Some(true);
         // Saved as: target=Stdout, cloud_on=true
         // (user wants server streaming + local
         // files).
@@ -4098,7 +4030,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().into_owned();
+        app.default_slot_config.path = dir.path().to_string_lossy().into_owned();
         app.config.voicebird_api_key = "sk-test".into();
         // Devices picker so `resolve_focused_source` returns
         // `Microphone` and the session slug picks the `-mic`
@@ -4160,14 +4092,14 @@ mod tests {
     #[test]
     fn cloud_only_platform_invariants() {
         let mut config = AppConfig::default();
-        config.cloud_broadcast_enabled = false;
+        config.default_slot_config.cloud_on = false;
         enforce_cloud_only_platform(&mut config);
-        assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
+        assert_eq!(config.default_slot_config.cloud_on, cfg!(windows));
 
         let mut settings = SectionSettings {
-            cloud_on: config.cloud_broadcast_enabled,
-            language: config.language.clone(),
-            model: config.default_model.clone(),
+            cloud_on: config.default_slot_config.cloud_on,
+            language: config.default_slot_config.language.clone(),
+            model: config.default_slot_config.model.clone(),
         };
         settings.cloud_on = false;
         clamp_section_settings_for_platform(&mut settings);
@@ -4359,7 +4291,7 @@ mod tests {
         fn export_banner_no_sessions() {
             let dir = tempfile::tempdir().unwrap();
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -4382,7 +4314,7 @@ mod tests {
             std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
 
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -4519,7 +4451,7 @@ mod tests {
 
         fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
             app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
             app.config.voicebird_api_key = "test-key-abc123".into();
             app

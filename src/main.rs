@@ -627,7 +627,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             // silently without touching cloud — the cloud-enable
             // flow is its own funnel (the `c` toggle's
             // "Cloud ON, no key" branch sets `reverts_cloud = true`).
-            app.open_api_key_modal(false);
+            app.open_api_key_modal();
         }
         KeyCode::Char('m') => {
             // Manual model override. Seeds the picker at the current
@@ -658,7 +658,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('c') => {
             // `false`: there's no cloud toggle to revert on Windows;
             // Cloud is always on. Esc just closes the modal.
-            app.open_api_key_modal(false);
+            app.open_api_key_modal();
         }
         // Toggle cloud transcription. When idle, mutates the global
         // config so the next-start defaults flip (and the mode panel
@@ -671,14 +671,18 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             if let Some(section) = app.focused_mut() {
                 section.settings.cloud_on = !section.settings.cloud_on;
                 let on = section.settings.cloud_on;
-                app.persist_focused_settings();
-                // Re-fetch the cloud Agents list so the picker reflects
-                // what the just-toggled per-section flag is authorized
-                // to see. The idle `c` branch already does this; the
-                // focused-section branch was missing it — so creating a
-                // custom agent on voicebird.app and then pressing `c`
-                // while a section was focused left the picker stale
-                // until the next process restart.
+                // Mirror the live toggle into the slot's
+                // customization so the next start sees the
+                // same value. `Slot.config` is the single
+                // source of truth for what the slot will use
+                // when starting a new section.
+                if let Some(slot) = app
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.id == app.focused_slot)
+                {
+                    slot.config.cloud_on = Some(on);
+                }
                 app.refresh_agents();
                 app.banner = Some(if on {
                     "Cloud: ON for focused section (applies on next start)".into()
@@ -716,7 +720,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     // records the OFF→ON flip; the user can
                     // press `c` again to revert. No more
                     // `pending_c_revert` bookkeeping.
-                    app.open_api_key_modal(false);
+                    app.open_api_key_modal();
                 } else {
                     app.banner = Some(if app.display_cloud_on() {
                         "Cloud: ON (next recording streams to voicebird.app)".into()
@@ -743,12 +747,15 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                     .unwrap_or(0);
                 let next = (i + 1) % langs.len();
                 section.settings.language = langs[next].into();
-                app.persist_focused_settings();
+                // Mirror to slot.config for next start.
+                if let Some(slot) = app
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.id == app.focused_slot)
+                {
+                    slot.config.language = Some(langs[next].into());
+                }
             } else if app.display_cloud_on() {
-                // Idle: write to the focused slot's
-                // `slot.config.language`. Other slots are
-                // untouched. The slot is the single source
-                // of truth for per-slot language.
                 if let Some(slot) = app
                     .slots
                     .iter_mut()
@@ -829,56 +836,12 @@ fn handle_path_modal(app: &mut App, key: KeyCode) {
 fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            // Cancel: only revert the cloud toggle if THIS modal
-            // was opened as the cloud-enable gate. `K` peek,
-            // first-run bootstrap, auth-failure recovery, and
-            // `start_section`'s pre-flight all set
-            // `api_key_modal_reverts_cloud = false` — for those
-            // flows Esc must close the modal silently, because
-            // cloud is either already on (and the user just wants
-            // to fix the key) or not in play (first run / peek).
-            if app.api_key_modal_reverts_cloud {
-                #[cfg(not(windows))]
-                {
-                    // Revert the per-source override the c
-                    // toggle just wrote, instead of flipping the
-                    // global flag. Restore the previous value
-                    // (or delete the override if there was no
-                    // prior override). The global flag is the
-                    // fallback default and stays unchanged so
-                    // other slots are not affected.
-                    if let Some((key, prev)) = app.pending_c_revert.take() {
-                        match prev {
-                            Some(ov) => {
-                                app.config.upsert_source_override(key, ov);
-                            }
-                            None => {
-                                app.config.source_overrides.remove(&key);
-                            }
-                        }
-                        if let Err(e) = app.config.save() {
-                            log::error!("config save (modal cancel): {e}");
-                        }
-                        app.banner =
-                            Some("Cloud: OFF (cancelled API key entry)".into());
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    // Windows can't fall back to local, so cloud
-                    // stays on; the start-recording guard re-opens
-                    // this modal when needed. (This branch is
-                    // defensive — the c-toggle's `reverts_cloud =
-                    // true` path is non-Windows only.)
-                    app.banner = Some(
-                        "Windows is cloud-only — press 'c' to set an API key before recording"
-                            .into(),
-                    );
-                }
-            }
-            app.pending_c_revert = None;
+            // Cancel: close the modal silently. The slot's
+            // per-slot cloud toggle (or the default) keeps
+            // the user's last flip — they can re-press `c`
+            // to revert manually. No more bookkeeping
+            // around a per-source override + global flag.
             app.api_key_buf = None;
-            app.api_key_modal_reverts_cloud = false;
             app.mode = AppMode::Normal;
         }
         KeyCode::Enter => {
@@ -1062,9 +1025,9 @@ fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
         "last_key": last_key,
         "status": status,
         "cloud_broadcast_active": app.focused_cloud_active(),
-        "cloud_broadcast_enabled": app.config.cloud_broadcast_enabled,
-        "language": app.config.language,
-        "default_model": app.config.default_model,
+        "cloud_broadcast_enabled": app.default_slot_config.cloud_on,
+        "language": app.default_slot_config.language,
+        "default_model": app.default_slot_config.model,
         "engine_kind": app.focused_engine_kind(),
         "duration_secs": app.duration,
         "banner": app.banner,
@@ -1556,7 +1519,7 @@ mod api_key_dispatcher_uppercase_k_tests {
 mod pr48_review_regression_tests {
     use super::*;
     use crate::platform::AudioDevice;
-    use voice_bird_cli::config::{AudioSessionKind, SourceSettingsOverride};
+    use voice_bird_cli::config::AudioSessionKind;
     use voice_bird_cli::session::layout::SessionSource;
 
     /// Snapshot of the developer's real `config.toml`, restored on
@@ -1610,41 +1573,7 @@ mod pr48_review_regression_tests {
         }
     }
 
-    /// Regression guard (review item 1; was RED, fixed in 992ae64).
-    ///
-    /// `K` opens the API-key modal from anywhere, and the modal's
-    /// "Current key:" line invites opening it just to *look* at the
-    /// saved key. The Esc arm used to unconditionally revert
-    /// `cloud_broadcast_enabled` (it was written for the
-    /// cloud-toggle-needs-a-key funnel, the only flow that existed
-    /// before `K`) — so peek-and-Esc silently disabled cloud. Now
-    /// `App::api_key_modal_reverts_cloud` records why the modal was
-    /// opened and Esc only reverts cloud for the cloud-enable gate.
-    #[test]
-    fn esc_after_k_peek_must_not_disable_cloud() {
-        let _guard = RealConfigGuard::snapshot();
-        let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
-
-        // The user peeks at the saved key via K…
-        handle_normal_mode(&mut app, KeyCode::Char('K'));
-        assert_eq!(app.mode, AppMode::ApiKeyModal, "K must open the modal");
-
-        // …and backs out without changing anything.
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        handle_api_key_modal(&mut app, &esc);
-
-        assert_eq!(app.mode, AppMode::Normal, "Esc must close the modal");
-        assert!(
-            app.config.cloud_broadcast_enabled,
-            "Esc from a K-opened (peek) modal must NOT disable cloud — \
-             the cancel-reverts-cloud behaviour only makes sense when the \
-             modal was opened by the cloud-enable flow that needs a key"
-        );
-    }
-
     /// Regression guard (review item 2; was RED, fixed in a608402).
-    ///
     /// `AppConfig::save()` used to write straight to the machine's
     /// real config path, so tests driving real key handlers
     /// persisted flipped flags and synthetic `sk-test` keys over

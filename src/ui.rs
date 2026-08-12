@@ -569,7 +569,13 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         " Mode "
     };
 
-    let path_raw = app.config.session_dir_expanded();
+    // Focused slot's customized output path, or the default
+    // if no customization. The slot is the single source of
+    // truth for per-slot output path.
+    let path_raw = app
+        .slot_by_id(app.focused_slot)
+        .and_then(|s| s.config.path.clone())
+        .unwrap_or_else(|| app.default_slot_config.path.clone());
     let path_display = if path_raw.len() > 24 {
         format!("…{}", &path_raw[path_raw.len().saturating_sub(23)..])
     } else {
@@ -1601,7 +1607,7 @@ mod tests {
     #[test]
     fn mode_panel_off_shows_language_locked() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = false;
+        app.default_slot_config.cloud_on = false;
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("Mode"), "mode panel title missing:\n{out}");
         assert!(out.contains("[OFF]"), "cloud-off label missing:\n{out}");
