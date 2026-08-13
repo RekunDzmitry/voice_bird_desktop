@@ -139,4 +139,33 @@ mod tests {
         );
     }
 
+    /// End-to-end parse of the live `GET https://voicebird.app/api/agents`
+    /// response captured against the user's API key on 2026-08-11.
+    /// Pins that the wire format (built-ins + custom UUIDs, `null`
+    /// icons, omitted `description`) is parsed cleanly by the
+    /// desktop and produces three `Agent` rows — including the
+    /// user's custom `Interviewee`. A future server refactor that
+    /// breaks any of those rows surfaces here.
+    #[test]
+    fn parses_live_voicebird_app_response() {
+        let body = std::fs::read_to_string(
+            "tests/fixtures/voicebird_app_agents_response.json",
+        )
+        .expect("fixture present");
+        let parsed: AgentsResponse = serde_json::from_str(&body)
+            .expect("live wire response must parse");
+        assert_eq!(
+            parsed.agents.len(),
+            3,
+            "expected dentist + note-taker + custom, got {}",
+            parsed.agents.len(),
+        );
+
+        let names: Vec<&str> =
+            parsed.agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"Dentist"), "Dentist built-in missing");
+        assert!(names.contains(&"Note Taker"), "Note Taker built-in missing");
+        assert!(names.contains(&"Interviewee"), "custom Interviewee missing");
+    }
+
 }

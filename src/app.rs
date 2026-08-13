@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
-use voice_bird_cli::config::AppConfig;
+use voice_bird_cli::config::{AppConfig, DefaultSlotConfig};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -107,10 +107,40 @@ pub struct RecordingRuntime {
     /// model is configured or when it failed to load.
     pub refinement_join: Option<tokio::task::JoinHandle<()>>,
 }
+/// Per-slot settings. Every slot owns one; idle slots read
+/// these directly, recording slots snapshot them into
+/// `Section.settings` at start time. Each `Option` field is
+/// `None` = "use the global `DefaultSlotConfig`";
+/// `Some(value)` = "this slot overrides the default".
+/// Toggling cloud, cycling language, cycling model, or saving
+/// a custom output path on a slot customizes the relevant
+/// field. The picker cursor (device / app) and agent routing
+/// are stored separately in `slot_picker_memo` and
+/// `pending_agent_overrides` — they index into the live
+/// inventory rather than carry device names directly.
+#[derive(Debug, Clone)]
+pub struct SlotConfig {
+    pub cloud_on: Option<bool>,
+    pub language: Option<String>,
+    pub model: Option<String>,
+    pub path: Option<String>,
+}
 
-/// Settings snapshotted at section start. In Stage 1 these are seeded
-/// from the global `AppConfig`; in Stage 2 they will gain per-source
-/// override persistence in `AppConfig::source_overrides`.
+impl SlotConfig {
+    /// All-None = "uses every field from the default".
+    pub fn default_passthrough() -> Self {
+        Self {
+            cloud_on: None,
+            language: None,
+            model: None,
+            path: None,
+        }
+    }
+}
+
+/// Snapshot of the slot's `SlotConfig` taken at section start.
+/// Holds the EFFECTIVE values (after applying the default) so the
+/// running engine reads from a stable, non-defaulting view.
 #[derive(Debug, Clone)]
 pub struct SectionSettings {
     pub cloud_on: bool,
@@ -118,7 +148,23 @@ pub struct SectionSettings {
     pub model: String,
 }
 
-/// One running recording slot. Each section owns its own audio capture,
+impl SectionSettings {
+    /// Convert a (slot_config, default) into the effective
+    /// snapshot the section will use.
+    pub fn effective(slot: &SlotConfig, default: &DefaultSlotConfig) -> Self {
+        Self {
+            cloud_on: slot.cloud_on.unwrap_or(default.cloud_on),
+            language: slot
+                .language
+                .clone()
+                .unwrap_or_else(|| default.language.clone()),
+            model: slot
+                .model
+                .clone()
+                .unwrap_or_else(|| default.model.clone()),
+        }
+    }
+}
 /// engine, and transcript buffers — multiple sections can record in
 /// parallel, each with independent settings (Stage 2+).
 pub struct Section {
@@ -209,11 +255,16 @@ impl std::fmt::Debug for SlotKind {
     }
 }
 
-/// One TUI pane and its current state. The pane's `id` is stable; the
-/// position in `App::slots` is incidental.
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
+    /// Per-slot settings. Each slot starts with
+    /// `SlotConfig::default_passthrough()` (every field inherits
+    /// from `App::default_slot_config`). The c/l/m/P keys and the
+    /// device/app picker mutate the FOCUSED slot's config; idle
+    /// slots read it directly, recording slots snapshot it into
+    /// `Section.settings` at start time.
+    pub config: SlotConfig,
 }
 
 impl Slot {
@@ -221,6 +272,7 @@ impl Slot {
         Self {
             id,
             kind: SlotKind::Empty,
+            config: SlotConfig::default_passthrough(),
         }
     }
 
@@ -243,7 +295,6 @@ impl Slot {
         }
     }
 }
-
 impl std::fmt::Debug for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Slot")
@@ -263,6 +314,19 @@ pub enum PickerFocus {
     Devices,
     Apps,
     Agents,
+}
+
+/// Per-slot memo of the picker cursor. The Devices / Apps cursors on
+/// `App` always reflect the FOCUSED slot's state; this struct holds
+/// the last cursor position seen for a slot that's not currently
+/// focused, so Tab/Shift-Tab back to it shows what was last selected.
+/// Created on first focus, updated on every Tab-away from the slot.
+/// In-memory only — not persisted across restarts.
+#[derive(Debug, Clone)]
+pub struct PickerSelection {
+    pub device_idx: usize,
+    pub app_idx: Option<usize>,
+    pub focus: PickerFocus,
 }
 
 /// Main application state
@@ -296,6 +360,7 @@ pub struct App {
     pub device_scroll: u16,
     pub app_scroll: u16,
     pub target_scroll: u16,
+
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
     pub status: RecordingStatus,
@@ -355,19 +420,9 @@ pub struct App {
     /// modal isn't open. Repurposed from the old per-field settings
     /// editor — the modal is now the only text-input flow in the TUI.
     pub api_key_buf: Option<String>,
-    /// Whether the currently-open API-key modal was opened as the
-    /// cloud-enable gate (i.e. the user just flipped Cloud ON with
-    /// no key, or the runtime detected `auth_failure` and needs a
-    /// key to recover). `true` ⇒ Esc cancels the cloud flip and
-    /// reverts `cloud_broadcast_enabled` to `false` (the pre-toggle
-    /// state); `false` ⇒ Esc just closes the modal without touching
-    /// cloud (e.g. `K` peeked at the saved key, or the modal was
-    /// opened as a first-run bootstrap). Set by the opener, reset
-    /// to `false` when the modal closes.
-    pub api_key_modal_reverts_cloud: bool,
-
     /// In-flight text buffer for the output-path modal. `None` when
-    /// the modal isn't open. Pre-filled with `config.session_dir`.
+    /// the modal isn't open. Pre-filled with the focused slot's
+    /// customized path, or the default if no customization.
     pub path_buf: Option<String>,
 
     /// Feedback banner for the transcript-export flow ("Exporting…",
@@ -419,6 +474,18 @@ pub struct App {
     /// `Target::Stdout` routing decision.
     pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
 
+    /// Per-slot memo of the picker cursor (Devices / Apps / focus).
+    /// `App::selected_device_index`, `selected_app_index`, and
+    /// `picker_focus` always reflect the FOCUSED slot's state. When
+    /// the user Tabs to a different slot, the current cursor is
+    /// saved here under the outgoing slot id, and the incoming
+    /// slot's memo is loaded back into the cursor fields. This way
+    /// each slot remembers the last device + app it was parked on,
+    /// even if the user never pressed Enter to start a recording.
+    /// Entries are pruned when a slot is removed (its id is
+    /// never reused). In-memory only — not persisted across restarts.
+    pub slot_picker_memo: std::collections::BTreeMap<SlotId, PickerSelection>,
+
     /// Rolling log of app events (verify ok/fail, push failures,
     /// dropped segments), newest at the back. Behind an
     /// `Arc<PlMutex<...>>` so any background task can
@@ -426,6 +493,14 @@ pub struct App {
     /// `t` status overlay ([`AppMode::Status`\]). Renamed
     /// from `agent_events` in §8.
     pub app_events: Arc<PlMutex<VecDeque<AppEvent>>>,
+
+    /// Global default for a slot's per-slot settings. Each slot
+    /// reads unset fields from here. The c/l/m/P keys mutate
+    /// the focused slot's `SlotConfig`; this field is the
+    /// background defaults. The user can customize it directly
+    /// (settings UI not yet implemented) but per-slot writes
+    /// never mutate it.
+    pub default_slot_config: voice_bird_cli::config::DefaultSlotConfig,
 }
 
 /// One row in the `t` status overlay.
@@ -505,7 +580,7 @@ impl App {
             {
                 let picked = voice_bird_cli::transcription::auto_select::pick_default_model();
                 log::info!("first run: auto-picked local model = {picked}");
-                config.default_model = picked.into();
+                config.default_slot_config.model = picked.into();
             }
             if let Err(e) = config.save() {
                 log::error!("config save (first run): {e}");
@@ -517,7 +592,7 @@ impl App {
         // Only the macOS screen-recording check below mutates this.
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut banner_on_launch: Option<String> =
-            if config.cloud_broadcast_enabled && config.voicebird_api_key.is_empty() {
+            if config.default_slot_config.cloud_on && config.voicebird_api_key.is_empty() {
                 Some("Cloud is on but no API key — press 'c' to paste one".into())
             } else {
                 None
@@ -567,7 +642,8 @@ impl App {
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
             start_time: None,
-            config,
+            config: config.clone(),
+            default_slot_config: config.default_slot_config.clone(),
             should_quit: false,
             status_message: None,
             error_channel: Arc::new(Mutex::new(None)),
@@ -581,7 +657,6 @@ impl App {
             picker: None,
             config_was_loaded_from_disk,
             api_key_buf: None,
-            api_key_modal_reverts_cloud: false,
             path_buf: None,
             export_banner: None,
             banner: banner_on_launch,
@@ -592,6 +667,7 @@ impl App {
             pending_target_overrides: std::collections::BTreeMap::new(),
             agents: Vec::new(),
             pending_agent_overrides: std::collections::BTreeMap::new(),
+            slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
 
@@ -619,7 +695,7 @@ impl App {
     }
 
     /// Read-only access to a slot by id.
-    fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
+    pub fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
         self.slots.iter().find(|s| s.id == id)
     }
 
@@ -668,27 +744,63 @@ impl App {
     }
 
     /// Cloud on/off as displayed in the Mode panel: focused section's
-    /// setting if one is running, else the global config default.
+    /// setting if one is running, else the per-source override for
+    /// the picker-resolved source (so the badge reflects what would
+    /// actually take effect if the user pressed Enter on this slot),
+    /// else the global config default. Falls through to global only
+    /// when no picker source can be resolved.
+    /// Cloud ON/OFF as displayed in the Mode panel.
+    ///
+    /// Resolution order:
+    /// 1. Focused recording section's `settings.cloud_on` (the
+    ///    value the running engine is using).
+    /// 2. Focused slot's `slot.config.cloud_on` if customized.
+    /// 3. Picker-resolved source's slot customizations (when
+    ///    no slot is focused, the source settles).
+    /// 4. `default_slot_config.cloud_on` (the global default).
     pub fn display_cloud_on(&self) -> bool {
-        self.focused()
-            .map(|s| s.settings.cloud_on)
-            .unwrap_or(self.config.cloud_broadcast_enabled)
+        if let Some(s) = self.focused() {
+            return s.settings.cloud_on;
+        }
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(c) = slot.config.cloud_on {
+                return c;
+            }
+        }
+        self.default_slot_config.cloud_on
     }
 
     /// Language as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// Language as displayed in the Mode panel: focused
+    /// section's setting if running, else the focused slot's
+    /// customized `slot.config.language`, else the global
+    /// `default_slot_config.language`.
     pub fn display_language(&self) -> String {
-        self.focused()
-            .map(|s| s.settings.language.clone())
-            .unwrap_or_else(|| self.config.language.clone())
+        if let Some(s) = self.focused() {
+            return s.settings.language.clone();
+        }
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(lang) = &slot.config.language {
+                return lang.clone();
+            }
+        }
+        self.default_slot_config.language.clone()
     }
 
-    /// Model id as displayed in the Mode panel: focused section's
-    /// setting if running, else the global config default.
+    /// Model id as displayed in the Mode panel: focused
+    /// section's setting if running, else the focused slot's
+    /// customized `slot.config.model`, else the global
+    /// `default_slot_config.model`.
     pub fn display_model(&self) -> String {
-        self.focused()
-            .map(|s| s.settings.model.clone())
-            .unwrap_or_else(|| self.config.default_model.clone())
+        if let Some(s) = self.focused() {
+            return s.settings.model.clone();
+        }
+        if let Some(slot) = self.slot_by_id(self.focused_slot) {
+            if let Some(m) = &slot.config.model {
+                return m.clone();
+            }
+        }
+        self.default_slot_config.model.clone()
     }
 
     /// The focused slot's current target (Stdout / Cloud), or `None`
@@ -782,16 +894,24 @@ impl App {
 
     /// Re-fetch the cloud Agents list from voicebird.app and
     /// store it on `self.agents`. No-op when:
-    ///   - `config.cloud_broadcast_enabled` is false, OR
-    ///   - the user has no API key set, OR
-    ///   - the server URL is empty / unparseable.
+    ///   - the effective cloud state for the focused slot is OFF
+    ///     (per-source override > global default; falls back to
+    ///     global only when no picker source can be resolved),
+    ///   - OR the user has no API key set,
+    ///   - OR the server URL is empty / unparseable.
     /// On HTTP failure (4xx / 5xx / network error), `self.agents`
     /// is cleared so the picker goes empty rather than showing
     /// stale rows, AND a banner is set explaining the failure —
     /// picker emptiness alone is too quiet and looks identical
     /// to "fetch hasn't run yet".
     pub fn refresh_agents(&mut self) {
-        if !self.config.cloud_broadcast_enabled
+        // Gate on the effective cloud state, not the bare global
+        // flag — a per-source override can flip the displayed
+        // state to ON while `cloud_broadcast_enabled` stays OFF
+        // (e.g. the user enabled Cloud for one mic only). Pre-fix
+        // this gate ignored the override and the picker stayed
+        // empty until the user also flipped the global default.
+        if !self.display_cloud_on()
             || self.config.voicebird_api_key.is_empty()
             || self.config.voicebird_server_url.is_empty()
         {
@@ -862,10 +982,15 @@ impl App {
     ///    key (e.g. `K` peek, first-run bootstrap, auth-recovery
     ///    pre-flight). Esc closes the modal silently.
     ///
-    /// Used by the `c` toggle and by auth-error recovery.
-    pub fn open_api_key_modal(&mut self, reverts_cloud: bool) {
+    /// Capture the saved key into `api_key_buf` and transition
+    /// to `AppMode::ApiKeyModal`. The modal is the only text-input
+    /// flow in the TUI — opens for cloud-enable (after `c`)
+    /// and auth-error recovery alike. Esc closes the modal
+    /// without side effects; the slot's per-slot `cloud_on`
+    /// (or the default) keeps the user's last toggle, ready
+    /// to re-flip on next `c` press.
+    pub fn open_api_key_modal(&mut self) {
         self.api_key_buf = Some(self.config.voicebird_api_key.clone());
-        self.api_key_modal_reverts_cloud = reverts_cloud;
         self.mode = AppMode::ApiKeyModal;
     }
 
@@ -874,7 +999,13 @@ impl App {
     /// key doesn't exist on cloud-only Windows.
     #[cfg(not(windows))]
     pub fn open_path_modal(&mut self) {
-        self.path_buf = Some(self.config.session_dir.clone());
+        // Pre-fill with the focused slot's customized path,
+        // or the default if the slot has no customization.
+        let initial = self
+            .slot_by_id(self.focused_slot)
+            .and_then(|s| s.config.path.clone())
+            .unwrap_or_else(|| self.default_slot_config.path.clone());
+        self.path_buf = Some(initial);
         self.mode = AppMode::PathModal;
     }
 
@@ -888,7 +1019,18 @@ impl App {
         // Clear any previous export banner
         self.export_banner = None;
 
-        let base_dir = self.config.session_dir_expanded();
+        // Look in the focused slot's customized output path,
+        // or the default slot's path if no customization.
+        // `expand_tilde` resolves `~/` to the home dir so
+        // the default `~/voice-bird/sessions` lands at the
+        // user's actual home directory rather than a literal
+        // `./~/voice-bird/...` relative path.
+        let base_dir = voice_bird_cli::config::AppConfig::expand_tilde(
+            &self
+                .slot_by_id(self.focused_slot)
+                .and_then(|s| s.config.path.clone())
+                .unwrap_or_else(|| self.default_slot_config.path.clone()),
+        );
         let base = std::path::Path::new(&base_dir);
 
         // Find the most recent session that has a transcript.json.
@@ -1079,7 +1221,14 @@ impl App {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
             let next_idx = (idx + 1) % n;
-            self.focused_slot = self.slots[next_idx].id;
+            let next_slot = self.slots[next_idx].id;
+            // Save the outgoing slot's cursor state so Tab-back
+            // restores it. Restore the incoming slot's memoized
+            // cursor (or keep the current one if no memo yet —
+            // first focus inherits whatever the cursor is at).
+            self.memoize_picker_for(self.focused_slot);
+            self.focused_slot = next_slot;
+            self.restore_picker_for(next_slot);
         }
     }
 
@@ -1089,10 +1238,12 @@ impl App {
         if let Some(idx) = self.slot_index(self.focused_slot) {
             let n = self.slots.len();
             let prev_idx = (idx + n - 1) % n;
-            self.focused_slot = self.slots[prev_idx].id;
+            let prev_slot = self.slots[prev_idx].id;
+            self.memoize_picker_for(self.focused_slot);
+            self.focused_slot = prev_slot;
+            self.restore_picker_for(prev_slot);
         }
     }
-
     /// Pick the first Empty slot, or `None` if every existing slot
     /// is busy. Callers that need to grow past `len()` should call
     /// `add_slot` instead — this stays narrow on purpose.
@@ -1107,12 +1258,19 @@ impl App {
     /// Returns the new slot's id. Refuses (and returns `None`) when
     /// the slot count is already at `MAX_SECTIONS` — the cap exists
     /// to keep the screen readable, not as a feature limitation.
+    /// The new slot inherits the focused slot's current picker
+    /// cursor (so `+` followed by Enter records from the same
+    /// device/app) — memoize the outgoing slot first so Tab back
+    /// to it still works.
     pub fn add_slot(&mut self) -> Option<SlotId> {
         if self.slots.len() >= MAX_SECTIONS {
             return None;
         }
         let id = SlotId(self.next_slot_id);
         self.next_slot_id += 1;
+        // Snapshot the current cursor under the outgoing slot so
+        // Tab back to it after `+` restores its state.
+        self.memoize_picker_for(self.focused_slot);
         self.slots.push(Slot::empty(id));
         self.focused_slot = id;
         Some(id)
@@ -1136,30 +1294,108 @@ impl App {
             return false;
         }
         self.slots.remove(pos);
-        // If the focused slot also had a pending target override,
-        // drop it — the slot id is gone from the Vec and we don't
-        // want the override to silently re-apply to a future slot.
+        // Drop the focused slot's per-slot state — the slot id is
+        // gone and `next_slot_id` won't reuse it, so the memo would
+        // otherwise be leaked for the rest of the session.
         self.pending_target_overrides.remove(&id);
+        self.slot_picker_memo.remove(&id);
         // Land focus on the nearest remaining slot. Prefer the slot
         // to the left of the removed one, else the new rightmost.
         let new_idx = if pos > 0 { pos - 1 } else { 0 };
         if let Some(s) = self.slots.get(new_idx) {
             self.focused_slot = s.id;
+            // Restore the new focused slot's memoized cursor so
+            // `-` doesn't accidentally reset the cursor to what
+            // the removed slot was showing.
+            self.restore_picker_for(s.id);
         }
         true
     }
 
+    /// Snapshot the current picker cursor under the given slot id.
+    /// Called immediately before focus moves away from that slot.
+    /// The cursor fields on `App` keep holding the slot's state
+    /// until the caller switches `focused_slot`, at which point
+    /// `restore_picker_for` loads the next slot's memo back in.
+    fn memoize_picker_for(&mut self, slot: SlotId) {
+        self.slot_picker_memo.insert(
+            slot,
+            PickerSelection {
+                device_idx: self.selected_device_index,
+                app_idx: self.selected_app_index,
+                focus: self.picker_focus,
+            },
+        );
+    }
+
+    /// Load the memoized picker cursor for the given slot id into
+    /// the cursor fields on `App`. No-op if the slot has no memo
+    /// (first time the user Tabs to it) — the cursor simply keeps
+    /// whatever value it had, which is the natural "first focus
+    /// inherits current state" behavior.
+    fn restore_picker_for(&mut self, slot: SlotId) {
+        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
+            // Clamp the restored indices against the current
+            // inventory — a refresh may have shrunk `devices` /
+            // `apps` between Tab-away and Tab-back.
+            let dev_idx = if self.devices.is_empty() {
+                0
+            } else {
+                p.device_idx.min(self.devices.len() - 1)
+            };
+            let app_idx = p.app_idx.and_then(|i| {
+                if self.apps.is_empty() {
+                    None
+                } else {
+                    Some(i.min(self.apps.len() - 1))
+                }
+            });
+            self.selected_device_index = dev_idx;
+            self.selected_app_index = app_idx;
+            self.picker_focus = p.focus;
+        }
+    }
+
     /// Refresh both panes' inventory. Preserves cursors by name when the
-    /// previously-cursored entries still exist after refresh.
+    /// previously-cursored entries still exist after refresh. The
+    /// focused slot's cursor is re-resolved in place; per-slot
+    /// memos for non-focused slots are also re-resolved so a later
+    /// Tab back to them lands on the same device/app the user
+    /// picked, even if the OS audio inventory reordered (e.g. a
+    /// USB headset reappearing at a different index).
     pub fn refresh_inventory(&mut self) {
-        let prior_device = self
+        use voice_bird_cli::config::AudioSessionKind;
+         // Snapshot the focused slot's current device/app names
+        // BEFORE replacing `devices` / `apps`, plus the per-slot
+        // memo's device/app names for every other slot. Both are
+        // re-resolved by name after the rebuild.
+        let focused_prior_device = self
             .devices
             .get(self.selected_device_index)
             .map(|d| (d.name.clone(), d.kind));
-        let prior_app = self
+        let focused_prior_app = self
             .selected_app_index
             .and_then(|i| self.apps.get(i))
             .map(|a| a.id.clone());
+        let memo_priors: std::collections::BTreeMap<
+            SlotId,
+            (Option<(String, AudioSessionKind)>, Option<String>),
+        > = self
+            .slot_picker_memo
+            .iter()
+            .filter(|(slot, _)| **slot != self.focused_slot)
+            .map(|(slot, sel)| {
+                let dev = self
+                    .devices
+                    .get(sel.device_idx)
+                    .map(|d| (d.name.clone(), d.kind));
+                let app = sel
+                    .app_idx
+                    .and_then(|i| self.apps.get(i))
+                    .map(|a| a.id.clone());
+                (*slot, (dev, app))
+            })
+            .collect();
 
         match crate::platform::enumerate_audio_inventory() {
             Ok(inv) => {
@@ -1167,11 +1403,13 @@ impl App {
                 self.apps = inv.apps;
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed to enumerate audio inventory: {}", e));
+                self.status_message =
+                    Some(format!("Failed to enumerate audio inventory: {}", e));
             }
         }
 
-        if let Some((name, kind)) = prior_device {
+        // Re-resolve focused slot.
+        if let Some((name, kind)) = focused_prior_device {
             if let Some(i) = self
                 .devices
                 .iter()
@@ -1182,10 +1420,31 @@ impl App {
                 self.selected_device_index = self.devices.len().saturating_sub(1);
             }
         }
-
-        self.selected_app_index = prior_app
+        self.selected_app_index = focused_prior_app
             .as_deref()
             .and_then(|id| self.apps.iter().position(|a| a.id == id));
+
+        // Re-resolve each non-focused slot's memo by name.
+        for (slot, (dev, app)) in memo_priors {
+            if let Some(sel) = self.slot_picker_memo.get_mut(&slot) {
+                if let Some((name, kind)) = dev {
+                    if let Some(i) = self
+                        .devices
+                        .iter()
+                        .position(|d| d.name == name && d.kind == kind)
+                    {
+                        sel.device_idx = i;
+                    }
+                    // If the device disappeared, leave the index
+                    // alone — `restore_picker_for` clamps against
+                    // the new `devices.len()`.
+                }
+                if let Some(id) = app {
+                    sel.app_idx = self.apps.iter().position(|a| a.id == id);
+                    // Same clamping story for apps.
+                }
+            }
+        }
 
         self.clamp_scrolls(usize::MAX);
     }
@@ -1332,12 +1591,45 @@ impl App {
         self.devices.get(self.selected_device_index)
     }
 
-    /// Currently focused (Apps pane) entry, if any. Returns `None` when
+    /// Per-slot Devices pane entry. For the focused slot, returns
+    /// the live cursor (same as [`focused_device`]). For a
+    /// non-focused slot, returns the device the slot's
+    /// `slot_picker_memo` points at — the one that will be
+    /// restored when the user Tabs back. This is what the slot
+    /// title renders, so non-focused slots stay frozen at their
+    /// last pick while the user moves the cursor elsewhere.
+    pub fn slot_device(&self, slot_id: SlotId) -> Option<&AudioDevice> {
+        let idx = if slot_id == self.focused_slot {
+            self.selected_device_index
+        } else {
+            self.slot_picker_memo
+                .get(&slot_id)
+                .map(|p| p.device_idx)
+                .unwrap_or(self.selected_device_index)
+        };
+        self.devices.get(idx)
+    }
+
     /// the user has cleared the selection or no apps are available.
     pub fn focused_app(&self) -> Option<&AppSession> {
         self.selected_app_index.and_then(|i| self.apps.get(i))
     }
 
+    /// Per-slot Apps pane entry. For the focused slot, returns the
+    pub fn slot_app(&self, slot_id: SlotId) -> Option<&AppSession> {
+        let idx = if slot_id == self.focused_slot {
+            self.selected_app_index
+        } else {
+            // Non-focused slot with no memo: fall back to the
+            // global cursor (i.e. the first focus on this slot
+            // inherits whatever the cursor is currently on).
+            self.slot_picker_memo
+                .get(&slot_id)
+                .and_then(|p| p.app_idx)
+                .or(self.selected_app_index)
+        };
+        idx.and_then(|i| self.apps.get(i))
+    }
     /// Resolve the source the focused Devices + Apps pickers
     /// would resolve to on Enter. Wraps `resolve_picker_source`
     /// (the canonical picker→source match) with the error
@@ -1502,12 +1794,18 @@ impl App {
             // Server rejected the saved key — surface the paste modal
             // immediately so the user can replace it without hunting
             // for a key binding.
-            if auth_failure && self.config.cloud_broadcast_enabled {
+            // Auth errors only happen when a recording was
+            // streaming to the cloud. The default slot
+            // config is the on-disk default — recorded
+            // sections may have had a per-slot override,
+            // but the auth failure happens during a
+            // recording, so the user is at least
+            // configured to WANT cloud. Open the modal.
+            if auth_failure && self.default_slot_config.cloud_on {
                 // `false`: the user already has Cloud ON and a key
                 // on disk — they just need to replace the bad
                 // key. Cancelling the modal leaves Cloud ON (the
-                // next recording will re-trigger the auth guard).
-                self.open_api_key_modal(false);
+                self.open_api_key_modal();
             }
         }
     }
@@ -1531,67 +1829,18 @@ impl App {
     }
 
     /// Resolve the effective settings for a given source. Prefers a
-    /// device-specific override (keyed on the actual selected device
-    /// name + kind) over the generic Microphone/System fallback.
+    /// Compute the effective settings for a section's source.
+    /// Per-slot: the section's slot owns the customization;
+    /// `slot.config` + `default_slot_config` is the single
+    /// source of truth. (Called with the focused slot's source
+    /// — see `start_section` / `resume_section`.)
     pub fn effective_settings_for(&self, source: &SessionSource) -> SectionSettings {
-        let key = self.source_key_for(source);
-        let ov = self.config.effective_override(&key);
-        SectionSettings {
-            cloud_on: ov.cloud_on,
-            language: ov.language,
-            model: ov.model,
-        }
+        let _ = source;
+        let slot = self
+            .slot_by_id(self.focused_slot)
+            .expect("focused slot must exist");
+        SectionSettings::effective(&slot.config, &self.default_slot_config)
     }
-
-    /// Compute the persistence key for a section's source. Device
-    /// sections key on the actual selected device name + kind so two
-    /// physical devices never collide; app sections key on app name +
-    /// paired device so "Zoom on Speakers" and "Zoom on AirPods" don't
-    /// share overrides.
-    pub fn source_key_for(&self, source: &SessionSource) -> String {
-        use voice_bird_cli::config::{device_source_id, source_id, AudioSessionKind};
-        match source {
-            SessionSource::Microphone | SessionSource::System => {
-                if let (Some(name), Some(kind)) = (
-                    self.config.input_device.as_deref(),
-                    self.config.input_device_kind,
-                ) {
-                    return device_source_id(name, kind);
-                }
-                source_id(
-                    source,
-                    self.config.input_device_kind.or(Some(match source {
-                        SessionSource::Microphone => AudioSessionKind::Input,
-                        _ => AudioSessionKind::Output,
-                    })),
-                )
-            }
-            SessionSource::App { .. } => source_id(source, None),
-        }
-    }
-
-    /// Update the focused section's settings AND persist the change as
-    /// a per-source override in `config.source_overrides`. The new value
-    /// applies to the running engine on next start; for live mutations
-    /// (toggling cloud while a section runs), Stage 3+ will rebuild
-    /// the engine. For now, the running engine is unaffected and the
-    /// new value is what the next start will use.
-    pub fn persist_focused_settings(&mut self) {
-        let Some(section) = self.focused() else {
-            return;
-        };
-        let key = self.source_key_for(&section.source);
-        let ov = voice_bird_cli::config::SourceSettingsOverride {
-            cloud_on: section.settings.cloud_on,
-            language: section.settings.language.clone(),
-            model: section.settings.model.clone(),
-        };
-        self.config.upsert_source_override(key, ov);
-        if let Err(e) = self.config.save() {
-            log::error!("config save (per-source override): {e}");
-        }
-    }
-
     /// Start recording a section in `slot` with explicit settings.
     /// Returns `Err(message)` for failures the UI should surface as a
     /// banner; `Ok(())` once the producer/consumer tasks are spawned.
@@ -1624,7 +1873,7 @@ impl App {
             // a key to start. Esc closes the modal and the banner
             // stays as "missing api key" — the user can press 'c'
             // to re-open or toggle cloud OFF.
-            self.open_api_key_modal(false);
+            self.open_api_key_modal();
             return Err("missing api key".into());
         }
 
@@ -1664,20 +1913,18 @@ impl App {
         // contract holds whether the ASR is local-Whisper or
         // cloud-Voice-Bird-Web, because the cloud engine's committed
         // segments flow into the same consumer task and the same
-        // local writer. `Target::Agent` is the one case where the
-        // agent runtime *is* the destination, so we skip the local
-        // tree entirely — the agent buffer (`~/.voice-bird/live/`)
-        // is the persistence layer there.
-        //
-        // Pre-this-commit, the decision was gated on `cloud_on`,
-        // which conflated "is the cloud engine the ASR?" with
-        // "should we keep a local copy?". The user-facing picker
-        // for `Stdout + Cloud ON` reads as "transcript streamed to
-        // the server + locally (from server)" — both, not either.
+        // Per-slot path: the focused slot's customized
+        // output path, or the default if no customization.
+        let path_str = voice_bird_cli::config::AppConfig::expand_tilde(
+            &self
+                .slot_by_id(slot)
+                .and_then(|s| s.config.path.clone())
+                .unwrap_or_else(|| self.default_slot_config.path.clone()),
+        );
         let session_dir: Option<std::path::PathBuf> =
             if matches!(target, Target::Stdout) {
                 let dir = voice_bird_cli::session::layout::session_dir(
-                    std::path::Path::new(&self.config.session_dir_expanded()),
+                    std::path::Path::new(&path_str),
                     now,
                     &source,
                 );
@@ -1688,7 +1935,6 @@ impl App {
             } else {
                 None
             };
-
         // Per-section live state. Reattach preserved transcript if the
         // slot had a Saved variant; otherwise start fresh.
         let (committed, refined) = match &self.slots[pos].kind {
@@ -2597,22 +2843,20 @@ impl App {
         }
 
         if done {
-            // If a section is focused, treat the picked model as a
-            // per-source override for that section (applies to its
-            // next start). Otherwise — idle path — update the global
-            // default so all unconfigured sources inherit it.
+            // Mirror the picked model into the focused slot's
+            // customization so the next start sees the same
+            // value. The slot's `config` is the single source
+            // of truth for what the slot will use.
+            if let Some(slot) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.id == self.focused_slot)
+            {
+                slot.config.model = Some(model_id.clone());
+            }
             if self.focused().is_some() {
                 if let Some(section) = self.focused_mut() {
                     section.settings.model = model_id;
-                }
-                self.persist_focused_settings();
-            } else {
-                self.config.default_model = model_id;
-                if let Err(e) = self.config.save() {
-                    log::error!("config save: {e}");
-                    let mut g = progress_arc.lock();
-                    g.error = Some(format!("config save: {e}"));
-                    return;
                 }
             }
             self.mode = AppMode::Normal;
@@ -2686,7 +2930,7 @@ impl Default for App {
 /// attribute) keeps the body compiled and testable on every target.
 fn enforce_cloud_only_platform(config: &mut AppConfig) {
     if cfg!(windows) {
-        config.cloud_broadcast_enabled = true;
+        config.default_slot_config.cloud_on = true;
     }
 }
 
@@ -2842,7 +3086,7 @@ mod tests {
     #[test]
     fn agents_pane_empty_when_no_api_key_with_cloud_on() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
+        app.default_slot_config.cloud_on = true;
         // voicebird_api_key stays empty (default).
         app.refresh_agents();
         assert!(
@@ -2899,11 +3143,13 @@ mod tests {
         });
 
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
+        // Cloud is gated on the EFFECTIVE state for the
+        // focused slot. Default ON means fresh-install
+        // behavior; explicit OFF turns the panel off.
+        app.default_slot_config.cloud_on = true;
         app.config.voicebird_api_key = "test-key-abc123".into();
         app.config.voicebird_server_url = format!("ws://{}/api/audio/stream", addr);
         app.refresh_agents();
-        let _ = server.join();
 
         assert_eq!(
             app.agents().len(),
@@ -2915,6 +3161,161 @@ mod tests {
         assert_eq!(app.agents()[1].id, "summarizer");
         // The picker should now reflect both rows.
         assert_eq!(app.targets().len(), 2);
+    }
+
+    /// If the picker-resolved source is effectively cloud-enabled via its
+    /// per-source override, refreshing Agents should fetch even when the
+    /// global cloud default is off. This is the same effective state that
+    /// `display_cloud_on()` and `start_section` use.
+    #[cfg(not(windows))]
+    #[test]
+    fn refresh_agents_uses_effective_source_cloud_state_not_only_global_default() {
+        use voice_bird_cli::config::AudioSessionKind;
+        use voice_bird_cli::session::layout::SessionSource;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok(s) => break s.0,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
+            let body = r#"{"agents":[{"id":"interviewee","name":"Interviewee","icon":null,"promptTemplate":"x"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use std::io::Write;
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let mut app = App::new();
+        app.devices = vec![crate::platform::AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        app.apps.clear();
+        app.selected_app_index = None;
+        // Global default OFF; the focused slot's customized
+        // cloud_on = true is what `display_cloud_on` returns.
+        app.default_slot_config.cloud_on = false;
+        app.config.voicebird_api_key = "test-key-abc123".into();
+        app.config.voicebird_server_url =
+            format!("ws://{}/api/audio/stream", addr);
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(true);
+
+        assert!(
+            app.display_cloud_on(),
+            "setup must be effectively cloud-on via the focused slot's config"
+        );
+
+        app.refresh_agents();
+        let _ = server.join();
+
+        assert_eq!(
+            app.agents().len(),
+            1,
+            "refresh_agents must fetch when the selected source is effectively \
+             cloud-on even if the global default is off"
+        );
+        assert_eq!(app.agents()[0].id, "interviewee");
+    }
+
+    /// Pre-fix bug: when no section was focused, `display_cloud_on`,
+    /// `display_language`, and `display_model` fell through to the
+    /// GLOBAL config default, ignoring the per-source override that
+    /// `c` writes to. Switching focus between two empty slots routed
+    /// to different sources showed the same badge value even when
+    /// their per-source overrides differed — the Mode panel didn't
+    /// reflect what would actually take effect on Enter.
+    ///
+    /// Post-fix: with no section focused, the helpers resolve the
+    /// picker-resolved source and return the per-source override for
+    /// that source. The global default is only the fallback when no
+    /// picker source can be resolved (e.g. empty Devices pane).
+    #[test]
+    #[cfg(not(windows))]
+    fn display_helpers_resolve_per_slot_customization_when_no_section_focused() {
+        use voice_bird_cli::config::AudioSessionKind;
+        use crate::platform::AudioDevice;
+
+        let mut app = App::new();
+
+        // Global defaults — what a fresh install would have.
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "en".into();
+        app.default_slot_config.model = "tiny.en".into();
+
+        // Picker parks on a specific input device.
+        app.devices = vec![AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: AudioSessionKind::Input,
+        }];
+        app.selected_device_index = 0;
+        app.apps.clear();
+        app.selected_app_index = None;
+
+        // The focused slot's customization DISAGREES with the
+        // global default — this is the exact scenario where
+        // the bug surfaced.
+        let slot = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == app.focused_slot)
+            .unwrap();
+        slot.config.cloud_on = Some(false);
+        slot.config.language = Some("ru".into());
+        slot.config.model = Some("base.en".into());
+
+        // No section focused → helpers must read the
+        // focused slot's customization, NOT the default.
+        assert!(
+            app.focused().is_none(),
+            "test setup must have no focused section"
+        );
+        assert!(
+            !app.display_cloud_on(),
+            "display_cloud_on must read the focused slot's customization \
+             (off) even though the default is on; this is the fix for \
+             the slot-specific cloud toggle that was leaking via the \
+             global flag"
+        );
+        assert_eq!(
+            app.display_language(),
+            "ru",
+            "display_language must read the focused slot's customization \
+             (ru) not the default (en)"
+        );
+        assert_eq!(
+            app.display_model(),
+            "base.en",
+            "display_model must read the focused slot's customization \
+             (base.en) not the default (tiny.en)"
+        );
     }
 
     /// `pick_target(TargetKind::Agent(id))` records the agent id
@@ -3099,19 +3500,16 @@ mod tests {
         // Simulate the user pressing `l` to cycle the
         // language to Russian and `c` to flip cloud on
         // *after* stopping. The c/l handlers update the
-        // global config and per-source override when no
-        // section is focused (the post-stop case). Persist
-        // the override the same way persist_focused_settings
-        // does so the test reflects production state.
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
-        let key = app.source_key_for(&SessionSource::Microphone);
-        let mut ov = app.config.effective_override(&key);
-        ov.cloud_on = true;
-        ov.language = "ru".into();
-        app.config.upsert_source_override(key, ov);
-
-        // Resume. The result is pipeline-dependent
+        // focused slot's `slot.config` (the post-stop
+        // state) — that's the single source of truth for
+        // what the next start will see.
+        let slot_obj = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == slot)
+            .expect("focused slot must exist");
+        slot_obj.config.cloud_on = Some(true);
+        slot_obj.config.language = Some("ru".into());
         // (capture may succeed or fail in the test env),
         // so we only assert on the slot's post-call
         // settings — not on Ok/Err.
@@ -3335,6 +3733,170 @@ mod tests {
         }
     }
 
+    /// Pre-fix bug: `App::selected_device_index` and
+    /// `selected_app_index` were single global fields shared by
+    /// every slot. Tabbing between slots changed the cursor once
+    /// and every slot saw the same value — the picker state wasn't
+    /// slot-specific.
+    ///
+    /// Post-fix: each slot memoizes its last picker cursor in
+    /// `slot_picker_memo`. `focus_next` saves the outgoing slot's
+    /// state and restores the incoming slot's memo. `+` inherits
+    /// the current cursor; `-` cleans up the removed slot's memo
+    /// and restores the new focused slot's.
+    #[cfg(not(windows))]
+    #[test]
+    fn focus_next_memoizes_picker_state_per_slot() {
+        use crate::platform::{AppSession, AudioDevice};
+        use voice_bird_cli::config::AudioSessionKind;
+
+        let mut app = App::new();
+
+        // Seed inventory with two devices and two apps so the
+        // cursor can land on either.
+        app.devices = vec![
+            AudioDevice {
+                name: "MacBook Pro Microphone".into(),
+                kind: AudioSessionKind::Input,
+            },
+            AudioDevice {
+                name: "USB Headset".into(),
+                kind: AudioSessionKind::Input,
+            },
+        ];
+        app.apps = vec![
+            AppSession {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                process_id: 1,
+            },
+            AppSession {
+                id: "com.google.Chrome".into(),
+                name: "Google Chrome".into(),
+                process_id: 2,
+            },
+        ];
+
+        // Default: slot 1 focused, cursor at device 0, no app.
+        let slot_a = app.focused_slot;
+        app.selected_device_index = 0;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+
+        // Add slot B and put the cursor on a different device+app.
+        let slot_b = app.add_slot().expect("add_slot under MAX_SECTIONS");
+        app.selected_device_index = 1;
+        app.selected_app_index = Some(1);
+        app.picker_focus = PickerFocus::Apps;
+
+        // Tab back to slot A — the cursor must restore to
+        // whatever slot A had when we left it (device 0, no app).
+        app.focus_next();
+        assert_eq!(
+            app.focused_slot, slot_a,
+            "Tab from slot B must focus slot A"
+        );
+        assert_eq!(
+            app.selected_device_index, 0,
+            "slot A's memoized device must be restored; got {}",
+            app.selected_device_index
+        );
+        assert_eq!(
+            app.selected_app_index, None,
+            "slot A's memoized app must be restored (None); got {:?}",
+            app.selected_app_index
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Devices,
+            "slot A's memoized pane focus must be restored"
+        );
+
+        // Tab forward again to slot B — the cursor must restore
+        // to whatever slot B had (device 1, app 1, Apps pane).
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_b);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memoized device must be restored; got {}",
+            app.selected_device_index
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be restored; got {:?}",
+            app.selected_app_index
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Apps,
+            "slot B's memoized pane focus must be restored"
+        );
+
+        // Independence check: change slot A's cursor while focused
+        // on A, then Tab to B (B's memo was captured before this
+        // change) and assert B is untouched, then Tab back to A
+        // and assert A kept the new value.
+        // After the prior round-trip, focused_slot is slot_b —
+        // Tab back to slot A first.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_a);
+        // Now mutate slot A's cursor.
+        app.selected_device_index = 1;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+        // Tab to B — slot B's memo must restore to whatever it
+        // was at the previous Tab-away (device 1, app Some(1),
+        // Apps pane), NOT slot A's just-edited values.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_b);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memoized device must be unchanged after slot A edits"
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be unchanged after slot A edits"
+        );
+        assert_eq!(
+            app.picker_focus,
+            PickerFocus::Apps,
+            "slot B's memoized pane focus must be unchanged"
+        );
+        // Tab back to A — slot A's NEW cursor must survive.
+        app.focus_next();
+        assert_eq!(app.focused_slot, slot_a);
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot A's NEW device must survive Tab round-trip"
+        );
+        assert_eq!(
+            app.selected_app_index, None,
+            "slot A's NEW app selection (None) must survive Tab round-trip"
+        );
+        // Removing slot A must drop its memo, leave slot B
+        // focused with its own memo restored.
+        app.remove_focused_slot();
+        assert_eq!(
+            app.focused_slot, slot_b,
+            "removing slot A must focus slot B"
+        );
+        assert_eq!(
+            app.selected_device_index, 1,
+            "slot B's memo must be restored after slot A removal"
+        );
+        assert_eq!(
+            app.selected_app_index,
+            Some(1),
+            "slot B's memoized app must be restored after slot A removal"
+        );
+        assert!(
+            !app.slot_picker_memo.contains_key(&slot_a),
+            "removed slot's memo must be dropped (not leaked)"
+        );
+    }
+
     // ── Cloud-target refactor: cloud is a transport, not a target ──
 
     /// The agents picker no longer offers Cloud as a
@@ -3376,29 +3938,15 @@ mod tests {
         }];
         app.selected_device_index = 0;
         let slot = app.slots[0].id;
-        // Per-source override for the microphone must read
-        // `cloud_on = true` — that's the source the picker
-        // resolves to, and the resume path derives
-        // `effective_settings_for` from the per-source
-        // override first. Without this, the resume would
-        // fall back to the global default
-        // (`cloud_broadcast_enabled = false` in the test
-        // tempdir) and the assertion below would trip.
-        // (Pre-test-overlay this assertion passed only
-        // because the developer's real config happened to
-        // have `cloud_broadcast_enabled = true` and no
-        // per-source override — implicit test data.)
-        let source = SessionSource::Microphone;
-        let key = app.source_key_for(&source);
-        use voice_bird_cli::config::SourceSettingsOverride;
-        app.config.source_overrides.insert(
-            key,
-            SourceSettingsOverride {
-                cloud_on: true,
-                language: "en".into(),
-                model: "tiny.en".into(),
-            },
-        );
+        // The slot's customization says cloud_on = true.
+        // The new model: slot.config is the single source
+        // of truth, not a per-source override map.
+        let slot_obj = app
+            .slots
+            .iter_mut()
+            .find(|s| s.id == slot)
+            .expect("focused slot must exist");
+        slot_obj.config.cloud_on = Some(true);
         // Saved as: target=Stdout, cloud_on=true
         // (user wants server streaming + local
         // files).
@@ -3463,7 +4011,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
-        app.config.session_dir = dir.path().to_string_lossy().into_owned();
+        app.default_slot_config.path = dir.path().to_string_lossy().into_owned();
         app.config.voicebird_api_key = "sk-test".into();
         // Devices picker so `resolve_focused_source` returns
         // `Microphone` and the session slug picks the `-mic`
@@ -3525,14 +4073,14 @@ mod tests {
     #[test]
     fn cloud_only_platform_invariants() {
         let mut config = AppConfig::default();
-        config.cloud_broadcast_enabled = false;
+        config.default_slot_config.cloud_on = false;
         enforce_cloud_only_platform(&mut config);
-        assert_eq!(config.cloud_broadcast_enabled, cfg!(windows));
+        assert_eq!(config.default_slot_config.cloud_on, cfg!(windows));
 
         let mut settings = SectionSettings {
-            cloud_on: config.cloud_broadcast_enabled,
-            language: config.language.clone(),
-            model: config.default_model.clone(),
+            cloud_on: config.default_slot_config.cloud_on,
+            language: config.default_slot_config.language.clone(),
+            model: config.default_slot_config.model.clone(),
         };
         settings.cloud_on = false;
         clamp_section_settings_for_platform(&mut settings);
@@ -3724,7 +4272,7 @@ mod tests {
         fn export_banner_no_sessions() {
             let dir = tempfile::tempdir().unwrap();
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -3747,7 +4295,7 @@ mod tests {
             std::fs::write(session.join("transcript.json"), "not json {{{{{").unwrap();
 
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
 
             app.export_transcript();
 
@@ -3884,7 +4432,7 @@ mod tests {
 
         fn app_with_mock_server(dir: &tempfile::TempDir, port: u16) -> App {
             let mut app = App::new();
-            app.config.session_dir = dir.path().to_string_lossy().to_string();
+            app.default_slot_config.path = dir.path().to_string_lossy().to_string();
             app.config.voicebird_server_url = format!("ws://127.0.0.1:{port}/api/audio/stream");
             app.config.voicebird_api_key = "test-key-abc123".into();
             app

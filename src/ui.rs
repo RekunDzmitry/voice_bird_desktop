@@ -342,51 +342,51 @@ fn build_slot_title(
     inner_w: usize,
 ) -> Vec<Line<'static>> {
     let n = slot.id.0;
+    let slot_id = slot.id;
 
-    if section.is_none() && saved.is_none() && !slot_has_picker_pick(app) {
+    if section.is_none() && saved.is_none() && !slot_has_picker_pick(app, slot_id) {
         return vec![Line::from(format!(" [{n}] (empty) "))];
     }
 
+    // Per-slot device + app: focused slot reads the live cursor;
+    // non-focused slots read their memo so the title stays FROZEN
+    // while the user moves the cursor elsewhere. Tab back to the
+    // slot to see the live cursor resume.
     let device = app
-        .focused_device()
+        .slot_device(slot_id)
         .map(|d| d.name.clone())
         .or_else(|| app.config.input_device.clone());
-    let app_pick = app.focused_app().map(|a| a.name.clone());
-    let target = if let Some(s) = section {
-        s.target.clone()
-    } else {
-        app.focused_pending_target()
-    };
+    let app_pick = app.slot_app(slot_id).map(|a| a.name.clone());
+    let _ = section;
+    let _ = saved;
     let device_label = device.as_deref().unwrap_or("(no device)");
     let app_str = app_pick
         .as_deref()
         .map(|a| format!(" + {a}"))
         .unwrap_or_default();
-    let prefix = format!(" [{n}] {device_label}{app_str} → {} ", target);
-    // §8.5: `Target` is a single-variant enum now, so the color
-    // is fixed. Kept as a match for clarity at the call site; §10's
-    // Agent picker will replace it.
-    let _ = target;
-    let target_color = Color::Green;
+    // Title is ` [N] {device} + {app} ` — no target suffix. The
+    // routing target (Stdout / Cloud Agent) is picked in the
+    // Agents pane, not declared in the slot title. §8.5 retired
+    // Stdout as a routing decision; today every slot implicitly
+    // routes Stdout, so the old `→ Stdout` arrow was dead text
+    // the user saw on every slot.
+    let prefix = format!(" [{n}] {device_label}{app_str} ");
     if prefix.chars().count() <= inner_w {
         vec![Line::from(Span::styled(
             prefix,
             Style::default().add_modifier(Modifier::BOLD),
         ))]
     } else {
-        let prefix_short = truncate_for_two_line(&prefix, inner_w);
-        vec![
-            Line::from(Span::styled(
-                prefix_short,
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!(" → {target} "),
-                Style::default()
-                    .fg(target_color)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ]
+        // When the picker prefix alone exceeds the column width,
+        // ellipsize the device/app name to fit one line. (The
+        // legacy two-line layout reserved a second line for the
+        // target suffix — that line is gone now, so we just
+        // truncate instead.)
+        let prefix_short = truncate_with_ellipsis(&prefix, inner_w);
+        vec![Line::from(Span::styled(
+            prefix_short,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))]
     }
 }
 
@@ -395,33 +395,10 @@ fn build_slot_title(
 /// picker selection that hasn't been turned into a recording yet —
 /// i.e. a device name in config OR a non-None focused app OR a
 /// pending target override for this slot.
-fn slot_has_picker_pick(app: &App) -> bool {
+fn slot_has_picker_pick(app: &App, slot_id: crate::app::SlotId) -> bool {
     app.config.input_device.is_some()
-        || app.focused_app().is_some()
-        || app.pending_target_overrides.contains_key(&app.focused_slot)
-}
-
-/// slot they're on and which target was picked.
-fn truncate_for_two_line(prefix: &str, inner_w: usize) -> String {
-    // The target suffix is appended as a separate line in the
-    // caller, so we only need to make the prefix (everything up to
-    // " → ") fit. The arrow + target is always its own second line.
-    if let Some(idx) = prefix.rfind(" → ") {
-        let head = &prefix[..idx + 1];
-        if head.chars().count() <= inner_w {
-            return prefix.to_string();
-        }
-        if let Some(bracket_end) = head.find("] ") {
-            let start = &head[..bracket_end + 2];
-            let rest = &head[bracket_end + 2..head.len() - 1];
-            let avail = inner_w.saturating_sub(start.chars().count() + 1);
-            if avail >= 3 {
-                let trimmed = truncate_with_ellipsis(rest, avail);
-                return format!("{start}{trimmed}…");
-            }
-        }
-    }
-    prefix.to_string()
+        || app.slot_app(slot_id).is_some()
+        || app.pending_target_overrides.contains_key(&slot_id)
 }
 
 /// Truncate `s` to `max` columns, appending "…" if anything was
@@ -592,7 +569,13 @@ fn render_mode_panel(f: &mut Frame, area: Rect, app: &App) {
         " Mode "
     };
 
-    let path_raw = app.config.session_dir_expanded();
+    // Focused slot's customized output path, or the default
+    // if no customization. The slot is the single source of
+    // truth for per-slot output path.
+    let path_raw = app
+        .slot_by_id(app.focused_slot)
+        .and_then(|s| s.config.path.clone())
+        .unwrap_or_else(|| app.default_slot_config.path.clone());
     let path_display = if path_raw.len() > 24 {
         format!("…{}", &path_raw[path_raw.len().saturating_sub(23)..])
     } else {
@@ -1624,7 +1607,7 @@ mod tests {
     #[test]
     fn mode_panel_off_shows_language_locked() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = false;
+        app.default_slot_config.cloud_on = false;
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("Mode"), "mode panel title missing:\n{out}");
         assert!(out.contains("[OFF]"), "cloud-off label missing:\n{out}");
@@ -1636,8 +1619,8 @@ mod tests {
     #[test]
     fn mode_panel_on_shows_language_cycle_hint() {
         let mut app = App::new();
-        app.config.cloud_broadcast_enabled = true;
-        app.config.language = "ru".into();
+        app.default_slot_config.cloud_on = true;
+        app.default_slot_config.language = "ru".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("[ON]"), "cloud-on label missing:\n{out}");
         // `ru` appears in the language line; the (l) hint accompanies it.
@@ -1744,7 +1727,7 @@ mod tests {
     #[test]
     fn mode_panel_shows_model_name() {
         let mut app = App::new();
-        app.config.default_model = "tiny.en".into();
+        app.default_slot_config.model = "tiny.en".into();
         let out = render_to_string(&app, 140, 30);
         assert!(out.contains("tiny.en"), "model name missing:\n{out}");
         assert!(out.contains("(m)"), "model picker hint missing:\n{out}");
@@ -1855,6 +1838,186 @@ mod tests {
         assert!(out.contains("[2]"), "slot 2 title missing:\n{out}");
         assert!(out.contains("[3]"), "slot 3 title missing:\n{out}");
         assert!(out.contains("(empty"), "empty placeholder missing:\n{out}");
+    }
+
+    /// Pre-fix bug: every slot title read the GLOBAL cursor via
+    /// `app.focused_device()` / `app.focused_app()`. When the user
+    /// Tab'd between slots and pressed arrow keys with slot 1
+    /// focused, slots 2 and 3's titles also updated to whatever
+    /// slot 1 was on — even though their per-slot memo was
+    /// preserved. The user saw three slots all showing the same
+    /// "EPOS PC 8 USB + Safari" combination regardless of focus,
+    /// and only switching focus back to a slot "recovered" the
+    /// per-slot device+app they had picked earlier.
+    ///
+    /// Post-fix: the slot title is FROZEN for non-focused slots
+    /// and reads from the per-slot memo. The focused slot still
+    /// reflects the live cursor. Moving the cursor with slot 1
+    /// focused must leave slots 2 and 3's titles untouched.
+    #[test]
+    fn unfocused_slot_titles_are_frozen_when_focused_slot_cursor_moves() {
+        let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
+
+        // Seed inventory.
+        app.devices = vec![
+            input("MacBook Pro Microphone"),
+            input("USB Headset"),
+        ];
+        app.apps = vec![fake_app("us.zoom.xos", "Zoom")];
+
+        // Slot 2 (id=2) memoizes device 1 (USB Headset) + no app.
+        // Slot 3 (id=3) memoizes device 0 (MacBook Pro Mic) + app 0 (Zoom).
+        // We push these into `slot_picker_memo` directly (the
+        // public API is focus-driven; the test bypasses to keep
+        // the test focused on the render-path contract).
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(2),
+            crate::app::PickerSelection {
+                device_idx: 1,
+                app_idx: None,
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(3),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+
+        // Focus slot 1, set the LIVE cursor to a third
+        // device+app combo that's different from both memos.
+        app.focused_slot = crate::app::SlotId(1);
+        app.selected_device_index = 0;
+        app.selected_app_index = None;
+        app.picker_focus = PickerFocus::Devices;
+
+        // `slot_has_picker_pick` reads global state, so seed it
+        // enough to make the title path render (and exercise the
+        // per-slot device/app lookup the test is targeting). The
+        // real test fixture is the per-slot memo above.
+        app.config.input_device = Some("MacBook Pro Microphone".into());
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(2),
+            voice_bird_cli::session::target::Target::Stdout,
+        );
+        app.pending_target_overrides.insert(
+            crate::app::SlotId(3),
+            voice_bird_cli::session::target::Target::Stdout,
+        );
+
+        let out = render_to_string(&app, 180, 40);
+        let out = render_to_string(&app, 180, 40);
+
+        // Slot 1 title shows the live cursor (MacBook Pro Mic).
+        assert!(
+            out.contains("MacBook Pro Microphone"),
+            "focused slot 1 must show the live cursor device; rendered:\n{out}"
+        );
+
+        // Slot 2 title must be FROZEN at its memoized device
+        // (USB Headset) — must NOT reflect slot 1's cursor.
+        assert!(
+            out.contains("USB Headset"),
+            "unfocused slot 2 title must show its memoized device (USB Headset), \
+             not the live cursor (MacBook Pro Microphone); rendered:\n{out}"
+        );
+        // Slot 2's memoized app is None — must NOT show + Zoom.
+        assert!(
+            !out.contains("[2] MacBook Pro Microphone"),
+            "slot 2 title must NOT adopt slot 1's device; rendered:\n{out}"
+        );
+
+        // Slot 3 title must show its memoized combo (MacBook Pro Mic + Zoom),
+        // NOT slot 1's live state (no app).
+        // The exact rendering includes "[3] <device> + <app>"; assert on
+        // the substring that uniquely identifies slot 3's memoized pick.
+        assert!(
+            out.contains("MacBook Pro Microphone") && out.contains("Zoom"),
+            "unfocused slot 3 title must show its memoized device + app \
+             (MacBook Pro Microphone + Zoom); rendered:\n{out}"
+        );
+    }
+
+    /// Pre-fix bug: the slot title template is
+    /// ` [N] {device} + {app} → Stdout `. Every slot shows
+    /// `→ Stdout` even though §8.5 retired Stdout as a routing
+    /// target — it's no longer in `Target::cloud`/`Target::agent`
+    /// decisions. The arrow + Stdout suffix is dead text the user
+    /// reads on every slot.
+    ///
+    /// Post-fix: title is ` [N] {device} + {app} ` with no
+    /// target suffix. The cloud Agent is selected elsewhere (the
+    /// Agents picker), not declared in the slot title.
+    #[test]
+    fn slot_title_does_not_include_stdout_suffix() {
+        let mut app = App::new();
+        app.add_slot();
+        app.add_slot();
+
+        app.devices = vec![crate::platform::AudioDevice {
+            name: "MacBook Pro Microphone".into(),
+            kind: voice_bird_cli::config::AudioSessionKind::Input,
+        }];
+        app.apps = vec![crate::platform::AppSession {
+            id: "us.zoom.xos".into(),
+            name: "Zoom".into(),
+            process_id: 0,
+        }];
+
+        // Seed each slot's memo so all three titles render the
+        // full `<device> + <app>` form (otherwise some slots
+        // would short-circuit to "(empty)" and never exercise
+        // the title template).
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(2),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.slot_picker_memo.insert(
+            crate::app::SlotId(3),
+            crate::app::PickerSelection {
+                device_idx: 0,
+                app_idx: Some(0),
+                focus: PickerFocus::Devices,
+            },
+        );
+        app.config.input_device = Some("MacBook Pro Microphone".into());
+
+        let out = render_to_string(&app, 180, 40);
+
+        // Assert the device+app is present so we know the title
+        // template fired (otherwise the absence of "Stdout" is
+        // meaningless — could just be that the slot stayed
+        // empty).
+        assert!(
+            out.contains("MacBook Pro Microphone") && out.contains("Zoom"),
+            "fixture must render the device+app title; got:\n{out}"
+        );
+
+        // The slot title must NOT contain the trailing
+        // `→ Stdout` arrow + label. Assert on each slot's full
+        // title shape so a regression in the template is
+        // pinned to the offending slot.
+        assert!(
+            !out.contains("[1] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 1 title must drop the Stdout suffix; got:\n{out}"
+        );
+        assert!(
+            !out.contains("[2] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 2 title must drop the Stdout suffix; got:\n{out}"
+        );
+        assert!(
+            !out.contains("[3] MacBook Pro Microphone + Zoom → Stdout"),
+            "slot 3 title must drop the Stdout suffix; got:\n{out}"
+        );
     }
     /// Agents pane renders as the third picker column. The
     /// header is " Agents " (focused variant carries the
