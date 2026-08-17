@@ -6,6 +6,7 @@ use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
 use voice_bird_cli::config::{AppConfig, DefaultSlotConfig};
+use voice_bird_cli::room::{Room, RoleDef};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -254,10 +255,15 @@ impl std::fmt::Debug for SlotKind {
         }
     }
 }
-
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
+    /// Optional role binding. `Some` for slots provisioned by an
+    /// agent room — the slot renders its role name in the title
+    /// and `start_section` records the role on the section so
+    /// `merged_timeline` can label entries. Free Room slots are
+    /// `None`.
+    pub role: Option<RoleDef>,
     /// Per-slot settings. Each slot starts with
     /// `SlotConfig::default_passthrough()` (every field inherits
     /// from `App::default_slot_config`). The c/l/m/P keys and the
@@ -266,12 +272,12 @@ pub struct Slot {
     /// `Section.settings` at start time.
     pub config: SlotConfig,
 }
-
 impl Slot {
     pub fn empty(id: SlotId) -> Self {
         Self {
             id,
             kind: SlotKind::Empty,
+            role: None,
             config: SlotConfig::default_passthrough(),
         }
     }
@@ -313,9 +319,8 @@ impl std::fmt::Debug for Slot {
 pub enum PickerFocus {
     Devices,
     Apps,
-    Agents,
+    Rooms,
 }
-
 /// Per-slot memo of the picker cursor. The Devices / Apps cursors on
 /// `App` always reflect the FOCUSED slot's state; this struct holds
 /// the last cursor position seen for a slot that's not currently
@@ -334,10 +339,11 @@ pub struct App {
     /// Current mode
     pub mode: AppMode,
 
+
     /// Capturable input/output devices (left pane of the picker).
     pub devices: Vec<AudioDevice>,
 
-    /// Per-application capture targets (right pane of the picker).
+    /// Per-application capture targets (middle pane of the picker).
     pub apps: Vec<AppSession>,
 
     /// Cursor in the Devices pane.
@@ -346,11 +352,10 @@ pub struct App {
     /// Cursor in the Apps pane. `None` = no app paired (run device alone).
     pub selected_app_index: Option<usize>,
 
-    /// Cursor in the Agents pane. The list of agents is fixed at
-    /// three entries (Stdout / Cloud / Agent) — see `targets()`. Always
-    /// `Some(idx)` while the TUI runs; the cursor is one of the
-    /// rendered rows.
-    pub selected_target_index: Option<usize>,
+    /// Cursor in the Rooms pane. The list of rooms is one row per
+    /// catalog entry (Free Room at index 0, then cloud-fetched rooms).
+    /// Always `Some(idx)` while the TUI runs.
+    pub selected_room_index: usize,
 
     /// Which pane the picker arrows / Enter target.
     pub picker_focus: PickerFocus,
@@ -359,7 +364,7 @@ pub struct App {
     /// auto-clamps these so the cursor stays visible.
     pub device_scroll: u16,
     pub app_scroll: u16,
-    pub target_scroll: u16,
+    pub room_scroll: u16,
 
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
@@ -461,27 +466,22 @@ pub struct App {
 
     /// Cloud Agents fetched from `GET /api/agents`. Populated by
     /// `App::refresh_agents` when the user has cloud on AND an API
-    /// key. The Agents picker renders one row per entry here —
-    /// `App::targets()` reads from this list, never from a
-    /// hard-coded `Stdout` row.
-    pub agents: Vec<voice_bird_cli::cloud::agents::Agent>,
-
-    /// Per-slot pending agent override. The Agents picker writes
-    /// to this when the user picks a row; `start_section` /
-    /// `pick_agent` consults it to resolve which cloud Agent the
-    /// `g` key (§11) should run. Distinct from
-    /// `pending_target_overrides`, which tracks the on-disk
-    /// `Target::Stdout` routing decision.
-    pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
-
-    /// Per-slot memo of the picker cursor (Devices / Apps / focus).
-    /// `App::selected_device_index`, `selected_app_index`, and
-    /// `picker_focus` always reflect the FOCUSED slot's state. When
-    /// the user Tabs to a different slot, the current cursor is
-    /// saved here under the outgoing slot id, and the incoming
-    /// slot's memo is loaded back into the cursor fields. This way
-    /// each slot remembers the last device + app it was parked on,
-    /// even if the user never pressed Enter to start a recording.
+    /// Rooms catalog fetched from `GET /api/rooms`. Index 0 is
+    /// always `Room::free_room()` so the TUI never needs a
+    /// "no rooms" branch — Free Room is the offline default
+    /// and is hardcoded locally.
+    pub rooms: Vec<Room>,
+    /// Index into `rooms` of the currently active room. Drives
+    /// the slot provisioning (Free Room → one empty slot;
+    /// agent room → one empty slot per role) and the merged
+    /// timeline view.
+    pub active_room: usize,
+    /// Last-known `plan` value from `/api/rooms`. `None` until
+    /// the first successful fetch (or after a 5xx); `Some(true)`
+    /// when the user is on Pro and agent rooms unlock,
+    /// `Some(false)` when they're not. The 402 response from
+    /// agent runs also forces this to `Some(false)`.
+    pub plan_is_pro: Option<bool>,
     /// Entries are pruned when a slot is removed (its id is
     /// never reused). In-memory only — not persisted across restarts.
     pub slot_picker_memo: std::collections::BTreeMap<SlotId, PickerSelection>,
@@ -511,38 +511,51 @@ pub struct AppEvent {
     pub message: String,
 }
 
-/// A single row in the Agents picker.
-/// The picker renders
-/// one row per known target; rows that point at a target
-/// the user can't actually use (e.g. Agent when the
-/// runtime binary is missing) are tagged `disabled = true`.
-/// `disabled` rows render dim and the cursor refuses to
-/// land on them (see `App::focused_target_kind`).
-pub struct TargetRow {
-    pub kind: TargetKind,
-    pub disabled: bool,
-}
-/// Picker-side classification of a target row. `Stdout` is
-/// retained for legacy `pick_target` callers but never
-/// produced by `App::targets()` — the §10 picker only shows
-/// `Agent(id)` rows derived from `GET /api/agents`. Routing
-/// on-disk (the `Target` enum in `session/target`) is a
-/// separate axis: an `Agent(id)` pick still defaults to
-/// `Target::Stdout` for local file persistence unless the
-/// caller explicitly switches the section's transport flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TargetKind {
-    /// Legacy: forces local persistence via the routing
-    /// `Target::Stdout` override. Never emitted by
-    /// `App::targets()`.
-    Stdout,
-    /// A cloud Agent id fetched from `GET /api/agents`.
-    /// `pick_target(TargetKind::Agent(id))` records the id
-    /// in `pending_agent_overrides` so `start_section` /
-    /// the §11 `g` key handler can look it up.
-    Agent(String),
-}
 impl App {
+    /// Snapshot the current picker cursor under the given slot id.
+    /// Called immediately before focus moves away from that slot.
+    /// The cursor fields on `App` keep holding the slot's state
+    /// until the caller switches `focused_slot`, at which point
+    /// `restore_picker_for` loads the next slot's memo back in.
+    fn memoize_picker_for(&mut self, slot: SlotId) {
+        self.slot_picker_memo.insert(
+            slot,
+            PickerSelection {
+                device_idx: self.selected_device_index,
+                app_idx: self.selected_app_index,
+                focus: self.picker_focus,
+            },
+        );
+    }
+
+    /// Load the memoized picker cursor for the given slot id into
+    /// the cursor fields on `App`. No-op if the slot has no memo
+    /// (first time the user Tabs to it) — the cursor simply keeps
+    /// whatever value it had, which is the natural "first focus
+    /// inherits current state" behavior.
+    fn restore_picker_for(&mut self, slot: SlotId) {
+        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
+            // Clamp the restored indices against the current
+            // inventory — a refresh may have shrunk `devices` /
+            // `apps` between Tab-away and Tab-back.
+            let dev_idx = if self.devices.is_empty() {
+                0
+            } else {
+                p.device_idx.min(self.devices.len() - 1)
+            };
+            let app_idx = p.app_idx.and_then(|i| {
+                if self.apps.is_empty() {
+                    None
+                } else {
+                    Some(i.min(self.apps.len() - 1))
+                }
+            });
+            self.selected_device_index = dev_idx;
+            self.selected_app_index = app_idx;
+            self.picker_focus = p.focus;
+        }
+    }
+
     /// Create a new application instance
     pub fn new() -> Self {
         // Test builds only: install the process-local config
@@ -623,21 +636,25 @@ impl App {
             .expect("tokio runtime");
 
         #[cfg_attr(not(windows), allow(unused_mut))]
+        // Hardcode the Free Room as index 0 so the TUI never
+        // has to special-case "no rooms". Cloud-fetched rooms
+        // get appended by `refresh_rooms`.
+        let mut rooms: Vec<Room> = vec![Room::free_room()];
+        let active_room: usize = 0;
+
         let mut app = Self {
             mode: AppMode::Normal,
             devices: Vec::new(),
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
-            // Agents list starts with Stdout at index 0; the user
-            // grows it with Add Agent (config.agent_targets).
-            // pre-populated so the pane never renders in an
-            // empty-cursor state.
-            selected_target_index: Some(0),
+            // Rooms list starts with Free Room at index 0; the user
+            // grows it via the picker once refresh_rooms succeeds.
+            selected_room_index: 0,
             picker_focus: PickerFocus::Devices,
             device_scroll: 0,
             app_scroll: 0,
-            target_scroll: 0,
+            room_scroll: 0,
             status: RecordingStatus::Idle,
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
@@ -665,13 +682,25 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
             pending_target_overrides: std::collections::BTreeMap::new(),
-            agents: Vec::new(),
-            pending_agent_overrides: std::collections::BTreeMap::new(),
+            rooms,
+            active_room,
+            plan_is_pro: None,
             slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
         };
 
-        app.refresh_agents();
+        app.refresh_rooms();
+        // Re-activate the user's last room. If the slug no longer
+        // exists in the catalog, fall back to Free Room and clear
+        // the field so we don't keep reporting a missing room on
+        // every launch.
+        if let Some(slug) = app.config.last_room_slug.clone() {
+            if let Some(idx) = app.rooms.iter().position(|r| r.slug == slug) {
+                let _ = app.activate_room(idx);
+            } else {
+                app.config.last_room_slug = None;
+            }
+        }
         app
     }
 
@@ -821,130 +850,97 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// The picker list. Row 0 is `Stdout`; rows 1+ are
-    /// The picker list — one `TargetRow` per cloud Agent fetched
-    /// by `App::refresh_agents`. `Cloud` and the legacy `Stdout`
-    /// row are deliberately absent: cloud is a per-section
-    /// transport flag (`SectionSettings::cloud_on`), not a
-    /// picker destination; `Stdout` is the implicit routing
-    /// default applied by `start_section` when no Agent has
-    /// been picked (or when cloud is off entirely). Disabled
-    /// flag is reserved for future use; today every fetched
-    /// Agent is pickable.
-    pub fn targets(&self) -> Vec<TargetRow> {
-        self.agents
-            .iter()
-            .map(|a| TargetRow {
-                kind: TargetKind::Agent(a.id.clone()),
-                disabled: false,
-            })
-            .collect()
-    }
-    /// Resolve the currently focused Agents-pane row to a `Target`.
-    /// Returns `None` if the cursor is parked on a disabled row or
-    /// out of range.
-    pub fn focused_target_kind(&self) -> Option<TargetKind> {
-        let i = self.selected_target_index?;
-        self.targets().get(i).and_then(|r| {
-            if r.disabled {
-                None
-            } else {
-                Some(r.kind.clone())
-            }
-        })
+    /// The currently active room. Returns `&Room::free_room()` if
+    /// `active_room` is somehow out of range (defensive — `App::new`
+    /// and `activate_room` both keep it valid).
+    pub fn active_room(&self) -> &Room {
+        self.rooms
+            .get(self.active_room)
+            .unwrap_or_else(|| self.rooms.first().expect("Free Room at index 0"))
     }
 
-    /// Set the focused slot's pending target from a `TargetKind`.
-    /// `TargetKind::Stdout` writes the routing `Target::Stdout`
-    /// override (legacy path, kept for the test-suite). `TargetKind::Agent(id)`
-    /// writes the cloud Agent id to `pending_agent_overrides`
-    /// instead — the on-disk routing stays at its current value.
-    /// The resolved `Target` is returned so the caller can surface
-    /// it in a banner.
-    pub fn pick_target(&mut self, kind: TargetKind) -> Target {
-        let slot = self.focused_slot;
-        match kind {
-            TargetKind::Stdout => {
-                let target = Target::Stdout;
-                self.pending_target_overrides
-                    .insert(slot, target.clone());
-                target
-            }
-            TargetKind::Agent(id) => {
-                // Cloud Agent picks don't change the on-disk
-                // routing Target — local file persistence is
-                // still `Target::Stdout`. The picked id is
-                // recorded separately in
-                // `pending_agent_overrides` and consulted by
-                // `start_section` / the §11 `g` key handler
-                // when running the cloud prompt.
-                self.pending_agent_overrides.insert(slot, id);
-                Target::Stdout
-            }
+    /// Activate the room at `idx`. Refuses (returns `Err`) when any
+    /// slot is currently recording — switching mid-session would
+    /// span different room sessions and corrupt the merged
+    /// timeline.
+    ///
+    /// On success, the focused slot set is replaced: Free Room
+    /// gets a single empty slot; agent rooms get one empty slot
+    /// per role. The cursor lands on the first slot.
+    pub fn activate_room(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.rooms.len() {
+            return Err(format!("room index {idx} out of range"));
         }
+        if self.active_section_count() > 0 {
+            return Err("stop recording before switching rooms".to_string());
+        }
+        // Locked Pro rooms can be activated for display, but
+        // agent runs against them will hit 402. We let the
+        // TUI surface the lock with 🔒 and skip the call.
+        self.active_room = idx;
+        let room = self.active_room().clone();
+        if room.slug == "free" {
+            self.slots = Self::fresh_slots();
+        } else {
+            let next_id = self.next_slot_id;
+            self.slots = room
+                .roles
+                .iter()
+                .enumerate()
+                .map(|(i, role)| {
+                    let id = SlotId(next_id + i as u32);
+                    let mut slot = Slot::empty(id);
+                    slot.role = Some(role.clone());
+                    slot
+                })
+                .collect();
+            self.next_slot_id = next_id + self.slots.len() as u32;
+        }
+        self.focused_slot = self.slots[0].id;
+        self.slot_picker_memo.clear();
+        Ok(())
     }
 
-    /// Borrow the fetched cloud Agents list. Empty when the
-    /// fetch hasn't run yet, the user has cloud off, or the
-    /// request failed. The Agents picker reads through this
-    /// accessor — the storage lives on `self.agents`.
-    pub fn agents(&self) -> &[voice_bird_cli::cloud::agents::Agent] {
-        &self.agents
-    }
-
-    /// Re-fetch the cloud Agents list from voicebird.app and
-    /// store it on `self.agents`. No-op when:
-    ///   - the effective cloud state for the focused slot is OFF
-    ///     (per-source override > global default; falls back to
-    ///     global only when no picker source can be resolved),
-    ///   - OR the user has no API key set,
-    ///   - OR the server URL is empty / unparseable.
-    /// On HTTP failure (4xx / 5xx / network error), `self.agents`
-    /// is cleared so the picker goes empty rather than showing
-    /// stale rows, AND a banner is set explaining the failure —
-    /// picker emptiness alone is too quiet and looks identical
-    /// to "fetch hasn't run yet".
-    pub fn refresh_agents(&mut self) {
-        // Gate on the effective cloud state, not the bare global
-        // flag — a per-source override can flip the displayed
-        // state to ON while `cloud_broadcast_enabled` stays OFF
-        // (e.g. the user enabled Cloud for one mic only). Pre-fix
-        // this gate ignored the override and the picker stayed
-        // empty until the user also flipped the global default.
-        if !self.display_cloud_on()
-            || self.config.voicebird_api_key.is_empty()
+    /// Re-fetch the cloud Rooms list from voicebird.app and append
+    /// the catalog entries to `self.rooms` (Free Room stays at
+    /// index 0). No-op when the user has no API key set or the
+    /// server URL is empty. On HTTP failure, the existing
+    /// `self.rooms` (Free Room only) is preserved and a banner
+    /// explains the failure — picker emptiness alone is too
+    /// quiet and looks identical to "fetch hasn't run yet".
+    pub fn refresh_rooms(&mut self) {
+        if self.config.voicebird_api_key.is_empty()
             || self.config.voicebird_server_url.is_empty()
         {
-            self.agents.clear();
+            self.rooms.truncate(1);
             return;
         }
         let base = voice_bird_cli::cloud::http::rest_base_url(
             &self.config.voicebird_server_url,
         );
-        match voice_bird_cli::cloud::agents::fetch(
+        match voice_bird_cli::cloud::rooms::fetch(
             &base,
             &self.config.voicebird_api_key,
         ) {
             Ok(list) => {
-                log::info!("refresh_agents: fetched {} agents", list.len());
-                self.agents = list;
+                log::info!("refresh_rooms: fetched {} rooms", list.rooms.len());
+                self.plan_is_pro = Some(list.plan_is_pro());
+                let mut rooms = vec![Room::free_room()];
+                rooms.extend(list.rooms);
+                self.rooms = rooms;
             }
             Err(e) => {
-                log::warn!("refresh_agents: fetch failed: {e}");
-                self.agents.clear();
-                // Surface the failure so an empty Agents pane
-                // doesn't look identical to "fetch hasn't run
-                // yet". Common causes: wrong API key for the
-                // configured server, or the voicebird_server_url
-                // points at a different host than the key was
-                // issued for.
+                log::warn!("refresh_rooms: fetch failed: {e}");
+                // Keep the existing rooms (at minimum Free Room)
+                // and surface the failure as a banner.
                 self.banner = Some(format!(
-                    "Agents list unavailable: {e}. \
+                    "Rooms list unavailable: {e}. \
                      Check the API key and voicebird_server_url."
                 ));
             }
         }
     }
+
 
 
     /// Committed-transcript Arc for the focused section, or saved
@@ -1312,52 +1308,7 @@ impl App {
         true
     }
 
-    /// Snapshot the current picker cursor under the given slot id.
-    /// Called immediately before focus moves away from that slot.
-    /// The cursor fields on `App` keep holding the slot's state
-    /// until the caller switches `focused_slot`, at which point
-    /// `restore_picker_for` loads the next slot's memo back in.
-    fn memoize_picker_for(&mut self, slot: SlotId) {
-        self.slot_picker_memo.insert(
-            slot,
-            PickerSelection {
-                device_idx: self.selected_device_index,
-                app_idx: self.selected_app_index,
-                focus: self.picker_focus,
-            },
-        );
-    }
-
-    /// Load the memoized picker cursor for the given slot id into
-    /// the cursor fields on `App`. No-op if the slot has no memo
-    /// (first time the user Tabs to it) — the cursor simply keeps
-    /// whatever value it had, which is the natural "first focus
-    /// inherits current state" behavior.
-    fn restore_picker_for(&mut self, slot: SlotId) {
-        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
-            // Clamp the restored indices against the current
-            // inventory — a refresh may have shrunk `devices` /
-            // `apps` between Tab-away and Tab-back.
-            let dev_idx = if self.devices.is_empty() {
-                0
-            } else {
-                p.device_idx.min(self.devices.len() - 1)
-            };
-            let app_idx = p.app_idx.and_then(|i| {
-                if self.apps.is_empty() {
-                    None
-                } else {
-                    Some(i.min(self.apps.len() - 1))
-                }
-            });
-            self.selected_device_index = dev_idx;
-            self.selected_app_index = app_idx;
-            self.picker_focus = p.focus;
-        }
-    }
-
     /// Refresh both panes' inventory. Preserves cursors by name when the
-    /// previously-cursored entries still exist after refresh. The
     /// focused slot's cursor is re-resolved in place; per-slot
     /// memos for non-focused slots are also re-resolved so a later
     /// Tab back to them lands on the same device/app the user
@@ -1467,15 +1418,14 @@ impl App {
                     self.selected_app_index = Some(next);
                 }
             }
-            PickerFocus::Agents => {
-                let i = self.selected_target_index.unwrap_or(0);
-                if i > 0 {
-                    self.selected_target_index = Some(i - 1);
+            PickerFocus::Rooms => {
+                if self.selected_room_index > 0 {
+                    self.selected_room_index -= 1;
                 }
             }
         }
         log::debug!(
-            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
+            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) room_idx={} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
@@ -1485,13 +1435,8 @@ impl App {
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
-            self.selected_target_index,
-            {
-                let rows = self.targets();
-                self.selected_target_index
-                    .and_then(|i| rows.get(i))
-                    .map(|r| r.kind.clone())
-            },
+            self.selected_room_index,
+            self.rooms.get(self.selected_room_index).map(|r| r.slug.clone()),
         );
     }
 
@@ -1514,27 +1459,17 @@ impl App {
                     self.selected_app_index = Some(0);
                 }
             }
-            PickerFocus::Agents => {
-                let i = self.selected_target_index.unwrap_or(0);
-                // The Agents list is dynamic — Stdout / Cloud plus
-                // every entry in `config.agent_targets`. The renderer
-                // already iterates the full list, so the cursor cap
-                // must come from `targets().len()` too; a hardcoded
-                // `3` leaves user-added rows beyond the first Agent
-                // unreachable via ↑/↓ (the row renders but never
-                // receives the cursor). The disabled-row skip is
-                // still handled lazily in `focused_target_kind` so
-                // the cursor can park on a row that's visually
-                // present but unpickable — the banner and start call
-                // treat that as a no-op.
-                let total = self.targets().len();
-                if i + 1 < total {
-                    self.selected_target_index = Some(i + 1);
+            PickerFocus::Rooms => {
+                if self.rooms.is_empty() {
+                    return;
+                }
+                if self.selected_room_index + 1 < self.rooms.len() {
+                    self.selected_room_index += 1;
                 }
             }
         }
         log::debug!(
-            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
+            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) room_idx={} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
@@ -1544,16 +1479,10 @@ impl App {
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
-            self.selected_target_index,
-            {
-                let rows = self.targets();
-                self.selected_target_index
-                    .and_then(|i| rows.get(i))
-                    .map(|r| r.kind.clone())
-            },
+            self.selected_room_index,
+            self.rooms.get(self.selected_room_index).map(|r| r.slug.clone()),
         );
     }
-
     /// Clamp pane scroll offsets so the cursor row stays inside the
     /// viewport. `visible` is the inner row count of one pane (rough
     /// upper bound is fine — the render path also clamps); pass
@@ -1562,11 +1491,13 @@ impl App {
         let v = visible.max(1) as u16;
         let dev_max = self.devices.len().saturating_sub(1) as u16;
         let app_max = self.apps.len().saturating_sub(1) as u16;
+        let room_max = self.rooms.len().saturating_sub(1) as u16;
         let dev_idx = (self.selected_device_index as u16).min(dev_max);
         let app_idx = self
             .selected_app_index
             .map(|i| (i as u16).min(app_max))
             .unwrap_or(0);
+        let room_idx = (self.selected_room_index as u16).min(room_max);
         if dev_idx < self.device_scroll {
             self.device_scroll = dev_idx;
         } else if dev_idx >= self.device_scroll.saturating_add(v) {
@@ -1576,6 +1507,11 @@ impl App {
             self.app_scroll = app_idx;
         } else if app_idx >= self.app_scroll.saturating_add(v) {
             self.app_scroll = app_idx + 1 - v;
+        }
+        if room_idx < self.room_scroll {
+            self.room_scroll = room_idx;
+        } else if room_idx >= self.room_scroll.saturating_add(v) {
+            self.room_scroll = room_idx + 1 - v;
         }
     }
 
@@ -1734,16 +1670,6 @@ impl App {
         None
     }
 
-    /// Picked-target kind for the focused slot. The Agents
-    /// pane uses this to mark the active row. §8.5 collapsed
-    /// `Target` to a single `Stdout` variant; with no
-    /// `Agent` routing axis to consult, the function is a
-    /// stub until §10 repopulates the picker with cloud
-    /// Agents and the picker starts reading
-    /// `pending_agent_overrides` instead.
-    pub fn picked_target_kind(&self) -> Option<TargetKind> {
-        Some(TargetKind::Stdout)
-    }
 
     /// Update duration from start time
     pub fn update_duration(&mut self) {
@@ -3045,295 +2971,6 @@ mod tests {
         // Empty fallbacks for the focused-* Arcs.
         assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
-    }
-
-    // ── cloud Agents pane (red: §10) ───────────────────────────────
-
-    /// `App::targets()` must never emit a `Stdout` row. The picker
-    /// shows cloud Agents only — local file persistence is the
-    /// implicit default routing when the user hasn't picked one.
-    /// Today this fails: `targets()` returns a single `Stdout`
-    /// row from `App::new()` (the §8.5 fallback).
-    #[test]
-    fn no_stdout_row_in_agents_pane() {
-        let app = App::new();
-        for row in app.targets() {
-            assert!(
-                !matches!(row.kind, TargetKind::Stdout),
-                "Stdout must never appear in the Agents pane; got {:?}",
-                row.kind
-            );
-        }
-    }
-
-    /// Default config (cloud off, no key) ⇒ empty Agents pane.
-    /// The user hasn't enabled cloud so there's nothing to fetch;
-    /// the picker should render zero rows, not a fallback `Stdout`.
-    /// Today this fails: `targets()` returns `[Stdout]`.
-    #[test]
-    fn agents_pane_empty_when_cloud_off_default() {
-        let app = App::new();
-        assert!(
-            app.targets().is_empty(),
-            "cloud off ⇒ empty Agents pane; got {} rows",
-            app.targets().len()
-        );
-    }
-
-    /// Cloud on but no API key ⇒ empty Agents pane (can't fetch).
-    /// The current code emits a `Stdout` row regardless of config,
-    /// so this assertion fails today.
-    #[test]
-    fn agents_pane_empty_when_no_api_key_with_cloud_on() {
-        let mut app = App::new();
-        app.default_slot_config.cloud_on = true;
-        // voicebird_api_key stays empty (default).
-        app.refresh_agents();
-        assert!(
-            app.targets().is_empty(),
-            "cloud on + no key ⇒ empty Agents pane; got {} rows",
-            app.targets().len()
-        );
-    }
-
-    /// `App::refresh_agents()` against a stub server that returns two
-    /// Agents must populate `app.agents()` with both. Today this
-    /// fails: `refresh_agents()` is a no-op stub.
-    #[cfg(not(windows))]
-    #[test]
-    fn refresh_agents_with_cloud_on_populates_from_stub_server() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Serve a canned Agents response. Path is irrelevant —
-        // the server replies the same JSON to any request.
-        let server = std::thread::spawn(move || {
-            // Accept with a 2-second ceiling so the test can't
-            // hang forever if `refresh_agents` never reaches
-            // `fetch` (e.g. when the stub does nothing).
-            listener.set_nonblocking(true).ok();
-            let started = std::time::Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok(s) => break s.0,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        if started.elapsed() > std::time::Duration::from_secs(2) {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            };
-            stream.set_nonblocking(false).ok();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            // Read & discard the request (don't bother parsing).
-            let mut reader = std::io::BufReader::new(&stream);
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
-            let body = r#"{"agents":[{"id":"note-taker","name":"Note taker","icon":"\u270d\ufe0f","promptTemplate":"x"},{"id":"summarizer","name":"Summarizer","icon":"\u2728","promptTemplate":"y"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use std::io::Write;
-            let _ = stream.write_all(resp.as_bytes());
-        });
-
-        let mut app = App::new();
-        // Cloud is gated on the EFFECTIVE state for the
-        // focused slot. Default ON means fresh-install
-        // behavior; explicit OFF turns the panel off.
-        app.default_slot_config.cloud_on = true;
-        app.config.voicebird_api_key = "test-key-abc123".into();
-        app.config.voicebird_server_url = format!("ws://{}/api/audio/stream", addr);
-        app.refresh_agents();
-
-        assert_eq!(
-            app.agents().len(),
-            2,
-            "expected 2 agents from stub server, got {:?}",
-            app.agents()
-        );
-        assert_eq!(app.agents()[0].id, "note-taker");
-        assert_eq!(app.agents()[1].id, "summarizer");
-        // The picker should now reflect both rows.
-        assert_eq!(app.targets().len(), 2);
-    }
-
-    /// If the picker-resolved source is effectively cloud-enabled via its
-    /// per-source override, refreshing Agents should fetch even when the
-    /// global cloud default is off. This is the same effective state that
-    /// `display_cloud_on()` and `start_section` use.
-    #[cfg(not(windows))]
-    #[test]
-    fn refresh_agents_uses_effective_source_cloud_state_not_only_global_default() {
-        use voice_bird_cli::config::AudioSessionKind;
-        use voice_bird_cli::session::layout::SessionSource;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).ok();
-            let started = std::time::Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok(s) => break s.0,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        if started.elapsed() > std::time::Duration::from_secs(2) {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            };
-            stream.set_nonblocking(false).ok();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            let mut reader = std::io::BufReader::new(&stream);
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
-            let body = r#"{"agents":[{"id":"interviewee","name":"Interviewee","icon":null,"promptTemplate":"x"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use std::io::Write;
-            let _ = stream.write_all(resp.as_bytes());
-        });
-
-        let mut app = App::new();
-        app.devices = vec![crate::platform::AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-        // Global default OFF; the focused slot's customized
-        // cloud_on = true is what `display_cloud_on` returns.
-        app.default_slot_config.cloud_on = false;
-        app.config.voicebird_api_key = "test-key-abc123".into();
-        app.config.voicebird_server_url =
-            format!("ws://{}/api/audio/stream", addr);
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(true);
-
-        assert!(
-            app.display_cloud_on(),
-            "setup must be effectively cloud-on via the focused slot's config"
-        );
-
-        app.refresh_agents();
-        let _ = server.join();
-
-        assert_eq!(
-            app.agents().len(),
-            1,
-            "refresh_agents must fetch when the selected source is effectively \
-             cloud-on even if the global default is off"
-        );
-        assert_eq!(app.agents()[0].id, "interviewee");
-    }
-
-    /// Pre-fix bug: when no section was focused, `display_cloud_on`,
-    /// `display_language`, and `display_model` fell through to the
-    /// GLOBAL config default, ignoring the per-source override that
-    /// `c` writes to. Switching focus between two empty slots routed
-    /// to different sources showed the same badge value even when
-    /// their per-source overrides differed — the Mode panel didn't
-    /// reflect what would actually take effect on Enter.
-    ///
-    /// Post-fix: with no section focused, the helpers resolve the
-    /// picker-resolved source and return the per-source override for
-    /// that source. The global default is only the fallback when no
-    /// picker source can be resolved (e.g. empty Devices pane).
-    #[test]
-    #[cfg(not(windows))]
-    fn display_helpers_resolve_per_slot_customization_when_no_section_focused() {
-        use voice_bird_cli::config::AudioSessionKind;
-        use crate::platform::AudioDevice;
-
-        let mut app = App::new();
-
-        // Global defaults — what a fresh install would have.
-        app.default_slot_config.cloud_on = true;
-        app.default_slot_config.language = "en".into();
-        app.default_slot_config.model = "tiny.en".into();
-
-        // Picker parks on a specific input device.
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-
-        // The focused slot's customization DISAGREES with the
-        // global default — this is the exact scenario where
-        // the bug surfaced.
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(false);
-        slot.config.language = Some("ru".into());
-        slot.config.model = Some("base.en".into());
-
-        // No section focused → helpers must read the
-        // focused slot's customization, NOT the default.
-        assert!(
-            app.focused().is_none(),
-            "test setup must have no focused section"
-        );
-        assert!(
-            !app.display_cloud_on(),
-            "display_cloud_on must read the focused slot's customization \
-             (off) even though the default is on; this is the fix for \
-             the slot-specific cloud toggle that was leaking via the \
-             global flag"
-        );
-        assert_eq!(
-            app.display_language(),
-            "ru",
-            "display_language must read the focused slot's customization \
-             (ru) not the default (en)"
-        );
-        assert_eq!(
-            app.display_model(),
-            "base.en",
-            "display_model must read the focused slot's customization \
-             (base.en) not the default (tiny.en)"
-        );
-    }
-
-    /// `pick_target(TargetKind::Agent(id))` records the agent id
-    /// in the per-slot pending map so `start_section` / §11
-    /// `g` key know which cloud Agent to run. The local
-    /// routing `Target` axis stays `Stdout` — only the
-    /// agent override is updated.
-    #[test]
-    fn pick_target_with_agent_kind_records_id_in_pending_map() {
-        let mut app = App::new();
-        let slot = app.focused_slot;
-        app.pick_target(TargetKind::Agent("note-taker".into()));
-        assert_eq!(
-            app.pending_agent_overrides.get(&slot).map(String::as_str),
-            Some("note-taker"),
-            "pick_target(TargetKind::Agent(id)) must record the id in \
-             pending_agent_overrides"
-        );
     }
 
     // ── resume_section state matrix (R key) ──────────────────────────

@@ -760,32 +760,19 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
     render_devices_pane(f, cols[0], app);
     render_apps_pane(f, cols[1], app);
-    render_targets_list_pane(f, cols[2], app);
+    render_rooms_pane(f, cols[2], app);
 }
-/// Third picker column. Lists the three routing options (Stdout /
-/// Cloud / Agent) and lets the user pick one with the same arrow
-/// navigation + Enter pattern as Devices and Apps. Picking here
-/// writes to `pending_target_overrides` on the focused slot; the
-/// next start_section consumes it.
-///
-/// The Agent row is rendered dim and the cursor refuses to land on it
-/// when the agent runtime binary is not on disk (see
-/// `App::focused_target_kind`). This keeps the visible state and
-/// the pickable state in agreement.
-fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
-
-    let focused = app.picker_focus == PickerFocus::Agents;
-    // §8.5: `app.targets()` returns just the Stdout row.
-    let rows = app.targets();
-    // Pending-or-last target — the Agents pane reads this
-    // to mark the active row, including when the pane is
-    // unfocused (the user can still see which row is the
-    // live choice from the sidebar).
-    let picked = app.picked_target_kind();
+/// Render the Rooms pane. Rooms live in `App::rooms` (index 0 is
+/// always the hardcoded Free Room; cloud rooms follow). The
+/// active room gets a `●` marker; locked Pro rooms (when
+/// `plan_is_pro == Some(false)`) render dim with a 🔒 suffix.
+/// Enter in this pane activates the picked room.
+fn render_rooms_pane(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.picker_focus == PickerFocus::Rooms;
     let title = if focused {
-        " Agents ▸ [↑/↓] pick  [←] apps  [Enter] start "
+        " Rooms ▸ [↑/↓] pick  [←] apps  [Enter] activate "
     } else {
-        " Agents  ([→] focus) "
+        " Rooms  ([→] focus) "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -794,115 +781,69 @@ fn render_targets_list_pane(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let items: Vec<Line> = rows
+    let active_idx = app.active_room;
+    let is_pro = app.plan_is_pro;
+
+    let items: Vec<Line> = app
+        .rooms
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            let is_cursor = i == app.selected_target_index.unwrap_or(0) && focused;
-            // The Agents pane is now dynamic — `Agent` rows
-            // can also be picked. Clone the kind so the borrow
-            // on `row` ends before the next iteration's call.
-            let is_picked = picked.as_ref() == Some(&row.kind) && !row.disabled;
+        .map(|(i, room)| {
+            let is_cursor = i == app.selected_room_index && focused;
+            let is_active = i == active_idx;
+            let is_locked = room.requires_pro && is_pro == Some(false);
             let marker = if is_cursor { "▶ " } else { "  " };
-            // Look up the row's user-facing label from the
-            // fetched Agents list. Stdout rows (legacy, no
-            // longer emitted by `App::targets()` but kept in
-            // the enum for back-compat) render as "Stdout".
-            // Agent rows render as "{icon} {name}" so the
-            // picker matches the web dashboard's wording. The
-            // lookup falls back to the bare id if the agent
-            // vanished between fetch and render (e.g. picked
-            // an Agent that's no longer in `self.agents`).
-            let name: Option<String> = match &row.kind {
-                crate::app::TargetKind::Stdout => Some("Stdout".into()),
-                crate::app::TargetKind::Agent(id) => app
-                    .agents()
-                    .iter()
-                    .find(|a| a.id == *id)
-                    .map(|a| match &a.icon {
-                        Some(icon) if !icon.is_empty() => {
-                            format!("{icon} {}", a.name)
-                        }
-                        _ => a.name.clone(),
-                    })
-                    .or_else(|| Some(id.clone())),
+            let icon = room.icon.as_deref().unwrap_or("");
+            let label = if icon.is_empty() {
+                room.name.clone()
+            } else {
+                format!("{} {}", icon, room.name)
             };
-            let (label, style, hint) =
-                target_row_style(row.kind.clone(), row.disabled, name.as_deref());
-            // The picked row gets its base color bumped to Yellow
-            // (the rest of the picker uses Green / Magenta / Cyan
-            // per target kind) plus the BOLD modifier. Cursor row
-            // wins on the invert to stay readable.
-            let label_style = if is_cursor {
+            let mut suffix = String::new();
+            if is_active {
+                suffix.push_str(" ●");
+            }
+            if is_locked {
+                suffix.push_str(" 🔒");
+            }
+            let style = if is_cursor {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::White)
                     .add_modifier(Modifier::BOLD)
-            } else if is_picked {
+            } else if is_locked {
+                Style::default().fg(Color::DarkGray)
+            } else if is_active {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                style
+                Style::default().fg(Color::White)
             };
-            let picked_tag = if is_picked {
-                Span::styled(
-                    " ●",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
+            let suffix_style = if is_locked {
+                Style::default().fg(Color::DarkGray)
             } else {
-                Span::raw("")
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
                 Span::raw(marker),
-                Span::styled(label, label_style),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-                picked_tag,
+                Span::styled(label, style),
+                Span::styled(suffix, suffix_style),
             ])
         })
         .collect();
 
-    let cursor_row = app.selected_target_index.unwrap_or(0) as u16;
+    let cursor_row = app.selected_room_index as u16;
     let scroll = clamp_scroll_for_render(
         cursor_row,
-        app.target_scroll,
+        app.room_scroll,
         items.len() as u16,
         inner.height,
     );
     let p = Paragraph::new(items).scroll((scroll, 0));
     f.render_widget(p, inner);
-}
-/// (label, style, hint) for a single target row. `disabled=true`
-/// dims the label and appends a hint so the user knows the row
-/// exists but can't be picked.
-fn target_row_style(
-    kind: crate::app::TargetKind,
-    disabled: bool,
-    name: Option<&str>,
-) -> (String, Style, String) {
-    // generic over the picker content (Stdout, fetched
-    // Agent rows, etc.). The legacy call site — the
-    // `TargetKind::Stdout` enum variant — falls back to
-    // "Stdout" when the caller passes `None`. The disabled
-    // branch keeps the "not installed" hint from §8.5 —
-    // today no Agent row is ever marked disabled, but the
-    // structure is here for when a future per-row disabled
-    // flag lands (e.g. server-side Agent failed health-check).
-    let _ = kind;
-    let label = name.unwrap_or("Stdout").to_string();
-    let base_color = Color::Green;
-    if disabled {
-        (
-            label,
-            Style::default().fg(Color::DarkGray),
-            "  (not installed)".into(),
-        )
-    } else {
-        let s = Style::default().fg(base_color).add_modifier(Modifier::BOLD);
-        (label, s, String::new())
-    }
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -1315,7 +1256,7 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             // `[a]`/`[e]`/`[d]` Agent CRUD keys removed in §8.
             // `[e]` exports a recording from the Devices pane;
             // the Agents pane will be repurposed for cloud Agents in §10.
-            if app.picker_focus != crate::app::PickerFocus::Agents && local_keys {
+            if app.picker_focus != crate::app::PickerFocus::Rooms && local_keys {
                 lines.push(hotkey_line("[e]", "export"));
             }
             lines
@@ -2048,66 +1989,8 @@ mod tests {
     /// shape so the pin column lands identically. Cloud
     /// is no longer a target; its toggle lives in the
     /// Mode panel.
-    #[test]
-    fn target_row_style_stdout_has_no_hint() {
-        use crate::app::TargetKind;
-        let (_label, _style, hint) =
-            target_row_style(TargetKind::Stdout, false, None);
-        assert_eq!(hint, "", "enabled Stdout must not carry a trailing hint");
-    }
     /// Idle key sidebar shows the new Tab/cfg keys.
 
-    /// Cloud-Agent rows render with the agent's icon and
-    /// name from `app.agents()`, not the hardcoded "Stdout"
-    /// label that §8.5's renderer fell back to. Regression
-    /// for the "Stdout Stdout" bug where the cloud-agent
-    /// renames broke the visual mapping between `Agent` enum
-    /// variants and the user-facing row text.
-    #[test]
-    fn agents_pane_renders_cloud_agent_icons_and_names() {
-        use voice_bird_cli::cloud::agents::Agent;
-        let mut app = App::new();
-        app.picker_focus = PickerFocus::Agents;
-        app.selected_target_index = Some(0);
-        // Inject two fetched Agents directly. We bypass
-        // `refresh_agents()` because it would need a stub
-        // HTTP server for a render test — the render path
-        // only reads `self.agents`, so seeding the field is
-        // enough.
-        app.agents = vec![
-            Agent {
-                id: "dentist".into(),
-                name: "Dentist".into(),
-                icon: Some("🦷".into()),
-                is_built_in: true,
-            },
-            Agent {
-                id: "note-taker".into(),
-                name: "Note Taker".into(),
-                icon: Some("📝".into()),
-                is_built_in: false,
-            },
-        ];
-        let out = render_to_string(&app, 180, 40);
-        // Render uses two spaces between icon and name (one
-        // from the marker trailing-space, one from the
-        // format-string). Match the rendered text.
-        assert!(
-            out.contains("🦷  Dentist"),
-            "Agents pane must render icon + name from app.agents(); got:\n{out}"
-        );
-        assert!(
-            out.contains("📝  Note Taker"),
-            "Agents pane must render icon + name from app.agents(); got:\n{out}"
-        );
-        // Hardcoded "Stdout" label must NOT appear in the
-        // Agents pane when fetched agents are present.
-        assert!(
-            !out.contains("Stdout"),
-            "Stdout label leaked into Agents pane (cloud agents should not \
-             render as Stdout); got:\n{out}"
-        );
-    }
     #[test]
     fn key_sidebar_shows_tab_and_cfg_hints_when_idle() {
         let app = App::new();
@@ -2141,12 +2024,9 @@ mod tests {
             "[Space]",
             "[Enter]",
             "[Tab]",
-            // The +/- workspace controls are always rendered —
             // short-circuit the test when the static list drops
             // them.
             "[+]",
-            "[-]",
-            "[r]",
             "[c]",
             "[K]",
             "[l]",
@@ -2198,7 +2078,7 @@ mod tests {
         // branches.
         app.selected_device_index = 2;
         app.selected_app_index = Some(1);
-        app.selected_target_index = Some(1); // Cloud
+        app.selected_room_index = 0;
                                              // Pretend a previous start installed an Agent session id, so
                                              // the Agent row stays pickable but isn't the picked one.
         let out = render_to_string(&app, 180, 40);

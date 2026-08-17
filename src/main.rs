@@ -429,8 +429,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             use crate::app::PickerFocus::*;
             let next = match app.picker_focus {
                 Devices => Apps,
-                Apps => Agents,
-                Agents => Agents,
+                Apps => Rooms,
+                Rooms => Rooms,
             };
             app.picker_focus = next;
             log::info!("keys: Right → picker_focus = {:?}", next);
@@ -493,33 +493,26 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // `a`/`e`/`d` agent CRUD keys removed in §8 — see plan §8.1.
         // Their handler functions and `AppMode` variants are gone in §8.3.
         KeyCode::Enter => {
-            // When the Agents pane is focused, Enter first applies
-            // the picked target to the focused slot's
-            // pending_target_overrides (so start_section consumes
-            // it). The picked target may be disabled (e.g. Agent when
-            // the binary is missing) — in that case we surface a
-            // banner and abort; the user can press Down to land on
-            // a pickable row.
-            if app.picker_focus == crate::app::PickerFocus::Agents {
-                if let Some(kind) = app.focused_target_kind() {
-                    let target = app.pick_target(kind);
-                    log::info!(
-                        "keys: Enter in Agents pane → picked {target:?} for slot {}",
-                        app.focused_slot.0
-                    );
+            // When the Rooms pane is focused, Enter first activates
+            // the picked room (provisions the slot set). The
+            // activate_room call is the only Enter-specific UI
+            // concern for the rooms pane; everything else (slot
+            // pick, source resolution, config persist,
+            // start_section) is shared and lives in the App method
+            // so it can be unit-tested.
+            if app.picker_focus == crate::app::PickerFocus::Rooms {
+                let idx = app.selected_room_index;
+                if let Err(msg) = app.activate_room(idx) {
+                    log::warn!("keys: Enter in Rooms pane → activate_room FAILED: {msg}");
+                    app.banner = Some(msg);
                 } else {
-                    let i = app.selected_target_index.unwrap_or(0);
-                    app.banner = Some(format!(
-                        "Target row {i} is disabled (binary missing?) — pick a different row"
-                    ));
-                    return;
+                    log::info!(
+                        "keys: Enter in Rooms pane → activated room index {idx} ({})",
+                        app.active_room().slug
+                    );
                 }
+                return;
             }
-            // Hand the rest off to App::try_start_new_section. The
-            // Agents pick_target above is the only Enter-specific
-            // UI concern; everything else (slot pick, source
-            // resolution, config persist, start_section) is shared
-            // and lives in the App method so it can be unit-tested.
             match app.try_start_new_section() {
                 Ok(()) => {
                     log::info!(
@@ -535,27 +528,28 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
         // 'r' refreshes both inventories: local audio (devices + apps)
-        // and the cloud Agents list. Local refresh preserves cursor
-        // positions by name; cloud refresh replaces `self.agents` with
-        // whatever `GET /api/agents` returns (or clears it + sets a
-        // banner on error). Pre-this-commit, `r` only refreshed local
-        // audio, so newly-created custom Agents on voicebird.app never
-        // appeared in the picker until process restart / `c` toggle /
-        // API-key re-save.
+        // and the cloud Rooms list. Local refresh preserves cursor
+        // positions by name; cloud refresh replaces `self.rooms`
+        // (preserving the Free Room at index 0) with whatever
+        // `GET /api/rooms` returns (or clears it + sets a banner
+        // on error). Pre-this-commit, `r` only refreshed local
+        // audio, so newly-created custom Rooms on voicebird.app
+        // never appeared in the picker until process restart / `c`
+        // toggle / API-key re-save.
         KeyCode::Char('r') => {
             let before_d = app.devices.len();
             let before_a = app.apps.len();
-            let before_ag = app.agents().len();
+            let before_r = app.rooms.len();
             app.refresh_inventory();
-            app.refresh_agents();
+            app.refresh_rooms();
             log::info!(
-                "keys: r refresh: devices {} → {}, apps {} → {}, agents {} → {}",
+                "keys: r refresh: devices {} → {}, apps {} → {}, rooms {} → {}",
                 before_d,
                 app.devices.len(),
                 before_a,
                 app.apps.len(),
-                before_ag,
-                app.agents().len()
+                before_r,
+                app.rooms.len()
             );
         }
         // 's' stops the focused section (no-op if its slot is empty).
@@ -683,7 +677,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 {
                     slot.config.cloud_on = Some(on);
                 }
-                app.refresh_agents();
+                app.refresh_rooms();
                 app.banner = Some(if on {
                     "Cloud: ON for focused section (applies on next start)".into()
                 } else {
@@ -712,7 +706,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                         .unwrap_or(app.default_slot_config.cloud_on);
                     slot.config.cloud_on = Some(!current);
                 }
-                app.refresh_agents();
+                app.refresh_rooms();
                 if app.display_cloud_on() && app.config.voicebird_api_key.is_empty() {
                     // Cloud-enable gate. The modal opens with
                     // the new (ON) cloud state visible. Esc
@@ -867,7 +861,7 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                     // Empty key: clear any stale agents list so the
                     // picker doesn't keep showing entries from a
                     // prior fetch.
-                    app.refresh_agents();
+                    app.refresh_rooms();
                 } else {
                     app.banner =
                         Some("API key saved — start a recording to verify".into());
@@ -876,7 +870,7 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                     // authorized to see. Without this the picker
                     // stays empty until the next `App::new()`
                     // (i.e. process restart).
-                    app.refresh_agents();
+                    app.refresh_rooms();
                 }
             }
             app.mode = AppMode::Normal;
