@@ -21,4 +21,5 @@
 
 pub mod agents;
 pub mod http;
+pub mod rooms;
 pub mod run;
