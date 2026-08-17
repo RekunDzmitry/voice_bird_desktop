@@ -15,6 +15,19 @@ pub struct SessionMeta {
     pub started_at: String,
     pub ended_at: String,
     pub duration_ms: u64,
+    /// Optional role binding. Set when this section was provisioned
+    /// by an agent room (e.g. "patient" / "doctor" in Doctor
+    /// Appointment). `None` for Free Room sessions. The field is
+    /// `#[serde(default)]` so old meta.json files without the
+    /// key parse cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Optional room slug (e.g. "doctor-appointment"). Set when
+    /// this section was provisioned by an agent room. `None` for
+    /// Free Room sessions. The field is `#[serde(default)]` so old
+    /// meta.json files without the key parse cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_slug: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +137,8 @@ mod tests {
             started_at: "2026-04-16T14:32:07Z".into(),
             ended_at: "2026-04-16T14:32:10Z".into(),
             duration_ms: 3000,
+            role: None,
+            room_slug: None,
         };
 
         let out_json = dir.path().join("transcript.json");
@@ -142,6 +157,53 @@ mod tests {
         let m: SessionMeta =
             serde_json::from_str(&std::fs::read_to_string(&out_meta).unwrap()).unwrap();
         assert_eq!(m.model, "distil-small.en");
+    }
+    /// `role` and `room_slug` round-trip through meta.json. The
+    /// fields are `#[serde(default)]` so old meta files
+    /// without the keys still parse cleanly (D3.4.e + D3.5).
+    #[test]
+    fn room_meta_fields_round_trip_and_default() {
+        // With role + room_slug set, they serialize.
+        let dir = TempDir::new().unwrap();
+        let jsonl = dir.path().join("transcript.jsonl");
+        std::fs::write(&jsonl, "").unwrap();
+        let meta = SessionMeta {
+            version: "0.0.0".into(),
+            model: String::new(),
+            engine: String::new(),
+            source: "mic".into(),
+            device: String::new(),
+            started_at: String::new(),
+            ended_at: String::new(),
+            duration_ms: 0,
+            role: Some("doctor".into()),
+            room_slug: Some("doctor-appointment".into()),
+        };
+        finalize(
+            &jsonl,
+            &dir.path().join("transcript.json"),
+            &dir.path().join("transcript.txt"),
+            &dir.path().join("meta.json"),
+            &meta,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(dir.path().join("meta.json")).unwrap();
+        assert!(body.contains("\"role\": \"doctor\""), "{body}");
+        assert!(body.contains("\"room_slug\": \"doctor-appointment\""), "{body}");
+
+        // Old-style meta (no role / room_slug) still parses.
+        std::fs::write(
+            dir.path().join("meta.json"),
+            "{\"version\":\"0.1.0\",\"model\":\"tiny.en\",\"engine\":\"whisper_rs\",\
+             \"source\":\"mic\",\"device\":\"\",\"started_at\":\"\",\"ended_at\":\"\",\
+             \"duration_ms\":0}",
+        ).unwrap();
+        let parsed: SessionMeta = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed.role.is_none());
+        assert!(parsed.room_slug.is_none());
     }
 
     #[test]

@@ -469,8 +469,13 @@ pub struct App {
     /// Per-slot pending target override. The Agents picker writes
     /// to this when the user picks a row; the next `start_section`
     /// consults it and applies it instead of the default
-    /// `cloud_on` heuristic. The value is consumed (set back to
-    /// `None`) by start_section so it only affects the very next
+    pub active_room: usize,
+    /// Path of the active room session dir (`<ts>-room-<slug>/`)
+    /// when an agent room is active. `None` when Free Room is
+    /// active (which has no parent dir) or before the first
+    /// activation.
+    pub room_session_dir: Option<std::path::PathBuf>,
+    /// Last-known `plan` value from `/api/rooms`.
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
 
@@ -651,7 +656,7 @@ impl App {
         // get appended by `refresh_rooms`.
         let mut rooms: Vec<Room> = vec![Room::free_room()];
         let active_room: usize = 0;
-
+        let room_session_dir: Option<std::path::PathBuf> = None;
         let mut app = Self {
             mode: AppMode::Normal,
             devices: Vec::new(),
@@ -697,6 +702,7 @@ impl App {
             plan_is_pro: None,
             slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
+            room_session_dir,
         };
 
         app.refresh_rooms();
@@ -892,6 +898,32 @@ impl App {
         if room.slug == "free" {
             self.slots = Self::fresh_slots();
         } else {
+            // Write room.json up front so the per-role session
+            // dirs land inside a directory the operator can
+            // identify. IO failures are surfaced as a banner but
+            // don't fail the activation — the user can still
+            // record; the per-role finalize path will surface
+            // write errors itself.
+            let started_at = chrono::Utc::now();
+            let base = voice_bird_cli::config::AppConfig::expand_tilde(
+                &self.config.default_slot_config.path,
+            );
+            let base = std::path::PathBuf::from(base);
+            let room_dir = voice_bird_cli::session::layout::room_session_dir(
+                &base,
+                started_at,
+                &room.slug,
+            );
+            if let Err(e) = voice_bird_cli::room_fs::write_room_json(
+                &room_dir,
+                &room,
+                started_at,
+            ) {
+                self.banner = Some(format!(
+                    "could not write room.json: {e}"
+                ));
+            }
+            self.room_session_dir = Some(room_dir);
             let next_id = self.next_slot_id;
             self.slots = room
                 .roles
@@ -906,9 +938,6 @@ impl App {
                 .collect();
             self.next_slot_id = next_id + self.slots.len() as u32;
         }
-        self.focused_slot = self.slots[0].id;
-        self.slot_picker_memo.clear();
-        Ok(())
     }
 
     /// Re-fetch the cloud Rooms list from voicebird.app and append
@@ -2418,11 +2447,17 @@ impl App {
                 version: env!("CARGO_PKG_VERSION").into(),
                 model: section.settings.model.clone(),
                 engine: engine_for_meta,
-                source: "mic".into(),
-                device: "mock".into(),
+                source: source_to_string(&section.source),
+                device: device_name_for_source(&section.source),
                 started_at: started.to_rfc3339(),
                 ended_at: ended.to_rfc3339(),
                 duration_ms: (ended - started).num_milliseconds().max(0) as u64,
+                role: section.role.as_ref().map(|r| r.name.clone()),
+                room_slug: self
+                    .active_room()
+                    .slug
+                    .clone()
+                    .into_option_if_not_free(),
             };
             if let Err(e) = voice_bird_cli::session::finalize::finalize(
                 &dir.join("transcript.jsonl"),
@@ -2891,6 +2926,58 @@ fn clamp_section_settings_for_platform(settings: &mut SectionSettings) {
 #[cfg(not(windows))]
 fn find_latest_session(base: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(base) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => return None,
+    };
+/// Render the `source` field of `SessionMeta` for the active
+/// `SessionSource`. Replaces the legacy `source: "mic"` hardcode
+/// — the meta file now reflects what the user actually recorded
+/// from.
+fn source_to_string(source: &voice_bird_cli::session::layout::SessionSource) -> String {
+    use voice_bird_cli::session::layout::SessionSource;
+    match source {
+        SessionSource::Microphone => "mic".into(),
+        SessionSource::System => "system".into(),
+        SessionSource::App { name, .. } => name.clone(),
+    }
+}
+
+/// Render the `device` field of `SessionMeta` for the active
+/// `SessionSource`. The legacy `device: "mock"` hardcode is
+/// gone — for mic/system we report the focused device from the
+/// picker; for per-app capture we report the app's display name.
+fn device_name_for_source(
+    source: &voice_bird_cli::session::layout::SessionSource,
+) -> String {
+    use voice_bird_cli::session::layout::SessionSource;
+    match source {
+        SessionSource::Microphone | SessionSource::System => String::new(),
+        SessionSource::App { name, .. } => name.clone(),
+    }
+}
+
+/// Helper for the meta-write site: turn a `String` into
+/// `Option<String>` only when it's neither the Free Room slug
+/// nor empty. Keeps the meta file lean — Free Room sessions
+/// don't carry a `room_slug` field, agent rooms do.
+trait IntoOptionIfNotFree {
+    fn into_option_if_not_free(self) -> Option<String>;
+}
+impl IntoOptionIfNotFree for String {
+    fn into_option_if_not_free(self) -> Option<String> {
+        if self.is_empty() || self == "free" {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+ /// Windows is cloud-only: force cloud on in memory regardless of what the
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
