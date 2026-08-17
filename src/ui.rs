@@ -364,13 +364,22 @@ fn build_slot_title(
         .as_deref()
         .map(|a| format!(" + {a}"))
         .unwrap_or_default();
-    // Title is ` [N] {device} + {app} ` — no target suffix. The
-    // routing target (Stdout / Cloud Agent) is picked in the
-    // Agents pane, not declared in the slot title. §8.5 retired
-    // Stdout as a routing decision; today every slot implicitly
-    // routes Stdout, so the old `→ Stdout` arrow was dead text
-    // the user saw on every slot.
-    let prefix = format!(" [{n}] {device_label}{app_str} ");
+    // Role prefix: when the slot was provisioned by an agent
+    // room, prepend the role name so the user can tell at a
+    // glance which human role this slot represents. Free Room
+    // slots are unlabeled.
+    let role_prefix = slot
+        .role
+        .as_ref()
+        .map(|r| format!("[{}] ", r.name))
+        .unwrap_or_default();
+    // Title is ` [N] {role}{device} + {app} ` — no target suffix.
+    // The routing target (Stdout / Cloud Agent) is picked in
+    // the Agents pane, not declared in the slot title. §8.5
+    // retired Stdout as a routing decision; today every slot
+    // implicitly routes Stdout, so the old `→ Stdout` arrow
+    // was dead text the user saw on every slot.
+    let prefix = format!(" [{n}] {role_prefix}{device_label}{app_str} ");
     if prefix.chars().count() <= inner_w {
         vec![Line::from(Span::styled(
             prefix,
@@ -2125,6 +2134,8 @@ mod tests {
                         language: "en".into(),
                         model: "tiny.en".into(),
                     },
+                    session_started_at: chrono::Utc::now(),
+                    role: None,
                 },
             };
         }

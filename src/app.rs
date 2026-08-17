@@ -97,6 +97,12 @@ pub struct SavedTranscript {
     /// and rewrites this field, so post-stop changes (language,
     /// cloud toggle) take effect on the resumed section.
     pub settings: SectionSettings,
+    /// Wall-clock start of the original recording — the merged
+    /// timeline anchors lines to this moment.
+    pub session_started_at: chrono::DateTime<chrono::Utc>,
+    /// Optional role binding (set when the slot was provisioned
+    /// by an agent room).
+    pub role: Option<RoleDef>,
 }
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
@@ -184,10 +190,6 @@ pub struct Section {
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Latest tentative (in-progress) transcript text.
     pub tentative: Arc<PlMutex<String>>,
-    /// On-disk session directory (`None` when broadcasting to cloud).
-    pub session_dir: Option<PathBuf>,
-    /// Wall-clock start of this section.
-    pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Which engine is actually running ("whisperkit" / "whisper_rs" /
     /// "voicebird"). Persisted into `meta.json` at stop.
     pub engine_kind: String,
@@ -199,6 +201,14 @@ pub struct Section {
     /// Wall-clock time when the cloud reminder banner should be hidden
     /// (3 s after recording start). `None` for local sections.
     pub cloud_reminder_until: Option<std::time::Instant>,
+    /// On-disk session directory (`None` when broadcasting to cloud).
+    pub session_dir: Option<PathBuf>,
+    /// Optional role binding. `start_section` copies this from
+    /// `slot.role` so the running section knows which human
+    /// `Role:` label prefix.
+    pub role: Option<RoleDef>,
+    /// Wall-clock start of this section.
+    pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Transcript scroll offset for this section (lines from top).
     /// Only consulted when `transcript_follow` is false.
     pub transcript_scroll: u16,
@@ -2303,6 +2313,7 @@ impl App {
                 refinement_join,
             },
             _capture_stream: stream,
+            role: self.slots[pos].role.clone(),
             committed,
             refined,
             tentative,
@@ -2368,6 +2379,8 @@ impl App {
             // instead of asking the user to re-pick.
             source: section.source.clone(),
             settings: section.settings.clone(),
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         self.slots[pos].kind = SlotKind::Saved { saved };
 
@@ -3027,6 +3040,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -3131,6 +3146,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -3207,7 +3224,9 @@ mod tests {
                     language: lang.into(),
                     model: "tiny.en".into(),
                 },
-            };
+            session_started_at: chrono::Utc::now(),
+            role: None,
+        };
             app.slots[pos].kind = SlotKind::Saved { saved };
         }
 
@@ -3310,7 +3329,9 @@ mod tests {
                     language: "en".into(),
                     model: "tiny.en".into(),
                 },
-            },
+            session_started_at: chrono::Utc::now(),
+            role: None,
+        },
         };
         // Populate a device so we don't fail on the
         // "no device" branch before the "no free slot"
@@ -3598,6 +3619,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -3673,6 +3696,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
