@@ -131,8 +131,35 @@ pub fn write_room_transcript_jsonl(
     Ok(path)
 }
 
+/// Write (or rewrite) the `context.md` file inside the room
+/// session directory. D4's agent run path will populate this
+/// with the last completed agent run output; for now it stores
+/// a simple placeholder so the file always exists when the
+/// user activates a room.
+///
+/// `markdown` is the full body of the context file (the agent
+/// produces a single Markdown response — the file is just the
+/// raw bytes). `last_run_at` is a small header the TUI can use
+/// to display "context from <timestamp>".
+pub fn write_room_context_md(
+    room_session_dir: &Path,
+    markdown: &str,
+    last_run_at: chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(room_session_dir)?;
+    let header = format!(
+        "<!-- voice-bird context: last agent run at {} -->\n\n",
+        last_run_at.to_rfc3339(),
+    );
+    let body = format!("{header}{markdown}");
+    let path = room_session_dir.join("context.md");
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+#[cfg(test)]
 mod tests {
-    use super::*;
+     use super::*;
     use crate::room::{AgentRef, RoleDef, Room};
 
     fn two_role_room() -> Room {
@@ -230,5 +257,39 @@ mod tests {
         write_room_transcript_jsonl(dir.path(), &one_entry).unwrap();
         let body2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body2.lines().count(), 1);
+    }
+
+    /// `context.md` is rewritten on every stop. The header
+    /// carries the last-run timestamp; the body is the agent's
+    /// Markdown output (D4 will populate this).
+    #[test]
+    fn room_context_md_round_trip() {
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::DateTime::<chrono::Utc>::from_str(
+            "2026-05-13T10:05:00Z",
+        )
+        .unwrap();
+        let path = write_room_context_md(
+            dir.path(),
+            "## Current question\nWhat are the symptoms?",
+            ts,
+        )
+        .unwrap();
+        assert!(path.exists());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("## Current question"));
+        assert!(body.contains("What are the symptoms?"));
+        assert!(body.contains("last agent run at 2026-05-13T10:05:00"));
+        // Rewrite semantics: a second call replaces the body.
+        write_room_context_md(
+            dir.path(),
+            "## Follow-up\nAny history of headaches?",
+            ts,
+        )
+        .unwrap();
+        let body2 = std::fs::read_to_string(&path).unwrap();
+        assert!(body2.contains("## Follow-up"));
+        assert!(!body2.contains("## Current question"));
     }
 }

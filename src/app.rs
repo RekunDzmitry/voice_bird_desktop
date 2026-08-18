@@ -2581,8 +2581,21 @@ impl App {
             {
                 log::error!("room transcript write: {e}");
             }
+            // D3.4.d: rewrite context.md on every stop. D4 will
+            // populate the body with the last completed agent
+            // run output; for now we write a placeholder so the
+            // file always exists when an agent room is active.
+            let placeholder = String::from(
+                "_No agent run has completed yet for this room._\n",
+            );
+            if let Err(e) = voice_bird_cli::room_fs::write_room_context_md(
+                room_dir,
+                &placeholder,
+                chrono::Utc::now(),
+            ) {
+                log::error!("room context.md write: {e}");
+            }
         }
-
         if self.active_section_count() == 0 {
             self.status = RecordingStatus::Idle;
             self.start_time = None;
