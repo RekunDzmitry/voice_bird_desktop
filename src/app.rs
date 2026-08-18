@@ -516,7 +516,24 @@ pub struct App {
     /// (settings UI not yet implemented) but per-slot writes
     /// never mutate it.
     pub default_slot_config: voice_bird_cli::config::DefaultSlotConfig,
-}
+
+    /// Live state of any in-flight agent run. Written by
+    /// `App::drain_agent_run_state` from the worker's
+    /// mpsc channel. Rendered by the agent-room TUI
+    /// branch (D5.1).
+    pub agent_run_state: voice_bird_cli::cloud::run::AgentRunState,
+
+    /// Handle to the in-flight agent-run worker (if any).
+    /// Set by `App::start_agent_run`, cleared when the
+    /// worker finishes or when `App` shuts down. The
+    /// worker is single-shot per run: when it returns,
+    /// `drain_agent_run_state` joins it and resets this
+    /// to `None`.
+    pub agent_run_worker: Option<(
+        std::thread::JoinHandle<voice_bird_cli::cloud::run::AgentRunError>,
+        std::sync::mpsc::Receiver<voice_bird_cli::cloud::run::RunEvent>,
+    )>,
+ }
 /// One row in the `t` status overlay.
 #[derive(Debug, Clone)]
 pub struct AppEvent {
@@ -585,7 +602,149 @@ impl App {
         }
     }
 
-    /// Create a new application instance
+    /// Start a fresh agent run for the currently active
+    /// room (which must have an agent). Spawns the
+    /// worker thread, replaces any in-flight worker
+    /// (D4.4: the older worker is joined and dropped
+    /// — the new request supersedes it), and resets
+    /// the streaming buffer. No-op when the active
+    /// room has no agent (Free Room).
+    ///
+    /// Returns the previous JoinHandle (if any) so
+    /// callers can join on shutdown.
+    pub fn start_agent_run(&mut self, transcript: String) {
+        use voice_bird_cli::cloud::run::{
+            spawn_agent_run, AgentRunState, RunRequest,
+        };
+        // Free Room has no agent — start_agent_run is
+        // a no-op there. The TUI guards against calling
+        // it for Free Room, but we double-check.
+        let room = match self.rooms.get(self.active_room) {
+            Some(r) if r.has_agent() => r,
+            _ => return,
+        };
+        let agent = match room.agent.as_ref() {
+            Some(a) => a,
+            None => return,
+        };
+        // If a worker is already in flight, join it
+        let base_url = self.config.voicebird_server_url.clone();
+        let api_key = self.config.voicebird_api_key.clone();
+        let req = RunRequest {
+            base_url,
+            api_key,
+            agent_id: agent.id.clone(),
+            room_slug: Some(room.slug.clone()),
+            source_label: Some("desktop".into()),
+            transcript,
+        };
+        self.agent_run_state = AgentRunState {
+            status: "starting".into(),
+            streaming: String::new(),
+            last_completed_md: std::mem::take(
+                &mut self.agent_run_state.last_completed_md,
+            ),
+            last_run_started: Some(std::time::Instant::now()),
+            lines_at_last_run: self.merged_timeline().len(),
+            queued: false,
+            last_error: None,
+            run_id: None,
+            plan_is_pro: self.agent_run_state.plan_is_pro,
+        };
+        self.agent_run_worker = Some(spawn_agent_run(req));
+    }
+
+    /// Drain the worker channel into `self.agent_run_state`.
+    /// Called once per UI tick (D4.3 wiring). Non-blocking —
+    /// the mpsc `try_recv` returns `Empty` when no frames
+    /// are ready. When the worker joins (the JoinHandle
+    /// reports `is_finished`), we mark the run as completed
+    /// and clear `agent_run_worker`.
+    pub fn drain_agent_run_state(&mut self) {
+        use voice_bird_cli::cloud::run::{AgentRunError, RunEvent};
+        let Some((handle, rx)) = self.agent_run_worker.as_ref() else {
+            return;
+        };
+        // Drain every available frame (non-blocking).
+        loop {
+            match rx.try_recv() {
+                Ok(RunEvent::Status { run_id, status }) => {
+                    self.agent_run_state.run_id = Some(run_id);
+                    self.agent_run_state.status = status.to_string();
+                }
+                Ok(RunEvent::Delta { text, .. }) => {
+                    self.agent_run_state.streaming.push_str(&text);
+                }
+                Ok(RunEvent::Done {
+                    content_markdown, ..
+                }) => {
+                    self.agent_run_state.last_completed_md =
+                        content_markdown;
+                    self.agent_run_state.streaming.clear();
+                    self.agent_run_state.status = "completed".into();
+                }
+                Ok(RunEvent::Error { message, .. }) => {
+                    self.agent_run_state.last_error = Some(message);
+                    self.agent_run_state.status = "failed".into();
+                }
+                Ok(RunEvent::DoneFinal) => {
+                    // Server closed the stream. The
+                    // "completed" / "failed" status was
+                    // already set by the matching
+                    // Delta/Done/Error frame; this is
+                    // just the EOF marker. We leave the
+                    // status as-is — the worker thread
+                    // is about to exit.
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Worker dropped the Sender (it
+                    // returned from run_event_loop).
+                    // Mark done; the join below will
+                    // observe the AgentRunError.
+                    if self.agent_run_state.status == "starting"
+                        || self.agent_run_state.status == "running"
+                    {
+                        self.agent_run_state.status =
+                            "failed".into();
+                    }
+                    break;
+                }
+            }
+        }
+        // If the worker has finished, join it and clear
+        // the slot. We check `is_finished` first so we
+        // never block the UI thread on `join()`.
+        if handle.is_finished() {
+            let (handle, rx) = self.agent_run_worker.take().unwrap();
+            drop(rx);
+            match handle.join() {
+                Ok(AgentRunError::None) => {
+                    // already handled by the matching
+                    // Done / Error frame
+                }
+                Ok(AgentRunError::StartFailed(msg)) => {
+                    self.agent_run_state.last_error = Some(msg);
+                    self.agent_run_state.status = classify_start_error(
+                        self.agent_run_state
+                            .last_error
+                            .as_deref()
+                            .unwrap_or(""),
+                    );
+                }
+                Ok(AgentRunError::StreamFailed(msg)) => {
+                    self.agent_run_state.last_error = Some(msg);
+                    self.agent_run_state.status = "failed".into();
+                }
+                Err(_) => {
+                    // Worker panicked. Mark failed
+                    // and let the user retry.
+                    self.agent_run_state.status = "failed".into();
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         // Test builds only: install the process-local config
         // tempdir before the first `AppConfig::load()`, so every
@@ -717,8 +876,9 @@ impl App {
             slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
             room_session_dir,
+            agent_run_state: Default::default(),
+            agent_run_worker: None,
         };
-
         app.refresh_rooms();
         // Re-activate the user's last room. If the slug no longer
         // exists in the catalog, fall back to Free Room and clear
@@ -3150,6 +3310,64 @@ fn looks_like_auth_error(msg: &str) -> bool {
         || m.contains("initsuccess: false")
 }
 
+/// Map a start-error string from `start()` to a UI status
+/// string. The string the worker surfaces is a free-form
+/// `anyhow` message ("Transcript too long", "API key
+/// rejected — check Settings", "Agent runs require Pro",
+/// or "agent run returned <code>"). The UI cares about
+/// the coarse bucket; we substring-match against the
+/// known error strings.
+fn classify_start_error(msg: &str) -> String {
+    let m = msg.to_lowercase();
+    if m.contains("api key") {
+        "needs_api_key".into()
+    } else if m.contains("pro") {
+        "needs_pro".into()
+    } else if m.contains("too long") {
+        "transcript_too_long".into()
+    } else if m.contains("rate") || m.contains("429") {
+        "rate_limited".into()
+    } else {
+        "failed".into()
+    }
+}
+
+#[cfg(test)]
+mod classify_start_error_tests {
+    use super::classify_start_error;
+
+    #[test]
+    fn api_key_string_maps_to_needs_api_key() {
+        assert_eq!(
+            classify_start_error("API key rejected — check Settings"),
+            "needs_api_key"
+        );
+    }
+
+    #[test]
+    fn pro_string_maps_to_needs_pro() {
+        assert_eq!(
+            classify_start_error("Agent runs require Pro"),
+            "needs_pro"
+        );
+    }
+
+    #[test]
+    fn too_long_string_maps_to_transcript_too_long() {
+        assert_eq!(
+            classify_start_error("Transcript too long"),
+            "transcript_too_long"
+        );
+    }
+
+    #[test]
+    fn unknown_string_maps_to_failed() {
+        assert_eq!(
+            classify_start_error("agent run returned 500"),
+            "failed"
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

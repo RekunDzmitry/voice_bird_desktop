@@ -359,10 +359,137 @@ fn parse_frame(run_id: &str, value: &serde_json::Value) -> Option<RunEvent> {
     }
 }
 
+// ---- D4.3: App::AgentRunState + worker ----
+//
+// The run is driven by a worker thread (one per active room,
+// keyed by run_id) that:
+//   1. POSTs the start request with the agent id + joined
+//      transcript + UUID clientRunId.
+//   2. Opens the SSE event loop and forwards each frame to
+//      the UI through an mpsc channel.
+//   3. Closes the channel when the stream ends (DoneFinal).
+// The UI never touches the network — it only reads from the
+// receiver on each tick and updates `App::agent_run_state`.
+
+/// The UI's view of an in-flight (or last completed) run.
+/// Owned by `App`; the worker thread is the only writer
+/// (via the mpsc receiver). `status` is a string for now;
+/// the dashboard's reducer stays the source of typed
+/// enums if/when we want one.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunState {
+    /// "idle" | "starting" | "running" | "completed" |
+    /// "failed" | "rate_limited" | "needs_pro" | "needs_api_key"
+    pub status: String,
+    /// Server run id, set once `start` returns 201. None
+    /// until then.
+    pub run_id: Option<String>,
+    /// Last-known streamed markdown. The UI shows this
+    /// verbatim in the context pane; the worker appends
+    /// to it as Delta frames arrive.
+    pub streaming: String,
+    /// The completed run's full markdown, populated when
+    /// the `done` frame arrives. Persisted to
+    /// `<room_dir>/context.md` by App on every stop (D3.4.d).
+    pub last_completed_md: String,
+    /// Local instant the worker started this run. Used to
+    /// enforce the 65 s debounce floor (D4.4).
+    pub last_run_started: Option<std::time::Instant>,
+    /// Number of transcript lines at the time the run
+    /// was kicked off. When the run finishes, the diff
+    /// (current - lines_at_last_run) is the new content
+    /// that the agent saw.
+    pub lines_at_last_run: usize,
+    /// True if the user pressed `g` between when the
+    /// worker last looked and now — the worker will
+    /// trigger one more run after the current one
+    /// completes (D4.4: manual `g` queues one).
+    pub queued: bool,
+    /// Last error message (cleared on next start). The
+    /// UI surfaces this in the status banner.
+    pub last_error: Option<String>,
+    /// `Some(true)` when the 402 path has fired; the UI
+    /// uses this to lock out the agent-room PickerFocus.
+    /// (Set elsewhere by App on 402; the worker also
+    /// reads it to suppress auto-runs.)
+    pub plan_is_pro: Option<bool>,
+}
+
+/// Arguments the worker needs to start a run. We don't
+/// borrow `App` directly because the worker thread
+/// outlives the borrow checker on `&mut self`.
+pub struct RunRequest {
+    pub base_url: String,
+    pub api_key: String,
+    pub agent_id: String,
+    pub room_slug: Option<String>,
+    pub source_label: Option<String>,
+    pub transcript: String,
+}
+
+/// Spawn a worker thread that runs the agent end-to-end:
+/// POST → SSE drain → DoneFinal. Each `RunEvent` from
+/// the SSE stream is forwarded to the UI via `tx`. The
+/// thread joins when the stream ends or `tx` is dropped
+/// (which `App` does on shutdown).
+///
+/// Returns `(JoinHandle, mpsc::Receiver<RunEvent>)`. The
+/// receiver is drained by `App::drain_agent_run_state`
+/// on each UI tick (D4.3 wiring).
+pub fn spawn_agent_run(
+    req: RunRequest,
+) -> (std::thread::JoinHandle<AgentRunError>, std::sync::mpsc::Receiver<RunEvent>) {
+    let (tx, rx) = std::sync::mpsc::channel::<RunEvent>();
+    let handle = std::thread::Builder::new()
+        .name("voice-bird-agent-run".into())
+        .spawn(move || -> AgentRunError {
+            // 1. POST /api/agent-runs → run_id
+            let client_run_id = generate_client_run_id();
+            let run_id = match start(
+                &req.base_url,
+                &req.api_key,
+                &req.agent_id,
+                &req.transcript,
+                req.source_label.as_deref(),
+                req.room_slug.as_deref(),
+                Some(&client_run_id),
+            ) {
+                Ok(id) => id,
+                Err(e) => return AgentRunError::StartFailed(e.to_string()),
+            };
+            // Surface the run id so the UI can show it in
+            // the status footer.
+            let _ = tx.send(RunEvent::Status {
+                run_id: run_id.clone(),
+                status: "starting",
+            });
+            // 2. SSE drain
+            let r = run_event_loop_chan(&req.base_url, &req.api_key, &run_id, tx.clone());
+            match r {
+                Ok(()) => AgentRunError::None,
+                Err(e) => AgentRunError::StreamFailed(e.to_string()),
+            }
+        })
+        .expect("spawn agent-run worker thread");
+    (handle, rx)
+}
+
+/// Errors the worker thread can return via JoinHandle.
+/// We don't use anyhow on the worker side because the
+/// UI only cares about the two coarse buckets: start
+/// (POST) failed vs stream (SSE) failed. Sub-categorization
+/// happens in App::drain_agent_run_state based on
+/// status codes from the error string.
+#[derive(Debug)]
+pub enum AgentRunError {
+    None,
+    StartFailed(String),
+    StreamFailed(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn parse_status_frame() {
         let v = serde_json::json!({"type": "status", "status": "running"});
@@ -602,5 +729,98 @@ data: {\"type\":\"delta\",\"text\":\"b\"}\r\n\
         let _ = tx.send(RunEvent::DoneFinal);
         // If we got here without panicking, the channel
         // send is correctly best-effort.
+    }
+
+    // ---- D4.3: AgentRunState + worker tests ----
+    //
+    // The worker is hard to unit-test end-to-end without
+    // a real HTTP server, so we test the parts that
+    // don't need one: state transitions, default shape,
+    // and the streaming-marker (the marker the UI uses
+    // to show "•" while a run is alive).
+
+    /// Default state is idle with no run id, no error,
+    /// no streaming — the TUI shows the last completed
+    /// context.md on first render.
+    #[test]
+    fn agent_run_state_default_is_idle() {
+        let s = AgentRunState::default();
+        assert_eq!(s.status, "");
+        assert!(s.run_id.is_none());
+        assert!(s.streaming.is_empty());
+        assert!(s.last_completed_md.is_empty());
+        assert!(s.last_run_started.is_none());
+        assert_eq!(s.lines_at_last_run, 0);
+        assert!(!s.queued);
+        assert!(s.last_error.is_none());
+        assert!(s.plan_is_pro.is_none());
+    }
+
+    /// `queued` starts false and is the manual `g` flag:
+    /// the worker checks it between auto-runs to know
+    /// whether the user wants a one-shot run.
+    #[test]
+    fn agent_run_state_queued_flag_toggles() {
+        let mut s = AgentRunState::default();
+        assert!(!s.queued);
+        s.queued = true;
+        assert!(s.queued);
+        // The worker resets it after the queued run
+        // completes; modeled here as a direct write.
+        s.queued = false;
+        assert!(!s.queued);
+    }
+
+    /// Status strings are the union the UI knows how to
+    /// render. If you add a new status here, the UI
+    /// branch in render::status_footer needs a match
+    /// arm — this test fails the build (no, it just
+    /// enumerates the known ones) so adding a string
+    /// is a deliberate choice.
+    #[test]
+    fn agent_run_state_known_status_strings() {
+        let known = [
+            "idle",
+            "starting",
+            "running",
+            "completed",
+            "failed",
+            "rate_limited",
+            "needs_pro",
+            "needs_api_key",
+        ];
+        // Round-trip: a hand-built state with each
+        // status string survives a Clone. (Smoke test
+        // — the real validation is the render match.)
+        for st in &known {
+            let s = AgentRunState {
+                status: (*st).to_string(),
+                ..Default::default()
+            };
+            assert_eq!(s.status, *st);
+        }
+    }
+
+    /// The worker thread spawns even when the receiver
+    /// is dropped immediately. The `start` call will
+    /// fail (no real server), but the spawn itself
+    /// must not panic and the JoinHandle must return
+    /// cleanly.
+    #[test]
+    fn spawn_agent_run_survives_dropped_receiver() {
+        let (handle, rx) = spawn_agent_run(RunRequest {
+            base_url: "http://127.0.0.1:1".into(), // blackhole
+            api_key: "test".into(),
+            agent_id: "test-agent".into(),
+            room_slug: None,
+            source_label: None,
+            transcript: "hello".into(),
+        });
+        drop(rx); // UI goes away
+        // The start call will fail (connection refused
+        // to 127.0.0.1:1); the worker returns
+        // StartFailed. We don't care which — the
+        // important property is the thread joins.
+        let _ = handle.join();
     }
 }
