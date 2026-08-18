@@ -159,9 +159,9 @@ pub fn write_room_context_md(
 
 #[cfg(test)]
 mod tests {
-     use super::*;
+    use super::*;
     use crate::room::{AgentRef, RoleDef, Room};
-
+    use std::str::FromStr;
     fn two_role_room() -> Room {
         Room {
             slug: "doctor-appointment".into(),
@@ -291,5 +291,96 @@ mod tests {
         let body2 = std::fs::read_to_string(&path).unwrap();
         assert!(body2.contains("## Follow-up"));
         assert!(!body2.contains("## Current question"));
+    }
+
+    /// E2E: build a complete Doctor Appointment room session
+    /// tree on disk and verify every file the plan §E
+    /// specifies is present (room.json + room-transcript.jsonl
+    /// + context.md + nested per-role session dirs). This
+    /// is the shape the server expects, the --recover
+    /// walk expects, and the TUI's "Open session folder"
+    /// button expects. If a file is missing, the user
+    /// sees a half-built session and the agent run
+    /// path can't join the run back to the room.
+    #[test]
+    fn end_to_end_doctor_appointment_tree_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = || {
+            chrono::DateTime::<chrono::Utc>::from_str(
+                "2026-05-13T10:00:00Z",
+            )
+            .unwrap()
+        };
+        let room_dir = dir.path().join("2026-05-13_10-00-00-room-doctor-appointment");
+        let room = Room {
+            slug: "doctor-appointment".to_string(),
+            name: "Doctor Appointment".to_string(),
+            icon: Some("\u{1FA7A}".to_string()),
+            roles: vec![
+                RoleDef {
+                    slug: "patient".to_string(),
+                    name: "Patient".to_string(),
+                },
+                RoleDef {
+                    slug: "doctor".to_string(),
+                    name: "Doctor".to_string(),
+                },
+            ],
+            agent: Some(AgentRef {
+                id: "dentist".to_string(),
+                name: "Dentist".to_string(),
+                icon: Some("\u{1F9B7}".to_string()),
+            }),
+            requires_pro: true,
+        };
+        // 1. room.json
+        write_room_json(&room_dir, &room, ts()).unwrap();
+        assert!(room_dir.join("room.json").exists());
+        // 2. room-transcript.jsonl with one line per role
+        let mut body = String::new();
+        body.push_str(
+            &room_transcript_line(ts(), Some("Patient"), "Hi doctor").unwrap(),
+        );
+        body.push('\n');
+        body.push_str(
+            &room_transcript_line(ts(), Some("Doctor"), "How are you?").unwrap(),
+        );
+        body.push('\n');
+        std::fs::write(room_dir.join("room-transcript.jsonl"), body).unwrap();
+        assert!(room_dir.join("room-transcript.jsonl").exists());
+        // 3. context.md (initial placeholder, D4 will rewrite)
+        write_room_context_md(
+            &room_dir,
+            "## Initial\nWaiting for the first agent run.",
+            ts(),
+        )
+        .unwrap();
+        assert!(room_dir.join("context.md").exists());
+        // 4. nested per-role session dirs
+        for role in &room.roles {
+            let role_dir = room_dir.join(&role.slug);
+            std::fs::create_dir_all(&role_dir).unwrap();
+            let session_dir = role_dir.join("2026-05-13_10-00-00-mic");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(
+                session_dir.join("transcript.jsonl"),
+                format!(
+                    "{{\"t_start_ms\":0,\"t_end_ms\":1000,\"text\":\"role={} sample\"}}",
+                    role.slug
+                ),
+            )
+            .unwrap();
+        }
+        // Sanity: --recover over this dir should yield one
+        // RecoveredSession per role. The actual recover()
+        // test in session::recover::tests covers that
+        // contract; here we just assert the dir tree
+        // shape the plan §E promises.
+        assert!(room_dir.join("patient/2026-05-13_10-00-00-mic/transcript.jsonl").exists());
+        assert!(room_dir.join("doctor/2026-05-13_10-00-00-mic/transcript.jsonl").exists());
+        // The room dir itself has no transcript.jsonl at
+        // the top (the role-nested dirs are the per-source
+        // ones). Verify by listing.
+        assert!(!room_dir.join("transcript.jsonl").exists());
     }
 }

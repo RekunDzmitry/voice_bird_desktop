@@ -4809,5 +4809,52 @@ mod tests {
                 Some("Exported \u{2713} \u{2014} newest")
             );
         }
+
+        // ---- E2E: Free Room is offline-safe ----
+        //
+        // The Free Room has no agent, so calling
+        // trigger_agent_run on it must NOT spawn a
+        // worker. The user gets the same "no agent"
+        // banner that the g-key path surfaces. The
+        // Plan §E contract says Free Room must "fully
+        // offline" — the agent path is opt-in only.
+
+        /// E2E: Free Room + no API key. trigger_agent_run
+        /// returns without spawning a worker or
+        /// mutating agent_run_state (the no-op guard
+        /// at the top of start_agent_run short-circuits
+        /// before the spawn_agent_run call).
+        #[test]
+        fn free_room_trigger_agent_run_is_noop() {
+            let dir = tempfile::tempdir().unwrap();
+            let _ = dir; // bind to silence unused warnings
+            let mut app = App::new();
+            // Free Room is at index 0 by App::new()'s
+            // contract.
+            assert_eq!(app.active_room, 0);
+            assert!(!app.active_room().has_agent());
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Auto,
+                "patient: hello".to_string(),
+            );
+            assert!(
+                app.agent_run_worker.is_none(),
+                "Free Room must NOT spawn a worker"
+            );
+            assert_eq!(app.agent_run_state.status, "");
+            assert!(app.agent_run_state.last_run_started.is_none());
+        }
+
+        /// E2E: Free Room + manual g trigger. Even with
+        /// RunTrigger::Manual, Free Room is a no-op.
+        #[test]
+        fn free_room_manual_trigger_is_noop() {
+            let mut app = App::new();
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Manual,
+                "any".into(),
+            );
+            assert!(app.agent_run_worker.is_none());
+        }
     }
-}
+ }
