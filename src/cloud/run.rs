@@ -602,7 +602,105 @@ pub fn truncate_transcript(text: &str) -> std::borrow::Cow<'_, str> {
     ))
 }
 
- #[cfg(test)]
+// ---- D4.5: error handling + SSE-drop polling ----
+//
+// The start() path already maps 401/402/413 to anyhow
+// strings; classify_start_error (in App) maps those to
+// a UI status. What start() does NOT do is surface the
+// "user is on free tier" hint — that's plan_is_pro, and
+// the worker has to set it on 402. So we add a thin
+// wrapper that:
+//   - 402 → returns RunStartError::ProRequired
+//   - 401 → returns RunStartError::BadApiKey
+//   - 413 → returns RunStartError::TranscriptTooLong
+//   - 429 → returns RunStartError::RateLimited
+//   - other → returns RunStartError::Other(http_code)
+// The App sees the typed variant and can drive the
+// right UI response (open the api-key modal, set
+// plan_is_pro, suppress auto-runs, etc).
+//
+// For the SSE drop case (the server closed the stream
+// before sending a `done` frame), the worker falls
+// back to GET /api/agent-runs/{id} (the dashboard's
+// poll endpoint) and returns the final markdown.
+/// Final-result lookup for a run. Used when the SSE
+/// stream drops before a `done` frame is delivered.
+/// The server's GET /api/agent-runs/{id} returns the
+/// current row regardless of stream state.
+pub fn poll_run(
+    base_url: &str,
+    api_key: &str,
+    run_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let url = format!(
+        "{}/api/agent-runs/{}",
+        base_url.trim_end_matches('/'),
+        run_id
+    );
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .map_err(|e| anyhow::anyhow!("poll run request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .map_err(|e| anyhow::anyhow!("poll run response was not JSON: {e}"))?;
+    Ok(value
+        .get("run")
+        .and_then(|r| r.get("contentMarkdown"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+/// Errors that `start()` can return, with enough type
+/// info for the App to drive the right UI response.
+/// The existing `start()` function still returns
+/// `anyhow::Result<String>`; this enum is what the
+/// App builds internally from the error string +
+/// status code it saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStartError {
+    /// 401 — the API key is bad or missing. App should
+    /// open the api-key modal (D4.5).
+    BadApiKey,
+    /// 402 — the user is not on Pro. App should set
+    /// `plan_is_pro = Some(false)` and suppress auto-runs.
+    ProRequired,
+    /// 413 — transcript over 200 000 chars. We should
+    /// never hit this because we truncate to 180 000
+    /// before sending, but surface the error if we do.
+    TranscriptTooLong,
+    /// 429 — server rate limit. Back off and retry.
+    RateLimited,
+    /// Any other 4xx/5xx. The string carries the code.
+    Other(String),
+}
+
+/// Classify a `start()` error string into a typed
+/// RunStartError. Mirrors the substrings the worker
+/// strings produce in `start()`. Pure for testing.
+pub fn classify_run_start_error(msg: &str) -> RunStartError {
+    let m = msg.to_lowercase();
+    if m.contains("api key") {
+        RunStartError::BadApiKey
+    } else if m.contains("pro") {
+        RunStartError::ProRequired
+    } else if m.contains("too long") {
+        RunStartError::TranscriptTooLong
+    } else if m.contains("rate") || m.contains("429") {
+        RunStartError::RateLimited
+    } else {
+        RunStartError::Other(msg.to_string())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -1067,5 +1165,66 @@ data: {\"type\":\"delta\",\"text\":\"b\"}\r\n\
         // relies on.
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         assert!(out.ends_with('✓'));
+    }
+
+    // ---- D4.5: RunStartError classification tests ----
+
+    /// 401 → BadApiKey
+    #[test]
+    fn classify_401_is_bad_api_key() {
+        assert_eq!(
+            classify_run_start_error("API key rejected — check Settings"),
+            RunStartError::BadApiKey,
+        );
+    }
+
+    /// 402 → ProRequired
+    #[test]
+    fn classify_402_is_pro_required() {
+        assert_eq!(
+            classify_run_start_error("Agent runs require Pro"),
+            RunStartError::ProRequired,
+        );
+    }
+
+    /// 413 → TranscriptTooLong
+    #[test]
+    fn classify_413_is_transcript_too_long() {
+        assert_eq!(
+            classify_run_start_error("Transcript too long"),
+            RunStartError::TranscriptTooLong,
+        );
+    }
+
+    /// 429 → RateLimited
+    #[test]
+    fn classify_429_is_rate_limited() {
+        assert_eq!(
+            classify_run_start_error("rate limit exceeded (429)"),
+            RunStartError::RateLimited,
+        );
+    }
+
+    /// Unknown string → Other(msg)
+    #[test]
+    fn classify_unknown_is_other() {
+        assert_eq!(
+            classify_run_start_error("agent run returned 500"),
+            RunStartError::Other("agent run returned 500".to_string()),
+        );
+    }
+
+    /// 402 path: setting plan_is_pro = Some(false)
+    /// suppresses subsequent auto-runs. (The actual
+    /// App.set_plan_is_pro + should_run_now interaction
+    /// is covered by trigger_auto_suppressed_on_free_tier
+    /// in D4.4; this test pins the typed enum.)
+    #[test]
+    fn pro_required_sets_free_tier() {
+        let e = classify_run_start_error("Agent runs require Pro");
+        assert_eq!(e, RunStartError::ProRequired);
+        // The App's response: set plan_is_pro = Some(false).
+        // Then should_run_now(... Auto, plan_is_pro=Some(false))
+        // returns false (see D4.4).
     }
 }

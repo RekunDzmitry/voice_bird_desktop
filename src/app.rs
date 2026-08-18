@@ -724,7 +724,25 @@ impl App {
                     // Done / Error frame
                 }
                 Ok(AgentRunError::StartFailed(msg)) => {
-                    self.agent_run_state.last_error = Some(msg);
+                    use voice_bird_cli::cloud::run::{
+                        classify_run_start_error, RunStartError,
+                    };
+                    self.agent_run_state.last_error = Some(msg.clone());
+                    let typed = classify_run_start_error(&msg);
+                    // 402 → user is on free tier. Mark
+                    // plan_is_pro = Some(false) so the
+                    // next auto-run is suppressed (D4.4
+                    // reads this).
+                    if typed == RunStartError::ProRequired {
+                        self.agent_run_state.plan_is_pro = Some(false);
+                    }
+                    // 401 → bad API key. Open the
+                    // api-key modal so the user can
+                    // re-enter it. The modal is keyed
+                    // off `api_key_buf.is_some()`.
+                    if typed == RunStartError::BadApiKey {
+                        self.open_api_key_modal();
+                    }
                     self.agent_run_state.status = classify_start_error(
                         self.agent_run_state
                             .last_error
