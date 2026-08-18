@@ -66,6 +66,7 @@ pub struct PickerState {
 }
 
 /// A single committed (finalized) transcript line.
+#[derive(Clone)]
 pub struct CommittedLine {
     pub t_start_ms: u64,
     pub text: String,
@@ -490,7 +491,6 @@ pub struct App {
     /// the slot provisioning (Free Room → one empty slot;
     /// agent room → one empty slot per role) and the merged
     /// timeline view.
-    pub active_room: usize,
     /// Last-known `plan` value from `/api/rooms`. `None` until
     /// the first successful fetch (or after a 5xx); `Some(true)`
     /// when the user is on Pro and agent rooms unlock,
@@ -517,13 +517,27 @@ pub struct App {
     /// never mutate it.
     pub default_slot_config: voice_bird_cli::config::DefaultSlotConfig,
 }
-
 /// One row in the `t` status overlay.
 #[derive(Debug, Clone)]
 pub struct AppEvent {
     /// Local wall-clock time the event was recorded.
     pub at: chrono::DateTime<chrono::Local>,
     pub message: String,
+}
+
+/// One row in the merged role-labeled timeline. Built by
+/// `App::merged_timeline` (D3.3) and consumed by the room
+/// view TUI (D5). The per-frame cost is O(N lines) which is
+/// fine at TUI transcript sizes.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    /// Absolute wall-clock time = `session_started_at +
+    /// committed_line.t_start_ms`.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// Role label (`None` for free-room slots).
+    pub role: Option<String>,
+    pub slot: SlotId,
+    pub text: String,
 }
 
 impl App {
@@ -938,6 +952,7 @@ impl App {
                 .collect();
             self.next_slot_id = next_id + self.slots.len() as u32;
         }
+        Ok(())
     }
 
     /// Re-fetch the cloud Rooms list from voicebird.app and append
@@ -1002,7 +1017,86 @@ impl App {
             .map(|s| s.tentative.clone())
             .unwrap_or_else(|| self.empty_tentative.clone())
     }
-    // -- Section accessors --------------------------------------------------
+
+    /// Merge every running + saved section's transcript lines
+    /// into a single role-labeled timeline. The merge key is
+    /// the absolute wall-clock time so the user can read the
+    /// conversation as it actually happened, even if the roles
+    /// started at slightly different times.
+    ///
+    /// Refined lines (when present) win over raw at the same
+    /// `t_start_ms` — the agent run path always shows the best
+    /// available text per role per moment. Empty-text lines are
+    /// filtered (a refined line that's a placeholder doesn't
+    /// pollute the view).
+    pub fn merged_timeline(&self) -> Vec<TimelineEntry> {
+        let mut out: Vec<TimelineEntry> = Vec::new();
+        for slot in &self.slots {
+            let (role_label, started, refined_lines, committed_lines) = match &slot.kind {
+                SlotKind::Recording { section } => (
+                    section.role.as_ref().map(|r| r.name.clone()),
+                    section.session_started_at,
+                    section
+                        .refined
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    section
+                        .committed
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                SlotKind::Saved { saved } => (
+                    saved.role.as_ref().map(|r| r.name.clone()),
+                    saved.session_started_at,
+                    saved
+                        .refined
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    saved
+                        .committed
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                SlotKind::Empty => continue,
+            };
+            for line in &refined_lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let at = started
+                    + chrono::Duration::milliseconds(line.t_start_ms as i64);
+                out.push(TimelineEntry {
+                    at,
+                    role: role_label.clone(),
+                    slot: slot.id,
+                    text: line.text.clone(),
+                });
+            }
+            for line in &committed_lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let at = started
+                    + chrono::Duration::milliseconds(line.t_start_ms as i64);
+                out.push(TimelineEntry {
+                    at,
+                    role: role_label.clone(),
+                    slot: slot.id,
+                    text: line.text.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.at.cmp(&b.at).then(a.slot.0.cmp(&b.slot.0)));
+        out
+    }
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
@@ -2470,7 +2564,25 @@ impl App {
             }
         }
 
-        // Aggregate App-level state. Idle iff no section is left.
+        // Rewrite the room-level transcript on every stop. The
+        // merged timeline at this moment covers every running
+        // + saved role-bound section, so the file always
+        // reflects the most recent view of the conversation.
+        if let Some(room_dir) = self.room_session_dir.as_ref() {
+            let entries: Vec<(chrono::DateTime<chrono::Utc>, Option<String>, String)> =
+                self.merged_timeline()
+                    .into_iter()
+                    .map(|e| (e.at, e.role, e.text))
+                    .collect();
+            if let Err(e) =
+                voice_bird_cli::room_fs::write_room_transcript_jsonl(
+                    room_dir, &entries,
+                )
+            {
+                log::error!("room transcript write: {e}");
+            }
+        }
+
         if self.active_section_count() == 0 {
             self.status = RecordingStatus::Idle;
             self.start_time = None;
@@ -2933,7 +3045,20 @@ fn find_latest_session(base: &std::path::Path) -> Option<std::path::PathBuf> {
             .collect(),
         Err(_) => return None,
     };
-/// Render the `source` field of `SessionMeta` for the active
+
+    // Sort by name descending (timestamps are ISO 8601 formatted, so
+    // lexicographic sort = chronological sort).
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    for d in dirs {
+        if d.join("transcript.json").exists() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+ /// Render the `source` field of `SessionMeta` for the active
 /// `SessionSource`. Replaces the legacy `source: "mic"` hardcode
 /// — the meta file now reflects what the user actually recorded
 /// from.
@@ -2977,26 +3102,6 @@ impl IntoOptionIfNotFree for String {
     }
 }
 
- /// Windows is cloud-only: force cloud on in memory regardless of what the
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => return None,
-    };
-
-    // Sort by name descending (timestamps are ISO 8601 formatted, so
-    // lexicographic sort = chronological sort).
-    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-
-    for d in dirs {
-        if d.join("transcript.json").exists() {
-            return Some(d);
-        }
-    }
-    None
-}
 
 /// Derive an HTTP base URL from the WebSocket server URL.
 /// E.g., `wss://voicebird.app/api/audio/stream` → `https://voicebird.app`
@@ -4003,6 +4108,8 @@ mod tests {
                 started_at: "2026-05-13T10:00:00Z".into(),
                 ended_at: "2026-05-13T10:05:00Z".into(),
                 duration_ms: 300_000,
+                role: None,
+                room_slug: None,
             };
             let segments: Vec<voice_bird_cli::session::writer::WrittenSegment> =
                 vec![voice_bird_cli::session::writer::WrittenSegment {
@@ -4346,6 +4453,8 @@ mod tests {
                 device: "BlackHole".into(),
                 ended_at: "2026-05-13T08:05:00Z".into(),
                 duration_ms: 300_000,
+                role: None,
+                room_slug: None,
             };
             let seg = voice_bird_cli::session::writer::WrittenSegment {
                 t_start_ms: 0,
