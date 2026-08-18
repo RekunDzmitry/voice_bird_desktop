@@ -487,7 +487,122 @@ pub enum AgentRunError {
     StreamFailed(String),
 }
 
-#[cfg(test)]
+// ---- D4.4: triggers + transcript truncation ----
+//
+// The server caps runs at 60/h per user, so the desktop
+// throttles its own runs to 1 per 65 s floor. Manual `g`
+// presses queue one run; the worker picks it up after the
+// current run finishes. On `stop_section`, App fires a
+// final run regardless of the floor — the user has stopped
+// the recording and wants the final summary.
+
+/// Minimum spacing between two auto-runs, in seconds.
+/// Server caps at 60/h; we add 5 s of slack.
+pub const AUTO_RUN_FLOOR_SECS: u64 = 65;
+
+/// Soft cap on the transcript we ship to the server. The
+/// server's zod schema caps at 200 000 chars; we cap at
+/// 180 000 so we stay comfortably under and keep the tail
+/// intact (the most recent dialog is what the agent
+/// should see).
+pub const TRANSCRIPT_MAX_CHARS: usize = 180_000;
+
+/// Why App is considering firing an agent run. The
+/// `Stop` variant bypasses the debounce floor (the user
+/// has stopped recording — they want the final summary
+/// NOW, not 65 s from now).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTrigger {
+    /// Auto: a new line was added; re-evaluate the 65 s
+    /// floor and the queue.
+    Auto,
+    /// Manual: the user pressed `g`. Forces a run
+    /// regardless of the floor; if a run is already
+    /// in flight, sets `queued = true` so the worker
+    /// re-runs after it finishes.
+    Manual,
+    /// Stop: the user stopped the recording. Forces a
+    /// run regardless of floor or queue.
+    Stop,
+}
+
+/// Pure decision function: should App start a new run
+/// right now? The caller provides:
+///   - now:                current Instant
+///   - last_run_started:   Instant of the last run's
+///                         worker spawn, or None
+///   - queued:             manual `g` queue flag
+///   - plan_is_pro:        if Some(false), the user
+///                         is on the free tier; suppress
+///                         auto-runs (manual + stop still
+///                         fire)
+///   - trigger:            why we're asking
+///
+/// Returns true when App should call
+/// `start_agent_run`. The decision is independent of
+/// the worker's state — App checks
+/// `agent_run_worker.is_some()` separately (D4.5
+/// gates against an in-flight run).
+pub fn should_run_now(
+    now: std::time::Instant,
+    last_run_started: Option<std::time::Instant>,
+    queued: bool,
+    plan_is_pro: Option<bool>,
+    trigger: RunTrigger,
+) -> bool {
+    // Free tier: auto-runs are suppressed. Manual `g`
+    // and Stop still fire — the server returns 402,
+    // which the worker classifies as `needs_pro` and
+    // the UI surfaces in the status banner (D4.5).
+    if plan_is_pro == Some(false) && trigger == RunTrigger::Auto {
+        return false;
+    }
+    // Stop and Manual bypass the debounce floor.
+    if matches!(trigger, RunTrigger::Stop | RunTrigger::Manual) {
+        return true;
+    }
+    // Auto: respect the floor and the queue.
+    if queued {
+        return true;
+    }
+    match last_run_started {
+        None => true,
+        Some(t) => now.duration_since(t).as_secs() >= AUTO_RUN_FLOOR_SECS,
+    }
+}
+
+/// Truncate a transcript for shipping to the server. The
+/// server caps at 200 000 chars; we cap at 180 000. We
+/// keep the tail (most recent dialog) and prepend a
+/// short marker so the agent knows it didn't see the
+/// whole thing.
+///
+/// If `text` is already under the cap, return it as-is.
+/// Otherwise, keep the last `TRANSCRIPT_MAX_CHARS` chars
+/// and prepend a marker line.
+pub fn truncate_transcript(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= TRANSCRIPT_MAX_CHARS {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let marker = "[earlier conversation truncated]\n\n";
+    // Keep the last TRANSCRIPT_MAX_CHARS chars of the body
+    // (so the most recent context survives). The marker
+    // is on the left so the agent sees it first.
+    let start = text.len() - TRANSCRIPT_MAX_CHARS;
+    // Walk forward to the next char boundary so we don't
+    // slice a multi-byte codepoint.
+    let start = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i >= start)
+        .unwrap_or(start);
+    std::borrow::Cow::Owned(format!(
+        "{marker}{}",
+        &text[start..]
+    ))
+}
+
+ #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -822,5 +937,135 @@ data: {\"type\":\"delta\",\"text\":\"b\"}\r\n\
         // StartFailed. We don't care which — the
         // important property is the thread joins.
         let _ = handle.join();
+    }
+
+    // ---- D4.4: trigger + truncation tests ----
+
+    /// First auto-run with no history: fire immediately.
+    #[test]
+    fn trigger_auto_fires_on_first_run() {
+        let now = std::time::Instant::now();
+        assert!(should_run_now(now, None, false, None, RunTrigger::Auto));
+    }
+
+    /// Auto within 65 s of the last run: suppressed.
+    #[test]
+    fn trigger_auto_suppressed_within_floor() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_secs(30);
+        assert!(!should_run_now(now, Some(last), false, None, RunTrigger::Auto));
+    }
+
+    /// Auto past the 65 s floor: fires.
+    #[test]
+    fn trigger_auto_fires_after_floor() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_secs(66);
+        assert!(should_run_now(now, Some(last), false, None, RunTrigger::Auto));
+    }
+
+    /// Manual `g`: bypasses the floor. Even at 1 s after
+    /// the last run, a manual press fires.
+    #[test]
+    fn trigger_manual_bypasses_floor() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_secs(1);
+        assert!(should_run_now(now, Some(last), false, None, RunTrigger::Manual));
+    }
+
+    /// Stop: forces a run regardless of floor or queue.
+    #[test]
+    fn trigger_stop_bypasses_floor() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_secs(1);
+        assert!(should_run_now(now, Some(last), false, None, RunTrigger::Stop));
+    }
+
+    /// Queued manual `g` set: the next auto-run fires
+    /// even within the floor.
+    #[test]
+    fn trigger_queued_presses_fire_on_next_auto_tick() {
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_secs(10);
+        assert!(should_run_now(now, Some(last), true, None, RunTrigger::Auto));
+    }
+
+    /// Free tier: auto-runs are suppressed. The 402
+    /// response from a Manual run still surfaces
+    /// (`needs_pro` in the status banner), so the user
+    /// sees why nothing's happening.
+    #[test]
+    fn trigger_auto_suppressed_on_free_tier() {
+        let now = std::time::Instant::now();
+        assert!(!should_run_now(
+            now,
+            None,
+            false,
+            Some(false),
+            RunTrigger::Auto
+        ));
+    }
+
+    /// Free tier: Manual still fires (so the user gets
+    /// the 402 banner explaining Pro is required).
+    #[test]
+    fn trigger_manual_still_fires_on_free_tier() {
+        let now = std::time::Instant::now();
+        assert!(should_run_now(
+            now,
+            None,
+            false,
+            Some(false),
+            RunTrigger::Manual
+        ));
+    }
+
+    /// Pro tier: auto-runs fire normally.
+    #[test]
+    fn trigger_auto_fires_on_pro_tier() {
+        let now = std::time::Instant::now();
+        assert!(should_run_now(
+            now,
+            None,
+            false,
+            Some(true),
+            RunTrigger::Auto
+        ));
+    }
+
+    /// Under the cap: returned as-is (zero-copy).
+    #[test]
+    fn truncate_under_cap_is_identity() {
+        let text = "short text";
+        let out = truncate_transcript(text);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, text);
+    }
+
+    /// Over the cap: returns a new String with the
+    /// marker prepended; the tail survives.
+    #[test]
+    fn truncate_over_cap_keeps_tail_with_marker() {
+        let long: String = (0..200_000).map(|_| 'a').collect();
+        let out = truncate_transcript(&long);
+        // Output must fit under the cap + marker.
+        assert!(out.len() < TRANSCRIPT_MAX_CHARS + 64);
+        // Marker must be the first line.
+        assert!(out.starts_with("[earlier conversation truncated]"));
+        // Tail must be preserved.
+        assert!(out.ends_with("aaaaa"));
+    }
+
+    /// Multi-byte safety: the cut point must not slice
+    /// a multi-byte codepoint.
+    #[test]
+    fn truncate_respects_utf8_boundaries() {
+        let long: String = (0..200_000).map(|_| '✓').collect();
+        let out = truncate_transcript(&long);
+        // Cow<str> is always valid UTF-8 by construction;
+        // this test pins the property the cut-walk
+        // relies on.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.ends_with('✓'));
     }
 }

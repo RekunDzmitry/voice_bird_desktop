@@ -741,8 +741,74 @@ impl App {
                     // and let the user retry.
                     self.agent_run_state.status = "failed".into();
                 }
-            }
+             }
+         }
+    }
+
+    /// Decide whether to start an agent run right now and,
+    /// if so, start it. This is the single entry point
+    /// every callsite (D4.4 auto path, the `g` keybind,
+    /// the `stop_section` final-run hook) uses — the
+    /// decision logic lives in `cloud::run::should_run_now`
+    /// so it's pure-testable without an App.
+    ///
+    /// `trigger`:
+    ///   - Auto: a new line was added. Respect the 65 s
+    ///     floor and the queue.
+    ///   - Manual: the user pressed `g`. Bypasses the
+    ///     floor; if a run is in flight, sets `queued = true`
+    ///     and the worker will re-run after the current
+    ///     run completes.
+    ///   - Stop: the user stopped the recording. Forces
+    ///     a final run; bypasses the floor.
+    ///
+    /// `transcript` is the full merged role-labeled
+    /// timeline, pre-truncated via `truncate_transcript`
+    /// to fit the server's 200 000-char cap with margin.
+    pub fn trigger_agent_run(
+        &mut self,
+        trigger: voice_bird_cli::cloud::run::RunTrigger,
+        mut transcript: String,
+    ) {
+        use voice_bird_cli::cloud::run::{
+            should_run_now, truncate_transcript, AgentRunError, RunTrigger,
+        };
+        // Manual: if a worker is already in flight, just
+        // queue a one-shot and return. The worker will
+        // re-run after it finishes (D4.3: drain sets
+        // status to "completed" and the next tick
+        // consults `queued`).
+        if trigger == RunTrigger::Manual
+            && self.agent_run_worker.is_some()
+        {
+            self.agent_run_state.queued = true;
+            return;
         }
+        let now = std::time::Instant::now();
+        let decision = should_run_now(
+            now,
+            self.agent_run_state.last_run_started,
+            self.agent_run_state.queued,
+            self.agent_run_state.plan_is_pro,
+            trigger,
+        );
+        if !decision {
+            return;
+        }
+        // If the previous worker is still around (the
+        // user pressed `g` while one was alive but
+        // not yet DoneFinal), join it before spawning
+        // the new one.
+        if let Some((handle, rx)) = self.agent_run_worker.take() {
+            drop(rx);
+            let _ = handle.join();
+        }
+        // Truncate so the server's 200 000-char cap is
+        // never hit (we ship 180 000 max).
+        transcript = truncate_transcript(&transcript).into_owned();
+        // Reset the queue flag — we're firing now.
+        self.agent_run_state.queued = false;
+        self.start_agent_run(transcript);
     }
 
     pub fn new() -> Self {
