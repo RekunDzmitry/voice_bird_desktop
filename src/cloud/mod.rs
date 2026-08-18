@@ -23,3 +23,13 @@ pub mod agents;
 pub mod http;
 pub mod rooms;
 pub mod run;
+
+// Re-export the agent-run types so callers can
+// `use voice_bird_cli::cloud::AgentRunState;` instead
+// of reaching into the deeply-nested run module. The
+// UI (App + ui.rs) needs these directly.
+pub use run::{
+    run_event_loop, run_event_loop_chan, should_run_now, spawn_agent_run, start,
+    truncate_transcript, AgentRunError, AgentRunState, RunEvent, RunRequest,
+    RunStartError, RunTrigger, AUTO_RUN_FLOOR_SECS, TRANSCRIPT_MAX_CHARS,
+};

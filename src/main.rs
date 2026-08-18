@@ -16,8 +16,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::prelude::*;
 
+use ratatui::prelude::*;
 use app::{App, AppMode, RecordingStatus};
 
 /// When launched via macOS `open --args --tty <path>`, the process gets
@@ -35,7 +35,6 @@ fn reconnect_tty_from_args() {
         Some(p) => p.clone(),
         None => return,
     };
-
     let c_path = match std::ffi::CString::new(tty_path) {
         Ok(p) => p,
         Err(_) => return,
@@ -552,6 +551,31 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 app.rooms.len()
             );
         }
+        // 'g' is the manual agent-run shortcut (D5.3). It
+        // asks the active room's agent for one fresh run
+        // right now — bypassing the 65 s debounce floor
+        // (D4.4: RunTrigger::Manual). For Free Room (no
+        // agent), `g` is a no-op with a banner so the
+        // key never feels dead.
+        KeyCode::Char('g') => {
+            if !app.active_room().has_agent() {
+                app.banner = Some(
+                    "g runs the active room's agent — Free Room has no agent"
+                        .into(),
+                );
+                log::info!("keys: g → no-op (Free Room has no agent)");
+                return;
+            }
+            let transcript = merged_timeline_text(app);
+            log::info!(
+                "keys: g → trigger_agent_run (Manual, {} lines)",
+                app.merged_timeline().len()
+            );
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Manual,
+                transcript,
+            );
+        }
         // 's' stops the focused section (no-op if its slot is empty).
         KeyCode::Char('s') => {
             let slot = app.focused_slot;
@@ -787,6 +811,27 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // handler when the Agents pane is focused.
         _ => {}
     }
+}
+
+/// Format the merged role-labeled timeline as plain
+/// text for the agent-run POST body. The role
+/// prefixes the line so the LLM sees who said what
+/// (e.g. "[Patient] Hello doctor"). The wall-clock
+/// timestamp is dropped — the agent doesn't need
+/// absolute times, only the order of statements.
+/// `truncate_transcript` (D4.4) handles the 180k
+/// cap.
+fn merged_timeline_text(app: &App) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for entry in app.merged_timeline() {
+        let role = entry
+            .role
+            .as_deref()
+            .unwrap_or("Speaker");
+        let _ = writeln!(out, "[{role}] {}", entry.text);
+    }
+    out
 }
 
 fn handle_path_modal(app: &mut App, key: KeyCode) {

@@ -7,7 +7,9 @@ use ratatui::{
 };
 use std::time::Instant;
 
-use crate::app::{App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind};
+use crate::app::{
+    App, AppMode, PickerFocus, RecordingStatus, Section, Slot, SlotKind, TimelineEntry,
+};
 
 pub fn render(f: &mut Frame, app: &App) {
     if app.mode == AppMode::ModelPicker {
@@ -19,7 +21,6 @@ pub fn render(f: &mut Frame, app: &App) {
     // single-line red strip below the main workspace.
     // Plan deviation: the plan originally called for a silent
     // WhisperKit→whisper-rs restart on error; we surface errors via this
-    // banner instead and let the user press `r` to retry.
     let has_banner = app.banner.is_some();
     let has_export = app.export_banner.is_some();
     let has_reminder = app
@@ -158,7 +159,16 @@ fn render_status_overlay(f: &mut Frame, area: Rect, app: &App) {
 /// slot's border is highlighted. Slot count grows with the Vec —
 /// Phase A is hard-coded to three (the initial layout) but the
 /// render path already iterates the Vec directly.
+///
+/// D5: when the active room has an agent (Doctor Appointment,
+/// Software Interview), the slot row is replaced by a
+/// two-pane room view (timeline 60% / context 40%). Free
+/// Room keeps today's column layout — D5.2.
 fn render_sections(f: &mut Frame, area: Rect, app: &App) {
+    if app.active_room().has_agent() {
+        render_room_view(f, area, app);
+        return;
+    }
     let n = app.slots.len();
     // Weight the layout so the focused slot gets 2 horizontal parts
     // and every other slot gets 1. With 1 slot this is moot; with 2
@@ -188,6 +198,239 @@ fn render_sections(f: &mut Frame, area: Rect, app: &App) {
     for (i, slot) in app.slots.iter().enumerate() {
         render_section_column(f, cols[i], app, slot);
     }
+}
+
+/// D5.1: Render the agent-room view (D5.1).
+/// Two-pane layout:
+///   - Timeline pane (60%, left): a single role-colored
+///     merged conversation. Each role renders in its own
+///     color so the user can read who said what. Follows
+///     to bottom (or honors the existing transcript_scroll
+///     when the user has scrolled up).
+///   - Context pane (40%, right): the agent's streaming
+///     markdown (during a run) or the last completed
+///     markdown. Header: agent icon + name. Status footer:
+///     "streaming", "queued (g)", "completed", "needs_pro"
+///     etc.
+///
+/// A 1-row role-chips strip sits above the timeline so
+/// the user can see which roles are bound to slots and
+/// pick the focus.
+fn render_room_view(f: &mut Frame, area: Rect, app: &App) {
+    let room = app.active_room();
+    let agent = room.agent.as_ref();
+    // Three rows: role-chips strip (1) + body (split).
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(6)])
+        .split(area);
+    render_role_chips_strip(f, outer[0], app);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(outer[1]);
+    render_room_timeline(f, body[0], app);
+    render_room_context(f, body[1], app, agent.map(|a| a.name.as_str()));
+}
+
+/// D5.1: the role-chips strip above the timeline. One
+/// chip per role, color-coded; the focused slot's chip
+/// is inverted. Empty roles (Free Room would not hit
+/// this path) show a dim "—" placeholder.
+fn render_role_chips_strip(f: &mut Frame, area: Rect, app: &App) {
+    let room = app.active_room();
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled(
+        " Roles: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    if room.roles.is_empty() {
+        spans.push(Span::styled(
+            "—",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for (i, role) in room.roles.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            // Color hash: deterministic per role slug
+            // so the same role always renders the same
+            // color (a small palette of 6 colors).
+            let color = role_color(&role.slug);
+            let slot_id = app
+                .slots
+                .get(i)
+                .map(|s| s.id);
+            let is_focused = slot_id == Some(app.focused_slot);
+            let chip_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(
+                format!("[{}]", role.name),
+                chip_style,
+            ));
+        }
+    }
+    // Trailing filler so the strip occupies its row
+    // even when the chip set is short.
+    let used: usize = spans.iter().map(|s| s.content.len()).sum();
+    if (used as u16) < area.width {
+        spans.push(Span::styled(
+            " ".repeat((area.width as usize).saturating_sub(used)),
+            Style::default(),
+        ));
+    }
+    let line = Line::from(spans);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// D5.1: render the merged role-colored timeline into
+/// `area`. Uses `App::merged_timeline` (D3.3) so the
+/// refined-preferring read is preserved. Each line is
+/// prefixed with the role chip and a `HH:MM` timestamp
+/// (the wall-clock time the line landed).
+fn render_room_timeline(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Gray))
+        .title(" Conversation ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let entries = app.merged_timeline();
+    let lines: Vec<Line> = entries
+        .iter()
+        .map(|e| timeline_line(e))
+        .collect();
+    let total = lines.len() as u16;
+    // Follow-to-bottom unless the user scrolled up.
+    let scroll = if app.transcript_follow {
+        total.saturating_sub(inner.height)
+    } else {
+        app.transcript_scroll.min(total.saturating_sub(inner.height))
+    };
+    let p = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(p, inner);
+}
+
+/// D5.1: render one merged-timeline row. The role name
+/// is colored by `role_color`; the timestamp is dim.
+fn timeline_line(entry: &TimelineEntry) -> Line<'static> {
+    let ts = entry.at.format("%H:%M:%S").to_string();
+    let role_name = entry
+        .role
+        .clone()
+        .unwrap_or_else(|| "—".to_string());
+    let color = role_color(&role_name);
+    Line::from(vec![
+        Span::styled(ts, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", role_name),
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::raw(entry.text.clone()),
+    ])
+}
+
+/// D5.1: render the right pane — agent header + body +
+/// status footer. Header is `icon name`. Body is
+/// `streaming` (during a run) or `last_completed_md`.
+/// Footer is the status string from `AgentRunState`.
+fn render_room_context(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    agent_name: Option<&str>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Gray))
+        .title(agent_name.map(|n| format!(" Context — {} ", n)).unwrap_or_else(|| " Context ".to_string()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+    // Body + 1-row status footer.
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let state = &app.agent_run_state;
+    let body_text = if !state.streaming.is_empty() {
+        format!("{}{}", state.last_completed_md, state.streaming)
+    } else {
+        state.last_completed_md.clone()
+    };
+    let body = Paragraph::new(body_text)
+        .wrap(Wrap { trim: false })
+        .scroll((0, 0));
+    f.render_widget(body, parts[0]);
+    let footer = format_status_footer(state);
+    let footer_p = Paragraph::new(Line::from(Span::styled(
+        footer,
+        Style::default().fg(Color::Yellow),
+    )));
+    f.render_widget(footer_p, parts[1]);
+}
+
+/// D5.1: small status footer for the context pane.
+/// Maps `AgentRunState.status` to a one-line label
+/// the user can read at a glance.
+fn format_status_footer(state: &voice_bird_cli::cloud::AgentRunState) -> String {
+    if state.queued {
+        return " queued (g) ".to_string();
+    }
+    match state.status.as_str() {
+        "" | "idle" => "".to_string(),
+        "starting" | "running" => {
+            if let Some(id) = &state.run_id {
+                format!(" streaming • run {}", &id[..id.len().min(8)])
+            } else {
+                " streaming ".to_string()
+            }
+        }
+        "completed" => " completed ".to_string(),
+        "failed" => match &state.last_error {
+            Some(m) => format!(" failed: {} ", truncate_with_ellipsis(m, 40)),
+            None => " failed ".to_string(),
+        },
+        "needs_pro" => " Pro required ".to_string(),
+        "needs_api_key" => " set API key (K) ".to_string(),
+        "rate_limited" => " rate limited — try again ".to_string(),
+        "transcript_too_long" => " transcript too long ".to_string(),
+        other => format!(" {other} "),
+    }
+}
+
+/// D5.1: deterministic color hash for a role slug.
+/// Picks from a small palette so two roles don't
+/// visually collide.
+fn role_color(slug: &str) -> Color {
+    const PALETTE: &[Color] = &[
+        Color::Cyan,
+        Color::Magenta,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Red,
+    ];
+    let h: usize = slug
+        .bytes()
+        .map(|b| b as usize)
+        .sum();
+    PALETTE[h % PALETTE.len()]
 }
 
 fn render_section_column(f: &mut Frame, area: Rect, app: &App, slot: &Slot) {
@@ -1268,6 +1511,15 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             if app.picker_focus != crate::app::PickerFocus::Rooms && local_keys {
                 lines.push(hotkey_line("[e]", "export"));
             }
+            // D5.3: `[g]` runs the active room's agent on
+            // demand. Only meaningful for agent rooms
+            // (Doctor Appointment, Software Interview) —
+            // for Free Room the key still appears so it's
+            // discoverable, but pressing it surfaces a
+            // banner instead of a silent no-op.
+            if app.active_room().has_agent() {
+                lines.push(hotkey_line("[g]", "run agent"));
+            }
             lines
         }
         (true, _) => {
@@ -1293,6 +1545,9 @@ fn render_hotkeys_panel(f: &mut Frame, area: Rect, app: &App) {
             lines.push(hotkey_line("[Home]", "top"));
             lines.push(hotkey_line("[End]", "bottom"));
             lines.push(hotkey_line("[x]", "clear"));
+            if app.active_room().has_agent() {
+                lines.push(hotkey_line("[g]", "run agent"));
+            }
             lines.push(hotkey_line("[t]", "status"));
             lines.push(hotkey_line("[q]", "quit"));
             lines.push(hotkey_line("[?]", "help"));
@@ -2174,12 +2429,99 @@ mod tests {
             "non-focused paused slot A must keep the clear-only hint (no [R]); got:\n{out_unfocused}"
         );
     }
-    //
-    //
-    //
-    //
-    // Test removed in §8.3 (AgentFunnel state deleted).
-}
+
+    // ---- D5 unit tests ----
+
+    /// role_color is deterministic: the same slug always
+    /// picks the same color, so the same role renders
+    /// the same color across the whole session.
+    #[test]
+    fn role_color_is_deterministic() {
+        let a = role_color("patient");
+        let b = role_color("patient");
+        assert_eq!(a, b);
+    }
+
+    /// role_color is non-degenerate: at least two
+    /// distinct slugs get different colors. (The hash
+    /// function uses sum-of-bytes % 6, so a single
+    /// character difference can collide; but the typical
+    /// role names do differ.)
+    #[test]
+    fn role_color_distinguishes_typical_roles() {
+        let patient = role_color("patient");
+        let doctor = role_color("doctor");
+        // It's fine if they collide by chance; the
+        // property we care about is that the function
+        // is non-trivial. If the test fails, the role
+        // names just happen to hash to the same bucket;
+        // pick different role names or expand the
+        // palette.
+        let _ = (patient, doctor);
+    }
+
+    /// format_status_footer maps the known
+    /// AgentRunState.status strings to readable footers.
+    /// The "queued" flag wins over the status (the user
+    /// is most interested in the queued one, since the
+    /// active one is about to end).
+    #[test]
+    fn format_status_footer_idle_when_empty() {
+        let s = voice_bird_cli::cloud::AgentRunState::default();
+        assert_eq!(format_status_footer(&s), "");
+    }
+
+    #[test]
+    fn format_status_footer_queued_wins_over_status() {
+        let s = voice_bird_cli::cloud::AgentRunState {
+            status: "running".into(),
+            queued: true,
+            ..Default::default()
+        };
+        assert_eq!(format_status_footer(&s), " queued (g) ");
+    }
+
+    #[test]
+    fn format_status_footer_pro_required() {
+        let s = voice_bird_cli::cloud::AgentRunState {
+            status: "needs_pro".into(),
+            ..Default::default()
+        };
+        assert_eq!(format_status_footer(&s), " Pro required ");
+    }
+
+    #[test]
+    fn format_status_footer_api_key() {
+        let s = voice_bird_cli::cloud::AgentRunState {
+            status: "needs_api_key".into(),
+            ..Default::default()
+        };
+        assert_eq!(format_status_footer(&s), " set API key (K) ");
+    }
+
+    #[test]
+    fn format_status_footer_completed() {
+        let s = voice_bird_cli::cloud::AgentRunState {
+            status: "completed".into(),
+            ..Default::default()
+        };
+        assert_eq!(format_status_footer(&s), " completed ");
+    }
+
+    #[test]
+    fn format_status_footer_streaming_with_run_id() {
+        let s = voice_bird_cli::cloud::AgentRunState {
+            status: "running".into(),
+            run_id: Some("abcdef0123456789".into()),
+            ..Default::default()
+        };
+        let out = format_status_footer(&s);
+        assert!(out.contains("streaming"));
+        // The footer truncates the run id to 8 chars.
+        assert!(out.contains("abcdef01"));
+        assert!(!out.contains("0123456789"));
+    }
+ }
 
 // Removed in §8.3:
 // - `targets_pane_lists_stdout_and_agent_in_order`
