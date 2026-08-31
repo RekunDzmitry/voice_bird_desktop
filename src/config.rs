@@ -52,6 +52,24 @@ pub fn source_id(source: &SessionSource, kind: Option<AudioSessionKind>) -> Stri
 pub fn device_source_id(name: &str, kind: AudioSessionKind) -> String {
     format!("device:{}:{}", kind_str(kind), name)
 }
+/// E.g., `wss://voicebird.app/api/audio/stream` → `https://voicebird.app`
+/// `ws://localhost:3000/api/audio/stream`     → `http://localhost:3000`
+/// Lives in `config` (rather than `app`) so both the bin
+/// and the library share the same URL derivation - the bin's
+/// cloud-on banner uses it to name the destination without
+/// hard-coding `voicebird.app`, which is wrong whenever the
+/// user is testing against a local stack.
+pub fn ws_url_to_http(ws_url: &str) -> String {
+    let (scheme, rest) = if let Some(r) = ws_url.strip_prefix("wss://") {
+        ("https", r)
+    } else if let Some(r) = ws_url.strip_prefix("ws://") {
+        ("http", r)
+    } else {
+        ("https", ws_url)
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
 
 fn kind_str(kind: AudioSessionKind) -> &'static str {
     match kind {
@@ -665,6 +683,28 @@ path = "~/sessions/explicit"
         assert_eq!(
             AppConfig::expand_tilde(abs),
             abs
+        );
+    }
+
+    /// Banner URL derivation must follow the cloud-on banner
+    /// declaration: the bin uses the *same* derivation as the
+    /// transcripts-upload helper so the banner never lies about
+    /// the destination (which is "localhost" during tests, not
+    /// "voicebird.app"). Pin every conversion that's used in a
+    /// user-facing string.
+    #[test]
+    fn ws_url_http_banner_for_localhost_dev() {
+        assert_eq!(
+            ws_url_to_http("ws://localhost:3303/api/audio/stream"),
+            "http://localhost:3303"
+        );
+    }
+
+    #[test]
+    fn ws_url_http_banner_for_prod() {
+        assert_eq!(
+            ws_url_to_http("wss://voicebird.app/api/audio/stream"),
+            "https://voicebird.app"
         );
     }
 

@@ -160,7 +160,7 @@ pub fn write_room_context_md(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room::{AgentRef, RoleDef, Room};
+    use crate::room::{AgentRef, RoleConstraint, RoleDef, Room, SourceKind};
     use std::str::FromStr;
     fn two_role_room() -> Room {
         Room {
@@ -177,6 +177,22 @@ mod tests {
                 icon: Some("🦷".into()),
             }),
             requires_pro: true,
+            requires_cloud: true,
+            prompt_template: "You are a dental documentation assistant".into(),
+            role_constraints: vec![
+                RoleConstraint {
+                    role_slug: "patient".into(),
+                    source_kind: SourceKind::DeviceInput,
+                    required_app_slug: None,
+                    device_required: true,
+                },
+                RoleConstraint {
+                    role_slug: "doctor".into(),
+                    source_kind: SourceKind::AppLoopback,
+                    required_app_slug: None,
+                    device_required: false,
+                },
+            ],
         }
     }
 
@@ -332,6 +348,22 @@ mod tests {
                 icon: Some("\u{1F9B7}".to_string()),
             }),
             requires_pro: true,
+            requires_cloud: true,
+            prompt_template: "You are a dental documentation assistant".into(),
+            role_constraints: vec![
+                RoleConstraint {
+                    role_slug: "patient".into(),
+                    source_kind: SourceKind::DeviceInput,
+                    required_app_slug: None,
+                    device_required: true,
+                },
+                RoleConstraint {
+                    role_slug: "doctor".into(),
+                    source_kind: SourceKind::AppLoopback,
+                    required_app_slug: None,
+                    device_required: false,
+                },
+            ],
         };
         // 1. room.json
         write_room_json(&room_dir, &room, ts()).unwrap();

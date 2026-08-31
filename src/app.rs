@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+    use voice_bird_cli::room::{RoleConstraint, SourceKind};
 
 use parking_lot::Mutex as PlMutex;
 
@@ -487,6 +488,12 @@ pub struct App {
     /// "no rooms" branch — Free Room is the offline default
     /// and is hardcoded locally.
     pub rooms: Vec<Room>,
+    /// Active funnel wizard. Non-None when the user is mid-way
+    /// through activating a non-Free Room's setup wizard.
+    /// The dispatcher polls this to route Esc/q/Enter.
+    pub room_funnel: Option<voice_bird_cli::funnel::RoomFunnelState>,
+    /// Last active room index for `Esc`-driven funnel cancel.
+    pub previous_active_room: Option<usize>,
     /// Index into `rooms` of the currently active room. Drives
     /// the slot provisioning (Free Room → one empty slot;
     /// agent room → one empty slot per role) and the merged
@@ -956,6 +963,8 @@ impl App {
             pending_target_overrides: std::collections::BTreeMap::new(),
             rooms,
             active_room,
+            room_funnel: None,
+            previous_active_room: None,
             plan_is_pro: None,
             slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
@@ -1151,6 +1160,9 @@ impl App {
         // Locked Pro rooms can be activated for display, but
         // agent runs against them will hit 402. We let the
         // TUI surface the lock with 🔒 and skip the call.
+        // Funnel revert: capture the previous room so Esc on
+        // the wizard rolls back to where the user was.
+        self.previous_active_room = Some(self.active_room);
         self.active_room = idx;
         let room = self.active_room().clone();
         if room.slug == "free" {
@@ -1195,6 +1207,14 @@ impl App {
                 })
                 .collect();
             self.next_slot_id = next_id + self.slots.len() as u32;
+            // Open the funnel wizard when the room has role
+            // constraints. Free Room is opened without the
+            // wizard (no role_constraints to bind).
+            if !room.role_constraints.is_empty() {
+                self.room_funnel = Some(
+                    voice_bird_cli::funnel::RoomFunnelState::new(&room),
+                );
+            }
         }
         Ok(())
     }
@@ -1223,9 +1243,10 @@ impl App {
             Ok(list) => {
                 log::info!("refresh_rooms: fetched {} rooms", list.rooms.len());
                 self.plan_is_pro = Some(list.plan_is_pro());
-                let mut rooms = vec![Room::free_room()];
-                rooms.extend(list.rooms);
-                self.rooms = rooms;
+                self.rooms = voice_bird_cli::cloud::rooms::merge_rooms_with_free(
+                    Room::free_room(),
+                    list.rooms,
+                );
             }
             Err(e) => {
                 log::warn!("refresh_rooms: fetch failed: {e}");
@@ -1781,6 +1802,71 @@ impl App {
     /// In the Agents pane, disabled rows (currently just `Agent` when
     /// the binary is missing) are skipped so the cursor never parks
     /// on a row that can't be picked.
+    /// Snap the room cursor to the nearest visible row.
+    fn snap_room_cursor_to_visible(&mut self, cloud_visible: bool) {
+        if self.rooms.is_empty() {
+            self.selected_room_index = 0;
+            return;
+        }
+        if self
+            .rooms
+            .get(self.selected_room_index)
+            .map(|r| r.is_visible(cloud_visible))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let start = self.selected_room_index;
+        for i in start..self.rooms.len() {
+            if self.rooms[i].is_visible(cloud_visible) {
+                self.selected_room_index = i;
+                return;
+            }
+        }
+        for i in (0..start).rev() {
+            if self.rooms[i].is_visible(cloud_visible) {
+                self.selected_room_index = i;
+                return;
+            }
+        }
+        self.selected_room_index = 0;
+    }
+
+    fn visible_room_at(&self, idx: usize, cloud_visible: bool) -> bool {
+        self.rooms
+            .get(idx)
+            .map(|r| r.is_visible(cloud_visible))
+            .unwrap_or(false)
+    }
+
+    /// Route `↑` / `k` to Rooms when only Rooms is visible
+    /// (the funnel-closed default). The dispatcher's direct
+    /// call to `select_previous` would otherwise steer into
+    /// the (hidden) Devices list because `PickerFocus::Devices`
+    /// is the legacy default for `App::new()`. This helper
+    /// bridges the gap.
+    pub fn arrow_previous_in_visible_picker(&mut self) {
+        let rooms_visible = self
+            .rooms
+            .iter()
+            .any(|r| r.is_visible(self.display_cloud_on()));
+        if rooms_visible && self.picker_focus != PickerFocus::Rooms {
+            self.picker_focus = PickerFocus::Rooms;
+        }
+        self.select_previous();
+    }
+
+    pub fn arrow_next_in_visible_picker(&mut self) {
+        let rooms_visible = self
+            .rooms
+            .iter()
+            .any(|r| r.is_visible(self.display_cloud_on()));
+        if rooms_visible && self.picker_focus != PickerFocus::Rooms {
+            self.picker_focus = PickerFocus::Rooms;
+        }
+        self.select_next();
+    }
+
     pub fn select_previous(&mut self) {
         match self.picker_focus {
             PickerFocus::Devices => {
@@ -1796,9 +1882,15 @@ impl App {
                 }
             }
             PickerFocus::Rooms => {
-                if self.selected_room_index > 0 {
-                    self.selected_room_index -= 1;
+                let cloud_visible = self.display_cloud_on();
+                self.snap_room_cursor_to_visible(cloud_visible);
+                let mut idx = self.selected_room_index;
+                while idx > 0
+                    && !self.visible_room_at(idx - 1, cloud_visible)
+                {
+                    idx -= 1;
                 }
+                self.selected_room_index = idx;
             }
         }
         log::debug!(
@@ -1840,8 +1932,16 @@ impl App {
                 if self.rooms.is_empty() {
                     return;
                 }
-                if self.selected_room_index + 1 < self.rooms.len() {
-                    self.selected_room_index += 1;
+                let cloud_visible = self.display_cloud_on();
+                self.snap_room_cursor_to_visible(cloud_visible);
+                let mut idx = self.selected_room_index + 1;
+                while idx < self.rooms.len()
+                    && !self.visible_room_at(idx, cloud_visible)
+                {
+                    idx += 1;
+                }
+                if idx < self.rooms.len() {
+                    self.selected_room_index = idx;
                 }
             }
         }
@@ -1943,7 +2043,155 @@ impl App {
         };
         idx.and_then(|i| self.apps.get(i))
     }
-    /// Resolve the source the focused Devices + Apps pickers
+    /// `slot_picker_memo`. Called by `handle_funnel_enter` on
+    /// commit so the slots provisioned for a non-free room
+    /// actually start recording from the device/app the user
+    /// picked in the wizard — not from whatever the global
+    /// picker cursor happened to be on.
+    ///
+    /// Without this, `start_section` reads
+    /// `selected_device_index` / `selected_app_index`, both of
+    /// which are global cursors the user moves freely between
+    /// sessions. The funnel's per-role selections would be
+    /// displayed in the modal and then silently discarded.
+    ///
+    /// For each role binding with `selected_name`:
+    /// - `DeviceInput` / `DeviceOutput`: look up the name in
+    ///   `self.devices` filtered by kind, store the raw index
+    ///   in `slot_picker_memo[slot].device_idx`.
+    /// - `AppLoopback`: look up the name in `self.apps`, store
+    ///   the raw index in `slot_picker_memo[slot].app_idx`.
+    ///
+    /// The mapping is `role_constraints[i]` ↔ `slots[i]`
+    /// (both are provisioned in `room.roles` order by
+    /// `activate_room`). Bindings without a `selected_name`
+    /// are skipped — the slot's memo keeps whatever was
+    /// there (typically nothing — first activation). On
+    /// commit we also focus slot 0 so the very first Enter
+    /// after the funnel uses the binding for role 0.
+    pub fn commit_funnel_bindings(
+        &mut self,
+        funnel: &voice_bird_cli::funnel::RoomFunnelState,
+    ) {
+        use voice_bird_cli::config::AudioSessionKind;
+        use voice_bird_cli::room::SourceKind;
+        for (i, binding) in funnel.role_bindings.iter().enumerate() {
+            let Some(slot_id) = self.slots.get(i).map(|s| s.id) else {
+                break;
+            };
+            let mut memo = self
+                .slot_picker_memo
+                .get(&slot_id)
+                .cloned()
+                .unwrap_or(PickerSelection {
+                    device_idx: 0,
+                    app_idx: None,
+                    focus: PickerFocus::Devices,
+                });
+            let Some(name) = binding.selected_name.as_deref() else {
+                // User didn't move the cursor onto a real row
+                // — keep whatever was in the memo (typically
+                // the uninitialized default). The user can
+                // still pick from the picker post-funnel.
+                self.slot_picker_memo.insert(slot_id, memo);
+                continue;
+            };
+            match binding.source_kind {
+                SourceKind::DeviceInput => {
+                    if let Some((raw_idx, _)) = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| {
+                            d.name == name
+                                && matches!(d.kind, AudioSessionKind::Input)
+                        })
+                    {
+                        memo.device_idx = raw_idx;
+                        // A DeviceInput role implies "no app
+                        // pairing" — Input devices are
+                        // captured directly, not per-app.
+                        memo.app_idx = None;
+                    }
+                }
+                SourceKind::DeviceOutput => {
+                    if let Some((raw_idx, _)) = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| {
+                            d.name == name
+                                && matches!(d.kind, AudioSessionKind::Output)
+                        })
+                    {
+                        memo.device_idx = raw_idx;
+                        // DeviceOutput without an app pairing
+                        // is the "loopback from this speaker"
+                        // case — leave app_idx None.
+                        memo.app_idx = None;
+                    }
+                }
+                SourceKind::AppLoopback => {
+                    // The app is the primary source. Look up
+                    // by name; the device leg (Output kind)
+                    // is a separate concern — if the user
+                    // didn't pair one, the resolve falls back
+                    // to `SessionSource::App { device_name:
+                    // "default" }`. We only persist the app
+                    // idx here; the device is picked
+                    // implicitly at resolve time.
+                    if let Some((app_idx, _)) = self
+                        .apps
+                        .iter()
+                        .enumerate()
+                        .find(|(_, a)| a.name == name)
+                    {
+                        memo.app_idx = Some(app_idx);
+                        // Match the device side to whatever
+                        // Output device is at the same name
+                        // (the renderer showed the full list
+                        // and the user picked by name, but the
+                        // device cursor also needs to point
+                        // somewhere coherent — picking the
+                        // first Output device that matches
+                        // keeps the picker consistent with the
+                        // funnel choice).
+                        if let Some((raw_idx, _)) = self
+                            .devices
+                            .iter()
+                            .enumerate()
+                            .find(|(_, d)| {
+                                d.kind == AudioSessionKind::Output
+                            })
+                        {
+                            memo.device_idx = raw_idx;
+                        }
+                    }
+                }
+            }
+            self.slot_picker_memo.insert(slot_id, memo);
+        }
+        // Focus slot 0 so the first Enter after the funnel
+        // uses the role-0 binding. Without this, focus stays
+        // on whatever slot was last picked (typically
+        // Free Room's), and the user has to Tab back to the
+        // agent room's slot to record.
+        if let Some(first) = self.slots.first() {
+            self.focused_slot = first.id;
+            // Load the memo we just wrote for slot 0 into
+            // the global cursors.
+            self.selected_device_index = self
+                .slot_picker_memo
+                .get(&first.id)
+                .map(|p| p.device_idx)
+                .unwrap_or(0)
+                .min(self.devices.len().saturating_sub(1).max(0));
+            self.selected_app_index = self
+                .slot_picker_memo
+                .get(&first.id)
+                .and_then(|p| p.app_idx);
+        }
+    }
     /// would resolve to on Enter. Wraps `resolve_picker_source`
     /// (the canonical picker→source match) with the error
     /// strings the TUI surfaces as banners for the three
@@ -4856,5 +5104,307 @@ mod tests {
             );
             assert!(app.agent_run_worker.is_none());
         }
+
+        fn cloud_required_room(slug: &str, name: &str) -> Room {
+            Room {
+                slug: slug.into(),
+                name: name.into(),
+                icon: None,
+                roles: vec![],
+                agent: None,
+                requires_pro: false,
+                requires_cloud: true,
+                prompt_template: String::new(),
+                role_constraints: vec![],
+            }
+        }
+
+        #[test]
+        fn arrow_dispatcher_routes_to_rooms_with_cloud_off() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = false;
+            app.plan_is_pro = Some(true);
+            app.rooms =
+                vec![Room::free_room(), cloud_required_room("x", "X")];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 1;
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.picker_focus, PickerFocus::Rooms);
+            assert_eq!(app.selected_room_index, 0, "cursor clamped to Free Room");
+        }
+
+        #[test]
+        fn arrow_dispatcher_walks_visible_rooms_with_cloud_on() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.rooms = vec![
+                Room::free_room(),
+                cloud_required_room("x", "Software Interview"),
+                cloud_required_room("y", "Doctor Appointment"),
+            ];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 0;
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 1);
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 2);
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 2, "past end → no-op");
+        }
+
+        #[test]
+        fn arrow_up_at_free_room_via_dispatcher_is_noop() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.rooms = vec![Room::free_room()];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 0;
+            app.arrow_previous_in_visible_picker();
+            assert_eq!(app.selected_room_index, 0);
+        }
+
+        #[test]
+        fn activating_agent_room_opens_funnel() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            let mut room = cloud_required_room("x", "X");
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "a".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            assert!(app.room_funnel.is_none());
+            let _ = app.activate_room(1);
+            assert!(app.room_funnel.is_some(),
+                "funnel should be open after activating the agent room");
+            assert_eq!(app.room_funnel.as_ref().unwrap().current_step, 0);
+            assert_eq!(app.previous_active_room, Some(0),
+                "previous_active_room should remember Free Room");
+        }
+
+        /// Regression for the no-stream-after-funnel bug.
+        /// Before this commit the funnel wizard collected
+        /// per-role selections into `RoleBindingDraft::selected_name`
+        /// but the commit path (`handle_funnel_enter`) never
+        /// wrote them anywhere — `start_section` reads the
+        /// global `selected_device_index` / `selected_app_index`,
+        /// both of which stay at whatever the cursor was on
+        /// BEFORE the funnel. Result: a user activating
+        /// Software Interview with a real USB mic would land
+        /// on "Mac mini Speakers" (Output) and capture silence.
+        ///
+        /// This test pins that the post-commit state points at
+        /// the picked device/app so the first Enter after the
+        /// funnel resolves to the role's binding.
+        #[test]
+        fn commit_funnel_bindings_writes_per_slot_device() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            // Inventory: a real mic + a non-input speaker.
+            // The mic is what role 0 will pick.
+            app.devices = vec![
+                crate::platform::AudioDevice {
+                    name: "EPOS PC 8 USB".into(),
+                    kind: voice_bird_cli::config::AudioSessionKind::Input,
+                },
+                crate::platform::AudioDevice {
+                    name: "Mac mini Speakers".into(),
+                    kind: voice_bird_cli::config::AudioSessionKind::Output,
+                },
+            ];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![voice_bird_cli::room::RoleDef {
+                slug: "interviewee".into(),
+                name: "Interviewee".into(),
+            }];
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "interviewee".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            // Simulate Free Room being active with the
+            // global cursor parked on "Mac mini Speakers"
+            // (index 1) — this is the state the user had
+            // BEFORE the funnel opened. The post-commit state
+            // must NOT keep this cursor — it must point at
+            // the EPOS mic, which is what the user picked in
+            // the funnel.
+            app.selected_device_index = 1;
+            // Simulate the funnel: user moved cursor to row 0
+            // step until the commit sentinel.
+            let _ = app.activate_room(1);
+            let mut funnel = app.room_funnel.clone().unwrap();
+            funnel
+                .role_bindings
+                .iter_mut()
+                .for_each(|b| b.selected_index = Some(0));
+            // Manually run record_selected_name against the
+            // same list the dispatcher would have used.
+            funnel.record_selected_name(&["EPOS PC 8 USB"]);
+            // Advance through the wizard (role 0 → prompt
+            // → commit).
+            funnel.advance(); // role 0 → prompt
+            funnel.advance(); // prompt → commit
+            assert!(funnel.at_commit_step());
+            // Commit the bindings and verify.
+            app.commit_funnel_bindings(&funnel);
+            // The role-0 slot's memo must point at the
+            // EPOS mic (raw index 0), NOT at Mac mini
+            // Speakers (raw index 1).
+            let slot0 = app.slots[0].id;
+            let memo = app
+                .slot_picker_memo
+                .get(&slot0)
+                .expect("slot 0 must have a memo after commit");
+            assert_eq!(memo.device_idx, 0,
+                "device_idx must point at EPOS mic, not the pre-funnel cursor");
+            assert_eq!(memo.app_idx, None,
+                "DeviceInput role must not pair an app");
+            // And the FOCUSED cursor on App must be on slot 0
+            // so the first Enter after the funnel uses the
+            // binding — not whatever slot was focused before.
+            assert_eq!(app.focused_slot, slot0,
+                "focus must land on slot 0 after the funnel commits");
+            assert_eq!(app.selected_device_index, 0,
+                "global device cursor must match slot 0's memo");
+        }
+
+        /// AppLoopback role bindings must write the picked
+        /// app's index into the slot's memo, and clear the
+        /// device leg (apps carry their own device_name —
+        /// the picker shows Output devices on the device side
+        /// only when the user explicitly pairs one).
+        #[test]
+        fn commit_funnel_bindings_writes_app_for_app_loopback() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.devices = vec![crate::platform::AudioDevice {
+                name: "Mac mini Speakers".into(),
+                kind: voice_bird_cli::config::AudioSessionKind::Output,
+            }];
+            app.apps = vec![
+                crate::platform::AppSession {
+                    id: "us.zoom.xos".into(),
+                    name: "Zoom".into(),
+                    process_id: 0,
+                },
+                crate::platform::AppSession {
+                    id: "com.google.Chrome".into(),
+                    name: "Chrome".into(),
+                    process_id: 0,
+                },
+            ];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![
+                voice_bird_cli::room::RoleDef {
+                    slug: "interviewee".into(),
+                    name: "Interviewee".into(),
+                },
+                voice_bird_cli::room::RoleDef {
+                    slug: "interviewer".into(),
+                    name: "Interviewer".into(),
+                },
+            ];
+            room.role_constraints = vec![
+                RoleConstraint {
+                    role_slug: "interviewee".into(),
+                    source_kind: SourceKind::DeviceInput,
+                    required_app_slug: None,
+                    device_required: true,
+                },
+                RoleConstraint {
+                    role_slug: "interviewer".into(),
+                    source_kind: SourceKind::AppLoopback,
+                    required_app_slug: None,
+                    device_required: false,
+                },
+            ];
+            app.rooms = vec![Room::free_room(), room];
+            let _ = app.activate_room(1);
+            // Walk the wizard: role 0 (DeviceInput) — leave
+            // the cursor at None / no name (user didn't move);
+            // role 1 (AppLoopback) — user picked row 1
+            // (Chrome, after sort). record_selected_name
+            // resolves by the visible app name list.
+            let mut funnel = app.room_funnel.clone().unwrap();
+            funnel.advance(); // role 0 → role 1
+            funnel.cursor_down(2);
+            funnel.record_selected_name(&["Chrome", "Zoom"]);
+            funnel.advance(); // role 1 → prompt
+            funnel.advance(); // prompt → commit
+            app.commit_funnel_bindings(&funnel);
+            let slot1 = app.slots[1].id;
+            let memo1 = app
+                .slot_picker_memo
+                .get(&slot1)
+                .expect("slot 1 must have a memo after commit");
+            assert_eq!(memo1.app_idx, Some(1),
+                "AppLoopback role 1 must point at the Chrome app entry");
+            // Switch focus to slot 1 (interviewer) so the
+            // start path resolves the source from the
+            // interviewer's memo, not slot 0's.
+            app.focused_slot = slot1;
+            app.selected_device_index = memo1.device_idx;
+            app.selected_app_index = memo1.app_idx;
+            // And the user can now start the interviewer
+            // slot and the session will resolve to
+            // SessionSource::App { … } with Chrome's id.
+            let source = app
+                .resolve_picker_source()
+                .expect("resolve_picker_source must produce a source");
+            assert!(matches!(source, voice_bird_cli::session::layout::SessionSource::App { .. }),
+                "interviewer slot must start as App, got {source:?}");
+        }
+
+        /// If the user didn't pick anything (selected_name is
+        /// None), the memo entry is created but left at the
+        /// default — the slot just hasn't been told what to
+        /// capture. The user can still pick from the picker
+        /// post-funnel.
+        #[test]
+        fn commit_funnel_bindings_with_no_picks_is_noop() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.devices = vec![crate::platform::AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: voice_bird_cli::config::AudioSessionKind::Input,
+            }];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![voice_bird_cli::room::RoleDef {
+                slug: "interviewee".into(),
+                name: "Interviewee".into(),
+            }];
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "interviewee".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            let _ = app.activate_room(1);
+            let mut funnel = app.room_funnel.clone().unwrap();
+            // User pressed Enter without moving the cursor.
+            funnel.advance(); // role 0 → prompt
+            funnel.advance(); // prompt → commit
+            app.commit_funnel_bindings(&funnel);
+            let slot0 = app.slots[0].id;
+            let memo = app
+                .slot_picker_memo
+                .get(&slot0)
+                .expect("slot 0 memo must exist (default) even with no picks");
+            assert_eq!(memo.device_idx, 0,
+                "no pick leaves the memo at its default (device_idx 0)");
+            assert!(memo.app_idx.is_none());
+        }
     }
- }
+}
