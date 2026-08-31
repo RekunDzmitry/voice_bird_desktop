@@ -52,6 +52,24 @@ pub fn source_id(source: &SessionSource, kind: Option<AudioSessionKind>) -> Stri
 pub fn device_source_id(name: &str, kind: AudioSessionKind) -> String {
     format!("device:{}:{}", kind_str(kind), name)
 }
+/// E.g., `wss://voicebird.app/api/audio/stream` → `https://voicebird.app`
+/// `ws://localhost:3000/api/audio/stream`     → `http://localhost:3000`
+/// Lives in `config` (rather than `app`) so both the bin
+/// and the library share the same URL derivation - the bin's
+/// cloud-on banner uses it to name the destination without
+/// hard-coding `voicebird.app`, which is wrong whenever the
+/// user is testing against a local stack.
+pub fn ws_url_to_http(ws_url: &str) -> String {
+    let (scheme, rest) = if let Some(r) = ws_url.strip_prefix("wss://") {
+        ("https", r)
+    } else if let Some(r) = ws_url.strip_prefix("ws://") {
+        ("http", r)
+    } else {
+        ("https", ws_url)
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
 
 fn kind_str(kind: AudioSessionKind) -> &'static str {
     match kind {
@@ -147,27 +165,14 @@ pub struct AppConfig {
     #[serde(default = "default_voicebird_server_url")]
     pub voicebird_server_url: String,
 
-    /// Per-slot override for which cloud Agent to run on `g`.
-    /// Keyed by `SlotId` (so the picker picks persist per slot).
-    /// When absent, the picker cursor in §10 falls back to the
-    /// most recently used agent (`last_character_id`).
+    /// Most recently activated room slug, persisted between
+    /// sessions. `App::new` re-activates the room after a
+    /// successful rooms fetch so the user's last choice sticks
+    /// across launches. When the slug no longer exists in the
+    /// catalog (e.g. server dropped the room), the App falls
+    /// back to Free Room and clears the field.
     #[serde(default)]
-    pub character_overrides: BTreeMap<String, String>,
-
-    /// Most recently used Agent id, persisted between sessions.
-    /// The §11 `g` key handler uses this as the default when a
-    /// slot has no override.
-    #[serde(default)]
-    pub last_character_id: Option<String>,
-
-    /// Set to `true` after the user accepts the one-time consent
-    /// modal (§11) that asks before sending transcripts that came
-    /// from a `cloud_on = false` recording. The flag sticks across
-    /// launches — once accepted, the `g` key fires immediately
-    /// for every future recording on every slot.
-    #[serde(default)]
-    pub dont_ask_character_upload: bool,
-
+    pub last_room_slug: Option<String>,
     /// Global default for a slot's per-slot settings. Each slot
     /// reads unset fields from here. The user customizes a slot
     /// by setting that field in the slot's `SlotConfig`; the
@@ -210,9 +215,7 @@ impl Default for AppConfig {
             refinement_beam_size: default_refinement_beam_size(),
             voicebird_api_key: String::new(),
             voicebird_server_url: default_voicebird_server_url(),
-            character_overrides: BTreeMap::new(),
-            last_character_id: None,
-            dont_ask_character_upload: false,
+            last_room_slug: None,
             default_slot_config: DefaultSlotConfig::default(),
         }
     }
@@ -590,9 +593,7 @@ path = "~/sessions/explicit"
             refinement_beam_size: 5,
             voicebird_api_key: "vb-test".into(),
             voicebird_server_url: "wss://example.test/api/audio/stream".into(),
-            character_overrides: BTreeMap::new(),
-            last_character_id: None,
-            dont_ask_character_upload: false,
+            last_room_slug: None,
             default_slot_config: DefaultSlotConfig::default(),
         };
         c.save_to(&path).unwrap();
@@ -685,58 +686,27 @@ path = "~/sessions/explicit"
         );
     }
 
-    /// §9b: per-slot Agent override + last-used agent id +
-    /// `dont_ask_character_upload` consent flag must all survive a
-    /// save/load round trip. Old config.toml files written before
-    /// these fields existed must still parse — the
-    /// `#[serde(default)]` attributes give every missing field its
-    /// default.
+    /// Banner URL derivation must follow the cloud-on banner
+    /// declaration: the bin uses the *same* derivation as the
+    /// transcripts-upload helper so the banner never lies about
+    /// the destination (which is "localhost" during tests, not
+    /// "voicebird.app"). Pin every conversion that's used in a
+    /// user-facing string.
     #[test]
-    fn character_run_fields_round_trip_through_toml() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut c = AppConfig::default();
-        c.character_overrides
-            .insert("2".into(), "uuid-prod-events".into());
-        c.character_overrides
-            .insert("3".into(), "uuid-zoom-bridge".into());
-        c.last_character_id = Some("uuid-zoom-bridge".into());
-        c.dont_ask_character_upload = true;
-        c.save_to(&path).unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.character_overrides.len(), 2);
+    fn ws_url_http_banner_for_localhost_dev() {
         assert_eq!(
-            loaded.character_overrides.get("2").map(String::as_str),
-            Some("uuid-prod-events")
+            ws_url_to_http("ws://localhost:3303/api/audio/stream"),
+            "http://localhost:3303"
         );
-        assert_eq!(loaded.last_character_id.as_deref(), Some("uuid-zoom-bridge"));
-        assert!(loaded.dont_ask_character_upload);
     }
 
-    /// Old config.toml files (pre-§9b) load with the new fields
-    /// at their defaults — `#[serde(default)]` makes the missing
-    /// keys behave like absent.
     #[test]
-    fn character_run_fields_default_when_missing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "default_model = \"tiny.en\"\nlanguage = \"en\"\n\
-             session_dir = \"~/sessions\"\n\
-             hop_ms = 750\n\
-             min_window_ms = 1000\n\
-             engine_prefer = \"auto\"\n\
-             audio_default_source = \"microphone\"\n\
-             voicebird_server_url = \"wss://voicebird.app/api/audio/stream\"\n\
-             voicebird_api_key = \"\"\n\
-             cloud_broadcast_enabled = false\n\
-             source_overrides = {}\n",
-        )
-        .unwrap();
-        let loaded = AppConfig::load_from(&path).unwrap();
-        assert!(loaded.character_overrides.is_empty());
-        assert!(loaded.last_character_id.is_none());
-        assert!(!loaded.dont_ask_character_upload);
+    fn ws_url_http_banner_for_prod() {
+        assert_eq!(
+            ws_url_to_http("wss://voicebird.app/api/audio/stream"),
+            "https://voicebird.app"
+        );
     }
+
+
 }

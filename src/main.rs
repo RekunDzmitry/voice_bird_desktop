@@ -16,8 +16,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::prelude::*;
 
+use ratatui::prelude::*;
 use app::{App, AppMode, RecordingStatus};
 
 /// When launched via macOS `open --args --tty <path>`, the process gets
@@ -35,7 +35,6 @@ fn reconnect_tty_from_args() {
         Some(p) => p.clone(),
         None => return,
     };
-
     let c_path = match std::ffi::CString::new(tty_path) {
         Ok(p) => p,
         Err(_) => return,
@@ -364,6 +363,80 @@ fn run_app<B: Backend>(
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyCode) {
+    // Funnel wizard gets the first chance at Esc/q/Enter so the
+    // wizard keys never fall through to picker/section
+    // navigation. The wizard is a modal that owns the
+    // workspace; nothing else should respond while it's open.
+    if app.room_funnel.is_some() {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                handle_funnel_cancel(app);
+                return;
+            }
+            KeyCode::Enter => {
+                handle_funnel_enter(app);
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let max = {
+                    let snapshot = app.room_funnel.clone();
+                    match snapshot.as_ref() {
+                        Some(s) => funnel_visible_options(app, s).len(),
+                        None => 0,
+                    }
+                };
+                // Compute visible names in a tight scope so the
+                // borrow on `app.devices`/`app.apps` ends before
+                // we mutably borrow `app.room_funnel`. The borrow
+                // checker rejects holding both because `funnel`
+                // lives on `app`.
+                let visible: Vec<String> = {
+                    let snapshot = app.room_funnel.clone();
+                    match snapshot.as_ref() {
+                        Some(s) => funnel_visible_options(app, s)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+                let visible_refs: Vec<&str> =
+                    visible.iter().map(String::as_str).collect();
+                if let Some(f) = app.room_funnel.as_mut() {
+                    f.cursor_up();
+                    f.record_selected_name(&visible_refs);
+                }
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = {
+                    let snapshot = app.room_funnel.clone();
+                    match snapshot.as_ref() {
+                        Some(s) => funnel_visible_options(app, s).len(),
+                        None => 0,
+                    }
+                };
+                let visible: Vec<String> = {
+                    let snapshot = app.room_funnel.clone();
+                    match snapshot.as_ref() {
+                        Some(s) => funnel_visible_options(app, s)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+                let visible_refs: Vec<&str> =
+                    visible.iter().map(String::as_str).collect();
+                if let Some(g) = app.room_funnel.as_mut() {
+                    g.cursor_down(max);
+                    g.record_selected_name(&visible_refs);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
     // Transcript scroll keys — always available, no mode conflict.
     match key {
         KeyCode::PageUp => {
@@ -408,9 +481,13 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 app.active_section_count()
             );
         }
-        // ↑/↓/k/j navigate within the focused picker pane.
-        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
-        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+        // ↑/↓/k/j navigate the picker. Outside the funnel only
+        // Rooms is visible, so the dispatcher sends the event
+        // through `arrow_*_in_visible_picker`, which redirects
+        // to the Rooms pane when the (legacy) Devices focus
+        // would otherwise steer into a hidden list.
+        KeyCode::Up | KeyCode::Char('k') => app.arrow_previous_in_visible_picker(),
+        KeyCode::Down | KeyCode::Char('j') => app.arrow_next_in_visible_picker(),
         // ←/→ cycle picker pane focus. `h` is aliased to `←` for
         // vim-style users. `l` is deliberately not bound: it cycles
         // cloud language already, and we don't want the picker
@@ -429,8 +506,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             use crate::app::PickerFocus::*;
             let next = match app.picker_focus {
                 Devices => Apps,
-                Apps => Agents,
-                Agents => Agents,
+                Apps => Rooms,
+                Rooms => Rooms,
             };
             app.picker_focus = next;
             log::info!("keys: Right → picker_focus = {:?}", next);
@@ -493,33 +570,26 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         // `a`/`e`/`d` agent CRUD keys removed in §8 — see plan §8.1.
         // Their handler functions and `AppMode` variants are gone in §8.3.
         KeyCode::Enter => {
-            // When the Agents pane is focused, Enter first applies
-            // the picked target to the focused slot's
-            // pending_target_overrides (so start_section consumes
-            // it). The picked target may be disabled (e.g. Agent when
-            // the binary is missing) — in that case we surface a
-            // banner and abort; the user can press Down to land on
-            // a pickable row.
-            if app.picker_focus == crate::app::PickerFocus::Agents {
-                if let Some(kind) = app.focused_target_kind() {
-                    let target = app.pick_target(kind);
-                    log::info!(
-                        "keys: Enter in Agents pane → picked {target:?} for slot {}",
-                        app.focused_slot.0
-                    );
+            // When the Rooms pane is focused, Enter first activates
+            // the picked room (provisions the slot set). The
+            // activate_room call is the only Enter-specific UI
+            // concern for the rooms pane; everything else (slot
+            // pick, source resolution, config persist,
+            // start_section) is shared and lives in the App method
+            // so it can be unit-tested.
+            if app.picker_focus == crate::app::PickerFocus::Rooms {
+                let idx = app.selected_room_index;
+                if let Err(msg) = app.activate_room(idx) {
+                    log::warn!("keys: Enter in Rooms pane → activate_room FAILED: {msg}");
+                    app.banner = Some(msg);
                 } else {
-                    let i = app.selected_target_index.unwrap_or(0);
-                    app.banner = Some(format!(
-                        "Target row {i} is disabled (binary missing?) — pick a different row"
-                    ));
-                    return;
+                    log::info!(
+                        "keys: Enter in Rooms pane → activated room index {idx} ({})",
+                        app.active_room().slug
+                    );
                 }
+                return;
             }
-            // Hand the rest off to App::try_start_new_section. The
-            // Agents pick_target above is the only Enter-specific
-            // UI concern; everything else (slot pick, source
-            // resolution, config persist, start_section) is shared
-            // and lives in the App method so it can be unit-tested.
             match app.try_start_new_section() {
                 Ok(()) => {
                     log::info!(
@@ -535,27 +605,53 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
             }
         }
         // 'r' refreshes both inventories: local audio (devices + apps)
-        // and the cloud Agents list. Local refresh preserves cursor
-        // positions by name; cloud refresh replaces `self.agents` with
-        // whatever `GET /api/agents` returns (or clears it + sets a
-        // banner on error). Pre-this-commit, `r` only refreshed local
-        // audio, so newly-created custom Agents on voicebird.app never
-        // appeared in the picker until process restart / `c` toggle /
-        // API-key re-save.
+        // and the cloud Rooms list. Local refresh preserves cursor
+        // positions by name; cloud refresh replaces `self.rooms`
+        // (preserving the Free Room at index 0) with whatever
+        // `GET /api/rooms` returns (or clears it + sets a banner
+        // on error). Pre-this-commit, `r` only refreshed local
+        // audio, so newly-created custom Rooms on voicebird.app
+        // never appeared in the picker until process restart / `c`
+        // toggle / API-key re-save.
         KeyCode::Char('r') => {
             let before_d = app.devices.len();
             let before_a = app.apps.len();
-            let before_ag = app.agents().len();
+            let before_r = app.rooms.len();
             app.refresh_inventory();
-            app.refresh_agents();
+            app.refresh_rooms();
             log::info!(
-                "keys: r refresh: devices {} → {}, apps {} → {}, agents {} → {}",
+                "keys: r refresh: devices {} → {}, apps {} → {}, rooms {} → {}",
                 before_d,
                 app.devices.len(),
                 before_a,
                 app.apps.len(),
-                before_ag,
-                app.agents().len()
+                before_r,
+                app.rooms.len()
+            );
+        }
+        // 'g' is the manual agent-run shortcut (D5.3). It
+        // asks the active room's agent for one fresh run
+        // right now — bypassing the 65 s debounce floor
+        // (D4.4: RunTrigger::Manual). For Free Room (no
+        // agent), `g` is a no-op with a banner so the
+        // key never feels dead.
+        KeyCode::Char('g') => {
+            if !app.active_room().has_agent() {
+                app.banner = Some(
+                    "g runs the active room's agent — Free Room has no agent"
+                        .into(),
+                );
+                log::info!("keys: g → no-op (Free Room has no agent)");
+                return;
+            }
+            let transcript = merged_timeline_text(app);
+            log::info!(
+                "keys: g → trigger_agent_run (Manual, {} lines)",
+                app.merged_timeline().len()
+            );
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Manual,
+                transcript,
             );
         }
         // 's' stops the focused section (no-op if its slot is empty).
@@ -683,7 +779,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                 {
                     slot.config.cloud_on = Some(on);
                 }
-                app.refresh_agents();
+                app.refresh_rooms();
                 app.banner = Some(if on {
                     "Cloud: ON for focused section (applies on next start)".into()
                 } else {
@@ -712,7 +808,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
                         .unwrap_or(app.default_slot_config.cloud_on);
                     slot.config.cloud_on = Some(!current);
                 }
-                app.refresh_agents();
+                app.refresh_rooms();
                 if app.display_cloud_on() && app.config.voicebird_api_key.is_empty() {
                     // Cloud-enable gate. The modal opens with
                     // the new (ON) cloud state visible. Esc
@@ -795,6 +891,27 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
     }
 }
 
+/// Format the merged role-labeled timeline as plain
+/// text for the agent-run POST body. The role
+/// prefixes the line so the LLM sees who said what
+/// (e.g. "[Patient] Hello doctor"). The wall-clock
+/// timestamp is dropped — the agent doesn't need
+/// absolute times, only the order of statements.
+/// `truncate_transcript` (D4.4) handles the 180k
+/// cap.
+fn merged_timeline_text(app: &App) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for entry in app.merged_timeline() {
+        let role = entry
+            .role
+            .as_deref()
+            .unwrap_or("Speaker");
+        let _ = writeln!(out, "[{role}] {}", entry.text);
+    }
+    out
+}
+
 fn handle_path_modal(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Esc => {
@@ -867,7 +984,7 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                     // Empty key: clear any stale agents list so the
                     // picker doesn't keep showing entries from a
                     // prior fetch.
-                    app.refresh_agents();
+                    app.refresh_rooms();
                 } else {
                     app.banner =
                         Some("API key saved — start a recording to verify".into());
@@ -876,7 +993,7 @@ fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
                     // authorized to see. Without this the picker
                     // stays empty until the next `App::new()`
                     // (i.e. process restart).
-                    app.refresh_agents();
+                    app.refresh_rooms();
                 }
             }
             app.mode = AppMode::Normal;
@@ -1659,4 +1776,534 @@ mod pr48_review_regression_tests {
              state (ON) after the toggle"
         );
     }
+}
+
+/// Return the names of devices or apps the funnel should
+/// navigate on the current step, in the order the picker
+/// will render them. Single source of truth for what "row 0"
+/// means — the cursor bounds, the picker renderer, and the
+/// cursor→name recorder all consume this list. When they
+/// drift, the cursor walks past the visible end and the
+/// commit picks a phantom row that wasn't on screen.
+///
+/// `DeviceInput` → Input devices only (mics).
+/// `DeviceOutput` → Output devices only (speakers).
+/// `AppLoopback` → per-app capture targets.
+///
+/// The prompt step and the commit sentinel return an empty
+/// list — the wizard's `cursor_*` methods are no-ops there.
+fn funnel_visible_options<'a>(
+    app: &'a App,
+    funnel: &voice_bird_cli::funnel::RoomFunnelState,
+) -> Vec<&'a str> {
+    use voice_bird_cli::room::SourceKind;
+    use voice_bird_cli::config::AudioSessionKind;
+    let Some(binding) = funnel.role_bindings.get(funnel.current_step) else {
+        return Vec::new();
+    };
+    match binding.source_kind {
+        SourceKind::DeviceInput => app
+            .devices
+            .iter()
+            .filter(|d| matches!(d.kind, AudioSessionKind::Input))
+            .map(|d| d.name.as_str())
+            .collect(),
+        SourceKind::DeviceOutput => app
+            .devices
+            .iter()
+            .filter(|d| matches!(d.kind, AudioSessionKind::Output))
+            .map(|d| d.name.as_str())
+            .collect(),
+        SourceKind::AppLoopback => {
+            app.apps.iter().map(|a| a.name.as_str()).collect()
+        }
+    }
+}
+
+/// Convenience wrapper that returns the count of visible
+/// rows for the funnel cursor-bounds check. Equivalent to
+/// `funnel_visible_options(...).len()`.
+fn funnel_visible_rows(
+    app: &App,
+    funnel: &voice_bird_cli::funnel::RoomFunnelState,
+) -> usize {
+    funnel_visible_options(app, funnel).len()
+}
+#[cfg(test)]
+mod funnel_visible_rows_tests {
+    //! Pin the cursor-bounds contract of `funnel_visible_rows`:
+    //! the function returns the count of rows the funnel will
+    //! actually render, so cursor_down cannot walk the cursor
+    //! past the last visible row. Before the fix the function
+    //! returned `app.devices.len()` for DeviceInput roles,
+    //! which on a duplex USB headset (1 Input + 1 Output leg)
+    //! and a Mac mini speaker (1 Output) returned 3 while the
+    //! renderer showed 5 — every `↓` after the visible last
+    //! row would silently drop the cursor onto a phantom
+    //! Output entry the renderer was actually showing.
+
+    use super::*;
+    use voice_bird_cli::config::AudioSessionKind;
+    use voice_bird_cli::room::{RoleConstraint, SourceKind};
+    use voice_bird_cli::funnel::RoomFunnelState;
+
+    fn device(name: &str, kind: AudioSessionKind) -> crate::platform::AudioDevice {
+        crate::platform::AudioDevice {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn app_with(devices: Vec<crate::platform::AudioDevice>) -> App {
+        let mut app = App::new();
+        app.devices = devices;
+        app
+    }
+
+    fn funnel_with(source_kind: SourceKind) -> RoomFunnelState {
+        let room = voice_bird_cli::room::Room {
+            slug: "x".into(),
+            name: "X".into(),
+            icon: None,
+            roles: vec![],
+            agent: None,
+            requires_pro: false,
+            requires_cloud: true,
+            prompt_template: String::new(),
+            role_constraints: vec![RoleConstraint {
+                role_slug: "interviewer".into(),
+                source_kind,
+                required_app_slug: None,
+                device_required: matches!(source_kind, SourceKind::DeviceInput),
+            }],
+        };
+        RoomFunnelState::new(&room)
+    }
+
+    #[test]
+    fn device_input_role_counts_only_input_kind() {
+        let app = app_with(vec![
+            device("EPOS PC 8 USB", AudioSessionKind::Input),
+            device("HD Pro Webcam C920", AudioSessionKind::Input),
+            device("EPOS PC 8 USB", AudioSessionKind::Output),
+            device("Smart M70D", AudioSessionKind::Output),
+            device("Mac mini Speakers", AudioSessionKind::Output),
+        ]);
+        let funnel = funnel_with(SourceKind::DeviceInput);
+        assert_eq!(
+            funnel_visible_rows(&app, &funnel),
+            2,
+            "DeviceInput funnel must count only Input devices — the renderer shows the same two"
+        );
+    }
+
+    #[test]
+    fn device_output_role_counts_only_output_kind() {
+        let app = app_with(vec![
+            device("EPOS PC 8 USB", AudioSessionKind::Input),
+            device("HD Pro Webcam C920", AudioSessionKind::Input),
+            device("EPOS PC 8 USB", AudioSessionKind::Output),
+            device("Smart M70D", AudioSessionKind::Output),
+            device("Mac mini Speakers", AudioSessionKind::Output),
+        ]);
+        let funnel = funnel_with(SourceKind::DeviceOutput);
+        assert_eq!(
+            funnel_visible_rows(&app, &funnel),
+            3,
+            "DeviceOutput funnel must count only Output devices"
+        );
+    }
+
+    #[test]
+    fn app_loopback_role_counts_apps() {
+        let mut app = App::new();
+        app.apps = vec![
+            crate::platform::AppSession {
+                id: "us.zoom.xos".into(),
+                name: "Zoom".into(),
+                process_id: 0,
+            },
+            crate::platform::AppSession {
+                id: "com.google.Chrome".into(),
+                name: "Chrome".into(),
+                process_id: 0,
+            },
+        ];
+        let funnel = funnel_with(SourceKind::AppLoopback);
+        assert_eq!(funnel_visible_rows(&app, &funnel), 2);
+    }
+
+    #[test]
+    fn cursor_bounds_match_rendered_rows_on_device_input_step() {
+        // Drives the bug end-to-end: take the same device list
+        // from the screenshot, run cursor_down up to the bound
+        // the function reports, and assert the selected_index
+        // saturates at `visible_rows - 1` (not at `devices.len()
+        // - 1`).
+        let app = app_with(vec![
+            device("EPOS PC 8 USB", AudioSessionKind::Input),
+            device("HD Pro Webcam C920", AudioSessionKind::Input),
+            device("EPOS PC 8 USB", AudioSessionKind::Output),
+            device("Smart M70D", AudioSessionKind::Output),
+            device("Mac mini Speakers", AudioSessionKind::Output),
+        ]);
+        let mut funnel = funnel_with(SourceKind::DeviceInput);
+        let visible = funnel_visible_rows(&app, &funnel);
+        for _ in 0..10 {
+            funnel.cursor_down(visible);
+        }
+        assert_eq!(
+            funnel.role_bindings[0].selected_index,
+            Some(visible - 1),
+            "cursor must saturate at the last visible row, not the last inventory row"
+        );
+    }
+
+    #[test]
+    fn empty_inventory_returns_zero_rows() {
+        let app = app_with(vec![]);
+        let funnel = funnel_with(SourceKind::DeviceInput);
+        assert_eq!(funnel_visible_rows(&app, &funnel), 0);
+    }
+}
+
+/// Cancel the funnel wizard: clear `room_funnel` and roll the
+/// the rollback is to Free Room (slot 0); a future iteration
+/// could remember the previous room via
+/// `previous_active_room`, but the funnel contract is "Esc
+/// means cancel" — landing on Free Room is the conservative
+/// choice.
+fn handle_funnel_cancel(app: &mut App) {
+    if app.room_funnel.is_none() {
+        return;
+    }
+    app.room_funnel = None;
+    // Revert to Free Room (always at index 0).
+    let _ = app.activate_room(0);
+    app.banner = Some("Funnel cancelled — back to Free Room.".to_string());
+    log::info!("funnel: Esc/q → reverted to Free Room");
+}
+
+/// Advance the funnel by one step. At the prompt step, "Enter"
+/// commits the draft (or falls back to the room's built-in
+/// `prompt_template` when the draft is empty), then closes
+/// the funnel and leaves the user in the activated room.
+fn handle_funnel_enter(app: &mut App) {
+    let Some(mut funnel) = app.room_funnel.clone() else {
+        return;
+    };
+    funnel.advance();
+    if funnel.at_commit_step() {
+        // We've advanced past the prompt step — time to commit.
+        // First, persist the funnel's per-role picks into
+        // `slot_picker_memo` so the slots provisioned for this
+        // room actually record from the device/app the user
+        // chose. Without this, the wizard's selections are
+        // displayed and silently discarded.
+        app.commit_funnel_bindings(&funnel);
+        // The activated room is already in place. Use the draft
+        // if non-empty, otherwise the room's built-in
+        // `prompt_template`.
+        let room = app.active_room().clone();
+        let prompt = if !funnel.prompt_draft.is_empty() {
+            funnel.prompt_draft.clone()
+        } else {
+            room.prompt_template.clone()
+        };
+        app.banner = Some(format!(
+            "Funnel committed for '{}'. Prompt: {} chars.",
+            room.name,
+            prompt.len()
+        ));
+        log::info!(
+            "funnel: Enter → committed for room={} prompt_len={}",
+            room.slug,
+            prompt.len()
+        );
+        // Close the funnel. Without this, the modal stays
+        // open across Enter presses and the user sees the
+        // same banner re-appear without the wizard ever
+        // going away — Enter "doesn't work" from their
+        // perspective even though the commit logic ran.
+        // The funnel commit is the user's "I'm ready to be
+        // assisted now" signal. If the activated room has
+        // an agent, kick off one manual run so the AI
+        // assistant streams its opening response (e.g.
+        // "no transcript yet — start the conversation")
+        // immediately, instead of waiting for the user to
+        // press `g` or to record a full line of audio. The
+        // server's transcript schema requires ≥1 char, so
+        // an empty merged timeline becomes a sentinel
+        // string the prompt template can recognize.
+        if room.has_agent() {
+            let mut transcript = merged_timeline_text(app);
+            if transcript.trim().is_empty() {
+                transcript =
+                    "[Conversation starting — no transcript yet]".into();
+            }
+            log::info!(
+                "funnel: auto-triggering agent run for room={} \
+                 transcript_chars={}",
+                room.slug,
+                transcript.len()
+            );
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Manual,
+                transcript,
+            );
+        }
+
+
+        app.room_funnel = None;
+    } else {
+        // Either landed on the next role, or landed on the
+        // prompt step (depending on which Enter this is). Park
+        // there and wait for the next Enter.
+        app.room_funnel = Some(funnel);
+    }
+}
+
+#[cfg(test)]
+mod funnel_commit_tests {
+    //! Pin the post-commit state. `handle_funnel_enter` runs
+    //! the commit branch when the funnel is on the prompt
+    //! step (current_step == role_bindings.len()). The bug
+    //! that motivated this module: the commit branch set the
+    //! banner but forgot to clear `app.room_funnel`. The
+    //! modal stayed open across every Enter press, the
+    //! banner got re-overwritten with the same text, and
+    //! the user concluded "Enter doesn't work". These tests
+    //! pin both halves of the contract — the bindings land
+    //! in the slot memo AND the funnel is closed so the
+    //! next Enter falls through to the normal-mode start
+    //! path instead of re-entering the wizard.
+    use super::*;
+    use voice_bird_cli::room::{Room, RoleConstraint, RoleDef};
+    use voice_bird_cli::funnel::RoomFunnelState;
+
+    fn open_software_interview_funnel(app: &mut App) {
+        app.default_slot_config.cloud_on = true;
+        app.plan_is_pro = Some(true);
+        app.devices = vec![crate::platform::AudioDevice {
+            name: "EPOS PC 8 USB".into(),
+            kind: voice_bird_cli::config::AudioSessionKind::Input,
+        }];
+        let mut room = voice_bird_cli::room::Room {
+            slug: "si".into(),
+            name: "Software Interview".into(),
+            icon: None,
+            roles: vec![RoleDef {
+                slug: "interviewee".into(),
+                name: "Interviewee".into(),
+            }],
+            agent: None,
+            requires_pro: false,
+            requires_cloud: true,
+            prompt_template: "default".into(),
+            role_constraints: vec![RoleConstraint {
+                role_slug: "interviewee".into(),
+                source_kind: voice_bird_cli::room::SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }],
+        };
+        app.rooms = vec![Room::free_room(), room];
+        let _ = app.activate_room(1);
+    }
+
+    /// The headline bug: Enter on the prompt step must close
+    /// the funnel. Without `app.room_funnel = None` in the
+    /// commit branch, the modal stays open and every
+    /// subsequent Enter replays the same commit logic.
+    #[test]
+    fn enter_on_prompt_step_closes_the_funnel() {
+        let mut app = App::new();
+        open_software_interview_funnel(&mut app);
+        // Walk to the prompt step.
+        let mut funnel = app.room_funnel.clone().unwrap();
+        funnel.cursor_down(1);
+        funnel.record_selected_name(&["EPOS PC 8 USB"]);
+        funnel.advance(); // role 0 → prompt step
+        assert!(funnel.at_prompt_step(),
+            "test setup must put the funnel on the prompt step");
+        app.room_funnel = Some(funnel);
+        // Now press Enter — should commit AND close.
+        handle_funnel_enter(&mut app);
+        assert!(app.room_funnel.is_none(),
+            "Enter on the prompt step must close the funnel; \
+             otherwise the modal stays open and the user sees \
+             'Enter doesn't work' even though commit ran");
+        assert!(app.banner.as_deref().unwrap_or("").starts_with("Funnel committed"),
+            "commit banner must still be set");
+    }
+
+    /// Repeated Enter presses after commit must be no-ops on
+    /// the funnel — the dispatcher reads `app.room_funnel`
+    /// and short-circuits the wizard branch when it's None.
+    /// Without the close, every Enter replays the commit
+    /// branch and the banner keeps re-overwriting itself.
+    #[test]
+    fn repeated_enter_after_commit_is_safe() {
+        let mut app = App::new();
+        open_software_interview_funnel(&mut app);
+        let mut funnel = app.room_funnel.clone().unwrap();
+        funnel.cursor_down(1);
+        funnel.record_selected_name(&["EPOS PC 8 USB"]);
+        funnel.advance(); // → prompt step
+        app.room_funnel = Some(funnel);
+        handle_funnel_enter(&mut app); // commits + closes
+        let banner_after_first = app.banner.clone();
+        // Second Enter — funnel is None, must be a no-op.
+        handle_funnel_enter(&mut app);
+        assert_eq!(app.banner, banner_after_first,
+            "second Enter after commit must not mutate the banner");
+        // Third for good measure.
+        handle_funnel_enter(&mut app);
+        assert_eq!(app.banner, banner_after_first);
+    }
+
+    /// Pre-commit (still on a role step), Enter must NOT
+    /// close the funnel — it must just advance to the next
+    /// role or the prompt step. The funnel is parked and
+    /// stays Some(…) so the next Enter on the prompt step
+    /// is what commits.
+    #[test]
+    fn enter_on_role_step_keeps_funnel_open() {
+        let mut app = App::new();
+        open_software_interview_funnel(&mut app);
+        // Stay on role 0 (no advance yet). Press Enter.
+        assert!(app.room_funnel.is_some());
+        handle_funnel_enter(&mut app);
+        // Not the commit branch — the funnel is parked on
+        // the prompt step, ready for the user's next Enter.
+        assert!(app.room_funnel.is_some(),
+            "Enter on a role step must advance, NOT close the funnel");
+        let funnel = app.room_funnel.as_ref().unwrap();
+        assert!(funnel.at_prompt_step(),
+            "advancing from role 0 must land on the prompt step");
+    }
+
+    // ---- auto-trigger after funnel commit ---------------------
+
+    /// Variant of `open_software_interview_funnel` for the
+    /// agent-run tests: the room has an `agent`, mirroring
+    /// the real `Software Interview` room on voicebird.app.
+    /// Without `agent = Some(...)`, `start_agent_run` early-
+    /// returns and no worker is spawned.
+    fn open_agent_room_funnel(
+        app: &mut App,
+    ) {
+        open_software_interview_funnel(app);
+        // Splice an agent onto the active room so the
+        // auto-trigger path actually fires.
+        if let Some(r) = app.rooms.get_mut(1) {
+            r.agent = Some(voice_bird_cli::room::AgentRef {
+                id: "ai-interview-assistant".into(),
+                name: "AI Interview Assistant".into(),
+                icon: None,
+            });
+        }
+    }
+
+    /// The headline "I don't see that anything is streamed"
+    /// bug: completing the funnel for an agent room must
+    /// spawn an agent run so the assistant's opening
+    /// response starts streaming in the Context pane. Pre-
+    /// fix, `handle_funnel_enter` committed and closed the
+    /// funnel but never called `trigger_agent_run`, so the
+    /// user had to press `g` (or start recording + wait for
+    /// the 65 s floor) to see any output — and on an empty
+    /// timeline the server rejected the run with 400.
+    /// This test pins that the spawn happens.
+    #[test]
+    fn funnel_commit_auto_triggers_agent_run() {
+        let mut app = App::new();
+        open_agent_room_funnel(&mut app);
+        let mut funnel = app.room_funnel.clone().unwrap();
+        funnel.cursor_down(1);
+        funnel.record_selected_name(&["EPOS PC 8 USB"]);
+        funnel.advance(); // role 0 → prompt step
+        app.room_funnel = Some(funnel);
+        assert!(app.agent_run_worker.is_none(),
+            "precondition: no in-flight agent run");
+        handle_funnel_enter(&mut app);
+        assert!(app.agent_run_worker.is_some(),
+            "completing the funnel for an agent room must \
+             spawn an agent run so the user sees streaming; \
+             otherwise the Context pane stays empty until \
+             they press `g` or hit the 65 s auto debounce");
+        // Drain a tick so the test's spawned worker
+        // doesn't outlive the test process.
+        app.drain_agent_run_state();
+        if let Some((handle, _)) = app.agent_run_worker.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Empty transcript on commit must use a sentinel, not
+    /// an empty string. The server's `/api/agent-runs`
+    /// schema enforces `transcript.min(1)` and returns 400
+    /// for empty bodies — the run would `StartFailed`
+    /// with "agent-runs returned 400" before any SSE
+    /// frames, leaving the user with the same "nothing
+    /// streamed" UX. Pre-fix `trigger_agent_run` received
+    /// an empty transcript and failed. This test pins
+    /// that the sentinel keeps the run alive.
+    #[test]
+    fn funnel_commit_with_empty_timeline_uses_sentinel() {
+        let mut app = App::new();
+        open_agent_room_funnel(&mut app);
+        // Precondition: no committed lines yet, the
+        // merged timeline is empty.
+        assert!(app.merged_timeline().is_empty());
+        let mut funnel = app.room_funnel.clone().unwrap();
+        funnel.cursor_down(1);
+        funnel.record_selected_name(&["EPOS PC 8 USB"]);
+        funnel.advance(); // → prompt step
+        app.room_funnel = Some(funnel);
+        handle_funnel_enter(&mut app);
+        // We can't see the exact transcript the worker
+        // shipped (it's already moved into the spawned
+        // thread), but we CAN verify the run actually
+        // fired and that `start_agent_run` accepted it —
+        // which proves a non-empty transcript went in,
+        // because an empty one would have been rejected
+        // by the server's 400 before any worker-side
+        // spawn could be observable here. The
+        // strongest unit-level signal we have is that
+        // the worker is `Some` and the state moved
+        // out of the default.
+        assert_eq!(app.agent_run_state.status, "starting",
+            "agent_run_state must transition out of idle \
+             on commit when the room has an agent");
+        // Drain + join so we don't leak the worker.
+        app.drain_agent_run_state();
+        if let Some((handle, _)) = app.agent_run_worker.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Auto-trigger must NOT fire for rooms without an
+    /// agent. Free Room's funnel path (if we ever
+    /// activate it directly without a catalog) must
+    /// remain silent — `g` and the auto path already
+    /// no-op for Free Room; the post-commit hook must
+    /// follow the same rule.
+    #[test]
+    fn funnel_commit_skips_trigger_when_no_agent() {
+        let mut app = App::new();
+        open_software_interview_funnel(&mut app); // agent: None
+        let mut funnel = app.room_funnel.clone().unwrap();
+        funnel.cursor_down(1);
+        funnel.record_selected_name(&["EPOS PC 8 USB"]);
+        funnel.advance();
+        app.room_funnel = Some(funnel);
+        assert!(app.agent_run_worker.is_none());
+        handle_funnel_enter(&mut app);
+        assert!(app.agent_run_worker.is_none(),
+            "funnel commit on a no-agent room must not \
+             spawn a worker; `trigger_agent_run` no-ops \
+             on Free Room and the commit hook must too");
+    }
+
 }

@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+    use voice_bird_cli::room::{RoleConstraint, SourceKind};
 
 use parking_lot::Mutex as PlMutex;
 
 use crate::platform::{AppSession, AudioDevice};
 use voice_bird_cli::config::{AppConfig, DefaultSlotConfig};
+use voice_bird_cli::room::{Room, RoleDef};
 use voice_bird_cli::session::layout::SessionSource;
 use voice_bird_cli::session::target::Target;
 /// Application running mode
@@ -65,6 +67,7 @@ pub struct PickerState {
 }
 
 /// A single committed (finalized) transcript line.
+#[derive(Clone)]
 pub struct CommittedLine {
     pub t_start_ms: u64,
     pub text: String,
@@ -96,6 +99,12 @@ pub struct SavedTranscript {
     /// and rewrites this field, so post-stop changes (language,
     /// cloud toggle) take effect on the resumed section.
     pub settings: SectionSettings,
+    /// Wall-clock start of the original recording — the merged
+    /// timeline anchors lines to this moment.
+    pub session_started_at: chrono::DateTime<chrono::Utc>,
+    /// Optional role binding (set when the slot was provisioned
+    /// by an agent room).
+    pub role: Option<RoleDef>,
 }
 pub struct RecordingRuntime {
     pub join: tokio::task::JoinHandle<()>,
@@ -183,10 +192,6 @@ pub struct Section {
     pub refined: Arc<PlMutex<Vec<CommittedLine>>>,
     /// Latest tentative (in-progress) transcript text.
     pub tentative: Arc<PlMutex<String>>,
-    /// On-disk session directory (`None` when broadcasting to cloud).
-    pub session_dir: Option<PathBuf>,
-    /// Wall-clock start of this section.
-    pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Which engine is actually running ("whisperkit" / "whisper_rs" /
     /// "voicebird"). Persisted into `meta.json` at stop.
     pub engine_kind: String,
@@ -198,6 +203,14 @@ pub struct Section {
     /// Wall-clock time when the cloud reminder banner should be hidden
     /// (3 s after recording start). `None` for local sections.
     pub cloud_reminder_until: Option<std::time::Instant>,
+    /// On-disk session directory (`None` when broadcasting to cloud).
+    pub session_dir: Option<PathBuf>,
+    /// Optional role binding. `start_section` copies this from
+    /// `slot.role` so the running section knows which human
+    /// `Role:` label prefix.
+    pub role: Option<RoleDef>,
+    /// Wall-clock start of this section.
+    pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Transcript scroll offset for this section (lines from top).
     /// Only consulted when `transcript_follow` is false.
     pub transcript_scroll: u16,
@@ -254,10 +267,15 @@ impl std::fmt::Debug for SlotKind {
         }
     }
 }
-
 pub struct Slot {
     pub id: SlotId,
     pub kind: SlotKind,
+    /// Optional role binding. `Some` for slots provisioned by an
+    /// agent room — the slot renders its role name in the title
+    /// and `start_section` records the role on the section so
+    /// `merged_timeline` can label entries. Free Room slots are
+    /// `None`.
+    pub role: Option<RoleDef>,
     /// Per-slot settings. Each slot starts with
     /// `SlotConfig::default_passthrough()` (every field inherits
     /// from `App::default_slot_config`). The c/l/m/P keys and the
@@ -266,12 +284,12 @@ pub struct Slot {
     /// `Section.settings` at start time.
     pub config: SlotConfig,
 }
-
 impl Slot {
     pub fn empty(id: SlotId) -> Self {
         Self {
             id,
             kind: SlotKind::Empty,
+            role: None,
             config: SlotConfig::default_passthrough(),
         }
     }
@@ -313,9 +331,8 @@ impl std::fmt::Debug for Slot {
 pub enum PickerFocus {
     Devices,
     Apps,
-    Agents,
+    Rooms,
 }
-
 /// Per-slot memo of the picker cursor. The Devices / Apps cursors on
 /// `App` always reflect the FOCUSED slot's state; this struct holds
 /// the last cursor position seen for a slot that's not currently
@@ -334,10 +351,11 @@ pub struct App {
     /// Current mode
     pub mode: AppMode,
 
+
     /// Capturable input/output devices (left pane of the picker).
     pub devices: Vec<AudioDevice>,
 
-    /// Per-application capture targets (right pane of the picker).
+    /// Per-application capture targets (middle pane of the picker).
     pub apps: Vec<AppSession>,
 
     /// Cursor in the Devices pane.
@@ -346,11 +364,10 @@ pub struct App {
     /// Cursor in the Apps pane. `None` = no app paired (run device alone).
     pub selected_app_index: Option<usize>,
 
-    /// Cursor in the Agents pane. The list of agents is fixed at
-    /// three entries (Stdout / Cloud / Agent) — see `targets()`. Always
-    /// `Some(idx)` while the TUI runs; the cursor is one of the
-    /// rendered rows.
-    pub selected_target_index: Option<usize>,
+    /// Cursor in the Rooms pane. The list of rooms is one row per
+    /// catalog entry (Free Room at index 0, then cloud-fetched rooms).
+    /// Always `Some(idx)` while the TUI runs.
+    pub selected_room_index: usize,
 
     /// Which pane the picker arrows / Enter target.
     pub picker_focus: PickerFocus,
@@ -359,7 +376,7 @@ pub struct App {
     /// auto-clamps these so the cursor stays visible.
     pub device_scroll: u16,
     pub app_scroll: u16,
-    pub target_scroll: u16,
+    pub room_scroll: u16,
 
     /// Aggregate recording status (Recording iff any section is running;
     /// Error iff the focused section has erred; Idle otherwise).
@@ -454,34 +471,39 @@ pub struct App {
     /// Per-slot pending target override. The Agents picker writes
     /// to this when the user picks a row; the next `start_section`
     /// consults it and applies it instead of the default
-    /// `cloud_on` heuristic. The value is consumed (set back to
-    /// `None`) by start_section so it only affects the very next
+    pub active_room: usize,
+    /// Path of the active room session dir (`<ts>-room-<slug>/`)
+    /// when an agent room is active. `None` when Free Room is
+    /// active (which has no parent dir) or before the first
+    /// activation.
+    pub room_session_dir: Option<std::path::PathBuf>,
+    /// Last-known `plan` value from `/api/rooms`.
     /// start.
     pub pending_target_overrides: std::collections::BTreeMap<SlotId, Target>,
 
     /// Cloud Agents fetched from `GET /api/agents`. Populated by
     /// `App::refresh_agents` when the user has cloud on AND an API
-    /// key. The Agents picker renders one row per entry here —
-    /// `App::targets()` reads from this list, never from a
-    /// hard-coded `Stdout` row.
-    pub agents: Vec<voice_bird_cli::cloud::agents::Agent>,
-
-    /// Per-slot pending agent override. The Agents picker writes
-    /// to this when the user picks a row; `start_section` /
-    /// `pick_agent` consults it to resolve which cloud Agent the
-    /// `g` key (§11) should run. Distinct from
-    /// `pending_target_overrides`, which tracks the on-disk
-    /// `Target::Stdout` routing decision.
-    pub pending_agent_overrides: std::collections::BTreeMap<SlotId, String>,
-
-    /// Per-slot memo of the picker cursor (Devices / Apps / focus).
-    /// `App::selected_device_index`, `selected_app_index`, and
-    /// `picker_focus` always reflect the FOCUSED slot's state. When
-    /// the user Tabs to a different slot, the current cursor is
-    /// saved here under the outgoing slot id, and the incoming
-    /// slot's memo is loaded back into the cursor fields. This way
-    /// each slot remembers the last device + app it was parked on,
-    /// even if the user never pressed Enter to start a recording.
+    /// Rooms catalog fetched from `GET /api/rooms`. Index 0 is
+    /// always `Room::free_room()` so the TUI never needs a
+    /// "no rooms" branch — Free Room is the offline default
+    /// and is hardcoded locally.
+    pub rooms: Vec<Room>,
+    /// Active funnel wizard. Non-None when the user is mid-way
+    /// through activating a non-Free Room's setup wizard.
+    /// The dispatcher polls this to route Esc/q/Enter.
+    pub room_funnel: Option<voice_bird_cli::funnel::RoomFunnelState>,
+    /// Last active room index for `Esc`-driven funnel cancel.
+    pub previous_active_room: Option<usize>,
+    /// Index into `rooms` of the currently active room. Drives
+    /// the slot provisioning (Free Room → one empty slot;
+    /// agent room → one empty slot per role) and the merged
+    /// timeline view.
+    /// Last-known `plan` value from `/api/rooms`. `None` until
+    /// the first successful fetch (or after a 5xx); `Some(true)`
+    /// when the user is on Pro and agent rooms unlock,
+    /// `Some(false)` when they're not. The 402 response from
+    /// agent runs also forces this to `Some(false)`.
+    pub plan_is_pro: Option<bool>,
     /// Entries are pruned when a slot is removed (its id is
     /// never reused). In-memory only — not persisted across restarts.
     pub slot_picker_memo: std::collections::BTreeMap<SlotId, PickerSelection>,
@@ -501,8 +523,24 @@ pub struct App {
     /// (settings UI not yet implemented) but per-slot writes
     /// never mutate it.
     pub default_slot_config: voice_bird_cli::config::DefaultSlotConfig,
-}
 
+    /// Live state of any in-flight agent run. Written by
+    /// `App::drain_agent_run_state` from the worker's
+    /// mpsc channel. Rendered by the agent-room TUI
+    /// branch (D5.1).
+    pub agent_run_state: voice_bird_cli::cloud::run::AgentRunState,
+
+    /// Handle to the in-flight agent-run worker (if any).
+    /// Set by `App::start_agent_run`, cleared when the
+    /// worker finishes or when `App` shuts down. The
+    /// worker is single-shot per run: when it returns,
+    /// `drain_agent_run_state` joins it and resets this
+    /// to `None`.
+    pub agent_run_worker: Option<(
+        std::thread::JoinHandle<voice_bird_cli::cloud::run::AgentRunError>,
+        std::sync::mpsc::Receiver<voice_bird_cli::cloud::run::RunEvent>,
+    )>,
+ }
 /// One row in the `t` status overlay.
 #[derive(Debug, Clone)]
 pub struct AppEvent {
@@ -511,39 +549,293 @@ pub struct AppEvent {
     pub message: String,
 }
 
-/// A single row in the Agents picker.
-/// The picker renders
-/// one row per known target; rows that point at a target
-/// the user can't actually use (e.g. Agent when the
-/// runtime binary is missing) are tagged `disabled = true`.
-/// `disabled` rows render dim and the cursor refuses to
-/// land on them (see `App::focused_target_kind`).
-pub struct TargetRow {
-    pub kind: TargetKind,
-    pub disabled: bool,
+/// One row in the merged role-labeled timeline. Built by
+/// `App::merged_timeline` (D3.3) and consumed by the room
+/// view TUI (D5). The per-frame cost is O(N lines) which is
+/// fine at TUI transcript sizes.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    /// Absolute wall-clock time = `session_started_at +
+    /// committed_line.t_start_ms`.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// Role label (`None` for free-room slots).
+    pub role: Option<String>,
+    pub slot: SlotId,
+    pub text: String,
 }
-/// Picker-side classification of a target row. `Stdout` is
-/// retained for legacy `pick_target` callers but never
-/// produced by `App::targets()` — the §10 picker only shows
-/// `Agent(id)` rows derived from `GET /api/agents`. Routing
-/// on-disk (the `Target` enum in `session/target`) is a
-/// separate axis: an `Agent(id)` pick still defaults to
-/// `Target::Stdout` for local file persistence unless the
-/// caller explicitly switches the section's transport flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TargetKind {
-    /// Legacy: forces local persistence via the routing
-    /// `Target::Stdout` override. Never emitted by
-    /// `App::targets()`.
-    Stdout,
-    /// A cloud Agent id fetched from `GET /api/agents`.
-    /// `pick_target(TargetKind::Agent(id))` records the id
-    /// in `pending_agent_overrides` so `start_section` /
-    /// the §11 `g` key handler can look it up.
-    Agent(String),
-}
+
 impl App {
-    /// Create a new application instance
+    /// Snapshot the current picker cursor under the given slot id.
+    /// Called immediately before focus moves away from that slot.
+    /// The cursor fields on `App` keep holding the slot's state
+    /// until the caller switches `focused_slot`, at which point
+    /// `restore_picker_for` loads the next slot's memo back in.
+    fn memoize_picker_for(&mut self, slot: SlotId) {
+        self.slot_picker_memo.insert(
+            slot,
+            PickerSelection {
+                device_idx: self.selected_device_index,
+                app_idx: self.selected_app_index,
+                focus: self.picker_focus,
+            },
+        );
+    }
+
+    /// Load the memoized picker cursor for the given slot id into
+    /// the cursor fields on `App`. No-op if the slot has no memo
+    /// (first time the user Tabs to it) — the cursor simply keeps
+    /// whatever value it had, which is the natural "first focus
+    /// inherits current state" behavior.
+    fn restore_picker_for(&mut self, slot: SlotId) {
+        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
+            // Clamp the restored indices against the current
+            // inventory — a refresh may have shrunk `devices` /
+            // `apps` between Tab-away and Tab-back.
+            let dev_idx = if self.devices.is_empty() {
+                0
+            } else {
+                p.device_idx.min(self.devices.len() - 1)
+            };
+            let app_idx = p.app_idx.and_then(|i| {
+                if self.apps.is_empty() {
+                    None
+                } else {
+                    Some(i.min(self.apps.len() - 1))
+                }
+            });
+            self.selected_device_index = dev_idx;
+            self.selected_app_index = app_idx;
+            self.picker_focus = p.focus;
+        }
+    }
+
+    /// Start a fresh agent run for the currently active
+    /// room (which must have an agent). Spawns the
+    /// worker thread, replaces any in-flight worker
+    /// (D4.4: the older worker is joined and dropped
+    /// — the new request supersedes it), and resets
+    /// the streaming buffer. No-op when the active
+    /// room has no agent (Free Room).
+    ///
+    /// Returns the previous JoinHandle (if any) so
+    /// callers can join on shutdown.
+    pub fn start_agent_run(&mut self, transcript: String) {
+        use voice_bird_cli::cloud::run::{
+            spawn_agent_run, AgentRunState, RunRequest,
+        };
+        // Free Room has no agent — start_agent_run is
+        // a no-op there. The TUI guards against calling
+        // it for Free Room, but we double-check.
+        let room = match self.rooms.get(self.active_room) {
+            Some(r) if r.has_agent() => r,
+            _ => return,
+        };
+        let agent = match room.agent.as_ref() {
+            Some(a) => a,
+            None => return,
+        };
+        // If a worker is already in flight, join it
+        let base_url = self.config.voicebird_server_url.clone();
+        let api_key = self.config.voicebird_api_key.clone();
+        let req = RunRequest {
+            base_url,
+            api_key,
+            agent_id: agent.id.clone(),
+            room_slug: Some(room.slug.clone()),
+            source_label: Some("desktop".into()),
+            transcript,
+        };
+        self.agent_run_state = AgentRunState {
+            status: "starting".into(),
+            streaming: String::new(),
+            last_completed_md: std::mem::take(
+                &mut self.agent_run_state.last_completed_md,
+            ),
+            last_run_started: Some(std::time::Instant::now()),
+            lines_at_last_run: self.merged_timeline().len(),
+            queued: false,
+            last_error: None,
+            run_id: None,
+            plan_is_pro: self.agent_run_state.plan_is_pro,
+        };
+        self.agent_run_worker = Some(spawn_agent_run(req));
+    }
+
+    /// Drain the worker channel into `self.agent_run_state`.
+    /// Called once per UI tick (D4.3 wiring). Non-blocking —
+    /// the mpsc `try_recv` returns `Empty` when no frames
+    /// are ready. When the worker joins (the JoinHandle
+    /// reports `is_finished`), we mark the run as completed
+    /// and clear `agent_run_worker`.
+    pub fn drain_agent_run_state(&mut self) {
+        use voice_bird_cli::cloud::run::{AgentRunError, RunEvent};
+        let Some((handle, rx)) = self.agent_run_worker.as_ref() else {
+            return;
+        };
+        // Drain every available frame (non-blocking).
+        loop {
+            match rx.try_recv() {
+                Ok(RunEvent::Status { run_id, status }) => {
+                    self.agent_run_state.run_id = Some(run_id);
+                    self.agent_run_state.status = status.to_string();
+                }
+                Ok(RunEvent::Delta { text, .. }) => {
+                    self.agent_run_state.streaming.push_str(&text);
+                }
+                Ok(RunEvent::Done {
+                    content_markdown, ..
+                }) => {
+                    self.agent_run_state.last_completed_md =
+                        content_markdown;
+                    self.agent_run_state.streaming.clear();
+                    self.agent_run_state.status = "completed".into();
+                }
+                Ok(RunEvent::Error { message, .. }) => {
+                    self.agent_run_state.last_error = Some(message);
+                    self.agent_run_state.status = "failed".into();
+                }
+                Ok(RunEvent::DoneFinal) => {
+                    // Server closed the stream. The
+                    // "completed" / "failed" status was
+                    // already set by the matching
+                    // Delta/Done/Error frame; this is
+                    // just the EOF marker. We leave the
+                    // status as-is — the worker thread
+                    // is about to exit.
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Worker dropped the Sender (it
+                    // returned from run_event_loop).
+                    // Mark done; the join below will
+                    // observe the AgentRunError.
+                    if self.agent_run_state.status == "starting"
+                        || self.agent_run_state.status == "running"
+                    {
+                        self.agent_run_state.status =
+                            "failed".into();
+                    }
+                    break;
+                }
+            }
+        }
+        // If the worker has finished, join it and clear
+        // the slot. We check `is_finished` first so we
+        // never block the UI thread on `join()`.
+        if handle.is_finished() {
+            let (handle, rx) = self.agent_run_worker.take().unwrap();
+            drop(rx);
+            match handle.join() {
+                Ok(AgentRunError::None) => {
+                    // already handled by the matching
+                    // Done / Error frame
+                }
+                Ok(AgentRunError::StartFailed(msg)) => {
+                    use voice_bird_cli::cloud::run::{
+                        classify_run_start_error, RunStartError,
+                    };
+                    self.agent_run_state.last_error = Some(msg.clone());
+                    let typed = classify_run_start_error(&msg);
+                    // 402 → user is on free tier. Mark
+                    // plan_is_pro = Some(false) so the
+                    // next auto-run is suppressed (D4.4
+                    // reads this).
+                    if typed == RunStartError::ProRequired {
+                        self.agent_run_state.plan_is_pro = Some(false);
+                    }
+                    // 401 → bad API key. Open the
+                    // api-key modal so the user can
+                    // re-enter it. The modal is keyed
+                    // off `api_key_buf.is_some()`.
+                    if typed == RunStartError::BadApiKey {
+                        self.open_api_key_modal();
+                    }
+                    self.agent_run_state.status = classify_start_error(
+                        self.agent_run_state
+                            .last_error
+                            .as_deref()
+                            .unwrap_or(""),
+                    );
+                }
+                Ok(AgentRunError::StreamFailed(msg)) => {
+                    self.agent_run_state.last_error = Some(msg);
+                    self.agent_run_state.status = "failed".into();
+                }
+                Err(_) => {
+                    // Worker panicked. Mark failed
+                    // and let the user retry.
+                    self.agent_run_state.status = "failed".into();
+                }
+             }
+         }
+    }
+
+    /// Decide whether to start an agent run right now and,
+    /// if so, start it. This is the single entry point
+    /// every callsite (D4.4 auto path, the `g` keybind,
+    /// the `stop_section` final-run hook) uses — the
+    /// decision logic lives in `cloud::run::should_run_now`
+    /// so it's pure-testable without an App.
+    ///
+    /// `trigger`:
+    ///   - Auto: a new line was added. Respect the 65 s
+    ///     floor and the queue.
+    ///   - Manual: the user pressed `g`. Bypasses the
+    ///     floor; if a run is in flight, sets `queued = true`
+    ///     and the worker will re-run after the current
+    ///     run completes.
+    ///   - Stop: the user stopped the recording. Forces
+    ///     a final run; bypasses the floor.
+    ///
+    /// `transcript` is the full merged role-labeled
+    /// timeline, pre-truncated via `truncate_transcript`
+    /// to fit the server's 200 000-char cap with margin.
+    pub fn trigger_agent_run(
+        &mut self,
+        trigger: voice_bird_cli::cloud::run::RunTrigger,
+        mut transcript: String,
+    ) {
+        use voice_bird_cli::cloud::run::{
+            should_run_now, truncate_transcript, AgentRunError, RunTrigger,
+        };
+        // Manual: if a worker is already in flight, just
+        // queue a one-shot and return. The worker will
+        // re-run after it finishes (D4.3: drain sets
+        // status to "completed" and the next tick
+        // consults `queued`).
+        if trigger == RunTrigger::Manual
+            && self.agent_run_worker.is_some()
+        {
+            self.agent_run_state.queued = true;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let decision = should_run_now(
+            now,
+            self.agent_run_state.last_run_started,
+            self.agent_run_state.queued,
+            self.agent_run_state.plan_is_pro,
+            trigger,
+        );
+        if !decision {
+            return;
+        }
+        // If the previous worker is still around (the
+        // user pressed `g` while one was alive but
+        // not yet DoneFinal), join it before spawning
+        // the new one.
+        if let Some((handle, rx)) = self.agent_run_worker.take() {
+            drop(rx);
+            let _ = handle.join();
+        }
+        // Truncate so the server's 200 000-char cap is
+        // never hit (we ship 180 000 max).
+        transcript = truncate_transcript(&transcript).into_owned();
+        // Reset the queue flag — we're firing now.
+        self.agent_run_state.queued = false;
+        self.start_agent_run(transcript);
+    }
+
     pub fn new() -> Self {
         // Test builds only: install the process-local config
         // tempdir before the first `AppConfig::load()`, so every
@@ -623,21 +915,25 @@ impl App {
             .expect("tokio runtime");
 
         #[cfg_attr(not(windows), allow(unused_mut))]
+        // Hardcode the Free Room as index 0 so the TUI never
+        // has to special-case "no rooms". Cloud-fetched rooms
+        // get appended by `refresh_rooms`.
+        let mut rooms: Vec<Room> = vec![Room::free_room()];
+        let active_room: usize = 0;
+        let room_session_dir: Option<std::path::PathBuf> = None;
         let mut app = Self {
             mode: AppMode::Normal,
             devices: Vec::new(),
             apps: Vec::new(),
             selected_device_index: 0,
             selected_app_index: None,
-            // Agents list starts with Stdout at index 0; the user
-            // grows it with Add Agent (config.agent_targets).
-            // pre-populated so the pane never renders in an
-            // empty-cursor state.
-            selected_target_index: Some(0),
+            // Rooms list starts with Free Room at index 0; the user
+            // grows it via the picker once refresh_rooms succeeds.
+            selected_room_index: 0,
             picker_focus: PickerFocus::Devices,
             device_scroll: 0,
             app_scroll: 0,
-            target_scroll: 0,
+            room_scroll: 0,
             status: RecordingStatus::Idle,
             audio_level: Arc::new(Mutex::new(0.0)),
             duration: 0.0,
@@ -665,13 +961,29 @@ impl App {
             empty_committed: Arc::new(PlMutex::new(Vec::new())),
             empty_tentative: Arc::new(PlMutex::new(String::new())),
             pending_target_overrides: std::collections::BTreeMap::new(),
-            agents: Vec::new(),
-            pending_agent_overrides: std::collections::BTreeMap::new(),
+            rooms,
+            active_room,
+            room_funnel: None,
+            previous_active_room: None,
+            plan_is_pro: None,
             slot_picker_memo: std::collections::BTreeMap::new(),
             app_events: Arc::new(PlMutex::new(VecDeque::new())),
+            room_session_dir,
+            agent_run_state: Default::default(),
+            agent_run_worker: None,
         };
-
-        app.refresh_agents();
+        app.refresh_rooms();
+        // Re-activate the user's last room. If the slug no longer
+        // exists in the catalog, fall back to Free Room and clear
+        // the field so we don't keep reporting a missing room on
+        // every launch.
+        if let Some(slug) = app.config.last_room_slug.clone() {
+            if let Some(idx) = app.rooms.iter().position(|r| r.slug == slug) {
+                let _ = app.activate_room(idx);
+            } else {
+                app.config.last_room_slug = None;
+            }
+        }
         app
     }
 
@@ -821,130 +1133,133 @@ impl App {
             .or_else(|| self.focused_target())
             .unwrap_or(Target::Stdout)
     }
-    /// The picker list. Row 0 is `Stdout`; rows 1+ are
-    /// The picker list — one `TargetRow` per cloud Agent fetched
-    /// by `App::refresh_agents`. `Cloud` and the legacy `Stdout`
-    /// row are deliberately absent: cloud is a per-section
-    /// transport flag (`SectionSettings::cloud_on`), not a
-    /// picker destination; `Stdout` is the implicit routing
-    /// default applied by `start_section` when no Agent has
-    /// been picked (or when cloud is off entirely). Disabled
-    /// flag is reserved for future use; today every fetched
-    /// Agent is pickable.
-    pub fn targets(&self) -> Vec<TargetRow> {
-        self.agents
-            .iter()
-            .map(|a| TargetRow {
-                kind: TargetKind::Agent(a.id.clone()),
-                disabled: false,
-            })
-            .collect()
-    }
-    /// Resolve the currently focused Agents-pane row to a `Target`.
-    /// Returns `None` if the cursor is parked on a disabled row or
-    /// out of range.
-    pub fn focused_target_kind(&self) -> Option<TargetKind> {
-        let i = self.selected_target_index?;
-        self.targets().get(i).and_then(|r| {
-            if r.disabled {
-                None
-            } else {
-                Some(r.kind.clone())
-            }
-        })
+    /// The currently active room. Returns `&Room::free_room()` if
+    /// `active_room` is somehow out of range (defensive — `App::new`
+    /// and `activate_room` both keep it valid).
+    pub fn active_room(&self) -> &Room {
+        self.rooms
+            .get(self.active_room)
+            .unwrap_or_else(|| self.rooms.first().expect("Free Room at index 0"))
     }
 
-    /// Set the focused slot's pending target from a `TargetKind`.
-    /// `TargetKind::Stdout` writes the routing `Target::Stdout`
-    /// override (legacy path, kept for the test-suite). `TargetKind::Agent(id)`
-    /// writes the cloud Agent id to `pending_agent_overrides`
-    /// instead — the on-disk routing stays at its current value.
-    /// The resolved `Target` is returned so the caller can surface
-    /// it in a banner.
-    pub fn pick_target(&mut self, kind: TargetKind) -> Target {
-        let slot = self.focused_slot;
-        match kind {
-            TargetKind::Stdout => {
-                let target = Target::Stdout;
-                self.pending_target_overrides
-                    .insert(slot, target.clone());
-                target
+    /// Activate the room at `idx`. Refuses (returns `Err`) when any
+    /// slot is currently recording — switching mid-session would
+    /// span different room sessions and corrupt the merged
+    /// timeline.
+    ///
+    /// On success, the focused slot set is replaced: Free Room
+    /// gets a single empty slot; agent rooms get one empty slot
+    /// per role. The cursor lands on the first slot.
+    pub fn activate_room(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.rooms.len() {
+            return Err(format!("room index {idx} out of range"));
+        }
+        if self.active_section_count() > 0 {
+            return Err("stop recording before switching rooms".to_string());
+        }
+        // Locked Pro rooms can be activated for display, but
+        // agent runs against them will hit 402. We let the
+        // TUI surface the lock with 🔒 and skip the call.
+        // Funnel revert: capture the previous room so Esc on
+        // the wizard rolls back to where the user was.
+        self.previous_active_room = Some(self.active_room);
+        self.active_room = idx;
+        let room = self.active_room().clone();
+        if room.slug == "free" {
+            self.slots = Self::fresh_slots();
+        } else {
+            // Write room.json up front so the per-role session
+            // dirs land inside a directory the operator can
+            // identify. IO failures are surfaced as a banner but
+            // don't fail the activation — the user can still
+            // record; the per-role finalize path will surface
+            // write errors itself.
+            let started_at = chrono::Utc::now();
+            let base = voice_bird_cli::config::AppConfig::expand_tilde(
+                &self.config.default_slot_config.path,
+            );
+            let base = std::path::PathBuf::from(base);
+            let room_dir = voice_bird_cli::session::layout::room_session_dir(
+                &base,
+                started_at,
+                &room.slug,
+            );
+            if let Err(e) = voice_bird_cli::room_fs::write_room_json(
+                &room_dir,
+                &room,
+                started_at,
+            ) {
+                self.banner = Some(format!(
+                    "could not write room.json: {e}"
+                ));
             }
-            TargetKind::Agent(id) => {
-                // Cloud Agent picks don't change the on-disk
-                // routing Target — local file persistence is
-                // still `Target::Stdout`. The picked id is
-                // recorded separately in
-                // `pending_agent_overrides` and consulted by
-                // `start_section` / the §11 `g` key handler
-                // when running the cloud prompt.
-                self.pending_agent_overrides.insert(slot, id);
-                Target::Stdout
+            self.room_session_dir = Some(room_dir);
+            let next_id = self.next_slot_id;
+            self.slots = room
+                .roles
+                .iter()
+                .enumerate()
+                .map(|(i, role)| {
+                    let id = SlotId(next_id + i as u32);
+                    let mut slot = Slot::empty(id);
+                    slot.role = Some(role.clone());
+                    slot
+                })
+                .collect();
+            self.next_slot_id = next_id + self.slots.len() as u32;
+            // Open the funnel wizard when the room has role
+            // constraints. Free Room is opened without the
+            // wizard (no role_constraints to bind).
+            if !room.role_constraints.is_empty() {
+                self.room_funnel = Some(
+                    voice_bird_cli::funnel::RoomFunnelState::new(&room),
+                );
             }
         }
+        Ok(())
     }
 
-    /// Borrow the fetched cloud Agents list. Empty when the
-    /// fetch hasn't run yet, the user has cloud off, or the
-    /// request failed. The Agents picker reads through this
-    /// accessor — the storage lives on `self.agents`.
-    pub fn agents(&self) -> &[voice_bird_cli::cloud::agents::Agent] {
-        &self.agents
-    }
-
-    /// Re-fetch the cloud Agents list from voicebird.app and
-    /// store it on `self.agents`. No-op when:
-    ///   - the effective cloud state for the focused slot is OFF
-    ///     (per-source override > global default; falls back to
-    ///     global only when no picker source can be resolved),
-    ///   - OR the user has no API key set,
-    ///   - OR the server URL is empty / unparseable.
-    /// On HTTP failure (4xx / 5xx / network error), `self.agents`
-    /// is cleared so the picker goes empty rather than showing
-    /// stale rows, AND a banner is set explaining the failure —
-    /// picker emptiness alone is too quiet and looks identical
-    /// to "fetch hasn't run yet".
-    pub fn refresh_agents(&mut self) {
-        // Gate on the effective cloud state, not the bare global
-        // flag — a per-source override can flip the displayed
-        // state to ON while `cloud_broadcast_enabled` stays OFF
-        // (e.g. the user enabled Cloud for one mic only). Pre-fix
-        // this gate ignored the override and the picker stayed
-        // empty until the user also flipped the global default.
-        if !self.display_cloud_on()
-            || self.config.voicebird_api_key.is_empty()
+    /// Re-fetch the cloud Rooms list from voicebird.app and append
+    /// the catalog entries to `self.rooms` (Free Room stays at
+    /// index 0). No-op when the user has no API key set or the
+    /// server URL is empty. On HTTP failure, the existing
+    /// `self.rooms` (Free Room only) is preserved and a banner
+    /// explains the failure — picker emptiness alone is too
+    /// quiet and looks identical to "fetch hasn't run yet".
+    pub fn refresh_rooms(&mut self) {
+        if self.config.voicebird_api_key.is_empty()
             || self.config.voicebird_server_url.is_empty()
         {
-            self.agents.clear();
+            self.rooms.truncate(1);
             return;
         }
         let base = voice_bird_cli::cloud::http::rest_base_url(
             &self.config.voicebird_server_url,
         );
-        match voice_bird_cli::cloud::agents::fetch(
+        match voice_bird_cli::cloud::rooms::fetch(
             &base,
             &self.config.voicebird_api_key,
         ) {
             Ok(list) => {
-                log::info!("refresh_agents: fetched {} agents", list.len());
-                self.agents = list;
+                log::info!("refresh_rooms: fetched {} rooms", list.rooms.len());
+                self.plan_is_pro = Some(list.plan_is_pro());
+                self.rooms = voice_bird_cli::cloud::rooms::merge_rooms_with_free(
+                    Room::free_room(),
+                    list.rooms,
+                );
             }
             Err(e) => {
-                log::warn!("refresh_agents: fetch failed: {e}");
-                self.agents.clear();
-                // Surface the failure so an empty Agents pane
-                // doesn't look identical to "fetch hasn't run
-                // yet". Common causes: wrong API key for the
-                // configured server, or the voicebird_server_url
-                // points at a different host than the key was
-                // issued for.
+                log::warn!("refresh_rooms: fetch failed: {e}");
+                // Keep the existing rooms (at minimum Free Room)
+                // and surface the failure as a banner.
                 self.banner = Some(format!(
-                    "Agents list unavailable: {e}. \
+                    "Rooms list unavailable: {e}. \
                      Check the API key and voicebird_server_url."
                 ));
             }
         }
     }
+
 
 
     /// Committed-transcript Arc for the focused section, or saved
@@ -967,7 +1282,86 @@ impl App {
             .map(|s| s.tentative.clone())
             .unwrap_or_else(|| self.empty_tentative.clone())
     }
-    // -- Section accessors --------------------------------------------------
+
+    /// Merge every running + saved section's transcript lines
+    /// into a single role-labeled timeline. The merge key is
+    /// the absolute wall-clock time so the user can read the
+    /// conversation as it actually happened, even if the roles
+    /// started at slightly different times.
+    ///
+    /// Refined lines (when present) win over raw at the same
+    /// `t_start_ms` — the agent run path always shows the best
+    /// available text per role per moment. Empty-text lines are
+    /// filtered (a refined line that's a placeholder doesn't
+    /// pollute the view).
+    pub fn merged_timeline(&self) -> Vec<TimelineEntry> {
+        let mut out: Vec<TimelineEntry> = Vec::new();
+        for slot in &self.slots {
+            let (role_label, started, refined_lines, committed_lines) = match &slot.kind {
+                SlotKind::Recording { section } => (
+                    section.role.as_ref().map(|r| r.name.clone()),
+                    section.session_started_at,
+                    section
+                        .refined
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    section
+                        .committed
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                SlotKind::Saved { saved } => (
+                    saved.role.as_ref().map(|r| r.name.clone()),
+                    saved.session_started_at,
+                    saved
+                        .refined
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    saved
+                        .committed
+                        .lock()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                SlotKind::Empty => continue,
+            };
+            for line in &refined_lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let at = started
+                    + chrono::Duration::milliseconds(line.t_start_ms as i64);
+                out.push(TimelineEntry {
+                    at,
+                    role: role_label.clone(),
+                    slot: slot.id,
+                    text: line.text.clone(),
+                });
+            }
+            for line in &committed_lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let at = started
+                    + chrono::Duration::milliseconds(line.t_start_ms as i64);
+                out.push(TimelineEntry {
+                    at,
+                    role: role_label.clone(),
+                    slot: slot.id,
+                    text: line.text.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.at.cmp(&b.at).then(a.slot.0.cmp(&b.slot.0)));
+        out
+    }
 
     /// Open the API-key modal, seeding the buffer with whatever key is
     /// currently saved (so backspace can edit it rather than starting
@@ -1312,52 +1706,7 @@ impl App {
         true
     }
 
-    /// Snapshot the current picker cursor under the given slot id.
-    /// Called immediately before focus moves away from that slot.
-    /// The cursor fields on `App` keep holding the slot's state
-    /// until the caller switches `focused_slot`, at which point
-    /// `restore_picker_for` loads the next slot's memo back in.
-    fn memoize_picker_for(&mut self, slot: SlotId) {
-        self.slot_picker_memo.insert(
-            slot,
-            PickerSelection {
-                device_idx: self.selected_device_index,
-                app_idx: self.selected_app_index,
-                focus: self.picker_focus,
-            },
-        );
-    }
-
-    /// Load the memoized picker cursor for the given slot id into
-    /// the cursor fields on `App`. No-op if the slot has no memo
-    /// (first time the user Tabs to it) — the cursor simply keeps
-    /// whatever value it had, which is the natural "first focus
-    /// inherits current state" behavior.
-    fn restore_picker_for(&mut self, slot: SlotId) {
-        if let Some(p) = self.slot_picker_memo.get(&slot).cloned() {
-            // Clamp the restored indices against the current
-            // inventory — a refresh may have shrunk `devices` /
-            // `apps` between Tab-away and Tab-back.
-            let dev_idx = if self.devices.is_empty() {
-                0
-            } else {
-                p.device_idx.min(self.devices.len() - 1)
-            };
-            let app_idx = p.app_idx.and_then(|i| {
-                if self.apps.is_empty() {
-                    None
-                } else {
-                    Some(i.min(self.apps.len() - 1))
-                }
-            });
-            self.selected_device_index = dev_idx;
-            self.selected_app_index = app_idx;
-            self.picker_focus = p.focus;
-        }
-    }
-
     /// Refresh both panes' inventory. Preserves cursors by name when the
-    /// previously-cursored entries still exist after refresh. The
     /// focused slot's cursor is re-resolved in place; per-slot
     /// memos for non-focused slots are also re-resolved so a later
     /// Tab back to them lands on the same device/app the user
@@ -1453,6 +1802,71 @@ impl App {
     /// In the Agents pane, disabled rows (currently just `Agent` when
     /// the binary is missing) are skipped so the cursor never parks
     /// on a row that can't be picked.
+    /// Snap the room cursor to the nearest visible row.
+    fn snap_room_cursor_to_visible(&mut self, cloud_visible: bool) {
+        if self.rooms.is_empty() {
+            self.selected_room_index = 0;
+            return;
+        }
+        if self
+            .rooms
+            .get(self.selected_room_index)
+            .map(|r| r.is_visible(cloud_visible))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let start = self.selected_room_index;
+        for i in start..self.rooms.len() {
+            if self.rooms[i].is_visible(cloud_visible) {
+                self.selected_room_index = i;
+                return;
+            }
+        }
+        for i in (0..start).rev() {
+            if self.rooms[i].is_visible(cloud_visible) {
+                self.selected_room_index = i;
+                return;
+            }
+        }
+        self.selected_room_index = 0;
+    }
+
+    fn visible_room_at(&self, idx: usize, cloud_visible: bool) -> bool {
+        self.rooms
+            .get(idx)
+            .map(|r| r.is_visible(cloud_visible))
+            .unwrap_or(false)
+    }
+
+    /// Route `↑` / `k` to Rooms when only Rooms is visible
+    /// (the funnel-closed default). The dispatcher's direct
+    /// call to `select_previous` would otherwise steer into
+    /// the (hidden) Devices list because `PickerFocus::Devices`
+    /// is the legacy default for `App::new()`. This helper
+    /// bridges the gap.
+    pub fn arrow_previous_in_visible_picker(&mut self) {
+        let rooms_visible = self
+            .rooms
+            .iter()
+            .any(|r| r.is_visible(self.display_cloud_on()));
+        if rooms_visible && self.picker_focus != PickerFocus::Rooms {
+            self.picker_focus = PickerFocus::Rooms;
+        }
+        self.select_previous();
+    }
+
+    pub fn arrow_next_in_visible_picker(&mut self) {
+        let rooms_visible = self
+            .rooms
+            .iter()
+            .any(|r| r.is_visible(self.display_cloud_on()));
+        if rooms_visible && self.picker_focus != PickerFocus::Rooms {
+            self.picker_focus = PickerFocus::Rooms;
+        }
+        self.select_next();
+    }
+
     pub fn select_previous(&mut self) {
         match self.picker_focus {
             PickerFocus::Devices => {
@@ -1467,15 +1881,20 @@ impl App {
                     self.selected_app_index = Some(next);
                 }
             }
-            PickerFocus::Agents => {
-                let i = self.selected_target_index.unwrap_or(0);
-                if i > 0 {
-                    self.selected_target_index = Some(i - 1);
+            PickerFocus::Rooms => {
+                let cloud_visible = self.display_cloud_on();
+                self.snap_room_cursor_to_visible(cloud_visible);
+                let mut idx = self.selected_room_index;
+                while idx > 0
+                    && !self.visible_room_at(idx - 1, cloud_visible)
+                {
+                    idx -= 1;
                 }
+                self.selected_room_index = idx;
             }
         }
         log::debug!(
-            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
+            "picker: ↑ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) room_idx={} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
@@ -1485,13 +1904,8 @@ impl App {
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
-            self.selected_target_index,
-            {
-                let rows = self.targets();
-                self.selected_target_index
-                    .and_then(|i| rows.get(i))
-                    .map(|r| r.kind.clone())
-            },
+            self.selected_room_index,
+            self.rooms.get(self.selected_room_index).map(|r| r.slug.clone()),
         );
     }
 
@@ -1514,27 +1928,25 @@ impl App {
                     self.selected_app_index = Some(0);
                 }
             }
-            PickerFocus::Agents => {
-                let i = self.selected_target_index.unwrap_or(0);
-                // The Agents list is dynamic — Stdout / Cloud plus
-                // every entry in `config.agent_targets`. The renderer
-                // already iterates the full list, so the cursor cap
-                // must come from `targets().len()` too; a hardcoded
-                // `3` leaves user-added rows beyond the first Agent
-                // unreachable via ↑/↓ (the row renders but never
-                // receives the cursor). The disabled-row skip is
-                // still handled lazily in `focused_target_kind` so
-                // the cursor can park on a row that's visually
-                // present but unpickable — the banner and start call
-                // treat that as a no-op.
-                let total = self.targets().len();
-                if i + 1 < total {
-                    self.selected_target_index = Some(i + 1);
+            PickerFocus::Rooms => {
+                if self.rooms.is_empty() {
+                    return;
+                }
+                let cloud_visible = self.display_cloud_on();
+                self.snap_room_cursor_to_visible(cloud_visible);
+                let mut idx = self.selected_room_index + 1;
+                while idx < self.rooms.len()
+                    && !self.visible_room_at(idx, cloud_visible)
+                {
+                    idx += 1;
+                }
+                if idx < self.rooms.len() {
+                    self.selected_room_index = idx;
                 }
             }
         }
         log::debug!(
-            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) target_idx={:?} (={:?})",
+            "picker: ↓ focus={:?} dev_idx={} (={:?}) app_idx={:?} (={:?}) room_idx={} (={:?})",
             self.picker_focus,
             self.selected_device_index,
             self.devices
@@ -1544,16 +1956,10 @@ impl App {
             self.selected_app_index
                 .and_then(|i| self.apps.get(i))
                 .map(|a| a.name.clone()),
-            self.selected_target_index,
-            {
-                let rows = self.targets();
-                self.selected_target_index
-                    .and_then(|i| rows.get(i))
-                    .map(|r| r.kind.clone())
-            },
+            self.selected_room_index,
+            self.rooms.get(self.selected_room_index).map(|r| r.slug.clone()),
         );
     }
-
     /// Clamp pane scroll offsets so the cursor row stays inside the
     /// viewport. `visible` is the inner row count of one pane (rough
     /// upper bound is fine — the render path also clamps); pass
@@ -1562,11 +1968,13 @@ impl App {
         let v = visible.max(1) as u16;
         let dev_max = self.devices.len().saturating_sub(1) as u16;
         let app_max = self.apps.len().saturating_sub(1) as u16;
+        let room_max = self.rooms.len().saturating_sub(1) as u16;
         let dev_idx = (self.selected_device_index as u16).min(dev_max);
         let app_idx = self
             .selected_app_index
             .map(|i| (i as u16).min(app_max))
             .unwrap_or(0);
+        let room_idx = (self.selected_room_index as u16).min(room_max);
         if dev_idx < self.device_scroll {
             self.device_scroll = dev_idx;
         } else if dev_idx >= self.device_scroll.saturating_add(v) {
@@ -1576,6 +1984,11 @@ impl App {
             self.app_scroll = app_idx;
         } else if app_idx >= self.app_scroll.saturating_add(v) {
             self.app_scroll = app_idx + 1 - v;
+        }
+        if room_idx < self.room_scroll {
+            self.room_scroll = room_idx;
+        } else if room_idx >= self.room_scroll.saturating_add(v) {
+            self.room_scroll = room_idx + 1 - v;
         }
     }
 
@@ -1630,7 +2043,155 @@ impl App {
         };
         idx.and_then(|i| self.apps.get(i))
     }
-    /// Resolve the source the focused Devices + Apps pickers
+    /// `slot_picker_memo`. Called by `handle_funnel_enter` on
+    /// commit so the slots provisioned for a non-free room
+    /// actually start recording from the device/app the user
+    /// picked in the wizard — not from whatever the global
+    /// picker cursor happened to be on.
+    ///
+    /// Without this, `start_section` reads
+    /// `selected_device_index` / `selected_app_index`, both of
+    /// which are global cursors the user moves freely between
+    /// sessions. The funnel's per-role selections would be
+    /// displayed in the modal and then silently discarded.
+    ///
+    /// For each role binding with `selected_name`:
+    /// - `DeviceInput` / `DeviceOutput`: look up the name in
+    ///   `self.devices` filtered by kind, store the raw index
+    ///   in `slot_picker_memo[slot].device_idx`.
+    /// - `AppLoopback`: look up the name in `self.apps`, store
+    ///   the raw index in `slot_picker_memo[slot].app_idx`.
+    ///
+    /// The mapping is `role_constraints[i]` ↔ `slots[i]`
+    /// (both are provisioned in `room.roles` order by
+    /// `activate_room`). Bindings without a `selected_name`
+    /// are skipped — the slot's memo keeps whatever was
+    /// there (typically nothing — first activation). On
+    /// commit we also focus slot 0 so the very first Enter
+    /// after the funnel uses the binding for role 0.
+    pub fn commit_funnel_bindings(
+        &mut self,
+        funnel: &voice_bird_cli::funnel::RoomFunnelState,
+    ) {
+        use voice_bird_cli::config::AudioSessionKind;
+        use voice_bird_cli::room::SourceKind;
+        for (i, binding) in funnel.role_bindings.iter().enumerate() {
+            let Some(slot_id) = self.slots.get(i).map(|s| s.id) else {
+                break;
+            };
+            let mut memo = self
+                .slot_picker_memo
+                .get(&slot_id)
+                .cloned()
+                .unwrap_or(PickerSelection {
+                    device_idx: 0,
+                    app_idx: None,
+                    focus: PickerFocus::Devices,
+                });
+            let Some(name) = binding.selected_name.as_deref() else {
+                // User didn't move the cursor onto a real row
+                // — keep whatever was in the memo (typically
+                // the uninitialized default). The user can
+                // still pick from the picker post-funnel.
+                self.slot_picker_memo.insert(slot_id, memo);
+                continue;
+            };
+            match binding.source_kind {
+                SourceKind::DeviceInput => {
+                    if let Some((raw_idx, _)) = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| {
+                            d.name == name
+                                && matches!(d.kind, AudioSessionKind::Input)
+                        })
+                    {
+                        memo.device_idx = raw_idx;
+                        // A DeviceInput role implies "no app
+                        // pairing" — Input devices are
+                        // captured directly, not per-app.
+                        memo.app_idx = None;
+                    }
+                }
+                SourceKind::DeviceOutput => {
+                    if let Some((raw_idx, _)) = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| {
+                            d.name == name
+                                && matches!(d.kind, AudioSessionKind::Output)
+                        })
+                    {
+                        memo.device_idx = raw_idx;
+                        // DeviceOutput without an app pairing
+                        // is the "loopback from this speaker"
+                        // case — leave app_idx None.
+                        memo.app_idx = None;
+                    }
+                }
+                SourceKind::AppLoopback => {
+                    // The app is the primary source. Look up
+                    // by name; the device leg (Output kind)
+                    // is a separate concern — if the user
+                    // didn't pair one, the resolve falls back
+                    // to `SessionSource::App { device_name:
+                    // "default" }`. We only persist the app
+                    // idx here; the device is picked
+                    // implicitly at resolve time.
+                    if let Some((app_idx, _)) = self
+                        .apps
+                        .iter()
+                        .enumerate()
+                        .find(|(_, a)| a.name == name)
+                    {
+                        memo.app_idx = Some(app_idx);
+                        // Match the device side to whatever
+                        // Output device is at the same name
+                        // (the renderer showed the full list
+                        // and the user picked by name, but the
+                        // device cursor also needs to point
+                        // somewhere coherent — picking the
+                        // first Output device that matches
+                        // keeps the picker consistent with the
+                        // funnel choice).
+                        if let Some((raw_idx, _)) = self
+                            .devices
+                            .iter()
+                            .enumerate()
+                            .find(|(_, d)| {
+                                d.kind == AudioSessionKind::Output
+                            })
+                        {
+                            memo.device_idx = raw_idx;
+                        }
+                    }
+                }
+            }
+            self.slot_picker_memo.insert(slot_id, memo);
+        }
+        // Focus slot 0 so the first Enter after the funnel
+        // uses the role-0 binding. Without this, focus stays
+        // on whatever slot was last picked (typically
+        // Free Room's), and the user has to Tab back to the
+        // agent room's slot to record.
+        if let Some(first) = self.slots.first() {
+            self.focused_slot = first.id;
+            // Load the memo we just wrote for slot 0 into
+            // the global cursors.
+            self.selected_device_index = self
+                .slot_picker_memo
+                .get(&first.id)
+                .map(|p| p.device_idx)
+                .unwrap_or(0)
+                .min(self.devices.len().saturating_sub(1).max(0));
+            self.selected_app_index = self
+                .slot_picker_memo
+                .get(&first.id)
+                .and_then(|p| p.app_idx);
+        }
+    }
     /// would resolve to on Enter. Wraps `resolve_picker_source`
     /// (the canonical picker→source match) with the error
     /// strings the TUI surfaces as banners for the three
@@ -1734,16 +2295,6 @@ impl App {
         None
     }
 
-    /// Picked-target kind for the focused slot. The Agents
-    /// pane uses this to mark the active row. §8.5 collapsed
-    /// `Target` to a single `Stdout` variant; with no
-    /// `Agent` routing axis to consult, the function is a
-    /// stub until §10 repopulates the picker with cloud
-    /// Agents and the picker starts reading
-    /// `pending_agent_overrides` instead.
-    pub fn picked_target_kind(&self) -> Option<TargetKind> {
-        Some(TargetKind::Stdout)
-    }
 
     /// Update duration from start time
     pub fn update_duration(&mut self) {
@@ -2377,6 +2928,7 @@ impl App {
                 refinement_join,
             },
             _capture_stream: stream,
+            role: self.slots[pos].role.clone(),
             committed,
             refined,
             tentative,
@@ -2442,6 +2994,8 @@ impl App {
             // instead of asking the user to re-pick.
             source: section.source.clone(),
             settings: section.settings.clone(),
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         self.slots[pos].kind = SlotKind::Saved { saved };
 
@@ -2479,11 +3033,17 @@ impl App {
                 version: env!("CARGO_PKG_VERSION").into(),
                 model: section.settings.model.clone(),
                 engine: engine_for_meta,
-                source: "mic".into(),
-                device: "mock".into(),
+                source: source_to_string(&section.source),
+                device: device_name_for_source(&section.source),
                 started_at: started.to_rfc3339(),
                 ended_at: ended.to_rfc3339(),
                 duration_ms: (ended - started).num_milliseconds().max(0) as u64,
+                role: section.role.as_ref().map(|r| r.name.clone()),
+                room_slug: self
+                    .active_room()
+                    .slug
+                    .clone()
+                    .into_option_if_not_free(),
             };
             if let Err(e) = voice_bird_cli::session::finalize::finalize(
                 &dir.join("transcript.jsonl"),
@@ -2496,7 +3056,38 @@ impl App {
             }
         }
 
-        // Aggregate App-level state. Idle iff no section is left.
+        // Rewrite the room-level transcript on every stop. The
+        // merged timeline at this moment covers every running
+        // + saved role-bound section, so the file always
+        // reflects the most recent view of the conversation.
+        if let Some(room_dir) = self.room_session_dir.as_ref() {
+            let entries: Vec<(chrono::DateTime<chrono::Utc>, Option<String>, String)> =
+                self.merged_timeline()
+                    .into_iter()
+                    .map(|e| (e.at, e.role, e.text))
+                    .collect();
+            if let Err(e) =
+                voice_bird_cli::room_fs::write_room_transcript_jsonl(
+                    room_dir, &entries,
+                )
+            {
+                log::error!("room transcript write: {e}");
+            }
+            // D3.4.d: rewrite context.md on every stop. D4 will
+            // populate the body with the last completed agent
+            // run output; for now we write a placeholder so the
+            // file always exists when an agent room is active.
+            let placeholder = String::from(
+                "_No agent run has completed yet for this room._\n",
+            );
+            if let Err(e) = voice_bird_cli::room_fs::write_room_context_md(
+                room_dir,
+                &placeholder,
+                chrono::Utc::now(),
+            ) {
+                log::error!("room context.md write: {e}");
+            }
+        }
         if self.active_section_count() == 0 {
             self.status = RecordingStatus::Idle;
             self.start_time = None;
@@ -2972,6 +3563,51 @@ fn find_latest_session(base: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
+ /// Render the `source` field of `SessionMeta` for the active
+/// `SessionSource`. Replaces the legacy `source: "mic"` hardcode
+/// — the meta file now reflects what the user actually recorded
+/// from.
+fn source_to_string(source: &voice_bird_cli::session::layout::SessionSource) -> String {
+    use voice_bird_cli::session::layout::SessionSource;
+    match source {
+        SessionSource::Microphone => "mic".into(),
+        SessionSource::System => "system".into(),
+        SessionSource::App { name, .. } => name.clone(),
+    }
+}
+
+/// Render the `device` field of `SessionMeta` for the active
+/// `SessionSource`. The legacy `device: "mock"` hardcode is
+/// gone — for mic/system we report the focused device from the
+/// picker; for per-app capture we report the app's display name.
+fn device_name_for_source(
+    source: &voice_bird_cli::session::layout::SessionSource,
+) -> String {
+    use voice_bird_cli::session::layout::SessionSource;
+    match source {
+        SessionSource::Microphone | SessionSource::System => String::new(),
+        SessionSource::App { name, .. } => name.clone(),
+    }
+}
+
+/// Helper for the meta-write site: turn a `String` into
+/// `Option<String>` only when it's neither the Free Room slug
+/// nor empty. Keeps the meta file lean — Free Room sessions
+/// don't carry a `room_slug` field, agent rooms do.
+trait IntoOptionIfNotFree {
+    fn into_option_if_not_free(self) -> Option<String>;
+}
+impl IntoOptionIfNotFree for String {
+    fn into_option_if_not_free(self) -> Option<String> {
+        if self.is_empty() || self == "free" {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+
 /// Derive an HTTP base URL from the WebSocket server URL.
 /// E.g., `wss://voicebird.app/api/audio/stream` → `https://voicebird.app`
 /// `ws://localhost:3000/api/audio/stream`     → `http://localhost:3000`
@@ -3006,6 +3642,64 @@ fn looks_like_auth_error(msg: &str) -> bool {
         || m.contains("initsuccess: false")
 }
 
+/// Map a start-error string from `start()` to a UI status
+/// string. The string the worker surfaces is a free-form
+/// `anyhow` message ("Transcript too long", "API key
+/// rejected — check Settings", "Agent runs require Pro",
+/// or "agent run returned <code>"). The UI cares about
+/// the coarse bucket; we substring-match against the
+/// known error strings.
+fn classify_start_error(msg: &str) -> String {
+    let m = msg.to_lowercase();
+    if m.contains("api key") {
+        "needs_api_key".into()
+    } else if m.contains("pro") {
+        "needs_pro".into()
+    } else if m.contains("too long") {
+        "transcript_too_long".into()
+    } else if m.contains("rate") || m.contains("429") {
+        "rate_limited".into()
+    } else {
+        "failed".into()
+    }
+}
+
+#[cfg(test)]
+mod classify_start_error_tests {
+    use super::classify_start_error;
+
+    #[test]
+    fn api_key_string_maps_to_needs_api_key() {
+        assert_eq!(
+            classify_start_error("API key rejected — check Settings"),
+            "needs_api_key"
+        );
+    }
+
+    #[test]
+    fn pro_string_maps_to_needs_pro() {
+        assert_eq!(
+            classify_start_error("Agent runs require Pro"),
+            "needs_pro"
+        );
+    }
+
+    #[test]
+    fn too_long_string_maps_to_transcript_too_long() {
+        assert_eq!(
+            classify_start_error("Transcript too long"),
+            "transcript_too_long"
+        );
+    }
+
+    #[test]
+    fn unknown_string_maps_to_failed() {
+        assert_eq!(
+            classify_start_error("agent run returned 500"),
+            "failed"
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3045,295 +3739,6 @@ mod tests {
         // Empty fallbacks for the focused-* Arcs.
         assert!(app.focused_committed().lock().is_empty());
         assert!(app.focused_tentative().lock().is_empty());
-    }
-
-    // ── cloud Agents pane (red: §10) ───────────────────────────────
-
-    /// `App::targets()` must never emit a `Stdout` row. The picker
-    /// shows cloud Agents only — local file persistence is the
-    /// implicit default routing when the user hasn't picked one.
-    /// Today this fails: `targets()` returns a single `Stdout`
-    /// row from `App::new()` (the §8.5 fallback).
-    #[test]
-    fn no_stdout_row_in_agents_pane() {
-        let app = App::new();
-        for row in app.targets() {
-            assert!(
-                !matches!(row.kind, TargetKind::Stdout),
-                "Stdout must never appear in the Agents pane; got {:?}",
-                row.kind
-            );
-        }
-    }
-
-    /// Default config (cloud off, no key) ⇒ empty Agents pane.
-    /// The user hasn't enabled cloud so there's nothing to fetch;
-    /// the picker should render zero rows, not a fallback `Stdout`.
-    /// Today this fails: `targets()` returns `[Stdout]`.
-    #[test]
-    fn agents_pane_empty_when_cloud_off_default() {
-        let app = App::new();
-        assert!(
-            app.targets().is_empty(),
-            "cloud off ⇒ empty Agents pane; got {} rows",
-            app.targets().len()
-        );
-    }
-
-    /// Cloud on but no API key ⇒ empty Agents pane (can't fetch).
-    /// The current code emits a `Stdout` row regardless of config,
-    /// so this assertion fails today.
-    #[test]
-    fn agents_pane_empty_when_no_api_key_with_cloud_on() {
-        let mut app = App::new();
-        app.default_slot_config.cloud_on = true;
-        // voicebird_api_key stays empty (default).
-        app.refresh_agents();
-        assert!(
-            app.targets().is_empty(),
-            "cloud on + no key ⇒ empty Agents pane; got {} rows",
-            app.targets().len()
-        );
-    }
-
-    /// `App::refresh_agents()` against a stub server that returns two
-    /// Agents must populate `app.agents()` with both. Today this
-    /// fails: `refresh_agents()` is a no-op stub.
-    #[cfg(not(windows))]
-    #[test]
-    fn refresh_agents_with_cloud_on_populates_from_stub_server() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Serve a canned Agents response. Path is irrelevant —
-        // the server replies the same JSON to any request.
-        let server = std::thread::spawn(move || {
-            // Accept with a 2-second ceiling so the test can't
-            // hang forever if `refresh_agents` never reaches
-            // `fetch` (e.g. when the stub does nothing).
-            listener.set_nonblocking(true).ok();
-            let started = std::time::Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok(s) => break s.0,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        if started.elapsed() > std::time::Duration::from_secs(2) {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            };
-            stream.set_nonblocking(false).ok();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            // Read & discard the request (don't bother parsing).
-            let mut reader = std::io::BufReader::new(&stream);
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
-            let body = r#"{"agents":[{"id":"note-taker","name":"Note taker","icon":"\u270d\ufe0f","promptTemplate":"x"},{"id":"summarizer","name":"Summarizer","icon":"\u2728","promptTemplate":"y"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use std::io::Write;
-            let _ = stream.write_all(resp.as_bytes());
-        });
-
-        let mut app = App::new();
-        // Cloud is gated on the EFFECTIVE state for the
-        // focused slot. Default ON means fresh-install
-        // behavior; explicit OFF turns the panel off.
-        app.default_slot_config.cloud_on = true;
-        app.config.voicebird_api_key = "test-key-abc123".into();
-        app.config.voicebird_server_url = format!("ws://{}/api/audio/stream", addr);
-        app.refresh_agents();
-
-        assert_eq!(
-            app.agents().len(),
-            2,
-            "expected 2 agents from stub server, got {:?}",
-            app.agents()
-        );
-        assert_eq!(app.agents()[0].id, "note-taker");
-        assert_eq!(app.agents()[1].id, "summarizer");
-        // The picker should now reflect both rows.
-        assert_eq!(app.targets().len(), 2);
-    }
-
-    /// If the picker-resolved source is effectively cloud-enabled via its
-    /// per-source override, refreshing Agents should fetch even when the
-    /// global cloud default is off. This is the same effective state that
-    /// `display_cloud_on()` and `start_section` use.
-    #[cfg(not(windows))]
-    #[test]
-    fn refresh_agents_uses_effective_source_cloud_state_not_only_global_default() {
-        use voice_bird_cli::config::AudioSessionKind;
-        use voice_bird_cli::session::layout::SessionSource;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).ok();
-            let started = std::time::Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok(s) => break s.0,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        if started.elapsed() > std::time::Duration::from_secs(2) {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            };
-            stream.set_nonblocking(false).ok();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            let mut reader = std::io::BufReader::new(&stream);
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut reader, &mut buf);
-            let body = r#"{"agents":[{"id":"interviewee","name":"Interviewee","icon":null,"promptTemplate":"x"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use std::io::Write;
-            let _ = stream.write_all(resp.as_bytes());
-        });
-
-        let mut app = App::new();
-        app.devices = vec![crate::platform::AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-        // Global default OFF; the focused slot's customized
-        // cloud_on = true is what `display_cloud_on` returns.
-        app.default_slot_config.cloud_on = false;
-        app.config.voicebird_api_key = "test-key-abc123".into();
-        app.config.voicebird_server_url =
-            format!("ws://{}/api/audio/stream", addr);
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(true);
-
-        assert!(
-            app.display_cloud_on(),
-            "setup must be effectively cloud-on via the focused slot's config"
-        );
-
-        app.refresh_agents();
-        let _ = server.join();
-
-        assert_eq!(
-            app.agents().len(),
-            1,
-            "refresh_agents must fetch when the selected source is effectively \
-             cloud-on even if the global default is off"
-        );
-        assert_eq!(app.agents()[0].id, "interviewee");
-    }
-
-    /// Pre-fix bug: when no section was focused, `display_cloud_on`,
-    /// `display_language`, and `display_model` fell through to the
-    /// GLOBAL config default, ignoring the per-source override that
-    /// `c` writes to. Switching focus between two empty slots routed
-    /// to different sources showed the same badge value even when
-    /// their per-source overrides differed — the Mode panel didn't
-    /// reflect what would actually take effect on Enter.
-    ///
-    /// Post-fix: with no section focused, the helpers resolve the
-    /// picker-resolved source and return the per-source override for
-    /// that source. The global default is only the fallback when no
-    /// picker source can be resolved (e.g. empty Devices pane).
-    #[test]
-    #[cfg(not(windows))]
-    fn display_helpers_resolve_per_slot_customization_when_no_section_focused() {
-        use voice_bird_cli::config::AudioSessionKind;
-        use crate::platform::AudioDevice;
-
-        let mut app = App::new();
-
-        // Global defaults — what a fresh install would have.
-        app.default_slot_config.cloud_on = true;
-        app.default_slot_config.language = "en".into();
-        app.default_slot_config.model = "tiny.en".into();
-
-        // Picker parks on a specific input device.
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-
-        // The focused slot's customization DISAGREES with the
-        // global default — this is the exact scenario where
-        // the bug surfaced.
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(false);
-        slot.config.language = Some("ru".into());
-        slot.config.model = Some("base.en".into());
-
-        // No section focused → helpers must read the
-        // focused slot's customization, NOT the default.
-        assert!(
-            app.focused().is_none(),
-            "test setup must have no focused section"
-        );
-        assert!(
-            !app.display_cloud_on(),
-            "display_cloud_on must read the focused slot's customization \
-             (off) even though the default is on; this is the fix for \
-             the slot-specific cloud toggle that was leaking via the \
-             global flag"
-        );
-        assert_eq!(
-            app.display_language(),
-            "ru",
-            "display_language must read the focused slot's customization \
-             (ru) not the default (en)"
-        );
-        assert_eq!(
-            app.display_model(),
-            "base.en",
-            "display_model must read the focused slot's customization \
-             (base.en) not the default (tiny.en)"
-        );
-    }
-
-    /// `pick_target(TargetKind::Agent(id))` records the agent id
-    /// in the per-slot pending map so `start_section` / §11
-    /// `g` key know which cloud Agent to run. The local
-    /// routing `Target` axis stays `Stdout` — only the
-    /// agent override is updated.
-    #[test]
-    fn pick_target_with_agent_kind_records_id_in_pending_map() {
-        let mut app = App::new();
-        let slot = app.focused_slot;
-        app.pick_target(TargetKind::Agent("note-taker".into()));
-        assert_eq!(
-            app.pending_agent_overrides.get(&slot).map(String::as_str),
-            Some("note-taker"),
-            "pick_target(TargetKind::Agent(id)) must record the id in \
-             pending_agent_overrides"
-        );
     }
 
     // ── resume_section state matrix (R key) ──────────────────────────
@@ -3390,6 +3795,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -3494,6 +3901,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -3570,7 +3979,9 @@ mod tests {
                     language: lang.into(),
                     model: "tiny.en".into(),
                 },
-            };
+            session_started_at: chrono::Utc::now(),
+            role: None,
+        };
             app.slots[pos].kind = SlotKind::Saved { saved };
         }
 
@@ -3673,7 +4084,9 @@ mod tests {
                     language: "en".into(),
                     model: "tiny.en".into(),
                 },
-            },
+            session_started_at: chrono::Utc::now(),
+            role: None,
+        },
         };
         // Populate a device so we don't fail on the
         // "no device" branch before the "no free slot"
@@ -3961,6 +4374,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -4036,6 +4451,8 @@ mod tests {
                 language: "en".into(),
                 model: "tiny.en".into(),
             },
+            session_started_at: chrono::Utc::now(),
+            role: None,
         };
         app.slots[0].kind = SlotKind::Saved { saved };
 
@@ -4254,6 +4671,8 @@ mod tests {
                 started_at: "2026-05-13T10:00:00Z".into(),
                 ended_at: "2026-05-13T10:05:00Z".into(),
                 duration_ms: 300_000,
+                role: None,
+                room_slug: None,
             };
             let segments: Vec<voice_bird_cli::session::writer::WrittenSegment> =
                 vec![voice_bird_cli::session::writer::WrittenSegment {
@@ -4597,6 +5016,8 @@ mod tests {
                 device: "BlackHole".into(),
                 ended_at: "2026-05-13T08:05:00Z".into(),
                 duration_ms: 300_000,
+                role: None,
+                room_slug: None,
             };
             let seg = voice_bird_cli::session::writer::WrittenSegment {
                 t_start_ms: 0,
@@ -4635,6 +5056,355 @@ mod tests {
                 app.export_banner.as_deref(),
                 Some("Exported \u{2713} \u{2014} newest")
             );
+        }
+
+        // ---- E2E: Free Room is offline-safe ----
+        //
+        // The Free Room has no agent, so calling
+        // trigger_agent_run on it must NOT spawn a
+        // worker. The user gets the same "no agent"
+        // banner that the g-key path surfaces. The
+        // Plan §E contract says Free Room must "fully
+        // offline" — the agent path is opt-in only.
+
+        /// E2E: Free Room + no API key. trigger_agent_run
+        /// returns without spawning a worker or
+        /// mutating agent_run_state (the no-op guard
+        /// at the top of start_agent_run short-circuits
+        /// before the spawn_agent_run call).
+        #[test]
+        fn free_room_trigger_agent_run_is_noop() {
+            let dir = tempfile::tempdir().unwrap();
+            let _ = dir; // bind to silence unused warnings
+            let mut app = App::new();
+            // Free Room is at index 0 by App::new()'s
+            // contract.
+            assert_eq!(app.active_room, 0);
+            assert!(!app.active_room().has_agent());
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Auto,
+                "patient: hello".to_string(),
+            );
+            assert!(
+                app.agent_run_worker.is_none(),
+                "Free Room must NOT spawn a worker"
+            );
+            assert_eq!(app.agent_run_state.status, "");
+            assert!(app.agent_run_state.last_run_started.is_none());
+        }
+
+        /// E2E: Free Room + manual g trigger. Even with
+        /// RunTrigger::Manual, Free Room is a no-op.
+        #[test]
+        fn free_room_manual_trigger_is_noop() {
+            let mut app = App::new();
+            app.trigger_agent_run(
+                voice_bird_cli::cloud::RunTrigger::Manual,
+                "any".into(),
+            );
+            assert!(app.agent_run_worker.is_none());
+        }
+
+        fn cloud_required_room(slug: &str, name: &str) -> Room {
+            Room {
+                slug: slug.into(),
+                name: name.into(),
+                icon: None,
+                roles: vec![],
+                agent: None,
+                requires_pro: false,
+                requires_cloud: true,
+                prompt_template: String::new(),
+                role_constraints: vec![],
+            }
+        }
+
+        #[test]
+        fn arrow_dispatcher_routes_to_rooms_with_cloud_off() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = false;
+            app.plan_is_pro = Some(true);
+            app.rooms =
+                vec![Room::free_room(), cloud_required_room("x", "X")];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 1;
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.picker_focus, PickerFocus::Rooms);
+            assert_eq!(app.selected_room_index, 0, "cursor clamped to Free Room");
+        }
+
+        #[test]
+        fn arrow_dispatcher_walks_visible_rooms_with_cloud_on() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.rooms = vec![
+                Room::free_room(),
+                cloud_required_room("x", "Software Interview"),
+                cloud_required_room("y", "Doctor Appointment"),
+            ];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 0;
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 1);
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 2);
+            app.arrow_next_in_visible_picker();
+            assert_eq!(app.selected_room_index, 2, "past end → no-op");
+        }
+
+        #[test]
+        fn arrow_up_at_free_room_via_dispatcher_is_noop() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.rooms = vec![Room::free_room()];
+            app.picker_focus = PickerFocus::Devices;
+            app.selected_room_index = 0;
+            app.arrow_previous_in_visible_picker();
+            assert_eq!(app.selected_room_index, 0);
+        }
+
+        #[test]
+        fn activating_agent_room_opens_funnel() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            let mut room = cloud_required_room("x", "X");
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "a".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            assert!(app.room_funnel.is_none());
+            let _ = app.activate_room(1);
+            assert!(app.room_funnel.is_some(),
+                "funnel should be open after activating the agent room");
+            assert_eq!(app.room_funnel.as_ref().unwrap().current_step, 0);
+            assert_eq!(app.previous_active_room, Some(0),
+                "previous_active_room should remember Free Room");
+        }
+
+        /// Regression for the no-stream-after-funnel bug.
+        /// Before this commit the funnel wizard collected
+        /// per-role selections into `RoleBindingDraft::selected_name`
+        /// but the commit path (`handle_funnel_enter`) never
+        /// wrote them anywhere — `start_section` reads the
+        /// global `selected_device_index` / `selected_app_index`,
+        /// both of which stay at whatever the cursor was on
+        /// BEFORE the funnel. Result: a user activating
+        /// Software Interview with a real USB mic would land
+        /// on "Mac mini Speakers" (Output) and capture silence.
+        ///
+        /// This test pins that the post-commit state points at
+        /// the picked device/app so the first Enter after the
+        /// funnel resolves to the role's binding.
+        #[test]
+        fn commit_funnel_bindings_writes_per_slot_device() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            // Inventory: a real mic + a non-input speaker.
+            // The mic is what role 0 will pick.
+            app.devices = vec![
+                crate::platform::AudioDevice {
+                    name: "EPOS PC 8 USB".into(),
+                    kind: voice_bird_cli::config::AudioSessionKind::Input,
+                },
+                crate::platform::AudioDevice {
+                    name: "Mac mini Speakers".into(),
+                    kind: voice_bird_cli::config::AudioSessionKind::Output,
+                },
+            ];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![voice_bird_cli::room::RoleDef {
+                slug: "interviewee".into(),
+                name: "Interviewee".into(),
+            }];
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "interviewee".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            // Simulate Free Room being active with the
+            // global cursor parked on "Mac mini Speakers"
+            // (index 1) — this is the state the user had
+            // BEFORE the funnel opened. The post-commit state
+            // must NOT keep this cursor — it must point at
+            // the EPOS mic, which is what the user picked in
+            // the funnel.
+            app.selected_device_index = 1;
+            // Simulate the funnel: user moved cursor to row 0
+            // step until the commit sentinel.
+            let _ = app.activate_room(1);
+            let mut funnel = app.room_funnel.clone().unwrap();
+            funnel
+                .role_bindings
+                .iter_mut()
+                .for_each(|b| b.selected_index = Some(0));
+            // Manually run record_selected_name against the
+            // same list the dispatcher would have used.
+            funnel.record_selected_name(&["EPOS PC 8 USB"]);
+            // Advance through the wizard (role 0 → prompt
+            // → commit).
+            funnel.advance(); // role 0 → prompt
+            funnel.advance(); // prompt → commit
+            assert!(funnel.at_commit_step());
+            // Commit the bindings and verify.
+            app.commit_funnel_bindings(&funnel);
+            // The role-0 slot's memo must point at the
+            // EPOS mic (raw index 0), NOT at Mac mini
+            // Speakers (raw index 1).
+            let slot0 = app.slots[0].id;
+            let memo = app
+                .slot_picker_memo
+                .get(&slot0)
+                .expect("slot 0 must have a memo after commit");
+            assert_eq!(memo.device_idx, 0,
+                "device_idx must point at EPOS mic, not the pre-funnel cursor");
+            assert_eq!(memo.app_idx, None,
+                "DeviceInput role must not pair an app");
+            // And the FOCUSED cursor on App must be on slot 0
+            // so the first Enter after the funnel uses the
+            // binding — not whatever slot was focused before.
+            assert_eq!(app.focused_slot, slot0,
+                "focus must land on slot 0 after the funnel commits");
+            assert_eq!(app.selected_device_index, 0,
+                "global device cursor must match slot 0's memo");
+        }
+
+        /// AppLoopback role bindings must write the picked
+        /// app's index into the slot's memo, and clear the
+        /// device leg (apps carry their own device_name —
+        /// the picker shows Output devices on the device side
+        /// only when the user explicitly pairs one).
+        #[test]
+        fn commit_funnel_bindings_writes_app_for_app_loopback() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.devices = vec![crate::platform::AudioDevice {
+                name: "Mac mini Speakers".into(),
+                kind: voice_bird_cli::config::AudioSessionKind::Output,
+            }];
+            app.apps = vec![
+                crate::platform::AppSession {
+                    id: "us.zoom.xos".into(),
+                    name: "Zoom".into(),
+                    process_id: 0,
+                },
+                crate::platform::AppSession {
+                    id: "com.google.Chrome".into(),
+                    name: "Chrome".into(),
+                    process_id: 0,
+                },
+            ];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![
+                voice_bird_cli::room::RoleDef {
+                    slug: "interviewee".into(),
+                    name: "Interviewee".into(),
+                },
+                voice_bird_cli::room::RoleDef {
+                    slug: "interviewer".into(),
+                    name: "Interviewer".into(),
+                },
+            ];
+            room.role_constraints = vec![
+                RoleConstraint {
+                    role_slug: "interviewee".into(),
+                    source_kind: SourceKind::DeviceInput,
+                    required_app_slug: None,
+                    device_required: true,
+                },
+                RoleConstraint {
+                    role_slug: "interviewer".into(),
+                    source_kind: SourceKind::AppLoopback,
+                    required_app_slug: None,
+                    device_required: false,
+                },
+            ];
+            app.rooms = vec![Room::free_room(), room];
+            let _ = app.activate_room(1);
+            // Walk the wizard: role 0 (DeviceInput) — leave
+            // the cursor at None / no name (user didn't move);
+            // role 1 (AppLoopback) — user picked row 1
+            // (Chrome, after sort). record_selected_name
+            // resolves by the visible app name list.
+            let mut funnel = app.room_funnel.clone().unwrap();
+            funnel.advance(); // role 0 → role 1
+            funnel.cursor_down(2);
+            funnel.record_selected_name(&["Chrome", "Zoom"]);
+            funnel.advance(); // role 1 → prompt
+            funnel.advance(); // prompt → commit
+            app.commit_funnel_bindings(&funnel);
+            let slot1 = app.slots[1].id;
+            let memo1 = app
+                .slot_picker_memo
+                .get(&slot1)
+                .expect("slot 1 must have a memo after commit");
+            assert_eq!(memo1.app_idx, Some(1),
+                "AppLoopback role 1 must point at the Chrome app entry");
+            // Switch focus to slot 1 (interviewer) so the
+            // start path resolves the source from the
+            // interviewer's memo, not slot 0's.
+            app.focused_slot = slot1;
+            app.selected_device_index = memo1.device_idx;
+            app.selected_app_index = memo1.app_idx;
+            // And the user can now start the interviewer
+            // slot and the session will resolve to
+            // SessionSource::App { … } with Chrome's id.
+            let source = app
+                .resolve_picker_source()
+                .expect("resolve_picker_source must produce a source");
+            assert!(matches!(source, voice_bird_cli::session::layout::SessionSource::App { .. }),
+                "interviewer slot must start as App, got {source:?}");
+        }
+
+        /// If the user didn't pick anything (selected_name is
+        /// None), the memo entry is created but left at the
+        /// default — the slot just hasn't been told what to
+        /// capture. The user can still pick from the picker
+        /// post-funnel.
+        #[test]
+        fn commit_funnel_bindings_with_no_picks_is_noop() {
+            let mut app = App::new();
+            app.default_slot_config.cloud_on = true;
+            app.plan_is_pro = Some(true);
+            app.devices = vec![crate::platform::AudioDevice {
+                name: "EPOS PC 8 USB".into(),
+                kind: voice_bird_cli::config::AudioSessionKind::Input,
+            }];
+            let mut room = cloud_required_room("si", "Software Interview");
+            room.roles = vec![voice_bird_cli::room::RoleDef {
+                slug: "interviewee".into(),
+                name: "Interviewee".into(),
+            }];
+            room.role_constraints = vec![RoleConstraint {
+                role_slug: "interviewee".into(),
+                source_kind: SourceKind::DeviceInput,
+                required_app_slug: None,
+                device_required: true,
+            }];
+            app.rooms = vec![Room::free_room(), room];
+            let _ = app.activate_room(1);
+            let mut funnel = app.room_funnel.clone().unwrap();
+            // User pressed Enter without moving the cursor.
+            funnel.advance(); // role 0 → prompt
+            funnel.advance(); // prompt → commit
+            app.commit_funnel_bindings(&funnel);
+            let slot0 = app.slots[0].id;
+            let memo = app
+                .slot_picker_memo
+                .get(&slot0)
+                .expect("slot 0 memo must exist (default) even with no picks");
+            assert_eq!(memo.device_idx, 0,
+                "no pick leaves the memo at its default (device_idx 0)");
+            assert!(memo.app_idx.is_none());
         }
     }
 }
