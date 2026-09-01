@@ -18,7 +18,7 @@ name = "voice_bird_cli"
 path = "src/lib.rs"
 
 [workspace]
-members = [".", "xtask"]
+members = [".", "xtask", "next"]
 
 [lints.rust]
 # The pinned `objc` 0.2 macros (msg_send!/class! via screencapturekit 0.3.6)
