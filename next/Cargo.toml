@@ -1,0 +1,25 @@
+[package]
+name = "voice-bird-next"
+version = "0.1.0"
+edition = "2021"
+description = "Voice Bird — next-generation TUI (in-progress rewrite, lives beside voice-bird-cli)"
+license-file = "../LICENSE"
+publish = false
+
+[lib]
+name = "voice_bird_next"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voice-bird-next"
+path = "src/main.rs"
+
+[dependencies]
+# Same versions as the root crate so Cargo.lock keeps one copy and render
+# code ports over by copy-paste.
+ratatui = "0.29"
+crossterm = "0.28"
+
+[dev-dependencies]
+pretty_assertions = "1"
+proptest = "1"
