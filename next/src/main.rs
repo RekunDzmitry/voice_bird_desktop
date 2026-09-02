@@ -10,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use voice_bird_next::{input, state::UiState, ui};
+use voice_bird_next::{bus::EventBus, input, state::UiState, ui};
 
 /// Runs `restore` on drop. Constructed as soon as the first irreversible
 /// terminal step (raw mode) has succeeded, so every later failure — the
@@ -69,15 +69,23 @@ fn main() -> io::Result<()> {
     run(&mut terminal)
 }
 
-/// Draw, block until the next terminal event, apply it, repeat. Nothing in
-/// the state changes on its own yet, so there is no tick: `event::read`
-/// wakes on key presses and on resizes (which just trigger a redraw).
+/// Draw, block until the next terminal event, publish it, drain the bus
+/// into the state, repeat. Background producers (audio devices, timers)
+/// will need `event::poll` or a reader thread; today all producers are
+/// the input path, so blocking on `event::read` is fine.
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    let mut bus = EventBus::new();
+    let keys = bus.sender();
     let mut state = UiState::default();
     loop {
         terminal.draw(|f| ui::render(f, &state))?;
         if let Event::Key(key) = event::read()? {
-            input::handle_key(&mut state, key);
+            if let Some(ev) = input::map_key(key) {
+                keys.publish(ev);
+            }
+        }
+        for ev in bus.drain() {
+            state.apply(ev);
         }
         if state.should_quit {
             break;

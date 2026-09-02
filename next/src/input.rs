@@ -1,18 +1,23 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::state::UiState;
+use crate::bus::AppEvent;
 
-/// Apply one key event to the state. Only `Press` events count (same
+/// Map one key event to an [`AppEvent`]. Only `Press` events count (same
 /// filter as the old `run_app`, which otherwise double-fires on Windows).
-pub fn handle_key(state: &mut UiState, key: KeyEvent) {
+/// Returns `None` for keys the app does not act on.
+///
+/// Matches `'+'` by code only — many layouts report `'+'` with SHIFT set,
+/// and stripping the modifier at this layer would drop those.
+pub fn map_key(key: KeyEvent) -> Option<AppEvent> {
     if key.kind != KeyEventKind::Press {
-        return;
+        return None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-        KeyCode::Char('c') if ctrl => state.should_quit = true,
-        _ => {}
+        KeyCode::Char('q') | KeyCode::Esc => Some(AppEvent::Quit),
+        KeyCode::Char('c') if ctrl => Some(AppEvent::Quit),
+        KeyCode::Char('+') => Some(AppEvent::AddBlock),
+        _ => None,
     }
 }
 
@@ -26,24 +31,38 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn quits(key: KeyEvent) -> bool {
-        let mut s = UiState::default();
-        handle_key(&mut s, key);
-        s.should_quit
+    #[test]
+    fn q_esc_and_ctrl_c_map_to_quit() {
+        assert_eq!(map_key(press(KeyCode::Char('q'))), Some(AppEvent::Quit));
+        assert_eq!(map_key(press(KeyCode::Esc)), Some(AppEvent::Quit));
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(AppEvent::Quit)
+        );
     }
 
     #[test]
-    fn q_esc_and_ctrl_c_quit() {
-        assert!(quits(press(KeyCode::Char('q'))));
-        assert!(quits(press(KeyCode::Esc)));
-        assert!(quits(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    fn plus_maps_to_add_block_with_no_modifier() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('+'))),
+            Some(AppEvent::AddBlock)
+        );
+    }
+
+    #[test]
+    fn plus_maps_to_add_block_with_shift() {
+        // Many layouts report `+` with SHIFT set; we still want AddBlock.
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT)),
+            Some(AppEvent::AddBlock)
+        );
     }
 
     #[test]
     fn other_keys_are_ignored() {
-        assert!(!quits(press(KeyCode::Char('x'))));
-        assert!(!quits(press(KeyCode::Char('c')))); // plain `c`, no ctrl
-        assert!(!quits(press(KeyCode::Enter)));
+        assert_eq!(map_key(press(KeyCode::Char('x'))), None);
+        assert_eq!(map_key(press(KeyCode::Char('c'))), None); // plain `c`, no ctrl
+        assert_eq!(map_key(press(KeyCode::Enter)), None);
     }
 
     /// crossterm reports both `Press` and `Release` on Windows and on
@@ -56,6 +75,6 @@ mod tests {
             kind: KeyEventKind::Release,
             ..press(KeyCode::Char('q'))
         };
-        assert!(!quits(release));
+        assert_eq!(map_key(release), None);
     }
 }
