@@ -54,25 +54,25 @@ impl EventSender {
 
 /// Single-consumer pub/sub over `std::sync::mpsc`.
 pub struct EventBus {
-    tx: mpsc::Sender<AppEvent>,
-    rx: mpsc::Receiver<AppEvent>,
+    sender: mpsc::Sender<AppEvent>,
+    receiver: mpsc::Receiver<AppEvent>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self { tx, rx }
+        let (sender, receiver) = mpsc::channel();
+        Self { sender, receiver }
     }
 
     /// Cloneable handle that producers use to publish.
     pub fn sender(&self) -> EventSender {
-        EventSender(self.tx.clone())
+        EventSender(self.sender.clone())
     }
 
     /// Non-blocking: yields every queued event in publish order, then stops.
     /// Called once per tick from the event loop.
     pub fn drain(&mut self) -> impl Iterator<Item = AppEvent> + '_ {
-        self.rx.try_iter()
+        self.receiver.try_iter()
     }
 }
 
@@ -129,12 +129,58 @@ mod tests {
         );
     }
 
+    /// Once the bus is dropped, every `sender` clone is disconnected:
+    /// subsequent `publish` calls must neither panic nor ever reach a
+    /// consumer. The previous version only asserted "does not panic" by
+    /// virtue of running — this version makes both halves explicit so a
+    /// future refactor (e.g. one that returns the `Result` from `publish`,
+    /// or that spawns a producer thread) cannot silently weaken the
+    /// contract.
     #[test]
     fn publish_after_drop_is_a_silent_no_op() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
         let bus = EventBus::new();
         let tx = bus.sender();
         drop(bus);
-        // Must not panic — `send` returns `Err`, `publish` swallows it.
-        tx.publish(AppEvent::Quit);
+
+        // Reach the underlying `mpsc::Sender` to confirm the channel is
+        // disconnected: `send` returns `Err(SendError(_))` once the
+        // receiver is gone. `publish` wraps this and must agree by
+        // silently dropping the event instead of panicking.
+        assert!(
+            tx.0.send(AppEvent::Quit).is_err(),
+            "underlying channel should report disconnected after the bus is dropped",
+        );
+
+        // No panic on publish, even though the channel is closed.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            tx.publish(AppEvent::AddBlock);
+            tx.publish(AppEvent::Quit);
+        }));
+        assert!(result.is_ok(), "publish after drop must not panic");
+    }
+
+    /// A fresh bus has nothing queued: draining yields zero events even
+    /// when previous buses were dropped mid-flight. Guards the "consumer
+    /// received nothing" half of the drop contract at the bus level.
+    #[test]
+    fn dropped_sender_does_not_deliver_to_a_fresh_bus() {
+        // Drop a sender's bus before publishing.
+        let stale = EventBus::new();
+        let stale_tx = stale.sender();
+        drop(stale);
+
+        // `stale_tx` is now disconnected; publishes must be silent no-ops.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stale_tx.publish(AppEvent::AddBlock);
+        }));
+        assert!(result.is_ok());
+        assert!(stale_tx.0.send(AppEvent::AddBlock).is_err());
+
+        // A brand-new bus has its own channel; nothing from the stale one
+        // can leak into it.
+        let mut fresh = EventBus::new();
+        assert_eq!(fresh.drain().count(), 0);
     }
 }

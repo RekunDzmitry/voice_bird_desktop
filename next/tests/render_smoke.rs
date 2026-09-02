@@ -41,7 +41,8 @@ proptest! {
     }
 
     /// Random block counts across random terminal sizes must never panic.
-    /// Layout::vertical clamps zero-height rows; ratatui skips the draw.
+    /// The Direction::Horizontal layout clamps zero-width columns;
+    /// ratatui skips the draw.
     #[test]
     fn render_never_panics_with_random_block_count(
         w in 1u16..200,
