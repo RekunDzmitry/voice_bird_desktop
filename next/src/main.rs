@@ -44,8 +44,9 @@ fn enter_terminal<F: FnMut()>(
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    // Harmless if the alternate screen was never entered (terminals treat
-    // a redundant leave as a no-op).
+    // Shared by every exit path (normal quit, panic hook, rollback). On a
+    // rollback the alternate screen was never entered and this write is a
+    // no-op; a per-path restore would cost more code than that one write.
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }
 
