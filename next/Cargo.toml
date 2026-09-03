@@ -18,6 +18,7 @@ path = "src/main.rs"
 # Same versions as the root crate so Cargo.lock keeps one copy and render
 # code ports over by copy-paste.
 chrono = "0.4"
+directories = "5"
 ratatui = "0.29"
 crossterm = "0.28"
 

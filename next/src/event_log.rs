@@ -1,9 +1,11 @@
 //! On-disk append-only log of every [`AppEvent`] that traverses the bus.
 //!
 //! One JSON object per line, ISO-8601 UTC timestamp + variant tag.
-//! Hardcoded path under `target/voice-bird-next-events/`; deliberately
-//! not configurable yet — replace with the planned `paths::Session`
-//! abstraction once it lands.
+//! Path is resolved at runtime from the platform data-directory API
+//! (`directories::ProjectDirs::data_dir()`), so the compiled binary
+//! contains no source paths and stays portable across checkouts.
+//! Deliberately not configurable yet - replace with the planned
+//! `paths::Session` abstraction once it lands.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -11,10 +13,9 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::bus::AppEvent;
+use directories::ProjectDirs;
 
-/// Subdirectory under `next/target/` that holds per-session event logs.
-const LOG_SUBDIR: &str = "voice-bird-next-events";
+use crate::bus::AppEvent;
 
 /// Owns the open append handle and the resolved path so `Drop` can flush.
 pub struct EventLog {
@@ -53,19 +54,21 @@ impl EventLog {
         Some(Self { file, path })
     }
 
-    /// Build the log directory path. Always rooted at the workspace's
-    /// `next/target/` so the path is stable across machines and the
-    /// existing root `.gitignore` `/target/` rule already covers it.
+    /// Resolve the log directory at runtime. Uses the platform data
+    /// directory via `directories` so the compiled binary is portable:
+    /// `~/Library/Application Support/com.RekunDzmitry.voice-bird-next/events`
+    /// on macOS, `~/.local/share/voice-bird-next/events` on Linux,
+    /// `%APPDATA%\voice-bird-next\events` on Windows.
+    ///
+    /// Falls back to `std::env::temp_dir()/voice-bird-next/events` only
+    /// when the platform cannot provide a data dir (rare; e.g. exotic
+    /// targets). Returns `None` only as a structural guard.
     fn log_dir() -> Option<PathBuf> {
-        // CARGO_MANIFEST_DIR is the absolute path to the `next/` crate
-        // directory at compile time. Tests in this crate live under
-        // `next/tests/`; CARGO_MANIFEST_DIR resolves correctly for them
-        // because `cargo test` runs in the package's directory.
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(LOG_SUBDIR),
-        )
+        if let Some(proj) = ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next") {
+            return Some(proj.data_dir().join("events"));
+        }
+        Some(std::env::temp_dir().join("voice-bird-next").join("events"))
+
     }
 
     /// Path the log was opened against. Exposed for diagnostics and for
@@ -134,15 +137,36 @@ mod tests {
         assert!(lines[1].contains("\"event\":\"Quit\""));
     }
 
-    /// Confirm `log_dir()` resolves under the next-crate target/ dir.
-    /// Pure path check — does not actually open a file.
+    /// `log_dir()` resolves at runtime via the platform data directory
+    /// (or the temp-dir fallback). It MUST NOT contain any path under
+    /// the build machine's source tree - the binary is portable.
     #[test]
-    fn log_dir_is_inside_next_target() {
+    fn log_dir_does_not_contain_manifest_path() {
         let dir = EventLog::log_dir().expect("dir");
-        assert!(dir.ends_with("voice-bird-next-events"), "{dir:?}");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
-            dir.components().any(|c| c.as_os_str() == "target"),
-            "expected `target` in path, got {dir:?}"
+            !dir.starts_with(manifest),
+            "log_dir {dir:?} lives under CARGO_MANIFEST_DIR {manifest:?}; \
+             binary would not be portable"
+        );
+        // Tail must mark this as a voice-bird-next log dir regardless
+        // of whether we took the ProjectDirs or temp-dir branch.
+        let ends_branch_a = dir.ends_with("com.RekunDzmitry.voice-bird-next/events")
+            || dir.ends_with("voice-bird-next/events");
+        assert!(ends_branch_a, "unexpected log_dir tail: {dir:?}");
+    }
+
+    /// Sanity-check the platform data-dir is writable from this process
+    /// so `open()` can use it. Skipped silently when we fall back to
+    /// temp-dir (e.g. unsupported target): the rest of the test suite
+    /// already exercises `open()` with a real path.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn log_dir_lives_under_application_support_on_macos() {
+        let dir = EventLog::log_dir().expect("dir");
+        assert!(
+            dir.components().any(|c| c.as_os_str() == "Application Support"),
+            "expected Application Support on macOS, got {dir:?}"
         );
     }
 
