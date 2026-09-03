@@ -9,6 +9,7 @@
 //! - Input maps keys to [`bus::AppEvent`]; the bus transports them; a pure
 //!   reducer on `UiState::apply` folds them in. Input never mutates state.
 pub mod bus;
+pub mod event_log;
 pub mod input;
 pub mod state;
 pub mod testing;
