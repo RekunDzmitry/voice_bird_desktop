@@ -76,6 +76,10 @@ fn main() -> io::Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut bus = EventBus::new();
     let keys = bus.sender();
+    let mut log = voice_bird_next::event_log::EventLog::open();
+    if let Some(l) = &log {
+        eprintln!("event_log: writing to {}", l.path().display());
+    }
     let mut state = UiState::default();
     loop {
         terminal.draw(|f| ui::render(f, &state))?;
@@ -85,6 +89,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             }
         }
         for ev in bus.drain() {
+            if let Some(l) = log.as_mut() {
+                l.append(ev);
+            }
             state.apply(ev);
         }
         if state.should_quit {

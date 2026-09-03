@@ -3944,10 +3944,12 @@ dependencies = [
 name = "voice-bird-next"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "pretty_assertions",
  "proptest",
  "ratatui",
+ "tempfile",
 ]
 
 [[package]]
