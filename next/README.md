@@ -17,12 +17,13 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
 
 | path | role |
 |---|---|
-| `src/state.rs`   | `UiState` — plain data the UI draws from |
+| `src/bus.rs`     | `AppEvent` enum + `EventBus` / `EventSender` pub-sub over `std::mpsc` |
+| `src/state.rs`   | `UiState` — plain data the UI draws from + `UiState::apply` reducer |
 | `src/ui.rs`      | `render(f, &UiState)` + unit tests per render fn |
-| `src/input.rs`   | `handle_key(&mut UiState, KeyEvent)` + tests |
+| `src/input.rs`   | `map_key(KeyEvent) -> Option<AppEvent>` + tests |
 | `src/testing.rs` | `render_to_string(state, w, h)` via `TestBackend`, shared by all tests |
 | `src/main.rs`    | terminal guard + event loop — the only file touching a real terminal |
-| `tests/`         | integration tests: golden snapshot, proptest "never panics at any size" |
+| `tests/`         | integration tests: golden snapshots, proptest "never panics at any size" |
 
 ## Growth rules
 
@@ -32,6 +33,9 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
    from the old `src/ui.rs` `mod tests` when the fn is ported.
 3. **Side effects live behind traits** (audio, engines, cloud), never in
    `UiState`; tests use fixture implementations.
+4. **Input flows through the bus.** `input::map_key` returns
+   `Option<AppEvent>`; the loop publishes to `EventBus` and drains into
+   `UiState::apply`. There is no direct input→state mutation.
 
 ## Refreshing the golden snapshot
 

@@ -6,7 +6,9 @@
 //! - [`ui::render`] is a pure function of `&UiState`.
 //! - Side effects (terminal, audio, engines, cloud) live in `main.rs` or
 //!   behind traits, never inside the state struct.
-
+//! - Input maps keys to [`bus::AppEvent`]; the bus transports them; a pure
+//!   reducer on `UiState::apply` folds them in. Input never mutates state.
+pub mod bus;
 pub mod input;
 pub mod state;
 pub mod testing;
