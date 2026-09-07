@@ -27,15 +27,31 @@
 
 use std::sync::mpsc;
 
+use crate::picker::{ModelEntry, PickerMove};
+
 /// Everything that can happen in the app, as plain data.
 ///
 /// Named `AppEvent` to avoid colliding with `crossterm::event::Event`
 /// (imported in `main.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
-    /// The user pressed `'+'`. Reducer grows the block count by one.
+    /// The user pressed `+`. Lifecycle intent: the reducer decides what
+    /// it does (today: open the model picker; tomorrow: also log a
+    /// keystroke). The bus carries the intent, never the key.
     AddBlock,
-    /// The user asked to quit (`q`, `Esc`, or `Ctrl-C`).
+    /// The user pressed an arrow key while the picker is open. The
+    /// reducer routes this through `ModelPicker::apply`; the picker
+    /// clamps the index.
+    PickerMoved(PickerMove),
+    /// The user pressed Enter while the picker is open; the main loop
+    /// already resolved the current `ModelPicker::index` into the
+    /// concrete [`ModelEntry`] and publishes this so the bus only ever
+    /// sees resolved data.
+    ModelSelected(&'static ModelEntry),
+    /// The user pressed Esc while the picker is open.
+    PickerCancelled,
+    /// The user asked to quit (`q`, `Esc` outside the picker, or
+    /// Ctrl-C).
     Quit,
 }
 

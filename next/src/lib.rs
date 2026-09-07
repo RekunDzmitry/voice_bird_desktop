@@ -11,6 +11,7 @@
 pub mod bus;
 pub mod event_log;
 pub mod input;
+pub mod picker;
 pub mod state;
 pub mod testing;
 pub mod ui;
