@@ -11,7 +11,7 @@
 
 /// One row of the catalog: the model id (matches the snapshot test label),
 /// its on-disk size in megabytes, and the language tag rendered in the row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ModelEntry {
     pub id: &'static str,
     pub size_mb: u32,
@@ -63,7 +63,7 @@ pub enum PickerIntent {
 
 /// Direction the picker moved. Key-agnostic on purpose: `Up`/`Down` come
 /// from `j`/`k`/`↑`/`↓` at the input layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PickerMove {
     Up,
     Down,

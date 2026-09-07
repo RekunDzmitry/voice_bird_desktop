@@ -53,9 +53,9 @@ impl UiState {
             AppEvent::AddBlock => {
                 self.picker = Some(ModelPicker::open(PickerIntent::AddBlock));
             }
-            AppEvent::PickerMoved(mv) => {
+            AppEvent::PickerMoved { direction } => {
                 if let Some(p) = self.picker.as_mut() {
-                    p.apply(crate::picker::PickerEvent::Moved(mv));
+                    p.apply(crate::picker::PickerEvent::Moved(direction));
                 }
             }
             AppEvent::ModelSelected(entry) => {
@@ -136,13 +136,13 @@ mod tests {
         s.apply(AppEvent::AddBlock);
         // Down past last index clamps to last.
         for _ in 0..(CATALOG.len() + 5) {
-            s.apply(AppEvent::PickerMoved(PickerMove::Down));
+            s.apply(AppEvent::PickerMoved { direction: PickerMove::Down });
         }
         let p = s.picker.as_ref().unwrap();
         assert_eq!(p.index, CATALOG.len() - 1);
         // Up clamps at zero.
         for _ in 0..(CATALOG.len() + 5) {
-            s.apply(AppEvent::PickerMoved(PickerMove::Up));
+            s.apply(AppEvent::PickerMoved { direction: PickerMove::Up });
         }
         let p = s.picker.as_ref().unwrap();
         assert_eq!(p.index, 0);
@@ -151,8 +151,8 @@ mod tests {
     #[test]
     fn apply_picker_moved_is_noop_when_picker_closed() {
         let mut s = UiState::default();
-        s.apply(AppEvent::PickerMoved(PickerMove::Down));
-        s.apply(AppEvent::PickerMoved(PickerMove::Up));
+        s.apply(AppEvent::PickerMoved { direction: PickerMove::Down });
+        s.apply(AppEvent::PickerMoved { direction: PickerMove::Up });
         assert!(s.picker.is_none());
         assert!(s.blocks.is_empty());
     }

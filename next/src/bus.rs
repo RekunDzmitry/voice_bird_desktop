@@ -33,16 +33,15 @@ use crate::picker::{ModelEntry, PickerMove};
 ///
 /// Named `AppEvent` to avoid colliding with `crossterm::event::Event`
 /// (imported in `main.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "event")]
 pub enum AppEvent {
     /// The user pressed `+`. Lifecycle intent: the reducer decides what
     /// it does (today: open the model picker; tomorrow: also log a
     /// keystroke). The bus carries the intent, never the key.
     AddBlock,
     /// The user pressed an arrow key while the picker is open. The
-    /// reducer routes this through `ModelPicker::apply`; the picker
-    /// clamps the index.
-    PickerMoved(PickerMove),
+    PickerMoved { direction: PickerMove },
     /// The user pressed Enter while the picker is open; the main loop
     /// already resolved the current `ModelPicker::index` into the
     /// concrete [`ModelEntry`] and publishes this so the bus only ever

@@ -97,7 +97,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
                         keys.publish(AppEvent::ModelSelected(entry));
                     }
                     input::PickerKey::PickerMoved(mv) => {
-                        keys.publish(AppEvent::PickerMoved(mv));
+                        keys.publish(AppEvent::PickerMoved { direction: mv });
                     }
                     input::PickerKey::PickerCancelled => {
                         keys.publish(AppEvent::PickerCancelled);
