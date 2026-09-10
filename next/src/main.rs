@@ -10,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use voice_bird_next::{bus::EventBus, input, state::UiState, ui};
+use voice_bird_next::{bus::{AppEvent, EventBus}, input, picker::{self, CATALOG}, state::UiState, ui};
 
 /// Runs `restore` on drop. Constructed as soon as the first irreversible
 /// terminal step (raw mode) has succeeded, so every later failure — the
@@ -80,10 +80,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut state = UiState::default();
     loop {
         terminal.draw(|f| ui::render(f, &state))?;
-        if let Event::Key(key) = event::read()? {
-            if let Some(ev) = input::map_key(key) {
+        let key = match event::read()? {
+            Event::Key(k) => k,
+            _ => continue,
+        };
+        // Picker open: try the picker translator first; anything it
+        // doesn't recognize falls back to `map_key` so global quit
+        if let Some(picker) = state.picker.as_ref() {
+            if let Some(pk) = input::picker_keys(key) {
+                match pk {
+                    input::PickerKey::PickerEnter => {
+                        // The picker resolved itself in step 5 of the
+                        // plan — the loop only resolves the index into
+                        // a concrete `ModelEntry` here.
+                        let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
+                        keys.publish(AppEvent::ModelSelected(entry));
+                    }
+                    input::PickerKey::PickerMoved(mv) => {
+                        keys.publish(AppEvent::PickerMoved { direction: mv });
+                    }
+                    input::PickerKey::PickerCancelled => {
+                        keys.publish(AppEvent::PickerCancelled);
+                    }
+                }
+            } else if let Some(ev) = input::map_key(key) {
                 keys.publish(ev);
             }
+        } else if let Some(ev) = input::map_key(key) {
+            keys.publish(ev);
         }
         for ev in bus.drain() {
             if let Some(l) = log.as_mut() {
