@@ -1,21 +1,33 @@
 //! Binary entry point: the only file that touches a real terminal.
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::{
     cursor,
-    event::{self, Event},
+    event::{self, Event, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use voice_bird_next::{bus::{AppEvent, EventBus}, input, picker::{self, CATALOG}, state::UiState, ui};
+use voice_bird_next::{
+    bus::{AppEvent, EventBus, EventSender, FocusMove},
+    download::{begin, CancelRegistry, Downloader},
+    input::{self, Intent},
+    model_store::{CacheDirStore, ModelStore},
+    picker::{self, CATALOG},
+    state::{BlockState, UiState},
+    store::{DownloadRepository, InMemoryDownloadRepository},
+};
+#[cfg(feature = "net")]
+use voice_bird_next::download::HttpDownloader;
+
+
 
 /// Runs `restore` on drop. Constructed as soon as the first irreversible
-/// terminal step (raw mode) has succeeded, so every later failure — the
-/// alternate-screen write, `?` early returns, unwinds via the panic hook —
-/// rolls the terminal back.
+/// terminal step (raw mode) has succeeded.
 struct RestoreGuard<F: FnMut()> {
     restore: F,
 }
@@ -26,11 +38,6 @@ impl<F: FnMut()> Drop for RestoreGuard<F> {
     }
 }
 
-/// Enable raw mode, then enter the alternate screen. The guard is created
-/// between the two steps: if `enter_alt` fails, `?` drops it and `restore`
-/// undoes raw mode. If `enable_raw` itself fails there is nothing to undo
-/// and `restore` never runs. Takes the steps as closures so tests can drive
-/// the partial-initialization paths without a real terminal.
 fn enter_terminal<F: FnMut()>(
     enable_raw: impl FnOnce() -> io::Result<()>,
     enter_alt: impl FnOnce() -> io::Result<()>,
@@ -44,9 +51,6 @@ fn enter_terminal<F: FnMut()>(
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    // Shared by every exit path (normal quit, panic hook, rollback). On a
-    // rollback the alternate screen was never entered and this write is a
-    // no-op; a per-path restore would cost more code than that one write.
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }
 
@@ -69,57 +73,158 @@ fn main() -> io::Result<()> {
     run(&mut terminal)
 }
 
-/// Draw, block until the next terminal event, publish it, drain the bus
-/// into the state, repeat. Background producers (audio devices, timers)
-/// will need `event::poll` or a reader thread; today all producers are
-/// the input path, so blocking on `event::read` is fine.
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-    let mut bus = EventBus::new();
-    let keys = bus.sender();
-    let mut log = voice_bird_next::event_log::EventLog::open();
-    let mut state = UiState::default();
-    loop {
-        terminal.draw(|f| ui::render(f, &state))?;
-        let key = match event::read()? {
-            Event::Key(k) => k,
-            _ => continue,
-        };
-        // Picker open: try the picker translator first; anything it
-        // doesn't recognize falls back to `map_key` so global quit
-        if let Some(picker) = state.picker.as_ref() {
-            if let Some(pk) = input::picker_keys(key) {
-                match pk {
-                    input::PickerKey::PickerEnter => {
-                        // The picker resolved itself in step 5 of the
-                        // plan — the loop only resolves the index into
-                        // a concrete `ModelEntry` here.
-                        let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
-                        keys.publish(AppEvent::ModelSelected(entry));
-                    }
-                    input::PickerKey::PickerMoved(mv) => {
-                        keys.publish(AppEvent::PickerMoved { direction: mv });
-                    }
-                    input::PickerKey::PickerCancelled => {
-                        keys.publish(AppEvent::PickerCancelled);
+/// Resolve one [`Intent`] into bus events. The reducer does the rest.
+///
+/// - `Confirm` and `Retry` are the resolver's job: they need the
+///   focused block's stage and access to the store / repo.
+/// - All other intents are direct mappings.
+fn resolve_intent(
+    intent: Intent,
+    state: &UiState,
+    store: &Arc<dyn ModelStore>,
+    repo: &Arc<dyn DownloadRepository>,
+    downloader: &Arc<dyn Downloader>,
+    cancels: &CancelRegistry,
+    tx: &EventSender,
+) {
+    match intent {
+        Intent::AddBlock => tx.publish(AppEvent::AddBlock),
+        Intent::FocusPrev => tx.publish(AppEvent::FocusMoved {
+            direction: FocusMove::Prev,
+        }),
+        Intent::FocusNext => tx.publish(AppEvent::FocusMoved {
+            direction: FocusMove::Next,
+        }),
+        Intent::PickerPrev => tx.publish(AppEvent::PickerMoved {
+            direction: picker::PickerMove::Up,
+        }),
+        Intent::PickerNext => tx.publish(AppEvent::PickerMoved {
+            direction: picker::PickerMove::Down,
+        }),
+        Intent::Confirm => {
+            if let Some(block) = state.focused() {
+                if let BlockState::Picking(picker) = &block.state {
+                    let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
+                    begin(entry, store, repo, downloader, cancels, tx);
+                }
+            }
+        }
+        Intent::Retry => {
+            if let Some(block) = state.focused() {
+                if let BlockState::Failed { model, .. } = &block.state {
+                    if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
+                        begin(entry, store, repo, downloader, cancels, tx);
                     }
                 }
-            } else if let Some(ev) = input::map_key(key) {
-                keys.publish(ev);
             }
-        } else if let Some(ev) = input::map_key(key) {
-            keys.publish(ev);
+        }
+        Intent::BlockClosed => {
+            // Closing the focused block: if it was the last waiter on
+            // its model, fire the cancel signal so the in-flight
+            // thread observes it. The reducer takes the record down
+            // when no waiter remains; we just signal the thread.
+            if let Some(block) = state.focused() {
+                if let Some(model) = block.model() {
+                    let any_other = state.blocks.iter().any(|b| {
+                        b.id != block.id
+                            && matches!(&b.state, BlockState::Waiting { model: m } if *m == model)
+                    });
+                    if !any_other
+                        && matches!(block.state, BlockState::Waiting { .. })
+                    {
+                        cancels.cancel(model);
+                        cancels.clear(model);
+                        repo.remove(model);
+                    }
+                }
+            }
+            tx.publish(AppEvent::BlockClosed);
+        }
+        Intent::Quit => tx.publish(AppEvent::Quit),
+    }
+}
+
+fn handle_key(
+    key: KeyEvent,
+    state: &UiState,
+    store: &Arc<dyn ModelStore>,
+    repo: &Arc<dyn DownloadRepository>,
+    downloader: &Arc<dyn Downloader>,
+    cancels: &CancelRegistry,
+    tx: &EventSender,
+) {
+    if let Some(intent) = input::map_key(key) {
+        resolve_intent(intent, state, store, repo, downloader, cancels, tx);
+    }
+}
+
+/// Drive one tick: draw if dirty, drain events, fold into state. The
+/// 100 ms poll bounds bar latency at 10 fps while the dirty flag keeps
+/// an idle app from spamming the terminal.
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    const TICK: Duration = Duration::from_millis(100);
+
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+    let mut log = voice_bird_next::event_log::EventLog::open();
+    let mut state = UiState::default();
+
+    // Wired only in `main` — the live HTTP downloader. Tests use
+    // `FixtureDownloader` through the same trait.
+    let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
+        Ok(s) => {
+            let _ = s.sweep_staging();
+            Arc::new(s)
+        }
+        Err(e) => {
+            eprintln!("voice-bird-next: cannot resolve cache dir: {e}");
+            std::process::exit(2);
+        }
+    };
+    let repo: Arc<dyn DownloadRepository> =
+        Arc::new(InMemoryDownloadRepository::new());
+    let downloader: Arc<dyn Downloader> = cfg_build_downloader();
+    let cancels = CancelRegistry::new();
+
+    let mut dirty = true;
+    loop {
+        if dirty {
+            terminal.draw(|f| voice_bird_next::ui::render(f, &state))?;
+            dirty = false;
+        }
+        if event::poll(TICK)? {
+            if let Event::Key(k) = event::read()? {
+                handle_key(k, &state, &store, &repo, &downloader, &cancels, &tx);
+                dirty = true;
+            }
         }
         for ev in bus.drain() {
             if let Some(l) = log.as_mut() {
-                l.append(ev);
+                l.append(&ev);
             }
-            state.apply(ev);
+            voice_bird_next::store::apply(&*repo, &ev);
+            state.apply(&ev);
+            dirty = true;
         }
         if state.should_quit {
             break;
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "net")]
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
+    Arc::new(HttpDownloader)
+}
+
+#[cfg(not(feature = "net"))]
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
+    // Without the `net` feature the binary can't download. Tests
+    // exercise the full flow through FixtureDownloader; the binary
+    // is the production switch and exits early here.
+    eprintln!("voice-bird-next: built without the `net` feature, downloads are disabled");
+    std::process::exit(2);
 }
 
 #[cfg(test)]

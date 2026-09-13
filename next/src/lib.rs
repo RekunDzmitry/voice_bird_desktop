@@ -13,5 +13,8 @@ pub mod event_log;
 pub mod input;
 pub mod picker;
 pub mod state;
+pub mod store;
+pub mod download;
+pub mod model_store;
 pub mod testing;
 pub mod ui;

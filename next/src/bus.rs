@@ -13,51 +13,76 @@
 //! only ever touch [`EventSender::publish`], and `drain` yields in publish
 //! order on the loop thread.
 //!
-//! ## Upgrade paths without reshaping `publish`
+//! ## Why not `Copy`?
 //!
-//! - **Many producers** — already here: clone the [`EventSender`].
-//! - **Many consumers** — either dispatch each drained event to several
-//!   reducers in `run`, or grow `subscribe() -> Subscription` with internal
-//!   fan-out. Neither changes the public producer surface.
-//! - **Topics** — match on [`AppEvent`] variants (or a nested enum) at
-//!   dispatch time; the transport never has to know.
-//!
-//! Deliberately not built now: a generic `EventBus<T>`, topic registration,
-//! per-subscriber queues, crossbeam, tokio.
+//! `DownloadFailed` carries a `String` so the rendered error line is
+//! actionable ("HTTP 404" beats "network error"). That forfeits `Copy`
+//! for the whole enum. `Eq` survives — every payload stays integral;
+//! keep it that way. The moment a payload gains an `f64` (a ratio, a
+//! duration) the derive breaks and every `assert_eq!` in this file's
+//! tests stops compiling, which is why progress is `bytes`/`total` and
+//! never a pre-computed ratio.
 
 use std::sync::mpsc;
 
 use crate::picker::{ModelEntry, PickerMove};
 
-/// Everything that can happen in the app, as plain data.
-///
-/// Named `AppEvent` to avoid colliding with `crossterm::event::Event`
-/// (imported in `main.rs`).
+/// Direction focus travelled between blocks. The reducer saturates at
+/// both ends; the key layer never has to reason about wraparound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum FocusMove {
+    Prev,
+    Next,
+}
+
+/// Everything that can happen in the app, as plain data.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum AppEvent {
-    /// The user pressed `+`. Lifecycle intent: the reducer decides what
-    /// it does (today: open the model picker; tomorrow: also log a
-    /// keystroke). The bus carries the intent, never the key.
+    /// `+`: push a `Picking` block and focus it. Allowed at any time.
     AddBlock,
-    /// The user pressed an arrow key while the picker is open. The
+    /// `←` / `→`: move focus between blocks.
+    FocusMoved { direction: FocusMove },
+    /// `↑` / `↓` while the focused block is `Picking`: move the
+    /// highlight inside that block's catalog list.
     PickerMoved { direction: PickerMove },
-    /// The user pressed Enter while the picker is open; the main loop
-    /// already resolved the current `ModelPicker::index` into the
-    /// concrete [`ModelEntry`] and publishes this so the bus only ever
-    /// sees resolved data.
+    /// Enter on a focused `Picking` block. Today this transitions
+    /// straight to `Recording`; step 8 routes it through the resolver
+    /// (`begin`).
     ModelSelected(&'static ModelEntry),
-    /// The user pressed Esc while the picker is open.
-    PickerCancelled,
-    /// The user asked to quit (`q`, `Esc` outside the picker, or
-    /// Ctrl-C).
+    /// Esc on the focused block: remove it.
+    BlockClosed,
+    /// Model is on disk and ready.
+    RecordingStarted(&'static ModelEntry),
+    /// The focused block now waits on this model.
+    DownloadRequested(&'static ModelEntry),
+    /// Progress on a download.
+    DownloadProgress {
+        model: &'static str,
+        bytes: u64,
+        total: Option<u64>,
+    },
+    /// Bytes verified; the format handler is unpacking.
+    DownloadInstalling { model: &'static str },
+    /// Fans out to EVERY block waiting on `model`.
+    DownloadSucceeded { model: &'static str },
+    /// `error` carries an actionable message.
+    DownloadFailed {
+        model: &'static str,
+        error: String,
+    },
+    /// Last waiter for `model` closed. Removes the repo row and the
+    /// UiState.downloads entry; the in-flight thread observes the
+    /// cancel flag separately and publishes nothing of its own.
+    DownloadCancelled { model: &'static str },
+    /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
 /// whole API they see, and cloning is the only way to get one.
 #[derive(Debug, Clone)]
-pub struct EventSender(mpsc::Sender<AppEvent>);
+pub struct EventSender(pub mpsc::Sender<AppEvent>);
 
 impl EventSender {
     /// Best-effort: send only fails when the bus is gone, i.e. the loop is
@@ -85,7 +110,6 @@ impl EventBus {
     }
 
     /// Non-blocking: yields every queued event in publish order, then stops.
-    /// Called once per tick from the event loop.
     pub fn drain(&mut self) -> impl Iterator<Item = AppEvent> + '_ {
         self.receiver.try_iter()
     }
@@ -144,13 +168,6 @@ mod tests {
         );
     }
 
-    /// Once the bus is dropped, every `sender` clone is disconnected:
-    /// subsequent `publish` calls must neither panic nor ever reach a
-    /// consumer. The previous version only asserted "does not panic" by
-    /// virtue of running — this version makes both halves explicit so a
-    /// future refactor (e.g. one that returns the `Result` from `publish`,
-    /// or that spawns a producer thread) cannot silently weaken the
-    /// contract.
     #[test]
     fn publish_after_drop_is_a_silent_no_op() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -159,16 +176,11 @@ mod tests {
         let tx = bus.sender();
         drop(bus);
 
-        // Reach the underlying `mpsc::Sender` to confirm the channel is
-        // disconnected: `send` returns `Err(SendError(_))` once the
-        // receiver is gone. `publish` wraps this and must agree by
-        // silently dropping the event instead of panicking.
         assert!(
             tx.0.send(AppEvent::Quit).is_err(),
             "underlying channel should report disconnected after the bus is dropped",
         );
 
-        // No panic on publish, even though the channel is closed.
         let result = catch_unwind(AssertUnwindSafe(|| {
             tx.publish(AppEvent::AddBlock);
             tx.publish(AppEvent::Quit);
@@ -176,25 +188,18 @@ mod tests {
         assert!(result.is_ok(), "publish after drop must not panic");
     }
 
-    /// A fresh bus has nothing queued: draining yields zero events even
-    /// when previous buses were dropped mid-flight. Guards the "consumer
-    /// received nothing" half of the drop contract at the bus level.
     #[test]
     fn dropped_sender_does_not_deliver_to_a_fresh_bus() {
-        // Drop a sender's bus before publishing.
         let stale = EventBus::new();
         let stale_tx = stale.sender();
         drop(stale);
 
-        // `stale_tx` is now disconnected; publishes must be silent no-ops.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             stale_tx.publish(AppEvent::AddBlock);
         }));
         assert!(result.is_ok());
         assert!(stale_tx.0.send(AppEvent::AddBlock).is_err());
 
-        // A brand-new bus has its own channel; nothing from the stale one
-        // can leak into it.
         let mut fresh = EventBus::new();
         assert_eq!(fresh.drain().count(), 0);
     }

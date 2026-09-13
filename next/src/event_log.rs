@@ -93,7 +93,11 @@ impl EventLog {
     /// Errors are swallowed: a full disk or a rotated inode is not
     /// worth surfacing to the UI mid-frame. The next successful
     /// write covers the gap silently.
-    pub fn append(&mut self, event: AppEvent) {
+    /// Borrow by reference so the drain loop can log, repo-apply and
+    /// state-apply the same event in turn without cloning. The inner
+    /// `Record` already holds a `&'a AppEvent`, so the move from
+    /// owned to borrowed is a signature change, not a behaviour change.
+    pub fn append(&mut self, event: &AppEvent) {
         #[derive(serde::Serialize)]
         struct Record<'a> {
             ts: String,
@@ -102,7 +106,7 @@ impl EventLog {
         }
         let record = Record {
             ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            event: &event,
+            event,
         };
         match serde_json::to_writer(&mut self.file, &record) {
             Ok(()) => {}
@@ -139,8 +143,8 @@ mod tests {
             .open(&path)
             .expect("open");
         let mut log = EventLog { file, path: path.clone() };
-        log.append(AppEvent::AddBlock);
-        log.append(AppEvent::Quit);
+        log.append(&AppEvent::AddBlock);
+        log.append(&AppEvent::Quit);
         drop(log);
 
         let mut body = String::new();
@@ -217,7 +221,7 @@ mod tests {
         a.publish(AppEvent::AddBlock);
         b.publish(AppEvent::Quit);
         for ev in bus.drain() {
-            log.append(ev);
+            log.append(&ev);
         }
         drop(log);
 
@@ -255,11 +259,11 @@ mod tests {
         // reviewer-flagged case; `PickerMoved` is the other payload-
         // bearing variant, paired here so a regression that fixed
         // only one of them would fail this test.
-        log.append(AppEvent::AddBlock);
-        log.append(AppEvent::PickerMoved { direction: PickerMove::Down });
-        log.append(AppEvent::ModelSelected(&CATALOG[0]));
-        log.append(AppEvent::PickerCancelled);
-        log.append(AppEvent::Quit);
+        log.append(&AppEvent::AddBlock);
+        log.append(&AppEvent::PickerMoved { direction: PickerMove::Down });
+        log.append(&AppEvent::ModelSelected(&CATALOG[0]));
+        log.append(&AppEvent::BlockClosed);
+        log.append(&AppEvent::Quit);
 
         let body = std::fs::read_to_string(&path).expect("read");
         let lines: Vec<&str> = body.lines().collect();
