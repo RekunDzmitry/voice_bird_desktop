@@ -50,6 +50,12 @@ pub struct DownloadState {
     pub phase: DownloadPhase,
     pub bytes: u64,
     pub total: Option<u64>,
+    /// Throughput observed between the last two throttle emits. Zero
+    /// until the throttle has produced a second sample. The renderer
+    /// uses it to label the gauge when `total` is `None` (otherwise
+    /// the user sees a bar with no MB/s readout for the whole 1.6 GB
+    /// pull).
+    pub bytes_per_sec: u64,
 }
 
 impl DownloadState {
@@ -159,16 +165,19 @@ impl UiState {
                     phase: DownloadPhase::Fetching,
                     bytes: 0,
                     total: None,
+                    bytes_per_sec: 0,
                 });
             }
             AppEvent::DownloadProgress {
                 model,
                 bytes,
                 total,
+                bytes_per_sec,
             } => {
                 if let Some(row) = self.downloads.get_mut(*model) {
                     row.bytes = *bytes;
                     row.total = *total;
+                    row.bytes_per_sec = *bytes_per_sec;
                 }
             }
             AppEvent::DownloadInstalling { model } => {
@@ -375,6 +384,7 @@ mod tests {
             model: "tiny.en",
             bytes: 100,
             total: Some(200),
+            bytes_per_sec: 0,
         });
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
@@ -395,6 +405,7 @@ mod tests {
             model: "tiny.en",
             bytes: 50,
             total: Some(100),
+            bytes_per_sec: 0,
         });
         let row = s.downloads.get("tiny.en").unwrap();
         assert_eq!(row.bytes, 50);
@@ -412,6 +423,7 @@ mod tests {
             model: "tiny.en",
             bytes: 10,
             total: None,
+            bytes_per_sec: 0,
         });
         assert!(!s.downloads.contains_key("tiny.en"));
     }
@@ -508,6 +520,7 @@ mod tests {
             phase: DownloadPhase::Fetching,
             bytes: 200,
             total: Some(100),
+            bytes_per_sec: 0,
         };
         let ratio = r.ratio().unwrap();
         assert!((0.0..=1.0).contains(&ratio));
@@ -520,6 +533,7 @@ mod tests {
             phase: DownloadPhase::Fetching,
             bytes: 100,
             total: None,
+            bytes_per_sec: 0,
         };
         assert!(r.ratio().is_none());
     }
@@ -530,6 +544,7 @@ mod tests {
             phase: DownloadPhase::Fetching,
             bytes: 0,
             total: Some(0),
+            bytes_per_sec: 0,
         };
         assert_eq!(r.ratio(), Some(1.0));
     }
@@ -540,6 +555,7 @@ mod tests {
             phase: DownloadPhase::Fetching,
             bytes: 0,
             total: Some(0),
+            bytes_per_sec: 0,
         };
         assert_eq!(r.ratio(), Some(1.0));
     }

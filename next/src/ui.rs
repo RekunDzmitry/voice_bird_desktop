@@ -24,9 +24,10 @@ use crate::store::DownloadPhase;
 ///
 /// Each column renders its own stage:
 /// - `Picking(p)`     → the catalog list, `▶` on `p.index`.
-/// - `Waiting{m}`     → a `Gauge` from `state.downloads[m]` plus a
-///   - `human_bytes` line; `Installing` says
-///   - `Unpacking…`.
+/// - `Waiting{m}`     → a `Gauge` from `state.downloads[m]`. With
+///   - `Fetching` + known `total` it shows `bytes/total`; with no
+///     `total` it shows `MB/s · bytes`. `Installing` renders the
+///     label `Unpacking m…` left-aligned.
 /// - `Recording{m}`   → `● recording (mocked)`.
 /// - `Failed{m,e}`    → the error wrapped, plus `r retry · Esc close`.
 pub fn render(f: &mut Frame, state: &UiState) {
@@ -63,18 +64,12 @@ fn render_block(
 
     match &block.state {
         BlockState::Waiting { model } => {
-            if inner.height >= 2 {
-                let rows = Layout::new(
-                    Direction::Vertical,
-                    vec![Constraint::Length(1), Constraint::Length(1)],
-                )
-                .split(inner);
-                render_gauge(f, model, state.downloads.get(model), rows[0]);
-                let line = human_bytes_line(model, state.downloads.get(model));
-                f.render_widget(Paragraph::new(line), rows[1]);
-            } else if inner.height == 1 {
-                render_gauge(f, model, state.downloads.get(model), inner);
-            }
+            // The model name is already in the block title, so the body
+            // shows only the progress indicator. `render_gauge` picks
+            // the right shape (Installing → label, Fetching with total
+            // → filled bar with `bytes/total`, Fetching without total
+            // → pulsing bar with `MB/s`).
+            render_gauge(f, model, state.downloads.get(model), inner);
         }
         _ => {
             let lines = block_body_lines(block, state);
@@ -90,7 +85,7 @@ fn block_border(focused: bool) -> Block<'static> {
     if focused {
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().bold())
+            .border_style(Style::default().bold().yellow())
     } else {
         Block::default().borders(Borders::LEFT | Borders::RIGHT)
     }
@@ -118,39 +113,41 @@ fn block_body_lines(block: &crate::state::Block, _state: &UiState) -> Vec<Line<'
     }
 }
 
-fn render_gauge(f: &mut Frame, _model: &'static str, state: Option<&DownloadState>, area: Rect) {
-    let (ratio, label) = match state {
-        Some(s) => match s.phase {
-            DownloadPhase::Installing => (1.0_f64, "Unpacking…".to_string()),
-            DownloadPhase::Fetching => (
-                s.ratio().unwrap_or(0.0),
-                match s.total {
-                    Some(t) => format!("{} / {}", human_bytes(s.bytes), human_bytes(t)),
-                    None => format!("{} …", human_bytes(s.bytes)),
-                },
-            ),
-        },
-        None => (0.0, " ".to_string()),
-    };
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().bold())
-        .ratio(ratio)
-        .label(label);
-    f.render_widget(gauge, area);
-}
-
-fn human_bytes_line(model: &'static str, state: Option<&DownloadState>) -> Line<'static> {
+fn render_gauge(f: &mut Frame, model: &'static str, state: Option<&DownloadState>, area: Rect) {
     match state {
-        None => Line::from("…"),
-        Some(s) => match s.total {
-            Some(t) => Line::from(format!(
-                "{}  {} / {}",
-                model,
-                human_bytes(s.bytes),
-                human_bytes(t)
-            )),
-            None => Line::from(format!("{}  {} …", model, human_bytes(s.bytes))),
-        },
+        Some(s) if s.phase == DownloadPhase::Installing => {
+            // Unpacking is a left-aligned label so the user sees that
+            // *something* is happening but no fake bar slides to 100%.
+            f.render_widget(
+                Paragraph::new(format!("Unpacking {model}…")),
+                area,
+            );
+        }
+        Some(s) => {
+            // Fetching. Two label shapes:
+            //   - known total  → filled bar + "bytes / total"
+            //   - no total yet → pulsing bar (ratio=0) + MB/s + bytes
+            // The MB/s line is meaningful precisely because `total`
+            // is None — without it, the user sees only a widthless
+            // bar with no end in sight.
+            let ratio = s.ratio().unwrap_or(0.0);
+            let label = match s.total {
+                Some(t) => format!("{} / {}", human_bytes(s.bytes), human_bytes(t)),
+                None => format!(
+                    "{} · {:.2} MB/s",
+                    human_bytes(s.bytes),
+                    s.bytes_per_sec as f64 / 1_000_000.0
+                ),
+            };
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().bold())
+                .ratio(ratio)
+                .label(label);
+            f.render_widget(gauge, area);
+        }
+        None => {
+            f.render_widget(Gauge::default().ratio(0.0).label(" "), area);
+        }
     }
 }
 
@@ -164,29 +161,11 @@ fn picker_lines(picker: &ModelPicker) -> Vec<Line<'static>> {
 }
 
 fn picker_row(index: usize, selected: usize, entry: &ModelEntry) -> Line<'static> {
+    // Rows are just the marker and the model id. Earlier revisions
+    // appended size and language; the rows grew too wide and the
+    // additional columns weren't worth a second look.
     let marker = if index == selected { "\u{25b6}" } else { "  " };
     Line::from(format!("{marker} {}", entry.id))
-}
-
-pub fn picker_row_sized(
-    index: usize,
-    selected: usize,
-    entry: &ModelEntry,
-    width: usize,
-) -> Line<'static> {
-    let marker = if index == selected { "\u{25b6}" } else { "  " };
-    let id_only = format!("{marker} {}", entry.id);
-    if id_only.chars().count() > width {
-        return Line::from(marker.to_string());
-    }
-    let size_str = format!("{:>5} MB", entry.size_mb);
-    let lang_str = entry.language.to_string();
-    let full = format!("{id_only} {size_str}  {lang_str}");
-    if full.chars().count() <= width {
-        Line::from(full)
-    } else {
-        Line::from(id_only)
-    }
 }
 
 /// Human-readable byte count.
@@ -349,24 +328,27 @@ mod tests {
     }
 
     #[test]
-    fn picker_row_in_a_narrow_column_drops_size_and_language() {
-        let line = picker_row_sized(0, 0, &crate::picker::CATALOG[0], 20);
+    fn picker_row_renders_marker_and_id() {
+        let line = picker_row(0, 0, &crate::picker::CATALOG[0]);
         assert_eq!(line.to_string(), "\u{25b6} distil-small.en");
     }
 
     #[test]
-    fn picker_row_in_a_very_narrow_column_drops_the_id_too() {
-        let line = picker_row_sized(0, 0, &crate::picker::CATALOG[0], 4);
-        assert_eq!(line.to_string(), "\u{25b6}");
+    fn picker_row_unselected_row_has_no_marker() {
+        let line = picker_row(1, 0, &crate::picker::CATALOG[0]);
+        // The first two chars are padding (no marker), then the id.
+        let s = line.to_string();
+        assert!(s.starts_with("  "), "expected two-space indent; got {s:?}");
+        assert!(s.contains("distil-small.en"), "expected id; got {s:?}");
     }
 
     #[test]
-    fn picker_row_wide_column_adds_size_and_language() {
-        let line = picker_row_sized(2, 2, &crate::picker::CATALOG[2], 60);
+    fn picker_row_does_not_include_size_or_language() {
+        let line = picker_row(2, 2, &crate::picker::CATALOG[2]);
         let s = line.to_string();
-        assert!(s.contains("1600"), "{s}");
-        assert!(s.contains("MB"), "{s}");
-        assert!(s.contains("multi"), "{s}");
+        assert!(!s.contains("MB"), "size column should be gone; got {s:?}");
+        assert!(!s.contains("multi"), "language column should be gone; got {s:?}");
+        assert!(s.contains("large-v3-turbo"), "id should still be present; got {s:?}");
     }
 
     #[test]
@@ -386,6 +368,7 @@ mod tests {
                 phase: DownloadPhase::Fetching,
                 bytes: 50,
                 total: Some(100),
+                bytes_per_sec: 0,
             },
         );
         let out = render_to_string(&state, 100, 10);
@@ -416,6 +399,7 @@ mod tests {
                 phase: DownloadPhase::Fetching,
                 bytes: 50,
                 total: Some(100),
+                bytes_per_sec: 0,
             },
         );
         let out = render_to_string(&state, 100, 10);
@@ -438,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_block_installing_phase_says_unpacking() {
+    fn waiting_block_installing_phase_says_unpacking_left_aligned() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -456,14 +440,17 @@ mod tests {
                 phase: DownloadPhase::Installing,
                 bytes: 0,
                 total: Some(740 * 1024 * 1024),
+                bytes_per_sec: 0,
             },
         );
         let out = render_to_string(&state, 100, 10);
         assert!(out.contains("Unpacking"), "got:\n{out}");
+        // No filled bar — Installing should not draw a █ anywhere.
+        assert!(!out.contains('\u{2588}'), "Installing must not draw a filled bar; got:\n{out}");
     }
 
     #[test]
-    fn waiting_block_without_content_length_still_renders() {
+    fn waiting_block_without_content_length_uses_mb_per_sec_label() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -473,15 +460,29 @@ mod tests {
             next_block_id: 2,
             ..Default::default()
         };
+        // 2 MiB/s over the previous tick.
         state.downloads.insert(
             "tiny.en",
             DownloadState {
                 phase: DownloadPhase::Fetching,
                 bytes: 1024,
                 total: None,
+                bytes_per_sec: 2 * 1024 * 1024,
             },
         );
-        let _ = render_to_string(&state, 20, 5);
+        let out = render_to_string(&state, 40, 5);
+        assert!(out.contains("MB/s"), "expected MB/s readout; got:
+{out}");
+        // The model name lives only in the title — the body must not
+        // repeat it (only the gauge fills the body now).
+        let gauge_rows: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("MB/s") || l.contains("█"))
+            .collect();
+        assert!(
+            gauge_rows.iter().all(|l| !l.contains("tiny.en")),
+            "gauge body must not repeat the model id; rows: {gauge_rows:?}"
+        );
     }
 
     #[test]

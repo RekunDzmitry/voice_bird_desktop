@@ -56,11 +56,14 @@ pub enum AppEvent {
     RecordingStarted(&'static ModelEntry),
     /// The focused block now waits on this model.
     DownloadRequested(&'static ModelEntry),
-    /// Progress on a download.
+    /// Progress on a download. `bytes_per_sec` is a per-tick average
+    /// over the throttle window — used by the renderer to label the
+    /// gauge when `total` is `None`.
     DownloadProgress {
         model: &'static str,
         bytes: u64,
         total: Option<u64>,
+        bytes_per_sec: u64,
     },
     /// Bytes verified; the format handler is unpacking.
     DownloadInstalling { model: &'static str },

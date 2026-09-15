@@ -85,7 +85,7 @@ pub fn apply<R: DownloadRepository + ?Sized>(repo: &R, event: &AppEvent) {
                 repo.upsert(DownloadRecord { model: entry.id, phase: DownloadPhase::Fetching, bytes: 0, total: None });
             }
         }
-        AppEvent::DownloadProgress { model, bytes, total } => {
+        AppEvent::DownloadProgress { model, bytes, total, .. } => {
             if let Some(mut row) = repo.get(model) {
                 row.bytes = *bytes;
                 row.total = *total;

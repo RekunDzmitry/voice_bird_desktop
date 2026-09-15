@@ -60,6 +60,7 @@ fn present_model_skips_download_and_records_immediately() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
 
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
@@ -85,6 +86,7 @@ fn two_blocks_same_model_share_one_download() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
 
     state.apply(&AppEvent::AddBlock);
@@ -137,6 +139,7 @@ fn two_blocks_same_model_share_one_download() {
                 phase: DownloadPhase::Fetching,
                 bytes: 50,
                 total: Some(100),
+                bytes_per_sec: 0,
             },
         ))
         .collect(),
@@ -157,6 +160,7 @@ fn two_blocks_different_models_download_concurrently() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
 
     state.apply(&AppEvent::AddBlock);
@@ -194,6 +198,7 @@ fn succeeded_flips_both_blocks_to_recording() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
     begin(tiny(), &store, &repo, &downloader, &cancels, &tx);
@@ -218,6 +223,7 @@ fn failed_shows_error_in_block_then_retry_succeeds() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
 
@@ -251,6 +257,7 @@ fn closing_the_last_waiter_cancels_and_clears_staging() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
     begin(tiny(), &store, &repo, &downloader, &cancels, &tx);
@@ -283,6 +290,7 @@ fn closing_one_of_two_waiters_leaves_the_download_running() {
     let cancels = CancelRegistry::new();
     let mut bus = EventBus::new();
     let tx = bus.sender();
+    
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
     begin(tiny(), &store, &repo, &downloader, &cancels, &tx);
@@ -325,4 +333,30 @@ fn repo_apply_round_trip() {
     assert_eq!(row.phase, DownloadPhase::Fetching);
     apply(&repo, &AppEvent::DownloadSucceeded { model: "tiny.en" });
     assert!(repo.get("tiny.en").is_none());
+}
+
+#[test]
+fn download_progress_event_carries_bytes_per_sec() {
+    let repo = InMemoryDownloadRepository::new();
+    let mut state = UiState::default();
+    apply(&repo, &AppEvent::DownloadRequested(tiny()));
+    state.apply(&AppEvent::DownloadRequested(tiny()));
+    // Realistic measurement: 1 MiB/s over the previous tick.
+    let ev = AppEvent::DownloadProgress {
+        model: "tiny.en",
+        bytes: 1024,
+        total: None,
+        bytes_per_sec: 1024 * 1024,
+    };
+    apply(&repo, &ev);
+    state.apply(&ev);
+    assert_eq!(
+        state.downloads.get("tiny.en").unwrap().bytes_per_sec,
+        1024 * 1024
+    );
+    // The repo intentionally doesn't carry bytes_per_sec — it's a
+    // renderer-only signal. This pins that contract.
+    let row = repo.get("tiny.en").unwrap();
+    assert_eq!(row.bytes, 1024);
+    assert_eq!(row.total, None);
 }

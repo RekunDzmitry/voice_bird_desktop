@@ -106,6 +106,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
             phase: DownloadPhase::Fetching,
             bytes: 50,
             total: Some(100),
+            bytes_per_sec: 0,
         },
     );
     let out = render_to_string(&state, 100, 30);
@@ -210,6 +211,7 @@ proptest! {
                 phase: DownloadPhase::Fetching,
                 bytes,
                 total,
+                bytes_per_sec: 0,
             },
         );
         let _ = render_to_string(&state, w, h);

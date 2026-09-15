@@ -170,6 +170,10 @@ pub struct Throttle {
     last_bytes: u64,
     last_total: Option<u64>,
     last_emit_ms: u128,
+    /// Bytes recorded on the most recent progress emit. Used to compute
+    /// `bytes_per_sec` between emits. Zero on a fresh throttle or right
+    /// after the `BytesVerified` flip (when phase changes mid-stream).
+    last_emit_bytes: u64,
 }
 
 impl Throttle {
@@ -185,6 +189,7 @@ impl Default for Throttle {
             last_bytes: 0,
             last_total: None,
             last_emit_ms: 0,
+            last_emit_bytes: 0,
         }
     }
 }
@@ -206,11 +211,20 @@ impl Throttle {
                     self.last_pct = pct;
                     self.last_bytes = bytes;
                     self.last_total = Some(t);
+                    // Known total: bytes_per_sec isn't needed for the
+                    // gauge label, but keep the previous value so a
+                    // mid-stream phase flip doesn't show 0.0 MB/s.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
                     tx.publish(AppEvent::DownloadProgress {
                         model,
                         bytes,
                         total,
+                        bytes_per_sec: self.bytes_per_sec(now, bytes),
                     });
+                    self.last_emit_bytes = bytes;
                 }
             }
             _ => {
@@ -219,13 +233,16 @@ impl Throttle {
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 if now.saturating_sub(self.last_emit_ms) >= 250 {
+                    let bps = self.bytes_per_sec(now, bytes);
                     tx.publish(AppEvent::DownloadProgress {
                         model,
                         bytes,
                         total,
+                        bytes_per_sec: bps,
                     });
                     self.last_emit_ms = now;
                     self.last_bytes = bytes;
+                    self.last_emit_bytes = bytes;
                 }
             }
         }
@@ -238,13 +255,38 @@ impl Throttle {
         tx: &EventSender,
         model: &'static str,
     ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let bps = self.bytes_per_sec(now, bytes);
         tx.publish(AppEvent::DownloadProgress {
             model,
             bytes,
             total,
+            bytes_per_sec: bps,
         });
         self.last_bytes = bytes;
         self.last_total = total;
+        self.last_emit_bytes = bytes;
+    }
+
+    /// Bytes per second measured across the previous emit window. Zero
+    /// on the very first tick (no prior reference); the renderer treats
+    /// 0 as "no measurement yet".
+    fn bytes_per_sec(&self, now_ms: u128, bytes: u64) -> u64 {
+        if self.last_emit_ms == 0 {
+            return 0;
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.last_emit_ms);
+        if elapsed_ms == 0 || bytes < self.last_emit_bytes {
+            return 0;
+        }
+        let delta = bytes - self.last_emit_bytes;
+        // 1000 * delta / elapsed_ms, but watch u128 -> u64 truncation
+        // (delta fits in u64; the multiplication can overflow u128 only
+        // on a multi-million GB/s download, which we will not see).
+        ((delta as u128 * 1000) / elapsed_ms) as u64
     }
 
     pub fn last_total(&self) -> Option<u64> {
