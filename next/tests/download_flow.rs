@@ -958,6 +958,16 @@ impl ModelStore for NemotronTestStore {
             let _ = std::fs::remove_file(&p);
         }
     }
+    fn discard_inflight(&self, entry: &ModelEntry) {
+        let p = handler_for(entry.format).staging_path(&self.root, entry.id);
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+        }
+        let tmp = self.root.join(format!("{}.tmp", entry.id));
+        if tmp.is_dir() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
 }
 /// User scenario from the live session on 2026-09-16:
 /// pick nemotron, wait for download to complete, cancel during
@@ -1023,6 +1033,9 @@ impl ModelStore for SlowNemotronStore {
     }
     fn clear_staging(&self, entry: &ModelEntry) {
         self.inner.clear_staging(entry)
+    }
+    fn discard_inflight(&self, entry: &ModelEntry) {
+        self.inner.discard_inflight(entry)
     }
 }
 
@@ -1171,4 +1184,163 @@ fn user_scenario_pick_cancel_during_install_retry_does_full_fetch() {
         calls_after_retry > calls_before_retry,
         "retry must trigger a fresh fetch (calls went from {calls_before_retry} to {calls_after_retry})"
     );
+}
+/// Pin the contract of `ModelStore::discard_inflight`: a single call
+/// drops BOTH the staged archive AND the unpack scratch directory,
+/// regardless of whether install was reached. This is the method
+/// `main::cleanup_inflight` invokes at Quit for every in-flight
+/// model so a half-written `<id>.tmp/` from a killed worker doesn't
+/// survive to confuse the next session's first pick.
+#[test]
+fn discard_inflight_drops_both_part_and_tmp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nemotron = &CATALOG[3];
+    assert_eq!(nemotron.format, ModelFormat::NemotronPackage);
+    let store = NemotronTestStore::new(tmp.path().to_path_buf());
+
+    let staged = tmp.path().join(format!("{}.tar.gz.part", nemotron.id));
+    std::fs::write(&staged, b"not even close").unwrap();
+    let tmp_dir = tmp.path().join(format!("{}.tmp", nemotron.id));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    std::fs::write(tmp_dir.join("leftover.txt"), b"half unpacked").unwrap();
+
+    assert!(staged.is_file());
+    assert!(tmp_dir.is_dir());
+
+    store.discard_inflight(nemotron);
+
+    assert!(!staged.is_file(), "staged archive must be dropped");
+    assert!(!tmp_dir.is_dir(), "scratch dir must be removed");
+}
+
+/// Pin the Quit-time cleanup behaviour. Mirrors the user's live-
+/// session observation on 2026-09-16: kick off a download, signal
+/// the Quit-time cancellation mid-flight, run the cleanup routine,
+/// observe no leftover artifacts on disk. `cleanup_inflight` is a
+/// binary-only helper; the test exercises the same body inline.
+#[test]
+fn quit_during_install_leaves_cache_clean() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nemotron = &CATALOG[3];
+
+    // Build a real gzipped tarball so the install path runs.
+    let mut tar_bytes: Vec<u8> = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar_bytes);
+        let mut enc_header = tar::Header::new_gnu();
+        enc_header
+            .set_path(format!("{id}/encoder.onnx", id = nemotron.id))
+            .unwrap();
+        enc_header.set_size(8);
+        enc_header.set_mode(0o644);
+        enc_header.set_cksum();
+        b.append(&enc_header, &b"encoder!"[..]).unwrap();
+        let mut dec_header = tar::Header::new_gnu();
+        dec_header
+            .set_path(format!("{id}/decoder_joint.onnx", id = nemotron.id))
+            .unwrap();
+        dec_header.set_size(12);
+        dec_header.set_mode(0o644);
+        dec_header.set_cksum();
+        b.append(&dec_header, &b"decoder_jnt!"[..]).unwrap();
+        b.into_inner().unwrap();
+    }
+    let mut gz: Vec<u8> = Vec::new();
+    {
+        let mut enc = GzEncoder::new(&mut gz, Compression::default());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap();
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(slow_nemotron_store_install_delayed_helper(
+        gz.clone(),
+        Arc::clone(&calls),
+    ));
+    let store: Arc<dyn ModelStore> = Arc::new(SlowNemotronStore::new(tmp.path().to_path_buf()));
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    begin(nemotron, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tick_drain(&mut bus, &mut state, &*repo);
+        if state.downloads.get(nemotron.id).map(|d| d.phase) == Some(DownloadPhase::Installing) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "deadline waiting for Installing; blocks={:?} downloads={:?}",
+                state.blocks, state.downloads
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Same body as main::cleanup_inflight: snapshot active claims,
+    // cancel each, then drop both artifacts. The test name is the
+    // observable contract — the cache dir must be clean.
+    let active: Vec<&'static str> = repo.all().into_iter().map(|r| r.model).collect();
+    for model in &active {
+        repo.cancel(model);
+    }
+    for model in &active {
+        if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
+            store.discard_inflight(entry);
+        }
+    }
+
+    let staged = tmp.path().join(format!("{}.tar.gz.part", nemotron.id));
+    let scratch = tmp.path().join(format!("{}.tmp", nemotron.id));
+    assert!(
+        !staged.is_file(),
+        "staged archive must be gone after Quit-time cleanup"
+    );
+    assert!(
+        !scratch.is_dir(),
+        "scratch dir must be gone after Quit-time cleanup"
+    );
+}
+
+/// Wraps `WriteThroughDownloader` so the install-time slowness comes
+/// from the surrounding `SlowNemotronStore`, not from the download.
+struct DelayedInstallDownloader {
+    inner: WriteThroughDownloader,
+}
+
+impl DelayedInstallDownloader {
+    fn new(bytes: Vec<u8>, outcome: Outcome, calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: WriteThroughDownloader::new(bytes, outcome, calls, 0),
+        }
+    }
+}
+
+impl Downloader for DelayedInstallDownloader {
+    fn fetch(
+        &self,
+        url: &str,
+        staged: &Path,
+        expected_sha: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<(), DownloadError> {
+        self.inner
+            .fetch(url, staged, expected_sha, cancel, progress)
+    }
+}
+
+fn slow_nemotron_store_install_delayed_helper(
+    bytes: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+) -> DelayedInstallDownloader {
+    DelayedInstallDownloader::new(bytes, Outcome::Ok, calls)
 }

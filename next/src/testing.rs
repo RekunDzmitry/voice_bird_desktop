@@ -89,6 +89,16 @@ impl ModelStore for FixtureStore {
         self.clear_staging_calls.lock().unwrap().push(entry.id);
         let _ = std::fs::remove_file(self.staging_path(entry).unwrap());
     }
+
+    fn discard_inflight(&self, entry: &ModelEntry) {
+        // Record the call so tests can assert Quit-time cleanup ran.
+        self.clear_staging_calls.lock().unwrap().push(entry.id);
+        let _ = std::fs::remove_file(self.staging_path(entry).unwrap());
+        let tmp = self.root.join(format!("{}.tmp", entry.id));
+        if tmp.is_dir() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
 }
 
 /// A downloader that streams `bytes` in 64 KiB chunks, calling the

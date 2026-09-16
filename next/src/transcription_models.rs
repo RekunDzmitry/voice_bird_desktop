@@ -262,6 +262,13 @@ pub trait ModelStore: Send + Sync + 'static {
     ) -> Result<(), DownloadError>;
     /// Delete a leftover staging file (cancellation, and the startup sweep).
     fn clear_staging(&self, entry: &ModelEntry);
+    /// Drop BOTH the staged archive and the unpack scratch directory
+    /// for one model, regardless of which phase the worker is in.
+    /// Called at Quit for every in-flight model so the cache dir
+    /// is left clean for the next session — without this the next
+    /// session's first pick on the same model would attempt to
+    /// unpack a half-written `.tmp/` left by the killed worker.
+    fn discard_inflight(&self, entry: &ModelEntry);
 }
 
 /// Resolves to `<cache_dir>/voice-bird/models/`. Kept identical to the
@@ -333,6 +340,24 @@ impl ModelStore for CacheDirStore {
         let p = handler_for(entry.format).staging_path(&self.root, entry.id);
         if p.is_file() {
             let _ = fs::remove_file(&p);
+        }
+    }
+
+    fn discard_inflight(&self, entry: &ModelEntry) {
+        // Drop the staged archive first so a partial download never
+        // gets mistaken for a verified one on the next session.
+        let staged = handler_for(entry.format).staging_path(&self.root, entry.id);
+        if staged.is_file() {
+            let _ = fs::remove_file(&staged);
+        }
+        // Drop the unpack scratch dir. The handler's install_is_slow
+        // distinguishes single-rename from unpack formats: only the
+        // latter creates `<id>.tmp/`. We don't try to be smarter —
+        // asking the handler for the path keeps this consistent if
+        // a future format adds its own scratch layout.
+        let tmp = self.root.join(format!("{id}.tmp", id = entry.id));
+        if tmp.is_dir() {
+            let _ = fs::remove_dir_all(&tmp);
         }
     }
 }

@@ -14,6 +14,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 #[cfg(feature = "net")]
 use voice_bird_next::download::HttpDownloader;
+use voice_bird_next::picker::CATALOG;
 use voice_bird_next::{
     bus::{EventBus, EventSender},
     download::Downloader,
@@ -133,10 +134,36 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             dirty = true;
         }
         if state.should_quit {
+            cleanup_inflight(&store, &repo);
             break;
         }
     }
     Ok(())
+}
+
+/// Drop staged archives and unpack scratch directories for every
+/// model with an active claim. Called at Quit so the cache dir is
+/// left clean for the next session — without this, a half-written
+/// `<id>.tmp/` from a killed worker would survive and the next
+/// session's first pick on the same model would attempt to unpack
+/// from it (the `install: unpack: failed to unpack ...tmp/...`
+/// error the user observed on 2026-09-16).
+///
+/// Workers are NOT joined. Setting cancel on each active claim
+/// first means any worker that survives long enough to publish
+/// another event finds its row already gone (terminal is no-op on
+/// absent rows) and the late event is filtered out of the log.
+/// Process exit then kills any workers still running.
+fn cleanup_inflight(store: &Arc<dyn ModelStore>, repo: &Arc<dyn DownloadRepository>) {
+    let active: Vec<&'static str> = repo.all().into_iter().map(|r| r.model).collect();
+    for model in &active {
+        repo.cancel(model);
+    }
+    for model in &active {
+        if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
+            store.discard_inflight(entry);
+        }
+    }
 }
 
 #[cfg(feature = "net")]
