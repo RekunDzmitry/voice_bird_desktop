@@ -3,18 +3,16 @@
 
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ratatui::{backend::TestBackend, Terminal};
-
 use crate::download::{DownloadError, Downloader};
-use crate::transcription_models::{handler_for, ModelStore};
 use crate::picker::ModelEntry;
 use crate::state::UiState;
+use crate::transcription_models::{handler_for, ModelStore};
 use crate::ui;
+use ratatui::{backend::TestBackend, Terminal};
 
 /// Render `state` into a `w`×`h` in-memory terminal and return the cell
 /// grid as text, one line per row.
@@ -64,7 +62,19 @@ impl ModelStore for FixtureStore {
         Ok(self.root.join(format!("{}.part", entry.id)))
     }
 
-    fn install(&self, entry: &ModelEntry, _staged: &Path) -> Result<(), DownloadError> {
+    fn install(
+        &self,
+        entry: &ModelEntry,
+        _staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        // The fixture install is a Vec push — no filesystem work to
+        // interrupt. Honor cancel so a test that wants to verify the
+        // "no event on cancel" contract can set the token before the
+        // resolver reaches install.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DownloadError::Cancelled);
+        }
         // Mark the model present so subsequent is_available checks
         // observe the post-install state. The integration test wants
         // to assert the resolver reached `install`.
@@ -100,12 +110,24 @@ pub struct FixtureDownloader {
 
 impl FixtureDownloader {
     pub fn new(bytes: Vec<u8>, outcome: Outcome, calls: Arc<AtomicUsize>) -> Self {
-        Self { bytes, outcome, calls, skip_sha_verify: true, delay_ms: 0 }
+        Self {
+            bytes,
+            outcome,
+            calls,
+            skip_sha_verify: true,
+            delay_ms: 0,
+        }
     }
 
     /// Construct a downloader that verifies the sha against .
     pub fn with_sha_verify(bytes: Vec<u8>, outcome: Outcome, calls: Arc<AtomicUsize>) -> Self {
-        Self { bytes, outcome, calls, skip_sha_verify: false, delay_ms: 0 }
+        Self {
+            bytes,
+            outcome,
+            calls,
+            skip_sha_verify: false,
+            delay_ms: 0,
+        }
     }
 
     /// Configure the per-chunk delay in milliseconds.
@@ -149,7 +171,9 @@ impl Downloader for FixtureDownloader {
             if self.delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.delay_ms));
             }
-            let n = cursor.read(&mut buf).map_err(|e| DownloadError::Io(e.to_string()))?;
+            let n = cursor
+                .read(&mut buf)
+                .map_err(|e| DownloadError::Io(e.to_string()))?;
             if n == 0 {
                 break;
             }
@@ -158,9 +182,7 @@ impl Downloader for FixtureDownloader {
             progress(total_read, total);
         }
         let got = hex::encode(hasher.finalize());
-        if self.outcome == Outcome::ShaMismatch
-            || (!self.skip_sha_verify && got != expected_sha)
-        {
+        if self.outcome == Outcome::ShaMismatch || (!self.skip_sha_verify && got != expected_sha) {
             let _ = std::fs::remove_file(staged);
             return Err(DownloadError::Sha256Mismatch {
                 got,
@@ -172,6 +194,8 @@ impl Downloader for FixtureDownloader {
 }
 
 #[allow(dead_code)]
-fn _handler_used(f: crate::picker::ModelFormat) -> &'static dyn crate::transcription_models::ModelFormatHandler {
+fn _handler_used(
+    f: crate::picker::ModelFormat,
+) -> &'static dyn crate::transcription_models::ModelFormatHandler {
     handler_for(f)
 }

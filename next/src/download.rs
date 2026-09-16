@@ -434,10 +434,15 @@ pub fn spawn(
                 if crate::transcription_models::handler_for(format).install_is_slow() {
                     tx.publish(AppEvent::DownloadInstalling { model });
                 }
-                match store.install(entry, &staged) {
+                match store.install(entry, &staged, &cancel) {
                     Ok(()) => {
                         tx.publish(AppEvent::DownloadSucceeded { model });
                     }
+                    // Cancelled during install: the producer already
+                    // dropped the row when it set the token, so the
+                    // worker publishes nothing here (same contract
+                    // as the fetch-time Cancelled branch above).
+                    Err(DownloadError::Cancelled) => {}
                     Err(e) => tx.publish(AppEvent::DownloadFailed {
                         model,
                         error: truncate_error(&e.to_string()),

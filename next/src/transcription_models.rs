@@ -13,6 +13,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
@@ -32,9 +34,22 @@ pub trait ModelFormatHandler: Send + Sync {
     /// Present *and usable* — not merely "a path exists".
     fn is_installed(&self, dir: &Path, id: &str) -> bool;
     /// Move/unpack the verified staging file into place. On failure it
-    /// must leave nothing at `installed_path`, so a later `is_installed`
-    /// cannot return true for a half-installed model.
-    fn install(&self, dir: &Path, id: &str, staged: &Path) -> Result<(), DownloadError>;
+    /// Move/unpack the verified staging file into place. The cancel
+    /// token is the same one `spawn()` passed to the downloader; it
+    /// is polled between unpack and rename so closing the last
+    /// waiting block during the install phase actually stops the
+    /// worker instead of leaving a half-unpacked directory on disk.
+    /// Returning `DownloadError::Cancelled` is the contract the
+    /// worker relies on to publish nothing — the producer already
+    /// dropped the row when it set the token.
+    fn install(
+        &self,
+        dir: &Path,
+        id: &str,
+        staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError>;
+
     /// Whether `install` is slow enough to deserve its own UI phase
     /// (unpacking 740 MB is; a rename is not).
     fn install_is_slow(&self) -> bool {
@@ -64,7 +79,20 @@ impl ModelFormatHandler for GgufHandler {
     fn is_installed(&self, dir: &Path, id: &str) -> bool {
         self.installed_path(dir, id).is_file()
     }
-    fn install(&self, dir: &Path, id: &str, staged: &Path) -> Result<(), DownloadError> {
+    fn install(
+        &self,
+        dir: &Path,
+        id: &str,
+        staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        // GGUF install is a single atomic rename; the cancel token
+        // can only be observed once the worker re-enters its outer
+        // loop, so it has no useful check point here. The handler
+        // still takes the parameter so the trait stays uniform
+        // across formats — a future handler that streams entries
+        // can poll the token between iterations.
+        let _ = cancel;
         let target = self.installed_path(dir, id);
         fs::rename(staged, &target).map_err(|e| DownloadError::Io(e.to_string()))?;
         Ok(())
@@ -92,7 +120,13 @@ impl ModelFormatHandler for NemotronPackageHandler {
             && path.join("encoder.onnx").is_file()
             && path.join("decoder_joint.onnx").is_file()
     }
-    fn install(&self, dir: &Path, id: &str, staged: &Path) -> Result<(), DownloadError> {
+    fn install(
+        &self,
+        dir: &Path,
+        id: &str,
+        staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
         let tmp_dir = dir.join(format!("{id}.tmp"));
         let target = self.installed_path(dir, id);
         // Best-effort cleanup of leftovers from a prior crashed run.
@@ -103,38 +137,81 @@ impl ModelFormatHandler for NemotronPackageHandler {
             let _ = fs::remove_dir_all(&target);
         }
         fs::create_dir_all(&tmp_dir).map_err(|e| DownloadError::Io(e.to_string()))?;
-        // Unpack into a scratch directory, locate the ONNX-bearing
-        // subdir, rename it into place. On any error, ensure the
-        // scratch dir doesn't survive and the target dir isn't
-        // half-installed.
+        // Unpack entry by entry so the cancel token can be polled
+        // between entries. `Archive::unpack` would have run straight
+        // through with no observation point, which is exactly the
+        // bug the cancel-during-install repro exposed.
         let result = (|| -> Result<(), DownloadError> {
             let file = fs::File::open(staged).map_err(|e| DownloadError::Io(e.to_string()))?;
             let decoder = GzDecoder::new(file);
-            Archive::new(decoder)
-                .unpack(&tmp_dir)
+            let mut archive = Archive::new(decoder);
+            let entries = archive
+                .entries()
                 .map_err(|e| DownloadError::Install(format!("unpack: {e}")))?;
+            for entry in entries {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // The producer already dropped the row when it
+                    // set the token; the worker treats this the
+                    // same as the fetch-time Cancelled and
+                    // publishes nothing.
+                    return Err(DownloadError::Cancelled);
+                }
+                let mut entry =
+                    entry.map_err(|e| DownloadError::Install(format!("unpack: {e}")))?;
+                let path = entry
+                    .path()
+                    .map_err(|e| DownloadError::Install(format!("unpack: {e}")))?
+                    .into_owned();
+                // Per-entry `unpack_in` does not auto-create the
+                // parent directory the way `Archive::unpack` does.
+                // Recreate it manually so the manual loop matches
+                // the batch call's behavior. Root-level entries
+                // (parent == tmp_dir) already exist.
+                let parent = path.parent().unwrap_or(&tmp_dir);
+                let full_parent = tmp_dir.join(parent);
+                if full_parent != tmp_dir {
+                    fs::create_dir_all(&full_parent)
+                        .map_err(|e| DownloadError::Install(format!("unpack: {e}")))?;
+                }
+                entry
+                    .unpack_in(&tmp_dir)
+                    .map_err(|e| DownloadError::Install(format!("unpack: {e}")))?;
+            }
             let model_dir = locate_nemotron_dir(&tmp_dir).ok_or_else(|| {
                 DownloadError::Install(
                     "Nemotron package did not contain encoder.onnx and decoder_joint.onnx".into(),
                 )
             })?;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(DownloadError::Cancelled);
+            }
             fs::rename(model_dir, &target).map_err(|e| DownloadError::Io(e.to_string()))?;
             Ok(())
         })();
         let _ = fs::remove_dir_all(&tmp_dir);
-        if result.is_ok() {
-            // Drop the source archive now that everything inside has
-            // been verified and renamed into place. On failure we
-            // keep `staged` so a Retry can re-fetch from the
-            // already-downloaded bytes (the SHA has been verified,
-            // so it's safe to reuse). GGUF's install uses
-            // `fs::rename`, which already consumes the source path
-            // implicitly, so this handler is the only one that
-            // needs an explicit removal.
-            let _ = fs::remove_file(staged);
+        match &result {
+            // Install succeeded: drop the source archive now that
+            // every byte has been verified and the rename moved the
+            // model into place.
+            Ok(()) => {
+                let _ = fs::remove_file(staged);
+            }
+            // Cancelled between download and unpack: the user
+            // explicitly aborted, so drop the staged archive too.
+            // The next pick will re-fetch from scratch instead of
+            // resuming from a half-valid tarball.
+            Err(DownloadError::Cancelled) => {
+                let _ = fs::remove_file(staged);
+            }
+            // Any other failure (corrupt tar, missing ONNX pair,
+            // IO error) keeps the staged file: the SHA was verified
+            // at fetch time and a Retry can install it without
+            // re-downloading the 740 MB.
+            Err(_) => {}
         }
         result
     }
+
     fn install_is_slow(&self) -> bool {
         true
     }
@@ -177,7 +254,12 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
 pub trait ModelStore: Send + Sync + 'static {
     fn is_available(&self, entry: &ModelEntry) -> bool;
     fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError>;
-    fn install(&self, entry: &ModelEntry, staged: &Path) -> Result<(), DownloadError>;
+    fn install(
+        &self,
+        entry: &ModelEntry,
+        staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError>;
     /// Delete a leftover staging file (cancellation, and the startup sweep).
     fn clear_staging(&self, entry: &ModelEntry);
 }
@@ -238,8 +320,13 @@ impl ModelStore for CacheDirStore {
         Ok(handler_for(entry.format).staging_path(&self.root, entry.id))
     }
 
-    fn install(&self, entry: &ModelEntry, staged: &Path) -> Result<(), DownloadError> {
-        handler_for(entry.format).install(&self.root, entry.id, staged)
+    fn install(
+        &self,
+        entry: &ModelEntry,
+        staged: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        handler_for(entry.format).install(&self.root, entry.id, staged, cancel)
     }
 
     fn clear_staging(&self, entry: &ModelEntry) {
@@ -303,7 +390,13 @@ mod tests {
         let h = GgufHandler;
         let staged = h.staging_path(tmp.path(), "tiny.en");
         write(&staged, b"GGUF");
-        h.install(tmp.path(), "tiny.en", &staged).unwrap();
+        h.install(
+            tmp.path(),
+            "tiny.en",
+            &staged,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert!(!staged.exists());
         assert!(h.installed_path(tmp.path(), "tiny.en").is_file());
     }
@@ -341,13 +434,21 @@ mod tests {
 
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
-        h.install(dst.path(), nemotron_entry().id, &archive)
-            .unwrap();
+        h.install(
+            dst.path(),
+            nemotron_entry().id,
+            &archive,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         let installed = h.installed_path(dst.path(), nemotron_entry().id);
         assert!(installed.is_dir());
         assert!(installed.join("encoder.onnx").is_file());
         assert!(installed.join("decoder_joint.onnx").is_file());
-        assert!(!dst.path().join(format!("{}.tmp", nemotron_entry().id)).exists());
+        assert!(!dst
+            .path()
+            .join(format!("{}.tmp", nemotron_entry().id))
+            .exists());
     }
 
     #[test]
@@ -360,10 +461,18 @@ mod tests {
 
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
-        let res = h.install(dst.path(), nemotron_entry().id, &archive);
+        let res = h.install(
+            dst.path(),
+            nemotron_entry().id,
+            &archive,
+            &Arc::new(AtomicBool::new(false)),
+        );
         assert!(res.is_err());
         assert!(!h.installed_path(dst.path(), nemotron_entry().id).exists());
-        assert!(!dst.path().join(format!("{}.tmp", nemotron_entry().id)).exists());
+        assert!(!dst
+            .path()
+            .join(format!("{}.tmp", nemotron_entry().id))
+            .exists());
     }
 
     #[test]

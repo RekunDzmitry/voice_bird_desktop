@@ -2,23 +2,27 @@
 //! `HttpDownloader` is constructed only in `main.rs`; everything here
 //! drives the resolver through the `FixtureStore` and `FixtureDownloader`
 //! in [`voice_bird_next::testing`].
+//!
+//! The nemotron cancel-during-install repro is the exception: it
+//! builds a real gzipped-tarball so the production unpack path runs.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use voice_bird_next::bus::{AppEvent, EventBus};
-use voice_bird_next::download::{begin, Downloader};
+use voice_bird_next::download::{begin, DownloadError, Downloader};
 use voice_bird_next::input::Intent;
-use voice_bird_next::picker::CATALOG;
+use voice_bird_next::picker::{ModelEntry, ModelFormat, CATALOG};
 use voice_bird_next::producer;
 use voice_bird_next::state::{BlockState, DownloadState, UiState};
 use voice_bird_next::store::{
     DownloadClaim, DownloadPhase, DownloadRecord, DownloadRepository, InMemoryDownloadRepository,
 };
-use voice_bird_next::transcription_models::ModelStore;
-
 use voice_bird_next::testing::{render_to_string, FixtureDownloader, FixtureStore, Outcome};
+use voice_bird_next::transcription_models::{handler_for, ModelStore};
 
 fn tiny() -> &'static voice_bird_next::picker::ModelEntry {
     &CATALOG[5]
@@ -550,4 +554,408 @@ fn failure_then_retry_yields_fresh_token() {
         !Arc::ptr_eq(&first_token, &second_token),
         "retry token must be a fresh allocation"
     );
+}
+
+/// Plan §8 bug repro: closing the last block during the unpack
+/// phase leaves the model installed on disk because the cancel flag
+/// was never checked inside `install`. The fix routes the same
+/// cancel token the resolver already manages through the install
+/// call and aborts between tar entries.
+///
+/// The full integration path (spawn → fetch → install) is timing-
+/// sensitive for small fixtures: the worker unpacks a 2-entry
+/// tarball in microseconds, faster than the test can detect the
+/// `Installing` phase and fire `BlockClosed`. The handler-level
+/// test [`nemotron_install_aborts_when_cancel_is_prearmed`] pins
+/// the contract deterministically. This test only asserts the
+/// user-visible behavior: the second `begin()` does not produce a
+/// `Failed` block.
+#[test]
+fn cancel_during_nemotron_install_then_retry_does_not_corrupt_cache() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nemotron = &CATALOG[3];
+    assert_eq!(nemotron.id, "nemotron-3.5-asr-streaming-0.6b");
+    assert_eq!(nemotron.format, ModelFormat::NemotronPackage);
+
+    // Build a real gzipped tarball containing
+    // `<id>/encoder.onnx` + `<id>/decoder_joint.onnx` so the production
+    // unpack code path succeeds end-to-end.
+    let mut tar_bytes: Vec<u8> = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar_bytes);
+        let mut enc_header = tar::Header::new_gnu();
+        enc_header
+            .set_path(format!(
+                "{nemotron_id}/encoder.onnx",
+                nemotron_id = nemotron.id
+            ))
+            .unwrap();
+        enc_header.set_size(8);
+        enc_header.set_mode(0o644);
+        enc_header.set_cksum();
+        b.append(&enc_header, &b"encoder!"[..]).unwrap();
+        let mut dec_header = tar::Header::new_gnu();
+        dec_header
+            .set_path(format!(
+                "{nemotron_id}/decoder_joint.onnx",
+                nemotron_id = nemotron.id
+            ))
+            .unwrap();
+        dec_header.set_size(12);
+        dec_header.set_mode(0o644);
+        dec_header.set_cksum();
+        b.append(&dec_header, &b"decoder_jnt!"[..]).unwrap();
+        b.into_inner().unwrap();
+    }
+    let mut gz: Vec<u8> = Vec::new();
+    {
+        let mut enc = GzEncoder::new(&mut gz, Compression::default());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap();
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    // The stock FixtureDownloader hashes bytes in memory but never
+    // writes them to the staged path. This test needs the staged file
+    // to exist on disk so install can unpack it.
+    let downloader: Arc<dyn Downloader> = Arc::new(WriteThroughDownloader::new(
+        gz.clone(),
+        Outcome::Ok,
+        Arc::clone(&calls),
+        40,
+    ));
+    let store: Arc<dyn ModelStore> = Arc::new(NemotronTestStore::new(tmp.path().to_path_buf()));
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    begin(nemotron, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    // Spin until the worker enters Installing phase (DownloadInstalling
+    // observed) OR the block reaches Recording (already installed).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tick_drain(&mut bus, &mut state, &*repo);
+        if matches!(
+            state.downloads.get(nemotron.id).map(|d| d.phase),
+            Some(DownloadPhase::Installing)
+        ) {
+            break;
+        }
+        if matches!(
+            state.blocks[0].state,
+            BlockState::Recording {
+                model: "nemotron-3.5-asr-streaming-0.6b"
+            }
+        ) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "deadline waiting for Installing/Recording; blocks={:?} downloads={:?}",
+                state.blocks, state.downloads
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Drive the full flow to completion. The fix means cancel-during-install
+    // halts the worker, but the small fixture (2 entries) usually unpacks
+    // before the test can fire BlockClosed. The handler-level test in
+    // [`transcription_models`] pins the deterministic contract.
+    settle(&mut bus, &mut state, &*repo);
+    assert!(
+        !state.blocks.is_empty(),
+        "first pick reaches a terminal state (Recording or Failed)"
+    );
+    let first_terminal = &state.blocks[0].state;
+    assert!(
+        matches!(
+            first_terminal,
+            BlockState::Recording { .. } | BlockState::Failed { .. }
+        ),
+        "first block lands in a terminal state, got {first_terminal:?}"
+    );
+
+    // Whatever state we landed in, the second begin must not corrupt
+    // the cache: it produces either a fresh download + Recording or a
+    // cache-hit Recording. No `Failed` block is acceptable.
+    state.apply(&AppEvent::AddBlock);
+    let new_block_idx = state.blocks.len() - 1;
+    begin(nemotron, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < settle_deadline
+        && !matches!(
+            state.blocks[new_block_idx].state,
+            BlockState::Recording {
+                model: "nemotron-3.5-asr-streaming-0.6b",
+            }
+        )
+        && !state
+            .blocks
+            .iter()
+            .any(|b| matches!(b.state, BlockState::Failed { .. }))
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        tick_drain(&mut bus, &mut state, &*repo);
+    }
+
+    let final_block = &state.blocks[new_block_idx].state;
+    assert!(
+        !matches!(final_block, BlockState::Failed { .. }),
+        "second pick must not fail; got {final_block:?}"
+    );
+}
+
+/// Plan §8: install returns Cancelled when the token is set. Direct
+/// handler test — no spawn race window. Pairs with
+/// [`cancel_during_nemotron_install_then_retry_does_not_corrupt_cache`]
+/// which covers the integration path.
+#[test]
+fn nemotron_install_aborts_when_cancel_is_prearmed() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+    use voice_bird_next::transcription_models::handler_for;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nemotron = &CATALOG[3];
+    assert_eq!(nemotron.format, ModelFormat::NemotronPackage);
+
+    // Same fixture as the integration test.
+    let mut tar_bytes: Vec<u8> = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar_bytes);
+        let mut enc_header = tar::Header::new_gnu();
+        enc_header
+            .set_path(format!(
+                "{nemotron_id}/encoder.onnx",
+                nemotron_id = nemotron.id
+            ))
+            .unwrap();
+        enc_header.set_size(8);
+        enc_header.set_mode(0o644);
+        enc_header.set_cksum();
+        b.append(&enc_header, &b"encoder!"[..]).unwrap();
+        let mut dec_header = tar::Header::new_gnu();
+        dec_header
+            .set_path(format!(
+                "{nemotron_id}/decoder_joint.onnx",
+                nemotron_id = nemotron.id
+            ))
+            .unwrap();
+        dec_header.set_size(12);
+        dec_header.set_mode(0o644);
+        dec_header.set_cksum();
+        b.append(&dec_header, &b"decoder_jnt!"[..]).unwrap();
+        b.into_inner().unwrap();
+    }
+    let mut gz: Vec<u8> = Vec::new();
+    {
+        let mut enc = GzEncoder::new(&mut gz, Compression::default());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap();
+    }
+
+    // Write the staged file directly (handler test doesn't need a
+    // downloader at all — only the on-disk artifact).
+    let staged = tmp.path().join(format!("{}.tar.gz.part", nemotron.id));
+    std::fs::write(&staged, &gz).unwrap();
+
+    // Pre-arm cancel: install must abort before the rename.
+    let cancel = Arc::new(AtomicBool::new(true));
+    let h = handler_for(ModelFormat::NemotronPackage);
+    let res = h.install(tmp.path(), nemotron.id, &staged, &cancel);
+    assert!(
+        matches!(res, Err(DownloadError::Cancelled)),
+        "install must return Cancelled when token is set, got {res:?}"
+    );
+
+    // The scratch dir and target must not survive.
+    assert!(
+        !tmp.path().join(nemotron.id).exists(),
+        "target must not exist"
+    );
+    assert!(
+        !tmp.path().join(format!("{}.tmp", nemotron.id)).exists(),
+        "scratch dir must be cleaned up"
+    );
+    // Cancelled between download and unpack discards the staged
+    // archive too. The user explicitly aborted; the next pick must
+    // re-fetch from scratch instead of resuming from a tarball
+    // whose unpack was cut short mid-stream.
+    assert!(
+        !staged.exists(),
+        "staged file must be dropped on Cancelled install"
+    );
+
+    // Retry: write a fresh staged archive (the previous one is
+    // gone) and confirm install with an un-set cancel succeeds.
+    std::fs::write(&staged, &gz).unwrap();
+    let cancel_fresh = Arc::new(AtomicBool::new(false));
+    let res2 = h.install(tmp.path(), nemotron.id, &staged, &cancel_fresh);
+    assert!(
+        res2.is_ok(),
+        "retry with un-set cancel must install: {res2:?}"
+    );
+    assert!(
+        handler_for(ModelFormat::NemotronPackage).is_installed(tmp.path(), nemotron.id),
+        "retry must produce an installed model"
+    );
+}
+
+/// Pin the inverse case: a non-Cancelled install failure (corrupt
+/// tar) preserves the staged file. Its SHA was verified at fetch
+/// time so a Retry can install from the same bytes without
+/// re-downloading the 740 MB.
+#[test]
+fn nemotron_install_preserves_staged_on_non_cancel_failure() {
+    use voice_bird_next::transcription_models::handler_for;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nemotron = &CATALOG[3];
+    let staged = tmp.path().join(format!("{}.tar.gz.part", nemotron.id));
+
+    // Bytes that aren't a valid tarball: install must fail with
+    // an Install error (not Cancelled), and the staged file must
+    // survive.
+    std::fs::write(&staged, b"not a tarball").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h = handler_for(ModelFormat::NemotronPackage);
+    let res = h.install(tmp.path(), nemotron.id, &staged, &cancel);
+    assert!(
+        matches!(res, Err(DownloadError::Install(_))),
+        "corrupt archive must produce Install error, got {res:?}"
+    );
+    assert!(
+        staged.exists(),
+        "staged file must survive non-Cancelled install failure"
+    );
+}
+
+/// Like `FixtureDownloader` but actually writes the streamed bytes
+/// to the staged path. The stock fixture only hashes in memory, which
+/// is fine for the cache-hit / cancel paths but useless here because
+/// `install` opens the staged file from disk.
+struct WriteThroughDownloader {
+    bytes: Vec<u8>,
+    outcome: Outcome,
+    calls: Arc<AtomicUsize>,
+    delay_ms: u64,
+    skip_sha_verify: bool,
+}
+
+impl WriteThroughDownloader {
+    fn new(bytes: Vec<u8>, outcome: Outcome, calls: Arc<AtomicUsize>, delay_ms: u64) -> Self {
+        // The production catalog entry has the real SHA of a 740 MB
+        // tarball; this test ships a tiny fake, so skip SHA verification.
+        Self {
+            bytes,
+            outcome,
+            calls,
+            delay_ms,
+            skip_sha_verify: true,
+        }
+    }
+}
+
+impl Downloader for WriteThroughDownloader {
+    fn fetch(
+        &self,
+        _url: &str,
+        staged: &Path,
+        expected_sha: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<(), DownloadError> {
+        use sha2::{Digest, Sha256};
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.outcome == Outcome::Cancelled {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut cursor = std::io::Cursor::new(&self.bytes);
+        let total = Some(self.bytes.len() as u64);
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 1 << 16];
+        let mut out =
+            std::fs::File::create(staged).map_err(|e| DownloadError::Io(e.to_string()))?;
+        let mut total_read: u64 = 0;
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(staged);
+                return Err(DownloadError::Cancelled);
+            }
+            if self.delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.delay_ms));
+            }
+            let n = cursor
+                .read(&mut buf)
+                .map_err(|e| DownloadError::Io(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .map_err(|e| DownloadError::Io(e.to_string()))?;
+            total_read += n as u64;
+            progress(total_read, total);
+        }
+        let got = hex::encode(hasher.finalize());
+        if self.outcome == Outcome::ShaMismatch || (!self.skip_sha_verify && got != expected_sha) {
+            let _ = std::fs::remove_file(staged);
+            return Err(DownloadError::Sha256Mismatch {
+                got,
+                expected: expected_sha.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Thin `ModelStore` that delegates `install` to the production
+/// `NemotronPackageHandler` against a caller-controlled root. Lets
+/// the cancel-during-install repro exercise real `flate2`+`tar`
+/// behavior instead of `FixtureStore`'s `present.push` stub.
+struct NemotronTestStore {
+    root: PathBuf,
+}
+
+impl NemotronTestStore {
+    fn new(root: PathBuf) -> Self {
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+}
+
+impl ModelStore for NemotronTestStore {
+    fn is_available(&self, entry: &ModelEntry) -> bool {
+        handler_for(entry.format).is_installed(&self.root, entry.id)
+    }
+    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError> {
+        Ok(handler_for(entry.format).staging_path(&self.root, entry.id))
+    }
+    fn install(
+        &self,
+        entry: &ModelEntry,
+        staged: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        handler_for(entry.format).install(&self.root, entry.id, staged, cancel)
+    }
+    fn clear_staging(&self, entry: &ModelEntry) {
+        let p = handler_for(entry.format).staging_path(&self.root, entry.id);
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
