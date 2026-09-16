@@ -12,19 +12,16 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+#[cfg(feature = "net")]
+use voice_bird_next::download::HttpDownloader;
 use voice_bird_next::{
     bus::{EventBus, EventSender},
-    download::{CancelRegistry, Downloader},
-    input,
-    producer,
+    download::Downloader,
+    input, producer,
     state::UiState,
     store::{DownloadRepository, InMemoryDownloadRepository},
     transcription_models::{CacheDirStore, ModelStore},
 };
-#[cfg(feature = "net")]
-use voice_bird_next::download::HttpDownloader;
-
-
 
 /// Runs `restore` on drop. Constructed as soon as the first irreversible
 /// terminal step (raw mode) has succeeded.
@@ -82,11 +79,10 @@ fn handle_key(
     store: &Arc<dyn ModelStore>,
     repo: &Arc<dyn DownloadRepository>,
     downloader: &Arc<dyn Downloader>,
-    cancels: &CancelRegistry,
     tx: &EventSender,
 ) {
     if let Some(intent) = input::map_key(key) {
-        producer::resolve_intent(intent, state, store, repo, downloader, cancels, tx);
+        producer::resolve_intent(intent, state, store, repo, downloader, tx);
     }
 }
 
@@ -113,10 +109,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    let repo: Arc<dyn DownloadRepository> =
-        Arc::new(InMemoryDownloadRepository::new());
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-    let cancels = CancelRegistry::new();
 
     let mut dirty = true;
     loop {
@@ -126,7 +120,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
-                handle_key(k, &state, &store, &repo, &downloader, &cancels, &tx);
+                handle_key(k, &state, &store, &repo, &downloader, &tx);
                 dirty = true;
             }
         }
@@ -134,7 +128,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             if let Some(l) = log.as_mut() {
                 l.append(&ev);
             }
-            voice_bird_next::store::apply(&*repo, &ev);
+            repo.apply_event(&ev);
             state.apply(&ev);
             dirty = true;
         }

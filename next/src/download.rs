@@ -7,26 +7,28 @@
 //! network entirely.
 //!
 //! [`begin`] is the single entry point for Enter and for retry. It
-//! owns both the "is it on disk" and the "is it already downloading"
-//! decisions because both touch state the reducer must not see.
-//!
-//! [`CancelRegistry`] tracks the cancel flag per in-flight download so
-//! closing the last waiter actually stops the thread and clears the
-//! staging file.
+//! owns the "is it on disk" decision and asks
+//! [`DownloadRepository::request`] for an atomic claim; on `Start`
+//! the caller spawns a worker passing the claimed cancellation
+//! token, on `Join` the caller only publishes the join event. The
+//! store owns both the progress row and the cancellation token, so
+//! [`DownloadError::Cancelled`] is event-silent — the producer
+//! publishes [`AppEvent::DownloadCancelled`] after the last waiter
+//! closes, and that publish drives both table cleanup and UI state
+//! folding.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::transcription_models::ModelStore;
 use crate::picker::ModelEntry;
-use crate::store::DownloadRepository;
+use crate::store::{DownloadClaim, DownloadRepository};
+use crate::transcription_models::ModelStore;
 
 /// Failure vocabulary for the download pipeline. Seven variants cover
 /// the observed failure modes without falling back to `anyhow` —
@@ -111,11 +113,14 @@ pub fn stream_to<R: std::io::Read>(
             let _ = fs::remove_file(staged);
             return Err(DownloadError::Cancelled);
         }
-        let n = src.read(&mut buf).map_err(|e| DownloadError::Io(e.to_string()))?;
+        let n = src
+            .read(&mut buf)
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
         if n == 0 {
             break;
         }
-        out.write_all(&buf[..n]).map_err(|e| DownloadError::Io(e.to_string()))?;
+        out.write_all(&buf[..n])
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
         hasher.update(&buf[..n]);
         total_read += n as u64;
         progress(total_read, None);
@@ -195,7 +200,6 @@ impl Default for Throttle {
 }
 #[allow(dead_code)]
 impl Throttle {
-
     // Flow (review note #4 — readability refactor):
     //   call(bytes, total) [or finalize(bytes, total)]
     //     → now_ms()                            (time source)
@@ -212,14 +216,7 @@ impl Throttle {
     // (`should_emit`, `emit_progress`) replace one inline match so
     // each policy can be reasoned about independently.
 
-    pub fn call(
-
-        &mut self,
-        bytes: u64,
-        total: Option<u64>,
-        tx: &EventSender,
-        model: &'static str,
-    ) {
+    pub fn call(&mut self, bytes: u64, total: Option<u64>, tx: &EventSender, model: &'static str) {
         let now_ms = Self::now_ms();
         if self.should_emit(bytes, total, now_ms) {
             self.emit_progress(bytes, total, now_ms, tx, model);
@@ -342,56 +339,20 @@ impl Throttle {
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-
-// ---------------------------------------------------------------------------
-// CancelRegistry
-// ---------------------------------------------------------------------------
-
-/// Per-model cancel flags. `main.rs` fires `cancel(model)` when the
-/// reducer reports that `BlockClosed` dropped the last waiter; the
-/// in-flight thread observes the flag, aborts the chunk loop and
-/// publishes nothing (the record is already gone).
-#[derive(Default)]
-pub struct CancelRegistry {
-    inner: Mutex<HashMap<&'static str, Arc<AtomicBool>>>,
-}
-
-impl CancelRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn token(&self, model: &'static str) -> Arc<AtomicBool> {
-        let mut g = self.inner.lock().expect("cancel registry poisoned");
-        g.entry(model)
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
-    }
-
-    pub fn cancel(&self, model: &'static str) {
-        if let Some(flag) = self.inner.lock().expect("cancel registry poisoned").get(model) {
-            flag.store(true, Ordering::Relaxed);
-        }
-    }
-
-    pub fn clear(&self, model: &'static str) {
-        self.inner.lock().expect("cancel registry poisoned").remove(model);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // begin — the resolver's single entry point
 // ---------------------------------------------------------------------------
 
-/// Single entry point for Enter and for retry. Owns both the
-/// "present or missing" and the "already downloading" decisions,
-/// because both touch state the reducer must not see.
+/// Single entry point for Enter and for retry. Owns the "is it on
+/// disk" decision and asks [`DownloadRepository::request`] for an
+/// atomic claim. On `Start` the caller spawns a worker passing the
+/// claimed cancellation token; on `Join` the caller only publishes
+/// the join event. No separate registry, no separate row insert —
+/// one atomic claim replaces the previous `is_active` + `token` pair.
 pub fn begin(
     entry: &'static ModelEntry,
     store: &Arc<dyn ModelStore>,
     repo: &Arc<dyn DownloadRepository>,
     downloader: &Arc<dyn Downloader>,
-    cancels: &CancelRegistry,
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
@@ -402,18 +363,15 @@ pub fn begin(
         tx.publish(AppEvent::RecordingStarted(entry));
         return;
     }
+    // Every requester publishes DownloadRequested so the event log
+    // records the join even when the underlying worker was already
+    // started by an earlier request. Only the Start claim spawns.
     tx.publish(AppEvent::DownloadRequested(entry));
-    // Dedup: the second block to want this model joins the first
-    // block's download instead of racing it onto the same staging
-    // path.
-    if !repo.is_active(entry.id) {
-        spawn(
-            entry,
-            store.clone(),
-            downloader.clone(),
-            cancels.token(entry.id),
-            tx.clone(),
-        );
+    match repo.request(entry.id) {
+        DownloadClaim::Start { cancel } => {
+            spawn(entry, store.clone(), downloader.clone(), cancel, tx.clone());
+        }
+        DownloadClaim::Join => {}
     }
 }
 
@@ -469,8 +427,6 @@ pub fn spawn(
             downloader.fetch(url, &staged, sha, &cancel, &mut bridge)
         };
         match result {
-
-
             Ok(()) => {
                 if let Some(total) = throttle.last_total() {
                     throttle.finalize(total, Some(total), &tx, model);
@@ -524,8 +480,14 @@ mod tests {
         let staged = tmp.path().join("x.part");
         let bytes = b"hello world";
         let cancel = AtomicBool::new(false);
-        stream_to(Cursor::new(bytes), &staged, &sha_of(bytes), &cancel, &mut |_, _| {})
-            .unwrap();
+        stream_to(
+            Cursor::new(bytes),
+            &staged,
+            &sha_of(bytes),
+            &cancel,
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(fs::read(&staged).unwrap(), bytes);
     }
 
@@ -671,21 +633,6 @@ mod tests {
         assert!(n <= 1, "got {n} emissions");
         th.finalize(100, None, &tx, "tiny.en");
         assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    fn cancel_registry_token_is_stable_per_model() {
-        let r = CancelRegistry::new();
-        let a = r.token("tiny.en");
-        let b = r.token("tiny.en");
-        assert!(Arc::ptr_eq(&a, &b));
-        assert!(!a.load(Ordering::Relaxed));
-        r.cancel("tiny.en");
-        assert!(a.load(Ordering::Relaxed));
-        assert!(b.load(Ordering::Relaxed));
-        r.clear("tiny.en");
-        let c = r.token("tiny.en");
-        assert!(!Arc::ptr_eq(&a, &c));
     }
 
     /// The downloader's behaviour when invoked twice. Used by the dedup

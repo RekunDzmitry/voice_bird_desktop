@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender, FocusMove};
-use crate::download::{begin, CancelRegistry, Downloader};
+use crate::download::{begin, Downloader};
 use crate::input::Intent;
 use crate::picker::{self, CATALOG};
 use crate::state::{BlockState, UiState};
@@ -23,11 +23,7 @@ use crate::transcription_models::ModelStore;
 /// user pressed Up/Down while recording), the event logs both fields
 /// as `None` and the reducer still runs the move on the picker if one
 /// is open.
-pub fn stamp_picker_move(
-    tx: &EventSender,
-    state: &UiState,
-    direction: picker::PickerMove,
-) {
+pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::PickerMove) {
     let (from_model, to_model) = match state.focused() {
         Some(block) => match &block.state {
             BlockState::Picking(picker) => {
@@ -58,7 +54,6 @@ pub fn resolve_intent(
     store: &Arc<dyn ModelStore>,
     repo: &Arc<dyn DownloadRepository>,
     downloader: &Arc<dyn Downloader>,
-    cancels: &CancelRegistry,
     tx: &EventSender,
 ) {
     match intent {
@@ -75,7 +70,7 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Picking(picker) = &block.state {
                     let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
-                    begin(entry, store, repo, downloader, cancels, tx);
+                    begin(entry, store, repo, downloader, tx);
                 }
             }
         }
@@ -83,16 +78,17 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Failed { model, .. } = &block.state {
                     if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
-                        begin(entry, store, repo, downloader, cancels, tx);
+                        begin(entry, store, repo, downloader, tx);
                     }
                 }
             }
         }
         Intent::BlockClosed => {
             // Closing the focused block: if it was the last waiter on
-            // its model, fire the cancel signal so the in-flight
-            // thread observes it. The reducer takes the record down
-            // when no waiter remains; we just signal the thread.
+            // its model, atomically cancel the in-flight download
+            // (set the token, drop both tables) and publish the
+            // DownloadCancelled event so the reducer tears down
+            // UiState.downloads and the store drops the row.
             if let Some(block) = state.focused() {
                 if let Some(model) = block.model() {
                     let any_other = state.blocks.iter().any(|b| {
@@ -101,10 +97,9 @@ pub fn resolve_intent(
                     });
                     if !any_other
                         && matches!(block.state, BlockState::Waiting { .. })
+                        && repo.cancel(model)
                     {
-                        cancels.cancel(model);
-                        cancels.clear(model);
-                        repo.remove(model);
+                        tx.publish(AppEvent::DownloadCancelled { model });
                     }
                 }
             }
