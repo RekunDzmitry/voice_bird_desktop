@@ -77,6 +77,55 @@ fn present_model_skips_download_and_records_immediately() {
 }
 
 #[test]
+fn cache_hit_publishes_model_already_cached_then_recording_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &[tiny().id],
+    ));
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        Arc::clone(&calls),
+    ));
+    let cancels = CancelRegistry::new();
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    begin(tiny(), &store, &repo, &downloader, &cancels, &tx);
+
+    // Drain the bus without folding into state/repo so we observe
+    // the raw event sequence the resolver published.
+    let events: Vec<AppEvent> = bus.drain().collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "cache hit must publish exactly two events, got {events:?}"
+    );
+    assert!(
+        matches!(&events[0], AppEvent::ModelAlreadyCached(e) if e.id == tiny().id),
+        "first event must be ModelAlreadyCached for the requested model, got {:?}",
+        events[0]
+    );
+    assert!(
+        matches!(&events[1], AppEvent::RecordingStarted(e) if e.id == tiny().id),
+        "second event must be RecordingStarted for the requested model, got {:?}",
+        events[1]
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no fetch should have been attempted on the cache-hit path"
+    );
+}
+
+#[test]
 fn two_blocks_same_model_share_one_download() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));

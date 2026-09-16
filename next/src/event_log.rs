@@ -316,4 +316,53 @@ mod tests {
         assert_eq!(parsed["event"], "PickerMoved");
         assert_eq!(parsed["direction"], "Down");
     }
+
+    /// `ModelAlreadyCached` carries the same `&'static ModelEntry`
+    /// payload as `ModelSelected` and `RecordingStarted`, so it must
+    /// serialize with the same flattened shape and the same
+    /// well-typed payload fields (`id`, `size_mb`, `language`).
+    /// This pins the contract that adding a new tuple variant to
+    /// `AppEvent` doesn't accidentally regress into the
+    /// Debug-formatted string the previous incarnation produced.
+    #[test]
+    fn model_already_cached_line_round_trips_through_serde_json() {
+        use crate::picker::CATALOG;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("log.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let mut log = EventLog { file, path: path.clone() };
+
+        log.append(&AppEvent::ModelAlreadyCached(&CATALOG[0]));
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let line = body
+            .lines()
+            .next()
+            .expect("at least one line written");
+
+        // Round-trip through serde_json::Value -- the line must be a
+        // valid JSON object (the JSONL contract), and the variant
+        // tag must come out as "ModelAlreadyCached" rather than the
+        // Debug-spel form.
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("line parses");
+        assert!(parsed["ts"].as_str().expect("ts").len() > 10);
+        assert_eq!(parsed["event"], "ModelAlreadyCached");
+        assert_eq!(parsed["id"], CATALOG[0].id);
+        assert_eq!(parsed["size_mb"], CATALOG[0].size_mb);
+        assert_eq!(parsed["language"], CATALOG[0].language);
+        assert!(
+            parsed["id"].is_string(),
+            "id should be a JSON string; got {parsed:?}"
+        );
+        assert!(
+            parsed["size_mb"].is_number(),
+            "size_mb should be a JSON number; got {parsed:?}"
+        );
+    }
 }

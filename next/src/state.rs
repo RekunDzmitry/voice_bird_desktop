@@ -152,6 +152,20 @@ impl UiState {
                     }
                 }
             }
+            AppEvent::ModelAlreadyCached(entry) => {
+                // Alias for RecordingStarted: the resolver already
+                // published the cache-hit diagnostic immediately
+                // before this event; the reducer's only job is to
+                // flip the focused block to Recording.
+                if let Some(block) = self.focused_mut() {
+                    if matches!(
+                        block.state,
+                        BlockState::Picking(_) | BlockState::Failed { .. }
+                    ) {
+                        block.state = BlockState::Recording { model: entry.id };
+                    }
+                }
+            }
             AppEvent::DownloadRequested(entry) => {
                 if let Some(block) = self.focused_mut() {
                     if matches!(

@@ -395,6 +395,10 @@ pub fn begin(
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
+        // Log the cache-hit reason before transitioning the block,
+        // so a reader of the event log can distinguish "downloaded
+        // and now recording" from "already on disk, skip download".
+        tx.publish(AppEvent::ModelAlreadyCached(entry));
         tx.publish(AppEvent::RecordingStarted(entry));
         return;
     }

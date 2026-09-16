@@ -61,6 +61,14 @@ pub enum AppEvent {
     BlockClosed,
     /// Model is on disk and ready.
     RecordingStarted(&'static ModelEntry),
+    /// Resolver detected the model is already on disk before any
+    /// download was attempted. Published alongside `RecordingStarted`
+    /// on the cache-hit path so the event log records *why* the
+    /// block transitioned straight to `Recording` without a
+    /// `DownloadRequested`. Reducer treats this as an alias for
+    /// `RecordingStarted`.
+    ModelAlreadyCached(&'static ModelEntry),
+
     /// The focused block now waits on this model.
     DownloadRequested(&'static ModelEntry),
     /// Progress on a download. `bytes_per_sec` is a per-tick average
