@@ -15,6 +15,7 @@ pub mod picker;
 pub mod state;
 pub mod store;
 pub mod download;
-pub mod model_store;
+pub mod producer;
+pub mod transcription_models;
 pub mod testing;
 pub mod ui;

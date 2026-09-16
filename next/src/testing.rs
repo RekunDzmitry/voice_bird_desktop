@@ -11,7 +11,7 @@ use std::time::Duration;
 use ratatui::{backend::TestBackend, Terminal};
 
 use crate::download::{DownloadError, Downloader};
-use crate::model_store::{handler_for, ModelStore};
+use crate::transcription_models::{handler_for, ModelStore};
 use crate::picker::ModelEntry;
 use crate::state::UiState;
 use crate::ui;
@@ -172,6 +172,6 @@ impl Downloader for FixtureDownloader {
 }
 
 #[allow(dead_code)]
-fn _handler_used(f: crate::picker::ModelFormat) -> &'static dyn crate::model_store::ModelFormatHandler {
+fn _handler_used(f: crate::picker::ModelFormat) -> &'static dyn crate::transcription_models::ModelFormatHandler {
     handler_for(f)
 }

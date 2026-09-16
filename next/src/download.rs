@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::model_store::ModelStore;
+use crate::transcription_models::ModelStore;
 use crate::picker::ModelEntry;
 use crate::store::DownloadRepository;
 
@@ -471,7 +471,7 @@ pub fn spawn(
                 if let Some(total) = throttle.last_total() {
                     throttle.finalize(total, Some(total), &tx, model);
                 }
-                if crate::model_store::handler_for(format).install_is_slow() {
+                if crate::transcription_models::handler_for(format).install_is_slow() {
                     tx.publish(AppEvent::DownloadInstalling { model });
                 }
                 match store.install(entry, &staged) {

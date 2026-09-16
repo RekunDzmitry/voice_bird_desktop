@@ -10,7 +10,7 @@
 //! picker API or the reducer.
 
 /// On-disk format for one catalog row. New formats add a variant and a
-/// handler in `model_store`; the rest of the pipeline stays format-agnostic.
+/// handler in `transcription_models`; the rest of the pipeline stays format-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ModelFormat {
     /// A single Whisper GGUF `.bin` file.

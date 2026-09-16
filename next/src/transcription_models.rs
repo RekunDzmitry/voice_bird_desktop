@@ -1,4 +1,4 @@
-//! On-disk model store.
+//! On-disk transcription-model store (Whisper GGUF, Nemotron ONNX).
 //!
 //! The download pipeline is format-agnostic: fetch the URL to a staging
 //! file, verify its sha256, hand the staged file to a format-specific
@@ -172,8 +172,8 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
 }
 
 /// Public surface used by the resolver. `CacheDirStore` is a thin
-/// façade over [`ModelFormatHandler`]; future stores (memory, http,
-/// …) live behind the same trait.
+/// pass-through over [`ModelFormatHandler`]; future stores (memory,
+/// http, ...) live behind the same trait.
 pub trait ModelStore: Send + Sync + 'static {
     fn is_available(&self, entry: &ModelEntry) -> bool;
     fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError>;

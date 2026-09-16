@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use voice_bird_next::bus::{AppEvent, EventBus};
 use voice_bird_next::download::{begin, CancelRegistry, Downloader};
-use voice_bird_next::model_store::ModelStore;
+use voice_bird_next::transcription_models::ModelStore;
 use voice_bird_next::picker::CATALOG;
 use voice_bird_next::state::{BlockState, DownloadState, UiState};
 use voice_bird_next::store::{
@@ -171,8 +171,20 @@ fn two_blocks_different_models_download_concurrently() {
     begin(base(), &store, &repo, &downloader, &cancels, &tx);
     tick_drain(&mut bus, &mut state, &*repo);
 
-    // Wait for both spawn threads to start fetch.
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait for both spawn threads to start fetch and register in the
+    // repo. Polled rather than a fixed sleep so the test stays
+    // reliable under load when the OS scheduler takes longer to
+    // schedule both spawn threads. Both downloads must be active at
+    // the same instant to prove concurrency (vs. one finishing
+    // before the other even starts).
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while (calls.load(Ordering::SeqCst) < 2
+        || !repo.is_active("tiny.en")
+        || !repo.is_active("base.en"))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(repo.is_active("tiny.en"));
     assert!(repo.is_active("base.en"));
