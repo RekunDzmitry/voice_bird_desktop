@@ -260,7 +260,7 @@ mod tests {
         // bearing variant, paired here so a regression that fixed
         // only one of them would fail this test.
         log.append(&AppEvent::AddBlock);
-        log.append(&AppEvent::PickerMoved { direction: PickerMove::Down });
+        log.append(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
         log.append(&AppEvent::ModelSelected(&CATALOG[0]));
         log.append(&AppEvent::BlockClosed);
         log.append(&AppEvent::Quit);

@@ -140,6 +140,26 @@ impl ModelPicker {
         }
     }
 
+    /// Index the picker WOULD land on after applying `direction`,
+    /// without mutating. The resolver uses this to stamp `from_model`
+    /// and `to_model` on `AppEvent::PickerMoved` so the event log
+    /// records the visible move, not just the key. Saturation
+    /// matches `apply`'s clamping: at the top, Up returns 0; at the
+    /// bottom, Down returns the last index. Wrapping either direction
+    /// would attribute moves to non-moving rows.
+    pub fn peek_next(&self, direction: PickerMove) -> usize {
+        match direction {
+            PickerMove::Up => self.index.saturating_sub(1),
+            PickerMove::Down => {
+                if self.index + 1 < CATALOG.len() {
+                    self.index + 1
+                } else {
+                    self.index
+                }
+            }
+        }
+    }
+
     pub fn catalog(&self) -> &'static [ModelEntry] {
         CATALOG
     }

@@ -44,8 +44,15 @@ pub enum AppEvent {
     /// `←` / `→`: move focus between blocks.
     FocusMoved { direction: FocusMove },
     /// `↑` / `↓` while the focused block is `Picking`: move the
-    /// highlight inside that block's catalog list.
-    PickerMoved { direction: PickerMove },
+    /// highlight inside that block's catalog list. `from_model` and
+    /// `to_model` are stamped by the resolver; the input layer has
+    /// no catalog context. Tests (and any future event source that
+    /// doesn't know the focused block) pass `None, None`.
+    PickerMoved {
+        direction: PickerMove,
+        from_model: Option<&'static str>,
+        to_model: Option<&'static str>,
+    },
     /// Enter on a focused `Picking` block. Today this transitions
     /// straight to `Recording`; step 8 routes it through the resolver
     /// (`begin`).
@@ -85,9 +92,19 @@ pub enum AppEvent {
 /// Cloneable producer handle. Producers only need this — `publish` is the
 /// whole API they see, and cloning is the only way to get one.
 #[derive(Debug, Clone)]
-pub struct EventSender(pub mpsc::Sender<AppEvent>);
+pub struct EventSender(mpsc::Sender<AppEvent>);
 
 impl EventSender {
+    /// Wrap an `mpsc::Sender`. Sole constructor — the field is
+    /// private so producers have to come through [`EventBus`],
+    /// which is what guarantees the bus and its senders are
+    /// constructed together. Tests that used to inline the tuple
+    /// (`EventSender(mpsc::channel().0)`) now go through
+    /// `EventBus::new().sender()` to keep the same coupling.
+    pub fn from_mpsc(sender: mpsc::Sender<AppEvent>) -> Self {
+        Self(sender)
+    }
+
     /// Best-effort: send only fails when the bus is gone, i.e. the loop is
     /// shutting down — dropping the event is correct then.
     pub fn publish(&self, event: AppEvent) {
@@ -109,7 +126,7 @@ impl EventBus {
 
     /// Cloneable handle that producers use to publish.
     pub fn sender(&self) -> EventSender {
-        EventSender(self.sender.clone())
+        EventSender::from_mpsc(self.sender.clone())
     }
 
     /// Non-blocking: yields every queued event in publish order, then stops.

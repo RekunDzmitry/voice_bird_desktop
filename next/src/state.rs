@@ -128,7 +128,7 @@ impl UiState {
                     }
                 }
             },
-            AppEvent::PickerMoved { direction } => {
+            AppEvent::PickerMoved { direction, .. } => {
                 if let Some(block) = self.focused_mut() {
                     if let BlockState::Picking(picker) = &mut block.state {
                         picker.apply(crate::picker::PickerEvent::Moved(*direction));
@@ -287,8 +287,8 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down });
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down });
+        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
+        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
         let picker_index = match &s.blocks[1].state {
             BlockState::Picking(p) => p.index,
             _ => panic!("block 2 should still be picking"),
@@ -301,7 +301,7 @@ mod tests {
     fn model_selected_flips_focused_block() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down });
+        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
         s.apply(&AppEvent::ModelSelected(&CATALOG[2]));
         assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "large-v3-turbo" }));
     }

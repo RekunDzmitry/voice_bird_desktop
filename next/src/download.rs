@@ -193,87 +193,130 @@ impl Default for Throttle {
         }
     }
 }
-
 #[allow(dead_code)]
 impl Throttle {
 
+    // Flow (review note #4 — readability refactor):
+    //   call(bytes, total) [or finalize(bytes, total)]
+    //     → now_ms()                            (time source)
+    //     → should_emit(bytes, total, now_ms)   (gating policy)
+    //     → emit_progress(bytes, total, ...)    (single emit site)
+    //
+    // The conditional in `call` is intentional and is the answer
+    // to the reviewer who suggested sending total + bytes_per_sec
+    // always and letting the consumer handle the difference. Both
+    // `total.is_some()` paths now share one emit site, so the
+    // payload construction lives in exactly one place — the
+    // DownloadProgress event already always carries both fields,
+    // and the renderer picks the label format. Two named methods
+    // (`should_emit`, `emit_progress`) replace one inline match so
+    // each policy can be reasoned about independently.
+
     pub fn call(
+
         &mut self,
         bytes: u64,
         total: Option<u64>,
         tx: &EventSender,
         model: &'static str,
     ) {
+        let now_ms = Self::now_ms();
+        if self.should_emit(bytes, total, now_ms) {
+            self.emit_progress(bytes, total, now_ms, tx, model);
+        }
+    }
+
+    /// Emit one final 100% / final-byte progress on the success
+    /// path. `call` already does this when the final chunk reports
+    /// `bytes == total` (the percentage-changed branch), but a
+    /// slow-network boundary can leave the last `stream_to`
+    /// callback at a percentage identical to the previous one —
+    /// the throttle's percentage policy short-circuits the emit.
+    /// `finalize` always emits without checking either policy,
+    /// which is what guarantees the bar reaches its terminal
+    /// state in every scenario.
+    pub fn finalize(
+        &mut self,
+        bytes: u64,
+        total: Option<u64>,
+        tx: &EventSender,
+        model: &'static str,
+    ) {
+        let now_ms = Self::now_ms();
+        self.emit_progress(bytes, total, now_ms, tx, model);
+    }
+
+    // -- policy -------------------------------------------------------------
+
+    /// Apply the throttle gating rules and update the bookkeeping
+    /// that `bytes_per_sec` reads from. Returns `true` if the call
+    /// should publish. Side effect: on `true`, advances `last_pct`
+    /// so the next identical percentage won't re-emit, and updates
+    /// `last_emit_ms` so the elapsed-time window starts here.
+    fn should_emit(&mut self, bytes: u64, total: Option<u64>, now_ms: u128) -> bool {
         match total {
             Some(t) if t > 0 => {
                 let pct = ((bytes as f64 / t as f64) * 100.0) as i32;
                 if pct != self.last_pct || bytes == t {
                     self.last_pct = pct;
-                    self.last_bytes = bytes;
-                    self.last_total = Some(t);
-                    // Known total: bytes_per_sec isn't needed for the
-                    // gauge label, but keep the previous value so a
-                    // mid-stream phase flip doesn't show 0.0 MB/s.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    tx.publish(AppEvent::DownloadProgress {
-                        model,
-                        bytes,
-                        total,
-                        bytes_per_sec: self.bytes_per_sec(now, bytes),
-                    });
-                    self.last_emit_bytes = bytes;
+                    true
+                } else {
+                    false
                 }
             }
             _ => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                if now.saturating_sub(self.last_emit_ms) >= 250 {
-                    let bps = self.bytes_per_sec(now, bytes);
-                    tx.publish(AppEvent::DownloadProgress {
-                        model,
-                        bytes,
-                        total,
-                        bytes_per_sec: bps,
-                    });
-                    self.last_emit_ms = now;
-                    self.last_bytes = bytes;
-                    self.last_emit_bytes = bytes;
+                if now_ms.saturating_sub(self.last_emit_ms) >= Self::NO_TOTAL_TICK_MS {
+                    self.last_emit_ms = now_ms;
+                    true
+                } else {
+                    false
                 }
             }
         }
     }
 
-    pub fn flush(
+    // -- emit ---------------------------------------------------------------
+
+    /// Single emit site. Both call-site paths and finalize funnel
+    /// through here so the payload shape and bookkeeping stay
+    /// aligned. `bytes_per_sec` is always computed even when total
+    /// is known — the renderer treats 0 as "no prior reference"
+    /// (first tick), and a phase flip mid-stream can hand off a
+    /// non-zero value from the previous throttle window.
+    fn emit_progress(
         &mut self,
         bytes: u64,
         total: Option<u64>,
+        now_ms: u128,
         tx: &EventSender,
         model: &'static str,
     ) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let bps = self.bytes_per_sec(now, bytes);
         tx.publish(AppEvent::DownloadProgress {
             model,
             bytes,
             total,
-            bytes_per_sec: bps,
+            bytes_per_sec: self.bytes_per_sec(now_ms, bytes),
         });
         self.last_bytes = bytes;
         self.last_total = total;
         self.last_emit_bytes = bytes;
     }
 
-    /// Bytes per second measured across the previous emit window. Zero
-    /// on the very first tick (no prior reference); the renderer treats
-    /// 0 as "no measurement yet".
+    // -- leaves -------------------------------------------------------------
+
+    /// Wall-clock in milliseconds since the UNIX epoch. Single
+    /// source for everything that says "now" in this module —
+    /// tests that need to fake time should override this method.
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Bytes per second measured across the previous emit window.
+    /// Zero on the very first tick (no prior reference); the
+    /// renderer treats 0 as "no measurement yet".
     fn bytes_per_sec(&self, now_ms: u128, bytes: u64) -> u64 {
         if self.last_emit_ms == 0 {
             return 0;
@@ -292,6 +335,11 @@ impl Throttle {
     pub fn last_total(&self) -> Option<u64> {
         self.last_total
     }
+
+    /// Cooldown between progress emits when `total` is unknown.
+    /// 250 ms ≈ 4 fps; the bar moves without saturating the event
+    /// bus at ~25 000 chunks/1.6 GB × 64 KiB.
+    const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
 
@@ -421,7 +469,7 @@ pub fn spawn(
 
             Ok(()) => {
                 if let Some(total) = throttle.last_total() {
-                    throttle.flush(total, Some(total), &tx, model);
+                    throttle.finalize(total, Some(total), &tx, model);
                 }
                 if crate::model_store::handler_for(format).install_is_slow() {
                     tx.publish(AppEvent::DownloadInstalling { model });
@@ -585,7 +633,7 @@ mod tests {
     #[test]
     fn throttle_emits_at_most_once_per_percentage_point() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender(tx);
+        let tx = EventSender::from_mpsc(tx);
         let mut th = Throttle::new();
         let total = 1_600_000_000u64;
         let n = 25_000u64;
@@ -607,7 +655,7 @@ mod tests {
     #[test]
     fn throttle_without_total_emits_on_elapsed_time() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender(tx);
+        let tx = EventSender::from_mpsc(tx);
         let mut th = Throttle::new();
         for _ in 0..50 {
             th.call(100, None, &tx, "tiny.en");
@@ -617,7 +665,7 @@ mod tests {
             n += 1;
         }
         assert!(n <= 1, "got {n} emissions");
-        th.flush(100, None, &tx, "tiny.en");
+        th.finalize(100, None, &tx, "tiny.en");
         assert!(rx.try_recv().is_ok());
     }
 

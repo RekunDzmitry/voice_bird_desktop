@@ -73,6 +73,33 @@ fn main() -> io::Result<()> {
     run(&mut terminal)
 }
 
+/// Stamp the from/to model onto `PickerMoved` using the focused
+/// block's current `picker_index` plus a non-mutating peek at the
+/// target index. The input layer has no catalog context, so the
+/// resolver carries it. If the focused block isn't `Picking` (e.g.
+/// the user pressed Up/Down while recording), the event logs both
+/// fields as `None` and the reducer still runs the move on the
+/// picker if one is open.
+fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::PickerMove) {
+    let (from_model, to_model) = match state.focused() {
+        Some(block) => match &block.state {
+            BlockState::Picking(picker) => {
+                let from = CATALOG[picker.index].id;
+                let to_idx = picker.peek_next(direction);
+                let to = CATALOG[to_idx].id;
+                (Some(from), Some(to))
+            }
+            _ => (None, None),
+        },
+        None => (None, None),
+    };
+    tx.publish(AppEvent::PickerMoved {
+        direction,
+        from_model,
+        to_model,
+    });
+}
+
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
 /// - `Confirm` and `Retry` are the resolver's job: they need the
@@ -95,12 +122,8 @@ fn resolve_intent(
         Intent::FocusNext => tx.publish(AppEvent::FocusMoved {
             direction: FocusMove::Next,
         }),
-        Intent::PickerPrev => tx.publish(AppEvent::PickerMoved {
-            direction: picker::PickerMove::Up,
-        }),
-        Intent::PickerNext => tx.publish(AppEvent::PickerMoved {
-            direction: picker::PickerMove::Down,
-        }),
+        Intent::PickerPrev => stamp_picker_move(tx, state, picker::PickerMove::Up),
+        Intent::PickerNext => stamp_picker_move(tx, state, picker::PickerMove::Down),
         Intent::Confirm => {
             if let Some(block) = state.focused() {
                 if let BlockState::Picking(picker) = &block.state {

@@ -122,6 +122,17 @@ impl ModelFormatHandler for NemotronPackageHandler {
             Ok(())
         })();
         let _ = fs::remove_dir_all(&tmp_dir);
+        if result.is_ok() {
+            // Drop the source archive now that everything inside has
+            // been verified and renamed into place. On failure we
+            // keep `staged` so a Retry can re-fetch from the
+            // already-downloaded bytes (the SHA has been verified,
+            // so it's safe to reuse). GGUF's install uses
+            // `fs::rename`, which already consumes the source path
+            // implicitly, so this handler is the only one that
+            // needs an explicit removal.
+            let _ = fs::remove_file(staged);
+        }
         result
     }
     fn install_is_slow(&self) -> bool {
