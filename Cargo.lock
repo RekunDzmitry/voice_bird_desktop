@@ -3956,11 +3956,16 @@ dependencies = [
  "chrono",
  "crossterm",
  "directories",
+ "flate2",
+ "hex",
  "pretty_assertions",
  "proptest",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
 ]
 

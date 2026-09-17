@@ -93,7 +93,11 @@ impl EventLog {
     /// Errors are swallowed: a full disk or a rotated inode is not
     /// worth surfacing to the UI mid-frame. The next successful
     /// write covers the gap silently.
-    pub fn append(&mut self, event: AppEvent) {
+    /// Borrow by reference so the drain loop can log, repo-apply and
+    /// state-apply the same event in turn without cloning. The inner
+    /// `Record` already holds a `&'a AppEvent`, so the move from
+    /// owned to borrowed is a signature change, not a behaviour change.
+    pub fn append(&mut self, event: &AppEvent) {
         #[derive(serde::Serialize)]
         struct Record<'a> {
             ts: String,
@@ -102,7 +106,7 @@ impl EventLog {
         }
         let record = Record {
             ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            event: &event,
+            event,
         };
         match serde_json::to_writer(&mut self.file, &record) {
             Ok(()) => {}
@@ -139,8 +143,8 @@ mod tests {
             .open(&path)
             .expect("open");
         let mut log = EventLog { file, path: path.clone() };
-        log.append(AppEvent::AddBlock);
-        log.append(AppEvent::Quit);
+        log.append(&AppEvent::AddBlock);
+        log.append(&AppEvent::Quit);
         drop(log);
 
         let mut body = String::new();
@@ -217,7 +221,7 @@ mod tests {
         a.publish(AppEvent::AddBlock);
         b.publish(AppEvent::Quit);
         for ev in bus.drain() {
-            log.append(ev);
+            log.append(&ev);
         }
         drop(log);
 
@@ -255,11 +259,11 @@ mod tests {
         // reviewer-flagged case; `PickerMoved` is the other payload-
         // bearing variant, paired here so a regression that fixed
         // only one of them would fail this test.
-        log.append(AppEvent::AddBlock);
-        log.append(AppEvent::PickerMoved { direction: PickerMove::Down });
-        log.append(AppEvent::ModelSelected(&CATALOG[0]));
-        log.append(AppEvent::PickerCancelled);
-        log.append(AppEvent::Quit);
+        log.append(&AppEvent::AddBlock);
+        log.append(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
+        log.append(&AppEvent::ModelSelected(&CATALOG[0]));
+        log.append(&AppEvent::BlockClosed);
+        log.append(&AppEvent::Quit);
 
         let body = std::fs::read_to_string(&path).expect("read");
         let lines: Vec<&str> = body.lines().collect();
@@ -311,5 +315,54 @@ mod tests {
             serde_json::from_str(lines[1]).expect("moved line parses");
         assert_eq!(parsed["event"], "PickerMoved");
         assert_eq!(parsed["direction"], "Down");
+    }
+
+    /// `ModelAlreadyCached` carries the same `&'static ModelEntry`
+    /// payload as `ModelSelected` and `RecordingStarted`, so it must
+    /// serialize with the same flattened shape and the same
+    /// well-typed payload fields (`id`, `size_mb`, `language`).
+    /// This pins the contract that adding a new tuple variant to
+    /// `AppEvent` doesn't accidentally regress into the
+    /// Debug-formatted string the previous incarnation produced.
+    #[test]
+    fn model_already_cached_line_round_trips_through_serde_json() {
+        use crate::picker::CATALOG;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("log.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let mut log = EventLog { file, path: path.clone() };
+
+        log.append(&AppEvent::ModelAlreadyCached(&CATALOG[0]));
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        let line = body
+            .lines()
+            .next()
+            .expect("at least one line written");
+
+        // Round-trip through serde_json::Value -- the line must be a
+        // valid JSON object (the JSONL contract), and the variant
+        // tag must come out as "ModelAlreadyCached" rather than the
+        // Debug-spel form.
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("line parses");
+        assert!(parsed["ts"].as_str().expect("ts").len() > 10);
+        assert_eq!(parsed["event"], "ModelAlreadyCached");
+        assert_eq!(parsed["id"], CATALOG[0].id);
+        assert_eq!(parsed["size_mb"], CATALOG[0].size_mb);
+        assert_eq!(parsed["language"], CATALOG[0].language);
+        assert!(
+            parsed["id"].is_string(),
+            "id should be a JSON string; got {parsed:?}"
+        );
+        assert!(
+            parsed["size_mb"].is_number(),
+            "size_mb should be a JSON number; got {parsed:?}"
+        );
     }
 }

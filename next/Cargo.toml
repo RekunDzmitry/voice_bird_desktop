@@ -14,19 +14,37 @@ path = "src/lib.rs"
 name = "voice-bird-next"
 path = "src/main.rs"
 
+[features]
+# Default-on: pulls `reqwest` + `sha2` + `hex` for the live downloader.
+# Tests and `download_flow.rs` exercise the full flow through the
+# fixture downloader without this feature; running
+# `cargo test --no-default-features` finishes in seconds.
+default = ["net"]
+net = ["dep:reqwest"]
+
 [dependencies]
-# Same versions as the root crate so Cargo.lock keeps one copy and render
-# code ports over by copy-paste.
 chrono = "0.4"
 directories = "5"
 ratatui = "0.29"
 crossterm = "0.28"
-# Serde + JSON for the on-disk event log (next/src/event_log.rs).
-# Both crates are already in the workspace's Cargo.lock via the root
-# crate, so adding them here only registers direct-dep metadata; the
-# build graph doesn't grow a single new compilation unit.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Format-specific unpack for the Nemotron tarball. Always-on: a
+# verified staging file is meaningless if we can't actually install it.
+flate2 = "1"
+tar = "0.4"
+
+[dependencies.reqwest]
+version = "0.12"
+optional = true
+default-features = false
+features = ["blocking", "rustls-tls"]
+
+[dependencies.sha2]
+version = "0.10"
+
+[dependencies.hex]
+version = "0.4"
 
 [dev-dependencies]
 pretty_assertions = "1"

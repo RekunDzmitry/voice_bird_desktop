@@ -1,34 +1,58 @@
 use pretty_assertions::assert_eq;
 use proptest::prelude::*;
-use voice_bird_next::{picker::ModelPicker, state::{Block, UiState}, testing::render_to_string};
+use voice_bird_next::{
+    picker::{ModelPicker, PickerIntent},
+    state::{Block, BlockState, DownloadState, UiState},
+    store::DownloadPhase,
+    testing::render_to_string,
+};
 
-const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/idle_100x30.txt");
+const IDLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/idle_100x30.txt");
 const THREE_BLOCKS: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/three_blocks_100x30.txt");
+const PICKING: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/picking_100x30.txt");
+const DOWNLOADING_TWO_BLOCKS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/downloading_two_blocks_100x30.txt"
+);
+const FAILED: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/failed_100x30.txt");
 
-/// Golden snapshot of the idle window. Refresh with
-/// `UPDATE_SNAPSHOTS=1 cargo test -p voice-bird-next` and review the diff.
 #[test]
 fn idle_100x30_matches_golden() {
     let out = render_to_string(&UiState::default(), 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
-        std::fs::write(GOLDEN, &out).expect("write golden");
+        std::fs::write(IDLE, &out).expect("write golden");
     }
-    let expected = std::fs::read_to_string(GOLDEN).expect("read golden");
+    let expected = std::fs::read_to_string(IDLE).expect("read golden");
     assert_eq!(out, expected);
 }
 
-/// Golden snapshot of the window after three `+ → Enter` presses (each
-/// adding a block bound to a different catalog model). Refresh alongside
-/// `idle_100x30.txt` with `UPDATE_SNAPSHOTS=1`.
 #[test]
 fn three_blocks_100x30_matches_golden() {
     let state = UiState {
         blocks: vec![
-            Block { id: 1, model: "distil-small.en".to_string() },
-            Block { id: 2, model: "distil-large-v3".to_string() },
-            Block { id: 3, model: "large-v3-turbo".to_string() },
+            Block {
+                id: 1,
+                state: BlockState::Recording {
+                    model: "distil-small.en",
+                },
+            },
+            Block {
+                id: 2,
+                state: BlockState::Recording {
+                    model: "distil-large-v3",
+                },
+            },
+            Block {
+                id: 3,
+                state: BlockState::Recording {
+                    model: "large-v3-turbo",
+                },
+            },
         ],
+        focus: 0,
         next_block_id: 4,
         ..Default::default()
     };
@@ -40,38 +64,96 @@ fn three_blocks_100x30_matches_golden() {
     assert_eq!(out, expected);
 }
 
-/// Snapshot assertion that the picker overlay renders with the marker on
-/// the highlighted catalog row. Not a golden — explicit substring checks
-/// so the test survives cosmetic whitespace tweaks inside the paragraph.
 #[test]
-fn picker_overlay_renders_catalog_with_marker() {
-    use voice_bird_next::picker::PickerIntent;
+fn picking_100x30_matches_golden() {
     let state = UiState {
         blocks: vec![Block {
             id: 1,
-            model: "distil-small.en".to_string(),
+            state: BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
         }],
-        picker: Some(ModelPicker::open(PickerIntent::AddBlock)),
+        focus: 0,
+        next_block_id: 2,
         ..Default::default()
     };
     let out = render_to_string(&state, 100, 30);
-    assert!(
-        out.contains("\u{25b6} distil-small.en"),
-        "expected marker on first catalog row; got:\n{out}"
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(PICKING, &out).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(PICKING).expect("read golden");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn downloading_two_blocks_100x30_matches_golden() {
+    let mut state = UiState {
+        blocks: vec![
+            Block {
+                id: 1,
+                state: BlockState::Waiting { model: "tiny.en" },
+            },
+            Block {
+                id: 2,
+                state: BlockState::Waiting { model: "tiny.en" },
+            },
+        ],
+        focus: 0,
+        next_block_id: 3,
+        ..Default::default()
+    };
+    state.downloads.insert(
+        "tiny.en",
+        DownloadState {
+            phase: DownloadPhase::Fetching,
+            bytes: 50,
+            total: Some(100),
+            bytes_per_sec: 0,
+        },
     );
-    assert!(
-        out.contains("  distil-large-v3"),
-        "expected second catalog row padded; got:\n{out}"
-    );
-    assert!(
-        out.contains("Pick a model (Esc to cancel)"),
-        "expected picker title in overlay; got:\n{out}"
-    );
-    // The existing block must still be visible behind the overlay.
-    assert!(
-        out.contains("1 · distil-small.en"),
-        "expected block label behind overlay; got:\n{out}"
-    );
+    let out = render_to_string(&state, 100, 30);
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(DOWNLOADING_TWO_BLOCKS, &out).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(DOWNLOADING_TWO_BLOCKS).expect("read golden");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn failed_100x30_matches_golden() {
+    let state = UiState {
+        blocks: vec![Block {
+            id: 1,
+            state: BlockState::Failed {
+                model: "tiny.en",
+                error: "HTTP 404".to_string(),
+            },
+        }],
+        focus: 0,
+        next_block_id: 2,
+        ..Default::default()
+    };
+    let out = render_to_string(&state, 100, 30);
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(FAILED, &out).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(FAILED).expect("read golden");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn picker_renders_catalog_inside_focused_block() {
+    let state = UiState {
+        blocks: vec![Block {
+            id: 1,
+            state: BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
+        }],
+        focus: 0,
+        next_block_id: 2,
+        ..Default::default()
+    };
+    let out = render_to_string(&state, 100, 30);
+    assert!(out.contains("\u{25b6} distil-small.en"));
+    assert!(out.contains("  distil-large-v3"));
+    assert!(out.contains("pick a model"));
 }
 
 proptest! {
@@ -80,9 +162,6 @@ proptest! {
         let _ = render_to_string(&UiState::default(), w, h);
     }
 
-    /// Random block counts across random terminal sizes must never panic.
-    /// The Direction::Horizontal layout clamps zero-width columns;
-    /// ratatui skips the draw.
     #[test]
     fn render_never_panics_with_random_block_count(
         w in 1u16..200,
@@ -93,11 +172,48 @@ proptest! {
             blocks: (1..=blocks as u32)
                 .map(|i| Block {
                     id: i,
-                    model: "tiny.en".to_string(),
+                    state: BlockState::Recording { model: "tiny.en" },
                 })
                 .collect(),
+            focus: 0,
+            next_block_id: blocks as u32 + 1,
             ..Default::default()
         };
+        let _ = render_to_string(&state, w, h);
+    }
+
+    #[test]
+    fn render_never_panics_with_random_download_state(
+        w in 1u16..200,
+        h in 1u16..80,
+        bytes in 0u64..2_000_000_000u64,
+        total_raw in 0u64..2_000_000_000u64,
+    ) {
+        let total = if total_raw == 0 {
+            None
+        } else if total_raw % 2 == 0 {
+            Some(total_raw)
+        } else {
+            Some(0)
+        };
+        let mut state = UiState {
+            blocks: vec![Block {
+                id: 1,
+                state: BlockState::Waiting { model: "tiny.en" },
+            }],
+            focus: 0,
+            next_block_id: 2,
+            ..Default::default()
+        };
+        state.downloads.insert(
+            "tiny.en",
+            DownloadState {
+                phase: DownloadPhase::Fetching,
+                bytes,
+                total,
+                bytes_per_sec: 0,
+            },
+        );
         let _ = render_to_string(&state, w, h);
     }
 }
