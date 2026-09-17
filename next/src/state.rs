@@ -183,6 +183,7 @@ impl UiState {
                 });
             }
             AppEvent::DownloadProgress {
+                attempt: _,
                 model,
                 bytes,
                 total,
@@ -194,25 +195,27 @@ impl UiState {
                     row.bytes_per_sec = *bytes_per_sec;
                 }
             }
-            AppEvent::DownloadInstalling { model } => {
+            AppEvent::DownloadInstalling { attempt: _, model } => {
                 if let Some(row) = self.downloads.get_mut(*model) {
                     row.phase = DownloadPhase::Installing;
                 }
             }
-            AppEvent::DownloadSucceeded { model } => {
+            AppEvent::DownloadSucceeded { attempt: _, model } => {
                 self.downloads.remove(*model);
                 for block in &mut self.blocks {
-                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model)
-                    {
+                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
                         block.state = BlockState::Recording { model };
                     }
                 }
             }
-            AppEvent::DownloadFailed { model, error } => {
+            AppEvent::DownloadFailed {
+                attempt: _,
+                model,
+                error,
+            } => {
                 self.downloads.remove(*model);
                 for block in &mut self.blocks {
-                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model)
-                    {
+                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
                         block.state = BlockState::Failed {
                             model,
                             error: error.clone(),
@@ -228,7 +231,7 @@ impl UiState {
                     }
                 }
             }
-            AppEvent::DownloadCancelled { model } => {
+            AppEvent::DownloadCancelled { attempt: _, model } => {
                 self.downloads.remove(*model);
             }
             AppEvent::Quit => self.should_quit = true,
@@ -239,7 +242,7 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::{CATALOG, PickerMove};
+    use crate::picker::{PickerMove, CATALOG};
 
     #[test]
     fn apply_quit_sets_should_quit() {
@@ -267,7 +270,12 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 1);
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "distil-small.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording {
+                model: "distil-small.en"
+            }
+        ));
         assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
     }
 
@@ -279,11 +287,15 @@ mod tests {
         }
         assert_eq!(s.focus, 2);
         for _ in 0..5 {
-            s.apply(&AppEvent::FocusMoved { direction: FocusMove::Prev });
+            s.apply(&AppEvent::FocusMoved {
+                direction: FocusMove::Prev,
+            });
         }
         assert_eq!(s.focus, 0);
         for _ in 0..5 {
-            s.apply(&AppEvent::FocusMoved { direction: FocusMove::Next });
+            s.apply(&AppEvent::FocusMoved {
+                direction: FocusMove::Next,
+            });
         }
         assert_eq!(s.focus, 2);
     }
@@ -291,7 +303,9 @@ mod tests {
     #[test]
     fn focus_moved_is_noop_when_no_blocks() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::FocusMoved { direction: FocusMove::Next });
+        s.apply(&AppEvent::FocusMoved {
+            direction: FocusMove::Next,
+        });
         assert_eq!(s.focus, 0);
     }
 
@@ -301,23 +315,45 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
+        s.apply(&AppEvent::PickerMoved {
+            direction: PickerMove::Down,
+            from_model: None,
+            to_model: None,
+        });
+        s.apply(&AppEvent::PickerMoved {
+            direction: PickerMove::Down,
+            from_model: None,
+            to_model: None,
+        });
         let picker_index = match &s.blocks[1].state {
             BlockState::Picking(p) => p.index,
             _ => panic!("block 2 should still be picking"),
         };
         assert_eq!(picker_index, 2);
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "distil-small.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording {
+                model: "distil-small.en"
+            }
+        ));
     }
 
     #[test]
     fn model_selected_flips_focused_block() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
+        s.apply(&AppEvent::PickerMoved {
+            direction: PickerMove::Down,
+            from_model: None,
+            to_model: None,
+        });
         s.apply(&AppEvent::ModelSelected(&CATALOG[2]));
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "large-v3-turbo" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording {
+                model: "large-v3-turbo"
+            }
+        ));
     }
 
     #[test]
@@ -326,7 +362,12 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
         s.apply(&AppEvent::ModelSelected(&CATALOG[1]));
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "distil-small.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording {
+                model: "distil-small.en"
+            }
+        ));
     }
 
     #[test]
@@ -346,8 +387,12 @@ mod tests {
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
-        s.apply(&AppEvent::FocusMoved { direction: FocusMove::Prev });
-        s.apply(&AppEvent::FocusMoved { direction: FocusMove::Prev });
+        s.apply(&AppEvent::FocusMoved {
+            direction: FocusMove::Prev,
+        });
+        s.apply(&AppEvent::FocusMoved {
+            direction: FocusMove::Prev,
+        });
         assert_eq!(s.focus, 0);
         s.apply(&AppEvent::BlockClosed);
         assert_eq!(s.blocks.len(), 2);
@@ -395,6 +440,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadProgress {
+            attempt: 1,
             model: "tiny.en",
             bytes: 100,
             total: Some(200),
@@ -406,8 +452,14 @@ mod tests {
         assert_eq!(row.bytes, 100);
         assert_eq!(row.total, Some(200));
         assert_eq!(s.blocks.len(), 2);
-        assert!(matches!(s.blocks[0].state, BlockState::Waiting { model: "tiny.en" }));
-        assert!(matches!(s.blocks[1].state, BlockState::Waiting { model: "tiny.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Waiting { model: "tiny.en" }
+        ));
+        assert!(matches!(
+            s.blocks[1].state,
+            BlockState::Waiting { model: "tiny.en" }
+        ));
     }
 
     #[test]
@@ -416,6 +468,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadProgress {
+            attempt: 1,
             model: "tiny.en",
             bytes: 50,
             total: Some(100),
@@ -431,9 +484,13 @@ mod tests {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::DownloadSucceeded { model: "tiny.en" });
+        s.apply(&AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: "tiny.en",
+        });
         assert!(!s.downloads.contains_key("tiny.en"));
         s.apply(&AppEvent::DownloadProgress {
+            attempt: 1,
             model: "tiny.en",
             bytes: 10,
             total: None,
@@ -447,7 +504,10 @@ mod tests {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::DownloadInstalling { model: "tiny.en" });
+        s.apply(&AppEvent::DownloadInstalling {
+            attempt: 1,
+            model: "tiny.en",
+        });
         assert_eq!(
             s.downloads.get("tiny.en").unwrap().phase,
             DownloadPhase::Installing
@@ -461,9 +521,18 @@ mod tests {
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::DownloadSucceeded { model: "tiny.en" });
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "tiny.en" }));
-        assert!(matches!(s.blocks[1].state, BlockState::Recording { model: "tiny.en" }));
+        s.apply(&AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: "tiny.en",
+        });
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording { model: "tiny.en" }
+        ));
+        assert!(matches!(
+            s.blocks[1].state,
+            BlockState::Recording { model: "tiny.en" }
+        ));
         assert!(!s.downloads.contains_key("tiny.en"));
     }
 
@@ -475,6 +544,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
             model: "tiny.en",
             error: "HTTP 404".to_string(),
         });
@@ -496,11 +566,15 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
             model: "tiny.en",
             error: "boom".into(),
         });
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        assert!(matches!(s.blocks[0].state, BlockState::Waiting { model: "tiny.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Waiting { model: "tiny.en" }
+        ));
     }
 
     #[test]
@@ -512,7 +586,10 @@ mod tests {
         // The resolver publishes BlockClosed + DownloadCancelled when
         // the last waiter is dropped — split the test across both.
         s.apply(&AppEvent::BlockClosed);
-        s.apply(&AppEvent::DownloadCancelled { model: "tiny.en" });
+        s.apply(&AppEvent::DownloadCancelled {
+            attempt: 1,
+            model: "tiny.en",
+        });
         assert!(!s.downloads.contains_key("tiny.en"));
     }
 
@@ -525,7 +602,10 @@ mod tests {
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::BlockClosed);
         assert!(s.downloads.contains_key("tiny.en"));
-        assert!(matches!(s.blocks[0].state, BlockState::Waiting { model: "tiny.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Waiting { model: "tiny.en" }
+        ));
     }
 
     #[test]
@@ -579,7 +659,10 @@ mod tests {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::RecordingStarted(&CATALOG[5]));
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "tiny.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording { model: "tiny.en" }
+        ));
     }
 
     #[test]
@@ -588,10 +671,14 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
             model: "tiny.en",
             error: "boom".into(),
         });
         s.apply(&AppEvent::RecordingStarted(&CATALOG[5]));
-        assert!(matches!(s.blocks[0].state, BlockState::Recording { model: "tiny.en" }));
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording { model: "tiny.en" }
+        ));
     }
 }

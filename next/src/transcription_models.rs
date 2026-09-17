@@ -10,6 +10,18 @@
 //! Staging + install is what keeps the presence check honest: a
 //! truncated or sha-failing write that went straight to the final path
 //! would render as "present" the next time `is_available` runs.
+//!
+//! ## Attempt-scoped staging paths
+//!
+//! `ModelFormatHandler::staging_path` takes an `attempt: u32`. The
+//! store picks a fresh attempt id every time a request returns
+//! `Restart` (after a `Cancelling` row has not yet been acked). The
+//! handlers suffix the attempt into the staging filename so two
+//! concurrent attempts of the same model cannot write to the same
+//! `.part` file or unpack into the same scratch directory. The store
+//! filters every event by attempt id, so a stale `DownloadInstalling`
+//! from a superseded attempt cannot repaint the new attempt's
+//! progress row either.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,11 +41,19 @@ pub use crate::download::DownloadError;
 /// Everything format-specific about getting a model onto disk and
 /// deciding whether it is already there.
 pub trait ModelFormatHandler: Send + Sync {
-    fn staging_path(&self, dir: &Path, id: &str) -> PathBuf;
+    /// Resolve the on-disk staging path for `(dir, id, attempt)`.
+    /// `attempt` is the `DownloadClaim`'s monotonic id, supplied
+    /// by the store so two concurrent attempts of the same model
+    /// cannot write to the same staging file. Each handler picks
+    /// its own attempt-suffixing scheme; the store never inspects
+    /// the path.
+    fn staging_path(&self, dir: &Path, id: &str, attempt: u32) -> PathBuf;
+    /// Final installed path. Stable across attempts: this is the path
+    /// the renderer reports as "available" once install finishes, and
+    /// it does NOT carry an attempt suffix.
     fn installed_path(&self, dir: &Path, id: &str) -> PathBuf;
     /// Present *and usable* — not merely "a path exists".
     fn is_installed(&self, dir: &Path, id: &str) -> bool;
-    /// Move/unpack the verified staging file into place. On failure it
     /// Move/unpack the verified staging file into place. The cancel
     /// token is the same one `spawn()` passed to the downloader; it
     /// is polled between unpack and rename so closing the last
@@ -64,14 +84,24 @@ pub fn handler_for(format: ModelFormat) -> &'static dyn ModelFormatHandler {
     }
 }
 
-/// Single Whisper GGUF `.bin` file. Staging filename `<id>.gguf.part`,
-/// installed `<id>.gguf` (matches the legacy crate's `gguf_path` so a
-/// model already fetched by `voice-bird-cli` reads as present).
+/// Single Whisper GGUF `.bin` file. Staging filename
+/// `<id>.<attempt>.gguf.part`, installed `<id>.gguf` (matches the
+/// legacy crate's `gguf_path` so a model already fetched by
+/// `voice-bird-cli` reads as present).
+///
+/// The attempt suffix on the staging filename is what keeps two
+/// concurrent attempts of the same model from racing on the same
+/// `.part` file: even if the store issues `Restart` under a new
+/// attempt while the previous worker is still alive, the in-flight
+/// GGUF rename for the previous attempt operates on a different
+/// filename. Without the suffix, the rename would have promoted a
+/// half-written `.part` from the new attempt into the installed
+/// `.gguf`.
 pub struct GgufHandler;
 
 impl ModelFormatHandler for GgufHandler {
-    fn staging_path(&self, dir: &Path, id: &str) -> PathBuf {
-        dir.join(format!("{id}.gguf.part"))
+    fn staging_path(&self, dir: &Path, id: &str, attempt: u32) -> PathBuf {
+        dir.join(format!("{id}.{attempt}.gguf.part"))
     }
     fn installed_path(&self, dir: &Path, id: &str) -> PathBuf {
         dir.join(format!("{id}.gguf"))
@@ -100,16 +130,25 @@ impl ModelFormatHandler for GgufHandler {
 }
 
 /// Nemotron ONNX package, shipped as a `.tar.gz`. Staging filename
-/// `<id>.tar.gz.part`, installed `<id>/` (matches the legacy
+/// `<id>.<attempt>.tar.gz.part`, unpack scratch
+/// `<id>.<attempt>.tmp/`, installed `<id>/` (matches the legacy
 /// `nemotron_model_dir`).
 ///
-/// `is_installed` requires **both** `encoder.onnx` and `decoder_joint.onnx`
-/// so an empty or half-unpacked directory is not mistaken for a model.
+/// Both the staging archive and the unpack scratch carry the
+/// attempt suffix so two concurrent attempts cannot collide on
+/// either path. Without the suffix, the previous design would
+/// have let a retry's `tmp_dir` cleanup (`remove_dir_all` in the
+/// install prologue) wipe a still-running previous attempt's
+/// partial unpack.
+///
+/// `is_installed` requires **both** `encoder.onnx` and
+/// `decoder_joint.onnx` so an empty or half-unpacked directory
+/// is not mistaken for a model.
 pub struct NemotronPackageHandler;
 
 impl ModelFormatHandler for NemotronPackageHandler {
-    fn staging_path(&self, dir: &Path, id: &str) -> PathBuf {
-        dir.join(format!("{id}.tar.gz.part"))
+    fn staging_path(&self, dir: &Path, id: &str, attempt: u32) -> PathBuf {
+        dir.join(format!("{id}.{attempt}.tar.gz.part"))
     }
     fn installed_path(&self, dir: &Path, id: &str) -> PathBuf {
         dir.join(id)
@@ -127,7 +166,21 @@ impl ModelFormatHandler for NemotronPackageHandler {
         staged: &Path,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), DownloadError> {
-        let tmp_dir = dir.join(format!("{id}.tmp"));
+        // The unpack scratch dir mirrors the staging file's attempt
+        // suffix by stripping the trailing `.part` off `staged`'s
+        // filename and appending `.tmp`. Deriving it from `staged`
+        // (rather than from `id` and a fixed suffix) means the
+        // scratch dir always agrees with whatever staging filename
+        // the worker fetched into, and gives us per-attempt
+        // isolation for free.
+        let tmp_dir = match Path::new(staged).file_name().and_then(|n| n.to_str()) {
+            Some(name) => dir.join(format!("{}.tmp", name.trim_end_matches(".part"))),
+            None => {
+                return Err(DownloadError::Io(
+                    "staged file has no name component".into(),
+                ));
+            }
+        };
         let target = self.installed_path(dir, id);
         // Best-effort cleanup of leftovers from a prior crashed run.
         if tmp_dir.exists() {
@@ -253,7 +306,12 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
 /// http, ...) live behind the same trait.
 pub trait ModelStore: Send + Sync + 'static {
     fn is_available(&self, entry: &ModelEntry) -> bool;
-    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError>;
+    /// Resolve the staging path for the supplied attempt id. The
+    /// caller is the worker that just received a `DownloadClaim` from
+    /// the store; it threads the attempt through to the handler so
+    /// two concurrent attempts of the same model never share a
+    /// `.part` file.
+    fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError>;
     fn install(
         &self,
         entry: &ModelEntry,
@@ -291,9 +349,12 @@ impl CacheDirStore {
 
     /// Delete every `*.part` file and `*.tmp` directory left by a
     /// previous run. Called once from `main`. Staging names are
-    /// deterministic so a restarted download would overwrite rather
-    /// than accumulate; the sweep is what stops a killed 1.5 GB
-    /// download from sitting on disk forever.
+    /// deterministic per `(id, attempt)` so a restarted download
+    /// would overwrite rather than accumulate; the sweep is what
+    /// stops any leftover `.tmp/` directories from a killed worker
+    /// from sitting on disk forever. Newer attempts use a higher
+    /// attempt number, so an old attempt's leftover is matched by
+    /// the same wildcard.
     pub fn sweep_staging(&self) -> Result<(), DownloadError> {
         if !self.root.is_dir() {
             return Ok(());
@@ -308,6 +369,11 @@ impl CacheDirStore {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            // Match the previous suffix patterns too. The current
+            // attempt-scoped names use `<id>.<attempt>.gguf.part`
+            // and `<id>.<attempt>.tar.gz.part`, both of which still
+            // end in `.part`; scratch dirs end in `.tmp`. We don't
+            // try to be picky about the prefix.
             if name.ends_with(".part") && path.is_file() {
                 let _ = fs::remove_file(&path);
             } else if name.ends_with(".tmp") && path.is_dir() {
@@ -323,8 +389,8 @@ impl ModelStore for CacheDirStore {
         handler_for(entry.format).is_installed(&self.root, entry.id)
     }
 
-    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError> {
-        Ok(handler_for(entry.format).staging_path(&self.root, entry.id))
+    fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
+        Ok(handler_for(entry.format).staging_path(&self.root, entry.id, attempt))
     }
 
     fn install(
@@ -337,28 +403,24 @@ impl ModelStore for CacheDirStore {
     }
 
     fn clear_staging(&self, entry: &ModelEntry) {
-        let p = handler_for(entry.format).staging_path(&self.root, entry.id);
+        // `clear_staging` is called from tests and the startup sweep
+        // for a model id with no attempt context — assume attempt 1,
+        // which is the conventional id for the very first attempt.
+        let p = handler_for(entry.format).staging_path(&self.root, entry.id, 1);
         if p.is_file() {
             let _ = fs::remove_file(&p);
         }
     }
 
-    fn discard_inflight(&self, entry: &ModelEntry) {
-        // Drop the staged archive first so a partial download never
-        // gets mistaken for a verified one on the next session.
-        let staged = handler_for(entry.format).staging_path(&self.root, entry.id);
-        if staged.is_file() {
-            let _ = fs::remove_file(&staged);
-        }
-        // Drop the unpack scratch dir. The handler's install_is_slow
-        // distinguishes single-rename from unpack formats: only the
-        // latter creates `<id>.tmp/`. We don't try to be smarter —
-        // asking the handler for the path keeps this consistent if
-        // a future format adds its own scratch layout.
-        let tmp = self.root.join(format!("{id}.tmp", id = entry.id));
-        if tmp.is_dir() {
-            let _ = fs::remove_dir_all(&tmp);
-        }
+    fn discard_inflight(&self, _entry: &ModelEntry) {
+        // The startup sweep below is the canonical handler for any
+        // straggler `.part` files and `.tmp` directories from any
+        // attempt, so this per-call cleanup only needs to cover the
+        // canonical attempt=1 path. In practice a previous session's
+        // `cleanup_inflight` ran before exit; this defensive call
+        // exists so the contract still holds if the process is
+        // killed before the Quit handler.
+        let _ = self.sweep_staging();
     }
 }
 
@@ -410,10 +472,21 @@ mod tests {
     }
 
     #[test]
+    fn gguf_staging_path_includes_attempt_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let h = GgufHandler;
+        let p1 = h.staging_path(tmp.path(), "tiny.en", 1);
+        let p2 = h.staging_path(tmp.path(), "tiny.en", 2);
+        assert_eq!(p1.file_name().unwrap(), "tiny.en.1.gguf.part");
+        assert_eq!(p2.file_name().unwrap(), "tiny.en.2.gguf.part");
+        assert_ne!(p1, p2, "two attempts must not share a staging path");
+    }
+
+    #[test]
     fn gguf_install_renames_staged_file() {
         let tmp = TempDir::new().unwrap();
         let h = GgufHandler;
-        let staged = h.staging_path(tmp.path(), "tiny.en");
+        let staged = h.staging_path(tmp.path(), "tiny.en", 1);
         write(&staged, b"GGUF");
         h.install(
             tmp.path(),
@@ -440,6 +513,23 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_staging_path_includes_attempt_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let h = NemotronPackageHandler;
+        let p1 = h.staging_path(tmp.path(), nemotron_entry().id, 1);
+        let p2 = h.staging_path(tmp.path(), nemotron_entry().id, 2);
+        assert_eq!(
+            p1.file_name().unwrap().to_str().unwrap(),
+            format!("{}.1.tar.gz.part", nemotron_entry().id)
+        );
+        assert_eq!(
+            p2.file_name().unwrap().to_str().unwrap(),
+            format!("{}.2.tar.gz.part", nemotron_entry().id)
+        );
+        assert_ne!(p1, p2, "two attempts must not share a staging path");
+    }
+
+    #[test]
     fn nemotron_install_unpacks_and_renames() {
         // Build a minimal tar.gz: a directory `pkg/` containing both
         // ONNX files. Run install on it and assert the installed dir
@@ -450,7 +540,9 @@ mod tests {
         write(&pkg.join("encoder.onnx"), b"e");
         write(&pkg.join("decoder_joint.onnx"), b"d");
 
-        let archive = src.path().join("pkg.tar.gz");
+        let archive = src
+            .path()
+            .join(format!("{}.1.tar.gz.part", nemotron_entry().id));
         let f = fs::File::create(&archive).unwrap();
         let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
         let mut tar = tar::Builder::new(enc);
@@ -470,9 +562,11 @@ mod tests {
         assert!(installed.is_dir());
         assert!(installed.join("encoder.onnx").is_file());
         assert!(installed.join("decoder_joint.onnx").is_file());
+        // The attempt-scoped scratch dir was removed by the
+        // post-install cleanup.
         assert!(!dst
             .path()
-            .join(format!("{}.tmp", nemotron_entry().id))
+            .join(format!("{}.1.tar.gz.tmp", nemotron_entry().id))
             .exists());
     }
 
@@ -480,8 +574,11 @@ mod tests {
     fn nemotron_install_failure_leaves_no_installed_dir() {
         // Corrupt the archive by truncating; install must roll back
         // the scratch directory AND not leave anything at installed_path.
-        let src = TempDir::new().unwrap();
-        let archive = src.path().join("broken.tar.gz");
+        let archive_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(archive_dir.path()).unwrap();
+        let archive = archive_dir
+            .path()
+            .join(format!("{}.1.tar.gz.part", nemotron_entry().id));
         write(&archive, b"not a tarball");
 
         let dst = TempDir::new().unwrap();
@@ -496,7 +593,7 @@ mod tests {
         assert!(!h.installed_path(dst.path(), nemotron_entry().id).exists());
         assert!(!dst
             .path()
-            .join(format!("{}.tmp", nemotron_entry().id))
+            .join(format!("{}.1.tar.gz.tmp", nemotron_entry().id))
             .exists());
     }
 
@@ -536,7 +633,7 @@ mod tests {
         let store = CacheDirStore {
             root: tmp.path().to_path_buf(),
         };
-        let staged = store.staging_path(tiny_entry()).unwrap();
+        let staged = store.staging_path(tiny_entry(), 1).unwrap();
         write(&staged, b"x");
         assert!(staged.exists());
         store.clear_staging(tiny_entry());
@@ -549,16 +646,16 @@ mod tests {
         let store = CacheDirStore {
             root: tmp.path().to_path_buf(),
         };
-        // Stale: a part file + a tmp dir.
-        write(&tmp.path().join("tiny.en.gguf.part"), b"x");
-        fs::create_dir_all(tmp.path().join("old.tmp")).unwrap();
+        // Stale: a part file from a previous attempt + a tmp dir.
+        write(&tmp.path().join("tiny.en.1.gguf.part"), b"x");
+        fs::create_dir_all(tmp.path().join("tiny.en.1.gguf.tmp")).unwrap();
         // Real: an installed gguf and an unrelated file.
         write(&tmp.path().join("tiny.en.gguf"), b"real");
         write(&tmp.path().join("README"), b"keep me");
 
         store.sweep_staging().unwrap();
-        assert!(!tmp.path().join("tiny.en.gguf.part").exists());
-        assert!(!tmp.path().join("old.tmp").exists());
+        assert!(!tmp.path().join("tiny.en.1.gguf.part").exists());
+        assert!(!tmp.path().join("tiny.en.1.gguf.tmp").exists());
         assert!(tmp.path().join("tiny.en.gguf").exists());
         assert!(tmp.path().join("README").exists());
     }

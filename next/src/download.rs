@@ -216,31 +216,32 @@ impl Throttle {
     // (`should_emit`, `emit_progress`) replace one inline match so
     // each policy can be reasoned about independently.
 
-    pub fn call(&mut self, bytes: u64, total: Option<u64>, tx: &EventSender, model: &'static str) {
-        let now_ms = Self::now_ms();
-        if self.should_emit(bytes, total, now_ms) {
-            self.emit_progress(bytes, total, now_ms, tx, model);
-        }
-    }
-
-    /// Emit one final 100% / final-byte progress on the success
-    /// path. `call` already does this when the final chunk reports
-    /// `bytes == total` (the percentage-changed branch), but a
-    /// slow-network boundary can leave the last `stream_to`
-    /// callback at a percentage identical to the previous one —
-    /// the throttle's percentage policy short-circuits the emit.
-    /// `finalize` always emits without checking either policy,
-    /// which is what guarantees the bar reaches its terminal
-    /// state in every scenario.
-    pub fn finalize(
+    pub fn call(
         &mut self,
+        attempt: u32,
         bytes: u64,
         total: Option<u64>,
         tx: &EventSender,
         model: &'static str,
     ) {
         let now_ms = Self::now_ms();
-        self.emit_progress(bytes, total, now_ms, tx, model);
+        if self.should_emit(bytes, total, now_ms) {
+            self.emit_progress(attempt, bytes, total, now_ms, tx, model);
+        }
+    }
+
+    /// Emit one final 100% / final-byte progress on the success
+    /// path. `call` already does this when the final chunk reports
+    pub fn finalize(
+        &mut self,
+        attempt: u32,
+        bytes: u64,
+        total: Option<u64>,
+        tx: &EventSender,
+        model: &'static str,
+    ) {
+        let now_ms = Self::now_ms();
+        self.emit_progress(attempt, bytes, total, now_ms, tx, model);
     }
 
     // -- policy -------------------------------------------------------------
@@ -278,10 +279,9 @@ impl Throttle {
     /// through here so the payload shape and bookkeeping stay
     /// aligned. `bytes_per_sec` is always computed even when total
     /// is known — the renderer treats 0 as "no prior reference"
-    /// (first tick), and a phase flip mid-stream can hand off a
-    /// non-zero value from the previous throttle window.
     fn emit_progress(
         &mut self,
+        attempt: u32,
         bytes: u64,
         total: Option<u64>,
         now_ms: u128,
@@ -289,6 +289,7 @@ impl Throttle {
         model: &'static str,
     ) {
         tx.publish(AppEvent::DownloadProgress {
+            attempt,
             model,
             bytes,
             total,
@@ -368,8 +369,32 @@ pub fn begin(
     // started by an earlier request. Only the Start claim spawns.
     tx.publish(AppEvent::DownloadRequested(entry));
     match repo.request(entry.id) {
-        DownloadClaim::Start { cancel } => {
-            spawn(entry, store.clone(), downloader.clone(), cancel, tx.clone());
+        DownloadClaim::Start { cancel, attempt } => {
+            spawn(
+                entry,
+                store.clone(),
+                downloader.clone(),
+                cancel,
+                attempt,
+                tx.clone(),
+            );
+        }
+        DownloadClaim::Restart { cancel, attempt } => {
+            // A previous attempt is still unwinding (its row is in
+            // `Cancelling` state and its worker hasn't acked yet).
+            // The previous worker publishes its terminal event
+            // with the OLD attempt; the store's attempt gate
+            // discards it. We thread the NEW attempt through to
+            // the staging path and every event this attempt
+            // publishes.
+            spawn(
+                entry,
+                store.clone(),
+                downloader.clone(),
+                cancel,
+                attempt,
+                tx.clone(),
+            );
         }
         DownloadClaim::Join => {}
     }
@@ -380,21 +405,27 @@ pub fn begin(
 /// installs, publishes `DownloadSucceeded`. Any error publishes
 /// `DownloadFailed` with the message truncated to 160 chars.
 ///
-/// `Cancelled` publishes nothing — the record is already gone.
+/// `Cancelled` now publishes `DownloadCancelled { attempt }` so the
+/// store can drop the row under the attempt gate. If the attempt
+/// has since been superseded by a `Restart`, the store's gate
+/// discards the event and the row stays — the new attempt's
+/// progress remains visible.
 pub fn spawn(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
     downloader: Arc<dyn Downloader>,
     cancel: Arc<AtomicBool>,
+    attempt: u32,
     tx: EventSender,
 ) -> JoinHandle<()> {
     let url = entry.download_url;
     let sha = entry.download_sha256;
     let model = entry.id;
-    let staged = match store.staging_path(entry) {
+    let staged = match store.staging_path(entry, attempt) {
         Ok(p) => p,
         Err(e) => {
             tx.publish(AppEvent::DownloadFailed {
+                attempt,
                 model,
                 error: truncate_error(&e.to_string()),
             });
@@ -410,17 +441,20 @@ pub fn spawn(
         struct Progress<'a> {
             tx: &'a EventSender,
             model: &'static str,
+            attempt: u32,
             throttle: &'a mut Throttle,
         }
         impl<'a> Progress<'a> {
             fn call(&mut self, bytes: u64, total: Option<u64>) {
-                self.throttle.call(bytes, total, self.tx, self.model);
+                self.throttle
+                    .call(self.attempt, bytes, total, self.tx, self.model);
             }
         }
         let result = {
             let mut p = Progress {
                 tx: &tx,
                 model,
+                attempt,
                 throttle: &mut throttle,
             };
             let mut bridge = |bytes: u64, total: Option<u64>| p.call(bytes, total);
@@ -429,30 +463,43 @@ pub fn spawn(
         match result {
             Ok(()) => {
                 if let Some(total) = throttle.last_total() {
-                    throttle.finalize(total, Some(total), &tx, model);
+                    throttle.finalize(attempt, total, Some(total), &tx, model);
                 }
                 if crate::transcription_models::handler_for(format).install_is_slow() {
-                    tx.publish(AppEvent::DownloadInstalling { model });
+                    tx.publish(AppEvent::DownloadInstalling { attempt, model });
                 }
-                match store.install(entry, &staged, &cancel) {
+                let install_result = store.install(entry, &staged, &cancel);
+                match install_result {
                     Ok(()) => {
-                        tx.publish(AppEvent::DownloadSucceeded { model });
+                        tx.publish(AppEvent::DownloadSucceeded { attempt, model });
                     }
-                    // Cancelled during install: the producer already
-                    // dropped the row when it set the token, so the
-                    // worker publishes nothing here (same contract
-                    // as the fetch-time Cancelled branch above).
-                    Err(DownloadError::Cancelled) => {}
+                    // Cancelled during install: publish
+                    // `DownloadCancelled { attempt }` so the
+                    // store's attempt gate can drop the row. If
+                    // a Restart has superseded this attempt, the
+                    // gate discards the event and the row
+                    // stays — the new attempt's progress remains
+                    // visible.
+                    Err(DownloadError::Cancelled) => {
+                        tx.publish(AppEvent::DownloadCancelled { attempt, model });
+                    }
                     Err(e) => tx.publish(AppEvent::DownloadFailed {
+                        attempt,
                         model,
                         error: truncate_error(&e.to_string()),
                     }),
                 }
             }
             Err(DownloadError::Cancelled) => {
-                // No event — the reducer already dropped the record.
+                // Same contract as install-time cancel: publish
+                // `DownloadCancelled { attempt }` so the store
+                // can drop the row under the attempt gate. If
+                // the attempt has since been superseded, the
+                // gate discards this event and the row stays.
+                tx.publish(AppEvent::DownloadCancelled { attempt, model });
             }
             Err(e) => tx.publish(AppEvent::DownloadFailed {
+                attempt,
                 model,
                 error: truncate_error(&e.to_string()),
             }),
@@ -610,11 +657,11 @@ mod tests {
         let n = 25_000u64;
         let chunk = total / n;
         for i in 0..n {
-            th.call(i * chunk, Some(total), &tx, "tiny.en");
+            th.call(1, i * chunk, Some(total), &tx, "tiny.en");
         }
         // Final flush — the chunk loop ends with bytes=total-1, so we
         // call once more at bytes=total to push the bar to 100%.
-        th.call(total, Some(total), &tx, "tiny.en");
+        th.call(1, total, Some(total), &tx, "tiny.en");
         let mut emitted = 0;
         while rx.try_recv().is_ok() {
             emitted += 1;
@@ -629,14 +676,14 @@ mod tests {
         let tx = EventSender::from_mpsc(tx);
         let mut th = Throttle::new();
         for _ in 0..50 {
-            th.call(100, None, &tx, "tiny.en");
+            th.call(1, 100, None, &tx, "tiny.en");
         }
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
         }
         assert!(n <= 1, "got {n} emissions");
-        th.finalize(100, None, &tx, "tiny.en");
+        th.finalize(1, 100, None, &tx, "tiny.en");
         assert!(rx.try_recv().is_ok());
     }
 

@@ -129,8 +129,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             if let Some(l) = log.as_mut() {
                 l.append(&ev);
             }
-            repo.apply_event(&ev);
-            state.apply(&ev);
+            // `apply_event` returns `true` for non-stale events
+            // (non-download events pass through; download events
+            // whose attempt matches the current row pass; stale
+            // download events return `false`). Only accepted
+            // events touch `UiState` so a cancelled-but-still-
+            // running worker cannot repaint the new attempt's
+            // gauge or move attempt B's blocks out of Waiting.
+            if repo.apply_event(&ev) {
+                state.apply(&ev);
+            }
             dirty = true;
         }
         if state.should_quit {

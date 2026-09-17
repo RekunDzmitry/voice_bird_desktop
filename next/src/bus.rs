@@ -73,26 +73,31 @@ pub enum AppEvent {
     DownloadRequested(&'static ModelEntry),
     /// Progress on a download. `bytes_per_sec` is a per-tick average
     /// over the throttle window — used by the renderer to label the
-    /// gauge when `total` is `None`.
+    /// gauge when `total` is `None`. `attempt` disambiguates events
+    /// from concurrent attempts of the same model: the store
+    /// discards any event whose attempt does not match the row's
+    /// current attempt.
     DownloadProgress {
+        attempt: u32,
         model: &'static str,
         bytes: u64,
         total: Option<u64>,
         bytes_per_sec: u64,
     },
     /// Bytes verified; the format handler is unpacking.
-    DownloadInstalling { model: &'static str },
+    DownloadInstalling { attempt: u32, model: &'static str },
     /// Fans out to EVERY block waiting on `model`.
-    DownloadSucceeded { model: &'static str },
+    DownloadSucceeded { attempt: u32, model: &'static str },
     /// `error` carries an actionable message.
     DownloadFailed {
+        attempt: u32,
         model: &'static str,
         error: String,
     },
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
-    DownloadCancelled { model: &'static str },
+    DownloadCancelled { attempt: u32, model: &'static str },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 }

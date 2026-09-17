@@ -58,8 +58,11 @@ impl ModelStore for FixtureStore {
         self.present.lock().unwrap().contains(&entry.id)
     }
 
-    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError> {
-        Ok(self.root.join(format!("{}.part", entry.id)))
+    fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
+        // Per-attempt suffix so two concurrent attempts of the
+        // same model write to different paths; mirrors the
+        // real handlers' naming.
+        Ok(self.root.join(format!("{}.{}.part", entry.id, attempt)))
     }
 
     fn install(
@@ -78,25 +81,32 @@ impl ModelStore for FixtureStore {
         // Mark the model present so subsequent is_available checks
         // observe the post-install state. The integration test wants
         // to assert the resolver reached `install`.
-        self.installed.lock().unwrap().push(entry.id);
+        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
         self.present.lock().unwrap().push(entry.id);
         // Drop any staged file we created during the test.
-        let _ = std::fs::remove_file(self.staging_path(entry).unwrap());
+        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
         Ok(())
     }
 
     fn clear_staging(&self, entry: &ModelEntry) {
         self.clear_staging_calls.lock().unwrap().push(entry.id);
-        let _ = std::fs::remove_file(self.staging_path(entry).unwrap());
+        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
     }
 
     fn discard_inflight(&self, entry: &ModelEntry) {
         // Record the call so tests can assert Quit-time cleanup ran.
         self.clear_staging_calls.lock().unwrap().push(entry.id);
-        let _ = std::fs::remove_file(self.staging_path(entry).unwrap());
-        let tmp = self.root.join(format!("{}.tmp", entry.id));
-        if tmp.is_dir() {
-            let _ = std::fs::remove_dir_all(&tmp);
+        // Walk every per-attempt artifact that might still be on
+        // disk. Attempts are bounded in practice (the store's
+        // monotonic counter increments by 1 per Restart); capping
+        // at attempt=8 is generous for tests that drive the
+        // cancel-immediate-retry path several times in a row.
+        for attempt in 1..=8u32 {
+            let _ = std::fs::remove_file(self.staging_path(entry, attempt).unwrap());
+            let tmp = self.root.join(format!("{}.{}.tmp", entry.id, attempt));
+            if tmp.is_dir() {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
         }
     }
 }

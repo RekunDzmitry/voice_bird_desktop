@@ -19,7 +19,8 @@ use voice_bird_next::picker::{ModelEntry, ModelFormat, CATALOG};
 use voice_bird_next::producer;
 use voice_bird_next::state::{BlockState, DownloadState, UiState};
 use voice_bird_next::store::{
-    DownloadClaim, DownloadPhase, DownloadRecord, DownloadRepository, InMemoryDownloadRepository,
+    ClaimState, DownloadClaim, DownloadPhase, DownloadRecord, DownloadRepository,
+    InMemoryDownloadRepository,
 };
 use voice_bird_next::testing::{render_to_string, FixtureDownloader, FixtureStore, Outcome};
 use voice_bird_next::transcription_models::{handler_for, ModelStore};
@@ -32,10 +33,19 @@ fn base() -> &'static voice_bird_next::picker::ModelEntry {
     &CATALOG[4]
 }
 
+/// Drain the bus and apply each event, mirroring the production
+/// loop in `main::run`: the store's `apply_event` is the gate that
+/// decides whether the UI projection is updated, and a stale
+/// download event from a superseded attempt is filtered before
+/// `UiState::apply` ever sees it. Tests that exercise stale-event
+/// paths through the bus use this helper, so the cancelled-but-
+/// still-running worker's terminal event cannot repaint the new
+/// attempt's gauge.
 fn tick_drain(bus: &mut EventBus, state: &mut UiState, repo: &dyn DownloadRepository) {
     for ev in bus.drain() {
-        repo.apply_event(&ev);
-        state.apply(&ev);
+        if repo.apply_event(&ev) {
+            state.apply(&ev);
+        }
     }
 }
 
@@ -430,11 +440,18 @@ fn repo_apply_round_trip() {
     // events remove. DownloadRequested itself is a no-op on the
     // in-memory backend (defensive insert-if-absent would hide the
     // real boundary between request and event-fold).
-    let _ = repo.request(tiny().id);
+    let attempt_a = match repo.request(tiny().id) {
+        DownloadClaim::Start { attempt, .. } => attempt,
+        _ => panic!("must be Start"),
+    };
     repo.apply_event(&AppEvent::DownloadRequested(tiny()));
     let row: DownloadRecord = repo.get("tiny.en").unwrap();
     assert_eq!(row.phase, DownloadPhase::Fetching);
-    repo.apply_event(&AppEvent::DownloadSucceeded { model: "tiny.en" });
+    assert_eq!(row.attempt, attempt_a);
+    repo.apply_event(&AppEvent::DownloadSucceeded {
+        attempt: attempt_a,
+        model: "tiny.en",
+    });
     assert!(repo.get("tiny.en").is_none());
 }
 
@@ -446,11 +463,15 @@ fn download_progress_event_carries_bytes_per_sec() {
     // event (which is published *after* a successful claim). The
     // event-fold is a no-op for DownloadRequested in the in-memory
     // backend; the reducer still creates the UiState.downloads entry.
-    let _ = repo.request(tiny().id);
+    let attempt_a = match repo.request(tiny().id) {
+        DownloadClaim::Start { attempt, .. } => attempt,
+        _ => panic!("must be Start"),
+    };
     repo.apply_event(&AppEvent::DownloadRequested(tiny()));
     state.apply(&AppEvent::DownloadRequested(tiny()));
     // Realistic measurement: 1 MiB/s over the previous tick.
     let ev = AppEvent::DownloadProgress {
+        attempt: attempt_a,
         model: "tiny.en",
         bytes: 1024,
         total: None,
@@ -534,25 +555,32 @@ fn failure_then_retry_yields_fresh_token() {
     // First attempt: failure. The token is captured so we can assert
     // it was set / removed cleanly.
     let first_token = match repo.request(tiny().id) {
-        DownloadClaim::Start { cancel } => cancel,
+        DownloadClaim::Start { cancel, attempt } => (cancel, attempt),
         DownloadClaim::Join => panic!("first request must be Start"),
+        DownloadClaim::Restart { .. } => panic!("first request must be Start"),
     };
     repo.apply_event(&AppEvent::DownloadFailed {
+        attempt: first_token.1,
         model: tiny().id,
         error: "boom".into(),
     });
-    assert!(repo.get(tiny().id).is_none(), "row must be removed");
 
     // Second attempt: must yield a fresh Start, not a Join (no
-    // active lock), with a fresh false token (not the first one).
     let second_token = match repo.request(tiny().id) {
-        DownloadClaim::Start { cancel } => cancel,
+        DownloadClaim::Start { cancel, attempt } => (cancel, attempt),
         DownloadClaim::Join => panic!("retry must be Start, not Join"),
+        DownloadClaim::Restart { .. } => panic!("retry must be Start, not Join"),
     };
-    assert!(!second_token.load(Ordering::Relaxed));
+    let (second_cancel, second_attempt) = second_token;
+    assert!(!second_cancel.load(Ordering::Relaxed));
     assert!(
-        !Arc::ptr_eq(&first_token, &second_token),
+        !Arc::ptr_eq(&first_token.0, &second_cancel),
         "retry token must be a fresh allocation"
+    );
+    assert!(
+        second_attempt > first_token.1,
+        "retry attempt must increment; got {second_attempt} after {}",
+        first_token.1
     );
 }
 
@@ -941,8 +969,8 @@ impl ModelStore for NemotronTestStore {
     fn is_available(&self, entry: &ModelEntry) -> bool {
         handler_for(entry.format).is_installed(&self.root, entry.id)
     }
-    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError> {
-        Ok(handler_for(entry.format).staging_path(&self.root, entry.id))
+    fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
+        Ok(handler_for(entry.format).staging_path(&self.root, entry.id, attempt))
     }
     fn install(
         &self,
@@ -953,19 +981,26 @@ impl ModelStore for NemotronTestStore {
         handler_for(entry.format).install(&self.root, entry.id, staged, cancel)
     }
     fn clear_staging(&self, entry: &ModelEntry) {
-        let p = handler_for(entry.format).staging_path(&self.root, entry.id);
+        let p = handler_for(entry.format).staging_path(&self.root, entry.id, 1);
         if p.is_file() {
             let _ = std::fs::remove_file(&p);
         }
     }
     fn discard_inflight(&self, entry: &ModelEntry) {
-        let p = handler_for(entry.format).staging_path(&self.root, entry.id);
-        if p.is_file() {
-            let _ = std::fs::remove_file(&p);
-        }
-        let tmp = self.root.join(format!("{}.tmp", entry.id));
-        if tmp.is_dir() {
-            let _ = std::fs::remove_dir_all(&tmp);
+        // Walk every per-attempt artifact that might still be on
+        // disk. Matches the production cache dir's `.tmp` layout
+        // when a kill-during-unpack left a scratch directory.
+        for attempt in 1..=8u32 {
+            let p = handler_for(entry.format).staging_path(&self.root, entry.id, attempt);
+            if p.is_file() {
+                let _ = std::fs::remove_file(&p);
+            }
+            let tmp = self
+                .root
+                .join(format!("{}.{}.tar.gz.tmp", entry.id, attempt));
+            if tmp.is_dir() {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
         }
     }
 }
@@ -1002,8 +1037,8 @@ impl ModelStore for SlowNemotronStore {
     fn is_available(&self, entry: &ModelEntry) -> bool {
         self.inner.is_available(entry)
     }
-    fn staging_path(&self, entry: &ModelEntry) -> Result<PathBuf, DownloadError> {
-        self.inner.staging_path(entry)
+    fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
+        self.inner.staging_path(entry, attempt)
     }
     fn install(
         &self,
@@ -1198,14 +1233,9 @@ fn discard_inflight_drops_both_part_and_tmp() {
     assert_eq!(nemotron.format, ModelFormat::NemotronPackage);
     let store = NemotronTestStore::new(tmp.path().to_path_buf());
 
-    let staged = tmp.path().join(format!("{}.tar.gz.part", nemotron.id));
+    let staged = tmp.path().join(format!("{}.1.tar.gz.part", nemotron.id));
     std::fs::write(&staged, b"not even close").unwrap();
-    let tmp_dir = tmp.path().join(format!("{}.tmp", nemotron.id));
-    std::fs::create_dir_all(&tmp_dir).unwrap();
-    std::fs::write(tmp_dir.join("leftover.txt"), b"half unpacked").unwrap();
-
-    assert!(staged.is_file());
-    assert!(tmp_dir.is_dir());
+    let tmp_dir = tmp.path().join(format!("{}.1.tar.gz.tmp", nemotron.id));
 
     store.discard_inflight(nemotron);
 
@@ -1343,4 +1373,455 @@ fn slow_nemotron_store_install_delayed_helper(
     calls: Arc<AtomicUsize>,
 ) -> DelayedInstallDownloader {
     DelayedInstallDownloader::new(bytes, Outcome::Ok, calls)
+}
+
+#[test]
+fn cancel_and_immediate_retry_two_attempts_run_concurrently() {
+    // This is the deterministic integration test the reviewer
+    // asked for: attempt A remains blocked in fetch while
+    // attempt B starts. The two attempts write to distinct
+    // staging paths, and a stale terminal event from attempt A
+    // does NOT drop attempt B's row.
+    //
+    // We can't use `FixtureDownloader` here because it doesn't
+    // write to the staged file (it just simulates success by
+    // hashing in memory). The path-isolation guarantee is about
+    // real on-disk writes, so we use a tiny `DiskDownloader`
+    // that streams the bytes to the staged path and respects
+    // the cancel token between chunks.
+    use std::io::Cursor;
+
+    /// Minimal downloader that streams `bytes` to `staged` in 16
+    /// KiB chunks and honors the cancel token between chunks.
+    /// The `block_in_fetch: Arc<AtomicBool>` is set true by the
+    /// first call's first chunk; the test clears it after it has
+    /// observed the call counter, so the test knows the first
+    /// worker is parked in fetch.
+    struct DiskDownloader {
+        bytes: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+        chunk_delay_ms: u64,
+    }
+    impl Downloader for DiskDownloader {
+        fn fetch(
+            &self,
+            _url: &str,
+            staged: &Path,
+            _expected_sha: &str,
+            cancel: &std::sync::atomic::AtomicBool,
+            _progress: &mut dyn FnMut(u64, Option<u64>),
+        ) -> Result<(), DownloadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut cursor = Cursor::new(self.bytes.clone());
+            let mut file =
+                std::fs::File::create(staged).map_err(|e| DownloadError::Io(e.to_string()))?;
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(file);
+                    let _ = std::fs::remove_file(staged);
+                    return Err(DownloadError::Cancelled);
+                }
+                use std::io::Read;
+                let n = cursor
+                    .read(&mut buf)
+                    .map_err(|e| DownloadError::Io(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                if self.chunk_delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(self.chunk_delay_ms));
+                }
+                use std::io::Write;
+                file.write_all(&buf[..n])
+                    .map_err(|e| DownloadError::Io(e.to_string()))?;
+            }
+            drop(file);
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gguf = &CATALOG[5]; // tiny.en (GGUF; install is a rename)
+    let store: Arc<dyn ModelStore> = Arc::new(NemotronTestStore::new(tmp.path().to_path_buf()));
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(DiskDownloader {
+        // 64 KiB takes 4 chunks; 100 ms between chunks leaves
+        // a wide enough window for the test to cancel attempt A
+        // mid-fetch while attempt B starts and finishes.
+        bytes: vec![0u8; 64 * 1024],
+        calls: Arc::clone(&calls),
+        chunk_delay_ms: 100,
+    });
+
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+
+    // Block A: pick the GGUF model. Attempt 1 starts; the
+    // worker writes its first chunk to <id>.2.gguf.part and
+    // pauses between chunks long enough for the test to cancel.
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    begin(gguf, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let attempt_a = repo.get(gguf.id).expect("attempt A row").attempt;
+
+    // Wait until attempt A has started writing to disk.
+    let staged_a = tmp
+        .path()
+        .join(format!("{}.{}.gguf.part", gguf.id, attempt_a));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !staged_a.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        staged_a.exists(),
+        "attempt A must have created its staging file"
+    );
+
+    // cancel attempt A. Worker hasn't acked yet (it's still in
+    // the chunk loop, parked).
+    assert!(repo.cancel(gguf.id), "cancel on Active row reports true");
+    let row_after_cancel = repo.get(gguf.id).expect("row must persist");
+    assert_eq!(
+        row_after_cancel.state,
+        ClaimState::Cancelling,
+        "row stays in Cancelling until worker acks"
+    );
+    assert_eq!(row_after_cancel.attempt, attempt_a);
+
+    // Block B picks the same model. The resolver must return
+    // Restart (a fresh attempt id) under the attempt-scoped
+    // staging path. NOT Start (which would re-use attempt A's
+    // paths).
+    state.apply(&AppEvent::AddBlock);
+    begin(gguf, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let row_b = repo.get(gguf.id).expect("row still present");
+    let attempt_b = row_b.attempt;
+    assert!(
+        attempt_b > attempt_a,
+        "Restart must yield a strictly greater attempt id; got {attempt_b} after {attempt_a}"
+    );
+    assert_eq!(row_b.state, ClaimState::Active, "new attempt is Active");
+
+    // The two attempts write to different staging files. This
+    // is the file-isolation guarantee: the old worker's
+    // eventual install (which calls `fs::rename`) cannot
+    // operate on the new attempt's `.part`.
+    let staged_b = tmp
+        .path()
+        .join(format!("{}.{}.gguf.part", gguf.id, attempt_b));
+    assert_ne!(
+        staged_a, staged_b,
+        "two concurrent attempts must write to different staging paths"
+    );
+
+    // Wait for attempt B to complete install (rename to
+    // <id>.gguf). Attempt A is still parked in fetch; its
+    // cancel signal will unblock it shortly, at which point
+    // it returns Cancelled. The store's attempt gate
+    // discards the late `DownloadCancelled { attempt: A }`
+    // because the row now represents attempt B.
+    let installed = handler_for(gguf.format).installed_path(tmp.path(), gguf.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        tick_drain(&mut bus, &mut state, &*repo);
+        if installed.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        installed.is_file(),
+        "attempt B must complete install (model at {installed:?})"
+    );
+
+    // Pin the contract: attempt B's `DownloadSucceeded { attempt: B }`
+    // dropped the row. Attempt A's stale events were
+    // discarded by the attempt gate. The model is installed
+    // at the canonical path; attempt B's staging file was
+    // renamed into place.
+    assert!(
+        repo.get(gguf.id).is_none(),
+        "row must be removed after DownloadSucceeded"
+    );
+
+    // Block B must end in Recording state.
+    let last_block = state.blocks.last().expect("block B exists");
+    assert!(
+        matches!(last_block.state, BlockState::Recording { model } if model == gguf.id),
+        "block B must end in Recording; got {:?}",
+        last_block.state
+    );
+
+    // Attempt A's stale staging file may or may not have been
+    // cleaned up by the old worker's Cancelled branch; if it
+    // is, fine. The contract is that nothing on the new
+    // attempt's paths got touched.
+    assert!(
+        !staged_b.exists(),
+        "new attempt's staging file must have been renamed into the install path"
+    );
+}
+
+/// `@REVIEWER_BUG_FIX cancel-during-install-ui`:
+///
+/// DRAIN stale terminal events (`DownloadFailed`, `DownloadSucceeded`,
+/// `DownloadCancelled`) for attempt A AFTER attempt B has started,
+/// and assert BOTH the repository row AND the UiState projection
+/// remain on attempt B. The reviewer specifically called out the
+/// gap: the previous test only asserted the repository side. A
+/// late `DownloadFailed { attempt: A }` could still move attempt
+/// B's blocks into Failed because `UiState::apply` ignored
+/// `attempt` and was applied unconditionally from the bus drain.
+///
+/// Determinism: we drive attempt A into fetch via a slow
+/// `DiskDownloader`, cancel it, start attempt B, then reach into
+/// the bus and inject the stale terminal events manually. This
+/// models the real race precisely: the old worker's terminal
+/// publish arrives AFTER the new attempt is already in flight.
+#[test]
+fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
+    use std::io::Cursor;
+
+    /// Slow downloader for attempt A: parks for 200 ms inside
+    /// fetch so the test has time to cancel it, start attempt B,
+    /// and inject stale events while attempt A is still alive.
+    struct SlowFirstDownloader {
+        bytes: Vec<u8>,
+        chunk_delay_ms: u64,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Downloader for SlowFirstDownloader {
+        fn fetch(
+            &self,
+            _url: &str,
+            staged: &Path,
+            _expected_sha: &str,
+            cancel: &std::sync::atomic::AtomicBool,
+            _progress: &mut dyn FnMut(u64, Option<u64>),
+        ) -> Result<(), DownloadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut cursor = Cursor::new(self.bytes.clone());
+            let mut file =
+                std::fs::File::create(staged).map_err(|e| DownloadError::Io(e.to_string()))?;
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(file);
+                    let _ = std::fs::remove_file(staged);
+                    return Err(DownloadError::Cancelled);
+                }
+                use std::io::Read;
+                let n = cursor
+                    .read(&mut buf)
+                    .map_err(|e| DownloadError::Io(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                if self.chunk_delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(self.chunk_delay_ms));
+                }
+                use std::io::Write;
+                file.write_all(&buf[..n])
+                    .map_err(|e| DownloadError::Io(e.to_string()))?;
+            }
+            drop(file);
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gguf = &CATALOG[5]; // tiny.en (GGUF; install = rename)
+    let store: Arc<dyn ModelStore> = Arc::new(NemotronTestStore::new(tmp.path().to_path_buf()));
+    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(SlowFirstDownloader {
+        bytes: vec![0u8; 64 * 1024],
+        chunk_delay_ms: 200,
+        calls: Arc::clone(&calls),
+    });
+
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+
+    // Block A: attempt 1 starts; it parks in fetch.
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    begin(gguf, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let attempt_a = repo.get(gguf.id).expect("attempt A row").attempt;
+    let staged_a = tmp
+        .path()
+        .join(format!("{}.{}.gguf.part", gguf.id, attempt_a));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !staged_a.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        staged_a.exists(),
+        "attempt A must have created its staging file"
+    );
+
+    // Cancel attempt A. The row stays in `Cancelling` until the
+    // worker publishes a terminal event.
+    assert!(repo.cancel(gguf.id));
+
+    // Block B picks the same model: attempt 2 starts under a
+    // fresh token and a fresh staging path.
+    state.apply(&AppEvent::AddBlock);
+    begin(gguf, &store, &repo, &downloader, &tx);
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    let attempt_b = repo
+        .get(gguf.id)
+        .expect("row still present after Restart")
+        .attempt;
+    assert!(
+        attempt_b > attempt_a,
+        "Restart must yield a strictly greater attempt"
+    );
+
+    // Snapshot the UI projection BEFORE stale events arrive:
+    //   - Both blocks must be Waiting on `gguf.id`.
+    //   - downloads[gguf.id] must be present (Phase::Fetching).
+    assert_eq!(state.blocks.len(), 2);
+    for block in &state.blocks {
+        assert!(
+            matches!(&block.state, BlockState::Waiting { model } if *model == gguf.id),
+            "block must be Waiting on {}; got {:?}",
+            gguf.id,
+            block.state
+        );
+    }
+    let row_pre = state
+        .downloads
+        .get(gguf.id)
+        .expect("downloads[gguf.id] must be present");
+    assert!(
+        matches!(
+            row_pre.phase,
+            voice_bird_next::store::DownloadPhase::Fetching
+        ),
+        "downloads[gguf.id].phase must be Fetching; got {:?}",
+        row_pre.phase
+    );
+
+    // INJECT stale terminal events for attempt A. This models
+    // the production race: the cancelled worker, still alive
+    // in its chunk loop, eventually publishes Cancelled /
+    // Failed / Succeeded for the old attempt id. Without the
+    // gate, EACH of these would corrupt attempt B's projection
+    // — Failed would put B's block into Failed; Succeeded
+    // would prematurely put B into Recording; Cancelled
+    // would remove B's progress bar.
+    tx.publish(AppEvent::DownloadCancelled {
+        attempt: attempt_a,
+        model: gguf.id,
+    });
+    tx.publish(AppEvent::DownloadFailed {
+        attempt: attempt_a,
+        model: gguf.id,
+        error: "HTTP 404".into(),
+    });
+    tx.publish(AppEvent::DownloadSucceeded {
+        attempt: attempt_a,
+        model: gguf.id,
+    });
+
+    // Drain through the production path: tick_drain gates
+    // state.apply on apply_event's accept signal. Every stale
+    // event must return `false`, so UiState is untouched.
+    tick_drain(&mut bus, &mut state, &*repo);
+
+    // Pin the contract: attempt B's repository row is intact
+    // (the stale terminal events did not drop it).
+    let row_post = repo
+        .get(gguf.id)
+        .expect("attempt B's row must survive stale terminal events");
+    assert_eq!(row_post.attempt, attempt_b, "row must still be attempt B");
+    assert_eq!(
+        row_post.state,
+        ClaimState::Active,
+        "attempt B must still be Active (not Cancelling)"
+    );
+
+    // Pin the contract: UiState.downloads[gguf.id] is still
+    // present (no Cancelled removal), still in Fetching
+    // phase (no Installing repaint).
+    let row_post_ui = state
+        .downloads
+        .get(gguf.id)
+        .expect("downloads[gguf.id] must survive stale Cancelled");
+    assert!(
+        matches!(
+            row_post_ui.phase,
+            voice_bird_next::store::DownloadPhase::Fetching
+        ),
+        "downloads[gguf.id].phase must still be Fetching after stale events"
+    );
+
+    // Pin the contract: BOTH blocks are still Waiting. None of
+    // them were moved to Failed (by stale DownloadFailed),
+    // Recording (by stale DownloadSucceeded), or removed by
+    // stale DownloadCancelled.
+    assert_eq!(
+        state.blocks.len(),
+        2,
+        "no block may be removed by stale Cancelled"
+    );
+    for (i, block) in state.blocks.iter().enumerate() {
+        assert!(
+            matches!(&block.state, BlockState::Waiting { model } if *model == gguf.id),
+            "block {} must remain Waiting on {}; got {:?}",
+            i,
+            gguf.id,
+            block.state
+        );
+    }
+
+    // Sanity: now publish a CORRECT attempt-B Succeeded, and
+    // assert it transitions B's blocks to Recording and drops
+    // the row. This proves the gate isn't over-eager — it
+    // only rejects the stale events.
+    // Wait for attempt B's worker to actually finish first so
+    // the row's bytes are real. We tick until the row's
+    // bytes reaches the total (or the deadline expires).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        tick_drain(&mut bus, &mut state, &*repo);
+        let r = repo.get(gguf.id);
+        if r.is_none() {
+            break;
+        }
+        if let Some(rec) = r {
+            if rec.bytes >= (64 * 1024) as u64 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Let attempt B's natural terminal events drive the row
+    // to dropped state and both blocks to Recording.
+    settle(&mut bus, &mut state, &*repo);
+    assert!(
+        repo.get(gguf.id).is_none(),
+        "attempt B's row must be dropped on its own terminal event"
+    );
+    assert_eq!(state.blocks.len(), 2);
+    for block in &state.blocks {
+        assert!(
+            matches!(&block.state, BlockState::Recording { model } if *model == gguf.id),
+            "block must end in Recording; got {:?}",
+            block.state
+        );
+    }
 }

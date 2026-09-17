@@ -99,7 +99,19 @@ pub fn resolve_intent(
                         && matches!(block.state, BlockState::Waiting { .. })
                         && repo.cancel(model)
                     {
-                        tx.publish(AppEvent::DownloadCancelled { model });
+                        // `repo.cancel` kept the row (Cancelling
+                        // state). Read back the attempt id so the
+                        // event we publish matches the row the
+                        // store is tracking — the store's attempt
+                        // gate will discard this event if a
+                        // subsequent Restart supersedes the
+                        // attempt.
+                        if let Some(row) = repo.get(model) {
+                            tx.publish(AppEvent::DownloadCancelled {
+                                attempt: row.attempt,
+                                model,
+                            });
+                        }
                     }
                 }
             }

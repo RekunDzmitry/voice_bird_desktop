@@ -12,6 +12,26 @@
 //! in the same critical section. Splitting them across two mutexes would
 //! leave a window where a caller sees a row but no token (or vice versa).
 //!
+//! ## Attempt tracking
+//!
+//! Each row carries an `attempt: u32` and a `state: ClaimState`. While
+//! the worker is alive the row is `Active`. When the user closes the
+//! last waiter, `cancel` flips the row to `Cancelling` (sets the token,
+//! but keeps the row) so an immediate retry sees the row still exists
+//! and returns `Restart` under a fresh attempt + a fresh token +
+//! attempt-scoped staging paths. The old worker is still alive; it
+//! writes to `<id>.<old>.tar.gz.part` while the new worker writes to
+//! `<id>.<new>.tar.gz.part`. Every event the store accepts is gated on
+//! `event.attempt == row.attempt`; mismatches are stale and discarded.
+//!
+//! The previous design released the row immediately on cancel, which
+//! let an immediate retry reuse the same paths and race the still-
+//! running worker: a late `DownloadInstalling` from attempt A would
+//! paint into attempt B's progress row, and the GGUF handler's
+//! `fs::rename` would install attempt B's partially-written `.part`
+//! into the live model path. Attempt-scoped staging paths + attempt-
+//! matched event filtering closes both windows.
+//!
 //! Shaped as a trait so swapping in sqlite later is one impl and no
 //! call-site change. `InMemoryDownloadRepository` is `Mutex<DownloadTables>`
 //! behind `&self`, with `request/cancel/apply_event` doing the only
@@ -28,81 +48,74 @@ use std::sync::{Arc, Mutex};
 
 use crate::bus::AppEvent;
 
-/// Phase of one download. Fetched bytes are hash-verified before the
-/// format handler unpacks — for slow formats (e.g. the Nemotron tarball)
-/// unpacking is a second phase; for fast ones (renaming a GGUF) it
-/// collapses into the success event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadPhase {
     Fetching,
     Installing,
 }
 
-/// One row in the repository. The shape intentionally mirrors the
-/// render-side `crate::state::DownloadState` one-for-one — both are
-/// folded from the same drained events, so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    Active,
+    Cancelling,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadRecord {
     pub model: &'static str,
+    pub attempt: u32,
+    pub state: ClaimState,
     pub phase: DownloadPhase,
     pub bytes: u64,
     pub total: Option<u64>,
 }
 
-/// Result of a [`DownloadRepository::request`] call.
-///
-/// - `Start { cancel }`: this caller owns the download. Insert the
-///   progress row and a fresh `Arc<AtomicBool>` (false) under one lock;
-///   the caller is expected to spawn the worker, passing the token.
-///
-/// - `Join`: another caller already owns the download for this model.
-///   The caller should still publish `DownloadRequested` so the event
-///   log records the join, but must NOT spawn a second worker.
+#[derive(Debug)]
 pub enum DownloadClaim {
-    Start { cancel: Arc<AtomicBool> },
+    Start {
+        cancel: Arc<AtomicBool>,
+        attempt: u32,
+    },
     Join,
+    Restart {
+        cancel: Arc<AtomicBool>,
+        attempt: u32,
+    },
 }
 
-/// Storage facade. The trait hides the table mechanics so a future
-/// SQLite backend can swap in without touching call sites. Methods that
-/// mutate cross-table invariants take `&self` and an internal mutex;
-/// callers never see the lock directly.
 pub trait DownloadRepository: Send + Sync {
-    /// Atomic claim for one model. Returns `Start` if no active claim
-    /// existed (the caller should spawn), `Join` if one already does
-    /// (the caller should publish `DownloadRequested` only).
     fn request(&self, model: &'static str) -> DownloadClaim;
 
-    /// Atomic last-waiter cancellation. Removes both the progress row
-    /// and the cancellation token, and sets the removed token so the
-    /// in-flight thread observes the cancellation. Returns `true` if a
-    /// claim existed (i.e. a worker may still be unwinding); `false`
-    /// if there was nothing to cancel.
+    /// Set the cancellation token for an active claim and mark the
+    /// row as `Cancelling`. Returns `true` only on the **first**
+    /// cancel transition (Active → Cancelling); a second cancel
+    /// on an already-Cancelling row returns `false` so the
+    /// producer doesn't double-publish `DownloadCancelled`.
     fn cancel(&self, model: &str) -> bool;
 
-    /// Read-only snapshot of one progress row, or `None` if no claim
-    /// exists for the model.
     fn get(&self, model: &str) -> Option<DownloadRecord>;
 
-    /// Read-only snapshot of every active progress row.
     fn all(&self) -> Vec<DownloadRecord>;
 
-    /// Fold one drained [`AppEvent`] into the store. Idempotent — late
-    /// `DownloadProgress`/`DownloadInstalling` for an absent or already
-    /// terminal row are ignored.
-    fn apply_event(&self, event: &AppEvent);
+    /// Fold one drained [`AppEvent`] into the store. Returns `true`
+    /// when the event was **accepted** (non-stale: either a
+    /// non-download event, or a download event whose attempt matches
+    /// the current row). Returns `false` when the event was a stale
+    /// download event from a superseded attempt — the caller uses
+    /// this signal to skip `UiState::apply` for the same event, so
+    /// the UI projection can't be repainted by a worker that's been
+    /// cancelled but hasn't yet acknowledged.
+    ///
+    /// `DownloadRequested` is always accepted: it carries no attempt
+    /// (the attempt id is sealed inside `repo.request`, which the
+    /// resolver already called), and the reducer needs to see it
+    /// unconditionally so a focused block transitions to `Waiting`
+    /// and `downloads[id]` is materialised.
+    fn apply_event(&self, event: &AppEvent) -> bool;
 }
 
-/// Combined storage tables. Held under one mutex so any operation that
-/// touches both — `request`, `cancel`, terminal cleanup — runs as one
-/// critical section.
 struct DownloadTables {
-    /// Per-model progress row. Inserted by `request`; updated by
-    /// `DownloadProgress`/`DownloadInstalling`; removed by terminal
-    /// events and by `cancel`.
     rows: BTreeMap<&'static str, DownloadRecord>,
-    /// Per-model cancellation token. Inserted by `request`; removed
-    /// by `cancel` and by terminal events.
     locks: BTreeMap<&'static str, Arc<AtomicBool>>,
 }
 
@@ -114,36 +127,42 @@ impl DownloadTables {
         }
     }
 
-    /// Take both the row and the lock out in one critical section. The
-    /// token is set so the worker observes the cancellation regardless
-    /// of which table it would have polled first.
     fn cancel(&mut self, model: &str) -> bool {
-        let token = self.locks.remove(model);
-        self.rows.remove(model);
-        match token {
-            Some(flag) => {
+        match self.rows.get_mut(model) {
+            Some(row) if row.state == ClaimState::Active => {
+                let flag = self
+                    .locks
+                    .get(model)
+                    .cloned()
+                    .expect("Active row must have a token");
                 flag.store(true, Ordering::Relaxed);
+                row.state = ClaimState::Cancelling;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
-    /// Remove both tables for a terminal event. Late `DownloadProgress`
-    /// for an absent row is a no-op (the guard is in `apply_event`).
-    fn terminal(&mut self, model: &str) {
-        self.locks.remove(model);
-        self.rows.remove(model);
+    /// Drop the row AND the lock for a terminal event whose attempt
+    /// matches the row's current attempt. Mismatches are silently
+    /// ignored — the event came from a superseded attempt.
+    fn terminal(&mut self, model: &str, attempt: u32) {
+        if let Some(row) = self.rows.get(model) {
+            if row.attempt == attempt {
+                self.locks.remove(model);
+                self.rows.remove(model);
+            }
+        }
     }
 
-    /// Insert the initial `Fetching` row paired with a fresh token.
-    /// Returns the token so the caller can spawn the worker.
-    fn claim(&mut self, model: &'static str) -> Arc<AtomicBool> {
+    fn claim(&mut self, model: &'static str, attempt: u32) -> Arc<AtomicBool> {
         let cancel = Arc::new(AtomicBool::new(false));
         self.rows.insert(
             model,
             DownloadRecord {
                 model,
+                attempt,
+                state: ClaimState::Active,
                 phase: DownloadPhase::Fetching,
                 bytes: 0,
                 total: None,
@@ -152,10 +171,24 @@ impl DownloadTables {
         self.locks.insert(model, cancel.clone());
         cancel
     }
+
+    fn restart(&mut self, model: &'static str, attempt: u32) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(row) = self.rows.get_mut(model) {
+            row.attempt = attempt;
+            row.state = ClaimState::Active;
+            row.phase = DownloadPhase::Fetching;
+            row.bytes = 0;
+            row.total = None;
+        }
+        self.locks.insert(model, cancel.clone());
+        cancel
+    }
 }
 
 pub struct InMemoryDownloadRepository {
     tables: Mutex<DownloadTables>,
+    next_attempt: Mutex<BTreeMap<&'static str, u32>>,
 }
 
 impl Default for InMemoryDownloadRepository {
@@ -168,18 +201,32 @@ impl InMemoryDownloadRepository {
     pub fn new() -> Self {
         Self {
             tables: Mutex::new(DownloadTables::new()),
+            next_attempt: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn take_attempt(&self, model: &'static str) -> u32 {
+        let mut counters = self.next_attempt.lock().expect("counters poisoned");
+        let next = counters.get(model).copied().unwrap_or(1).saturating_add(1);
+        counters.insert(model, next);
+        next
     }
 }
 
 impl DownloadRepository for InMemoryDownloadRepository {
     fn request(&self, model: &'static str) -> DownloadClaim {
+        let attempt = self.take_attempt(model);
         let mut tables = self.tables.lock().expect("repo poisoned");
-        if tables.locks.contains_key(model) {
-            DownloadClaim::Join
-        } else {
-            let cancel = tables.claim(model);
-            DownloadClaim::Start { cancel }
+        match tables.rows.get(model) {
+            None => {
+                let cancel = tables.claim(model, attempt);
+                DownloadClaim::Start { cancel, attempt }
+            }
+            Some(row) if row.state == ClaimState::Active => DownloadClaim::Join,
+            Some(_) => {
+                let cancel = tables.restart(model, attempt);
+                DownloadClaim::Restart { cancel, attempt }
+            }
         }
     }
 
@@ -207,39 +254,71 @@ impl DownloadRepository for InMemoryDownloadRepository {
             .collect()
     }
 
-    fn apply_event(&self, event: &AppEvent) {
+    fn apply_event(&self, event: &AppEvent) -> bool {
         let mut tables = self.tables.lock().expect("repo poisoned");
         match event {
             AppEvent::DownloadRequested(entry) => {
-                // request() already inserted the row; this branch is
-                // a no-op for the in-memory backend but a real DB
-                // would use it as the "INSERT IF NOT EXISTS" path.
+                // Always accepted. The row is already inserted by
+                // `request`; this branch is a no-op for the
+                // in-memory backend but a real DB would use it as
+                // the "INSERT IF NOT EXISTS" path.
                 let _ = tables.rows.get(entry.id);
+                true
             }
             AppEvent::DownloadProgress {
+                attempt,
                 model,
                 bytes,
                 total,
                 ..
             } => {
-                if let Some(mut row) = tables.rows.remove(*model) {
+                if let Some(row) = tables.rows.get_mut(*model) {
+                    if row.attempt != *attempt {
+                        return false;
+                    }
                     row.bytes = *bytes;
                     row.total = *total;
-                    tables.rows.insert(*model, row);
+                    true
+                } else {
+                    // No row for this model — could be a late event
+                    // from a worker that was cancelled and
+                    // superseded before this fired. Drop.
+                    false
                 }
             }
-            AppEvent::DownloadInstalling { model } => {
-                if let Some(mut row) = tables.rows.remove(*model) {
+            AppEvent::DownloadInstalling { attempt, model } => {
+                if let Some(row) = tables.rows.get_mut(*model) {
+                    if row.attempt != *attempt {
+                        return false;
+                    }
                     row.phase = DownloadPhase::Installing;
-                    tables.rows.insert(*model, row);
+                    true
+                } else {
+                    false
                 }
             }
-            AppEvent::DownloadSucceeded { model }
-            | AppEvent::DownloadFailed { model, .. }
-            | AppEvent::DownloadCancelled { model } => {
-                tables.terminal(model);
+            AppEvent::DownloadSucceeded { attempt, model }
+            | AppEvent::DownloadFailed { attempt, model, .. }
+            | AppEvent::DownloadCancelled { attempt, model } => {
+                if let Some(row) = tables.rows.get(model) {
+                    if row.attempt == *attempt {
+                        tables.terminal(model, *attempt);
+                        true
+                    } else {
+                        // Stale: the row now represents a newer
+                        // attempt. Don't drop it; let the
+                        // newer attempt's terminal event do that.
+                        false
+                    }
+                } else {
+                    // Terminal for an already-terminal or never-
+                    // existed row. Drop silently.
+                    false
+                }
             }
-            _ => {}
+            _ => true, // Non-download events are accepted as-is;
+                       // they don't touch the store but the reducer still
+                       // needs to see them.
         }
     }
 }
@@ -257,9 +336,6 @@ mod tests {
         &crate::picker::CATALOG[4]
     }
 
-    /// Two threads racing on the same model: one wins `Start`, the other
-    /// gets `Join`. After the dust settles exactly one token/row pair
-    /// exists.
     #[test]
     fn racing_same_model_claims_yield_one_start_one_join() {
         use std::sync::Barrier;
@@ -292,98 +368,256 @@ mod tests {
         assert!(repo.get(tiny().id).is_some(), "row must persist");
     }
 
-    /// Two requests for different models: both `Start`, both rows exist.
     #[test]
     fn different_models_both_get_start_claims() {
         let repo = InMemoryDownloadRepository::new();
         match repo.request(tiny().id) {
             DownloadClaim::Start { .. } => {}
             DownloadClaim::Join => panic!("tiny must be Start"),
+            DownloadClaim::Restart { .. } => panic!("tiny must be Start"),
         }
         match repo.request(base().id) {
             DownloadClaim::Start { .. } => {}
             DownloadClaim::Join => panic!("base must be Start"),
+            DownloadClaim::Restart { .. } => panic!("base must be Start"),
         }
         assert!(repo.get(tiny().id).is_some());
         assert!(repo.get(base().id).is_some());
     }
 
-    /// Cancelling an active claim flips the token, empties both tables,
-    /// and reports `true`. A second cancel reports `false`.
+    /// `@REVIEWER_BUG_FIX cancel-immediate-retry`: cancel the active
+    /// claim and IMMEDIATELY request the same model. The second
+    /// request (which sees the row in `Cancelling` state) must get
+    /// `Restart` with a fresh attempt id, NOT a fresh `Start` (which
+    /// would have re-used the same staging paths and let two workers
+    /// race on the same `.part`/`.tmp/` files).
     #[test]
-    fn cancel_active_claim_empties_tables_and_returns_true() {
+    fn cancel_then_immediate_retry_returns_restart_under_new_attempt() {
+        let repo = InMemoryDownloadRepository::new();
+
+        let (cancel_a, attempt_a) = match repo.request(tiny().id) {
+            DownloadClaim::Start { cancel, attempt } => (cancel, attempt),
+            other => panic!("first request must be Start; got {other:?}"),
+        };
+
+        assert!(repo.cancel(tiny().id), "active claim must report true");
+        assert!(cancel_a.load(Ordering::Relaxed), "token must be flipped");
+        let row = repo
+            .get(tiny().id)
+            .expect("row must persist through cancel");
+        assert_eq!(
+            row.state,
+            ClaimState::Cancelling,
+            "row must stay in Cancelling until worker acks"
+        );
+        assert_eq!(row.attempt, attempt_a, "attempt must not change on cancel");
+
+        let (cancel_b, attempt_b) = match repo.request(tiny().id) {
+            DownloadClaim::Restart { cancel, attempt } => (cancel, attempt),
+            other => panic!("retry after cancel must be Restart; got {other:?}"),
+        };
+        assert!(
+            attempt_b > attempt_a,
+            "new attempt must increment; got {attempt_b} after {attempt_a}"
+        );
+        assert!(
+            !cancel_b.load(Ordering::Relaxed),
+            "new token must start false (not pre-cancelled)"
+        );
+        assert!(
+            !Arc::ptr_eq(&cancel_a, &cancel_b),
+            "new token must be a different allocation"
+        );
+
+        let row = repo
+            .get(tiny().id)
+            .expect("row must persist across restart");
+        assert_eq!(row.state, ClaimState::Active, "new attempt is Active");
+        assert_eq!(row.attempt, attempt_b);
+    }
+
+    /// After Restart, a stale terminal event for the OLD attempt
+    /// must NOT remove the row.
+    #[test]
+    fn stale_terminal_event_for_superseded_attempt_is_ignored() {
+        let repo = InMemoryDownloadRepository::new();
+
+        let attempt_a = match repo.request(tiny().id) {
+            DownloadClaim::Start { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+        assert!(repo.cancel(tiny().id));
+        let attempt_b = match repo.request(tiny().id) {
+            DownloadClaim::Restart { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+
+        repo.apply_event(&AppEvent::DownloadCancelled {
+            attempt: attempt_a,
+            model: tiny().id,
+        });
+        assert!(
+            repo.get(tiny().id).is_some(),
+            "stale Cancelled must not drop the row"
+        );
+
+        repo.apply_event(&AppEvent::DownloadFailed {
+            attempt: attempt_a,
+            model: tiny().id,
+            error: "late".into(),
+        });
+        assert!(
+            repo.get(tiny().id).is_some(),
+            "stale Failed must not drop the row"
+        );
+
+        repo.apply_event(&AppEvent::DownloadSucceeded {
+            attempt: attempt_b,
+            model: tiny().id,
+        });
+        assert!(
+            repo.get(tiny().id).is_none(),
+            "matching terminal event must drop the row"
+        );
+    }
+
+    /// Late `DownloadProgress` for a stale attempt must NOT update
+    /// the new attempt's row. THIS IS THE TEST THE REVIEWER FLAGGED:
+    /// without the attempt gate, a late `DownloadProgress` from a
+    /// cancelled-but-still-unwinding worker would repaint the new
+    /// attempt's progress row, jumping the gauge backwards.
+    #[test]
+    fn stale_progress_for_superseded_attempt_is_ignored() {
+        let repo = InMemoryDownloadRepository::new();
+
+        let attempt_a = match repo.request(tiny().id) {
+            DownloadClaim::Start { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+        assert!(repo.cancel(tiny().id));
+        let attempt_b = match repo.request(tiny().id) {
+            DownloadClaim::Restart { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+
+        repo.apply_event(&AppEvent::DownloadProgress {
+            attempt: attempt_a,
+            model: tiny().id,
+            bytes: 999_999,
+            total: Some(999_999),
+            bytes_per_sec: 0,
+        });
+        let row = repo.get(tiny().id).unwrap();
+        assert_eq!(
+            row.bytes, 0,
+            "stale progress must not leak into the new attempt"
+        );
+        assert_eq!(row.attempt, attempt_b, "row must still represent attempt B");
+
+        repo.apply_event(&AppEvent::DownloadProgress {
+            attempt: attempt_b,
+            model: tiny().id,
+            bytes: 42,
+            total: Some(100),
+            bytes_per_sec: 1,
+        });
+        let row = repo.get(tiny().id).unwrap();
+        assert_eq!(row.bytes, 42);
+    }
+
+    /// Late `DownloadInstalling` for a stale attempt must NOT
+    /// repaint the new attempt's phase. The reviewer specifically
+    /// called out the Installing event as one that needs the gate.
+    #[test]
+    fn stale_installing_for_superseded_attempt_is_ignored() {
+        let repo = InMemoryDownloadRepository::new();
+
+        let attempt_a = match repo.request(tiny().id) {
+            DownloadClaim::Start { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+        assert!(repo.cancel(tiny().id));
+        let attempt_b = match repo.request(tiny().id) {
+            DownloadClaim::Restart { attempt, .. } => attempt,
+            _ => panic!(),
+        };
+
+        // Old worker publishes Installing after the restart has
+        // bumped to attempt B. Without the gate, this would
+        // overwrite attempt B's phase to Installing even though
+        // attempt B is still in Fetching.
+        repo.apply_event(&AppEvent::DownloadInstalling {
+            attempt: attempt_a,
+            model: tiny().id,
+        });
+        let row = repo.get(tiny().id).unwrap();
+        assert_eq!(
+            row.phase,
+            DownloadPhase::Fetching,
+            "stale Installing must not repaint new attempt's phase"
+        );
+        assert_eq!(row.attempt, attempt_b);
+
+        // The matching-attempt Installing does apply.
+        repo.apply_event(&AppEvent::DownloadInstalling {
+            attempt: attempt_b,
+            model: tiny().id,
+        });
+        let row = repo.get(tiny().id).unwrap();
+        assert_eq!(row.phase, DownloadPhase::Installing);
+    }
+
+    #[test]
+    fn cancel_active_claim_flips_token_marks_row_and_reports_true_once() {
         let repo = InMemoryDownloadRepository::new();
         let token = match repo.request(tiny().id) {
-            DownloadClaim::Start { cancel } => cancel,
-            DownloadClaim::Join => panic!("must be Start"),
+            DownloadClaim::Start { cancel, .. } => cancel,
+            _ => panic!("must be Start"),
         };
         assert!(!token.load(Ordering::Relaxed));
 
         assert!(repo.cancel(tiny().id), "active claim must report true");
         assert!(token.load(Ordering::Relaxed), "token must be flipped");
+        assert_eq!(repo.get(tiny().id).unwrap().state, ClaimState::Cancelling);
 
-        assert!(repo.get(tiny().id).is_none(), "row must be gone");
         assert!(
             !repo.cancel(tiny().id),
-            "second cancel returns false (nothing to cancel)"
+            "second cancel returns false (already Cancelling; no transition to signal)"
         );
     }
 
-    /// After a successful terminal event, a subsequent `request` returns
-    /// `Start` with a *fresh* false token. This pins the contract that
-    /// success/failure/cancellation all leave the store clean enough for
-    /// a fresh attempt.
     #[test]
-    fn terminal_event_then_fresh_request_yields_fresh_token() {
+    fn terminal_event_then_fresh_request_yields_fresh_attempt_and_token() {
         let repo = InMemoryDownloadRepository::new();
-        let token = match repo.request(tiny().id) {
-            DownloadClaim::Start { cancel } => cancel,
-            DownloadClaim::Join => panic!("must be Start"),
+        let (token_a, attempt_a) = match repo.request(tiny().id) {
+            DownloadClaim::Start { cancel, attempt } => (cancel, attempt),
+            _ => panic!("must be Start"),
         };
-        repo.apply_event(&AppEvent::DownloadSucceeded { model: tiny().id });
+        repo.apply_event(&AppEvent::DownloadSucceeded {
+            attempt: attempt_a,
+            model: tiny().id,
+        });
         assert!(repo.get(tiny().id).is_none());
 
-        let fresh = match repo.request(tiny().id) {
-            DownloadClaim::Start { cancel } => cancel,
-            DownloadClaim::Join => panic!("must be Start"),
+        let (token_b, attempt_b) = match repo.request(tiny().id) {
+            DownloadClaim::Start { cancel, attempt } => (cancel, attempt),
+            _ => panic!("must be Start"),
         };
+        assert!(!token_b.load(Ordering::Relaxed));
+        assert!(attempt_b > attempt_a, "attempt must increment");
         assert!(
-            !fresh.load(Ordering::Relaxed),
-            "fresh token must start false"
-        );
-        assert!(
-            !Arc::ptr_eq(&token, &fresh),
-            "fresh token must be a different allocation"
+            !Arc::ptr_eq(&token_a, &token_b),
+            "token must be a fresh allocation"
         );
     }
 
-    /// Late `DownloadProgress` after a cancel must not recreate the row
-    /// or the lock. (Same row-absent guard as success/failure.)
-    #[test]
-    fn late_progress_after_cancel_is_ignored() {
-        let repo = InMemoryDownloadRepository::new();
-        repo.request(tiny().id);
-        repo.cancel(tiny().id);
-        repo.apply_event(&AppEvent::DownloadProgress {
-            model: tiny().id,
-            bytes: 1024,
-            total: None,
-            bytes_per_sec: 0,
-        });
-        assert!(
-            repo.get(tiny().id).is_none(),
-            "late progress must not recreate the row"
-        );
-    }
-
-    /// Late `DownloadCancelled` (e.g. the producer's publish reaches the
-    /// bus after the worker already self-cancelled) is a no-op for the
-    /// tables. Pinned because the reducer still folds the event into
-    /// UiState, so the event matters even if the store is already empty.
     #[test]
     fn terminal_event_on_absent_row_is_noop() {
         let repo = InMemoryDownloadRepository::new();
-        repo.apply_event(&AppEvent::DownloadCancelled { model: tiny().id });
+        repo.apply_event(&AppEvent::DownloadCancelled {
+            attempt: 1,
+            model: tiny().id,
+        });
         assert!(repo.get(tiny().id).is_none());
     }
 }
