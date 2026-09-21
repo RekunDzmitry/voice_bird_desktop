@@ -272,20 +272,22 @@ impl UiState {
                 // by a live block. The first free id wins. If
                 // every id in `1..=u8::MAX` is taken, we are at
                 // the realistic ceiling (~256 live sessions) and
-                // silently drop the AddBlock; the user can close
-                // one to make room. 0 is reserved (never issued)
-                // so an unset block has a distinguishable id.
+                // refuse the AddBlock with a visible warning; the
+                // user can close one to make room. 0 is reserved
+                // (never issued) so an unset block has a
+                // distinguishable id.
                 let candidate = self.next_block_id;
                 let id = (candidate..=u8::MAX)
                     .chain(1..candidate)
                     .find(|&id| !self.blocks.iter().any(|b| b.id == id));
                 let Some(id) = id else {
                     // Exhaustion: every id in 1..=255 is in use.
-                    // Refuse the AddBlock rather than silently
-                    // dropping a session the user may be watching.
-                    // The renderer shows `state.warning` in the
-                    // title bar; the warning clears automatically
-                    // once BlockClosed frees an id.
+                    // Refuse the AddBlock. We *don't* drop a live
+                    // session on the user's behalf — the user
+                    // might be watching its download gauge. Set a
+                    // user-visible warning instead; the renderer
+                    // shows `state.warning` in the title bar, and
+                    // BlockClosed clears it once a slot is free.
                     self.warning = Some(
                         "session limit reached; close a session to make room"
                             .to_string(),
@@ -648,11 +650,13 @@ mod tests {
     }
 
     /// Exhaustion: if every id in `1..=u8::MAX` is taken,
-    /// AddBlock is a silent no-op (the user must close a block
-    /// first). We can't actually create 255 live blocks in a
-    /// unit test cheaply, so we set `next_block_id` to a value
-    /// that, combined with a manually populated `blocks` vector
-    /// covering the full id range, makes the scan find nothing.
+    /// AddBlock refuses and surfaces a `state.warning` for the
+    /// title bar. (The block count is also unchanged — we don't
+    /// drop a session on the user's behalf.) We can't actually
+    /// create 255 live blocks in a unit test cheaply, so we set
+    /// `next_block_id` to a value that, combined with a manually
+    /// populated `blocks` vector covering the full id range,
+    /// makes the scan find nothing.
     #[test]
     fn add_block_is_a_noop_when_all_ids_are_exhausted() {
         let mut s = UiState {

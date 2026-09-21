@@ -183,7 +183,6 @@ mod tests {
     use super::*;
     use crate::bus::EventBus;
     use crate::picker::SessionMenu;
-    
     use crate::testing::{FixtureDownloader, FixtureStore, Outcome};
     use crate::transcription_models::ModelStore;
     use std::sync::Arc;
@@ -340,4 +339,3 @@ mod tests {
     }
 
 }
-
