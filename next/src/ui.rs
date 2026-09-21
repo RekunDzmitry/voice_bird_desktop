@@ -31,9 +31,23 @@ use crate::store::DownloadPhase;
 /// - `Recording{m}`   → `● recording (mocked)`.
 /// - `Failed{m,e}`    → the error wrapped, plus `r retry · Esc close`.
 pub fn render(f: &mut Frame, state: &UiState) {
+    // When the reducer sets a transient warning (e.g. "session
+    // limit reached; close a session to make room"), append it to
+    // the title bar so the user actually sees it. The title bar
+    // is the one place we *know* is on screen, regardless of cap,
+    // menu state, or focused block.
+    let title = match state.warning.as_deref() {
+        Some(w) => format!("{} — ! {w}", state.title),
+        None => state.title.clone(),
+    };
     let window = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", state.title));
+        .title(format!(" {title} "))
+        .border_style(if state.warning.is_some() {
+            Style::default().bold().red()
+        } else {
+            Style::default()
+        });
     f.render_widget(&window, f.area());
 
     let inner = window.inner(f.area());

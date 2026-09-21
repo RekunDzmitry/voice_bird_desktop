@@ -255,6 +255,43 @@ fn menu_open_many_100x30_matches_golden() {
     assert!(out.contains(" session 31"), "expected session 31 in window; got:\n{out}");
 }
 
+#[test]
+fn warning_renders_in_title_bar_when_set() {
+    // Set a transient warning and assert the title bar carries it.
+    // The base title "Voice Bird" is replaced/augmented by the
+    // warning text; the renderer joins them with " — ! ".
+    let mut s = UiState::default();
+    s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    s.warning = Some("session limit reached; close a session to make room".to_string());
+    let out = render_to_string(&s, 100, 30);
+    // First line of the render is the top border with title.
+    let first_line = out.lines().next().unwrap_or("");
+    assert!(
+        first_line.contains("Voice Bird"),
+        "title still includes the app name; got first line: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("session limit"),
+        "title must include the warning text; got first line: {first_line:?}"
+    );
+}
+
+#[test]
+fn title_bar_is_clean_when_no_warning() {
+    // Steady state: title is just "Voice Bird", no warning suffix.
+    let s = UiState::default();
+    let out = render_to_string(&s, 100, 30);
+    let first_line = out.lines().next().unwrap_or("");
+    assert!(
+        first_line.contains("Voice Bird"),
+        "title shows app name; got {first_line:?}"
+    );
+    assert!(
+        !first_line.contains("session limit"),
+        "no warning in steady state; got first line: {first_line:?}"
+    );
+}
+
 /// Focus navigation must not strand the user on a hidden block.
 ///
 /// When the cap evicts a block (becomes hidden), the keyboard

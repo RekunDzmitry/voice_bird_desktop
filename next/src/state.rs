@@ -146,6 +146,11 @@ pub struct UiState {
     /// focused block carries a strictly-greater stamp than any block
     /// not focused since the last bump.
     pub focus_clock: u64,
+    /// Transient user-facing warning shown in the title bar. Set by
+    /// the reducer when an action can't be completed (e.g. AddBlock
+    /// when the 1..=255 id space is full); cleared automatically once
+    /// the underlying condition is gone. `None` is the steady state.
+    pub warning: Option<String>,
 }
 
 impl Default for UiState {
@@ -159,6 +164,7 @@ impl Default for UiState {
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
+            warning: None,
         }
     }
 }
@@ -275,7 +281,15 @@ impl UiState {
                     .find(|&id| !self.blocks.iter().any(|b| b.id == id));
                 let Some(id) = id else {
                     // Exhaustion: every id in 1..=255 is in use.
-                    // No-op; the user must close a block.
+                    // Refuse the AddBlock rather than silently
+                    // dropping a session the user may be watching.
+                    // The renderer shows `state.warning` in the
+                    // title bar; the warning clears automatically
+                    // once BlockClosed frees an id.
+                    self.warning = Some(
+                        "session limit reached; close a session to make room"
+                            .to_string(),
+                    );
                     return;
                 };
                 // Advance `next_block_id` past the issued id, so
@@ -440,6 +454,16 @@ impl UiState {
                     // expects the window to stay at the cap while
                     // hidden sessions still exist.
                     self.promote_hidden();
+                }
+                // If the warning was the id-exhaustion message and
+                // we now have a free id slot, clear it. Any other
+                // warning (future use) stays put — only the
+                // exhaustion warning auto-clears on BlockClosed,
+                // because only BlockClosed frees an id.
+                if self.warning.as_deref() == Some("session limit reached; close a session to make room")
+                    && self.blocks.len() < u8::MAX as usize
+                {
+                    self.warning = None;
                 }
             }
             AppEvent::DownloadCancelled { attempt: _, model } => {
@@ -642,6 +666,7 @@ mod tests {
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
+            warning: None,
         };
         let len_before = s.blocks.len();
         s.apply(&AppEvent::AddBlock);
@@ -649,6 +674,85 @@ mod tests {
             s.blocks.len(),
             len_before,
             "AddBlock must not push when every id 1..=255 is taken"
+        );
+    }
+
+    /// When every id 1..=255 is taken, AddBlock must set a
+    /// user-visible warning so the user understands why the
+    /// key press did nothing. The warning is shown in the title
+    /// bar by the renderer.
+    #[test]
+    fn add_block_sets_a_warning_when_ids_are_exhausted() {
+        let mut s = UiState {
+            title: "Voice Bird".to_string(),
+            should_quit: false,
+            blocks: (1..=u8::MAX)
+                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .collect(),
+            focus: 0,
+            downloads: BTreeMap::new(),
+            next_block_id: 1,
+            menu: None,
+            focus_clock: 0,
+            warning: None,
+        };
+        assert!(s.warning.is_none(), "no warning in steady state");
+        s.apply(&AppEvent::AddBlock);
+        assert!(
+            s.warning.is_some(),
+            "AddBlock must surface a warning when refused"
+        );
+        let msg = s.warning.as_deref().unwrap();
+        assert!(
+            msg.contains("session limit"),
+            "warning should mention the limit; got {msg:?}"
+        );
+    }
+
+    /// Closing a block after the warning was raised must clear
+    /// the warning — the user freed an id and the next AddBlock
+    /// will succeed.
+    #[test]
+    fn block_closed_clears_the_exhaustion_warning() {
+        let mut s = UiState {
+            title: "Voice Bird".to_string(),
+            should_quit: false,
+            blocks: (1..=u8::MAX)
+                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .collect(),
+            focus: 0,
+            downloads: BTreeMap::new(),
+            next_block_id: 1,
+            menu: None,
+            focus_clock: 0,
+            warning: None,
+        };
+        s.apply(&AppEvent::AddBlock);
+        assert!(s.warning.is_some(), "warning raised on refused AddBlock");
+        // Closing the focused block (id 1) frees one id slot.
+        s.apply(&AppEvent::BlockClosed);
+        assert!(
+            s.warning.is_none(),
+            "BlockClosed must clear the exhaustion warning once a slot is free"
+        );
+    }
+
+    /// Closing a block before the warning was raised must NOT
+    /// spuriously clear any warning that was set some other way
+    /// (future use). Currently there's only the exhaustion
+    /// warning; this test guards the equality check.
+    #[test]
+    fn block_closed_only_clears_the_exhaustion_warning() {
+        let mut s = UiState {
+            warning: Some("some other future warning".to_string()),
+            ..UiState::default()
+        };
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&AppEvent::BlockClosed);
+        assert_eq!(
+            s.warning.as_deref(),
+            Some("some other future warning"),
+            "BlockClosed must not clear unrelated warnings"
         );
     }
 
@@ -815,6 +919,7 @@ mod tests {
             next_block_id: 42,
             menu: None,
             focus_clock: 0,
+            warning: None,
         };
         s.apply(&AppEvent::AddBlock);
         assert_eq!(s.title, "Hello");
