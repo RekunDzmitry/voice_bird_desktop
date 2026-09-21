@@ -1,0 +1,30 @@
+┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
+││   session 4 ││ 28 · pick a model ││ 29 · pick a model ││ 30 · pick a model│┌ 31 · pick a model ┐│
+││   session 5 ││▶ distil-small.en  ││▶ distil-small.en  ││▶ distil-small.en ││▶ distil-small.en  ││
+││   session 6 ││   distil-large-v3 ││   distil-large-v3 ││   distil-large-v3││   distil-large-v3 ││
+││   session 7 ││   large-v3-turbo  ││   large-v3-turbo  ││   large-v3-turbo ││   large-v3-turbo  ││
+││   session 8 ││   nemotron-3.5-asr││   nemotron-3.5-asr││   nemotron-3.5-as││   nemotron-3.5-asr││
+││   session 9 ││-streaming-0.6b    ││-streaming-0.6b    ││r-streaming-0.6b  ││-streaming-0.6b    ││
+││   session 10││   base.en         ││   base.en         ││   base.en        ││   base.en         ││
+││   session 11││   tiny.en         ││   tiny.en         ││   tiny.en        ││   tiny.en         ││
+││   session 12││                   ││                   ││                  ││                   ││
+││   session 13││                   ││                   ││                  ││                   ││
+││   session 14││                   ││                   ││                  ││                   ││
+││   session 15││                   ││                   ││                  ││                   ││
+││   session 16││                   ││                   ││                  ││                   ││
+││   session 17││                   ││                   ││                  ││                   ││
+││   session 18││                   ││                   ││                  ││                   ││
+││   session 19││                   ││                   ││                  ││                   ││
+││   session 20││                   ││                   ││                  ││                   ││
+││   session 21││                   ││                   ││                  ││                   ││
+││   session 22││                   ││                   ││                  ││                   ││
+││   session 23││                   ││                   ││                  ││                   ││
+││   session 24││                   ││                   ││                  ││                   ││
+││   session 25││                   ││                   ││                  ││                   ││
+││   session 26││                   ││                   ││                  ││                   ││
+││▶ session 27 ││                   ││                   ││                  ││                   ││
+││   session 28││                   ││                   ││                  ││                   ││
+││   session 29││                   ││                   ││                  ││                   ││
+││   session 30││                   ││                   ││                  ││                   ││
+││   session 31││                   ││                   ││                  │└───────────────────┘│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

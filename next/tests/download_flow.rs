@@ -195,10 +195,14 @@ fn two_blocks_same_model_share_one_download() {
             voice_bird_next::state::Block {
                 id: 1,
                 state: BlockState::Waiting { model: "tiny.en" },
+
+                ..Default::default()
             },
             voice_bird_next::state::Block {
                 id: 2,
                 state: BlockState::Waiting { model: "tiny.en" },
+
+                ..Default::default()
             },
         ],
         downloads: std::iter::once((
