@@ -282,23 +282,38 @@ impl UiState {
                 // enforced here too, not only on the menu's `Enter`.
                 self.show_block(id);
             }
-            AppEvent::FocusMoved { direction } => match direction {
-                FocusMove::Prev => {
-                    if !self.blocks.is_empty() {
-                        // Walk left over hidden blocks too — the
-                        // focused index is a position in `blocks`,
-                        // not in the visible subset, and skipping
-                        // hidden ones would strand the user.
-                        self.focus = self.focus.saturating_sub(1);
-                    }
+            AppEvent::FocusMoved { direction } => {
+                if self.blocks.is_empty() {
+                    return;
                 }
-                FocusMove::Next => {
-                    if !self.blocks.is_empty() {
+                // Walk over the whole `blocks` slice (visible + hidden).
+                // Skipping hidden indices would strand the user when
+                // the focused block becomes hidden — the keyboard path
+                // has no menu to fall back on. We *do* route focus
+                // through `show_block` if the destination is hidden so
+                // the cap stays enforced and the focused border lands
+                // on a rendered column.
+                let new_focus = match direction {
+                    FocusMove::Prev => self.focus.saturating_sub(1),
+                    FocusMove::Next => {
                         let last = self.blocks.len() - 1;
-                        self.focus = (self.focus + 1).min(last);
+                        (self.focus + 1).min(last)
                     }
+                };
+                self.focus = new_focus;
+                let id = self.blocks[new_focus].id;
+                if !self.blocks[new_focus].visible {
+                    // The destination was hidden. Make it visible,
+                    // which evicts the LRU peer and restamps focus.
+                    self.show_block(id);
+                } else {
+                    // Visible: bump the stamp so this block can't be
+                    // evicted on the next reveal, but don't trigger
+                    // an eviction we don't need.
+                    self.focus_clock = self.focus_clock.wrapping_add(1);
+                    self.blocks[new_focus].last_focused = self.focus_clock;
                 }
-            },
+            }
             AppEvent::PickerMoved { direction, .. } => {
                 if let Some(block) = self.focused_mut() {
                     if let BlockState::Picking(picker) = &mut block.state {

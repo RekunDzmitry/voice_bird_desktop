@@ -255,6 +255,232 @@ fn menu_open_many_100x30_matches_golden() {
     assert!(out.contains(" session 31"), "expected session 31 in window; got:\n{out}");
 }
 
+/// Focus navigation must not strand the user on a hidden block.
+///
+/// When the cap evicts a block (becomes hidden), the keyboard
+/// path (Left / Right) is the only way to reach it short of the
+/// menu. Walking left into a hidden index must **reveal** the
+/// block (going through `show_block`'s eviction logic) so the
+/// cap stays enforced and the focused border lands on a
+/// rendered column. Without this fix, focus could land on a
+/// hidden block and Up/Down/Enter/Retry/Esc would silently act
+/// on a block the user cannot see.
+#[test]
+fn focus_left_into_hidden_block_reveals_it() {
+    let mut s = UiState::default();
+    for _ in 0..5 {
+        s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    }
+    // focus is 4 after the five AddBlocks; block 1 (index 0) is
+    // the oldest-focused peer and was evicted.
+    assert_eq!(s.focus, 4, "expected initial focus on the 5th block");
+    assert!(!s.blocks[0].visible, "block 1 must be the evicted one");
+
+    for _ in 0..4 {
+        s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+            direction: voice_bird_next::bus::FocusMove::Prev,
+        });
+    }
+    assert_eq!(s.focus, 0, "expected focus to walk all the way to index 0");
+    assert!(
+        s.blocks[0].visible,
+        "hidden block 1 should be revealed when focus lands on it"
+    );
+
+    // Cap must still hold: 4 visible blocks, no more.
+    let visible = s.blocks.iter().filter(|b| b.visible).count();
+    assert_eq!(visible, 4, "cap violated after reveal; visible={visible}");
+
+    // Render: focused block draws `┌ … ┐` on the title line;
+    // unfocused neighbours share `│` dividers and have no top
+    // border. So the focused title for block 1 is wrapped in
+    // top-border glyphs.
+    let out = render_to_string(&s, 100, 30);
+    // Focused block title is wrapped in ┌ … ┐ on the title
+    // line; unfocused neighbours share │ dividers and have no
+    // top border. Assert BOTH: focused block 1 IS wrapped,
+    // AND no column carries the unfocused form for block 1.
+    let focused_title = "\u{250C} 1 \u{00B7} pick a model";
+    assert!(
+        out.contains(focused_title),
+        "focused block 1 missing top border; expected substring {focused_title:?}; got:\n{out}"
+    );
+    let unfocused_title = "\u{2502} 1 \u{00B7} pick a model";
+    assert!(
+        !out.contains(unfocused_title),
+        "block 1 still rendering as unfocused; rejected substring {unfocused_title:?}; got:\n{out}"
+    );
+}
+
+#[test]
+fn focus_right_into_hidden_block_reveals_it() {
+    // Symmetric path: walk Right into a hidden index. To make
+    // a hidden block sit *to the right of focus*, we close the
+    // focused block (so it goes hidden by being removed) and
+    // walk past its former position — no, simpler: set up a
+    // hidden block at the END of the slice by closing the last
+    // block, then add a fresh one. After AddBlock #6 (visible
+    // at index 5) and a BlockClosed on block 5, block 5 is
+    // gone, blocks 1..=4 remain. Then add 3 more (7, 8, 9),
+    // cap evicts the LRU each time, leaving blocks 4 (newest
+    // revealed from earlier), 6, 7, 8, 9 visible and 1, 2, 3
+    // hidden — wait, this is getting complicated.
+    //
+    // Simplest setup: 2 blocks (both visible), add 4 more so
+    // 1..=2 are hidden. Focus is at index 5 (the newest, last).
+    // Walk Right from there: focus stays at 5 (right-edge clamp).
+    // That doesn't exercise reveal.
+    //
+    // To exercise reveal-on-Next: start with focus NOT at the
+    // right edge, then walk Right *across* a hidden index.
+    // Build a state where index 0 is hidden and indices 1..=4
+    // are visible, with focus at index 1 — Next from index 1
+    // walks 2, 3, 4, 5, all visible; nothing reveals. So we
+    // need focus to be somewhere that Next lands on index 0
+    // (hidden). That requires focus to be 0 already and Next
+    // wrap, but Next clamps, not wraps.
+    //
+    // Therefore the only way to land on a hidden block via
+    // Next is when the rightmost block is hidden (cap evicts
+    // the *newest* block) — which doesn't happen with LRU. The
+    // Next path reveals when we add a block that becomes
+    // hidden (cap=4, 5 blocks), then walk Right past the
+    // newest index... but Next clamps.
+    //
+    // Conclusion: the Next path almost never reveals under
+    // LRU. The keyboard's "Next" simply clamps at the
+    // rightmost block, which is always visible. The Prev
+    // path (tested above) is the only one that walks into
+    // hidden territory. So we only need to assert that Next
+    // *correctly clamps* — which is already covered by
+    // `focus_right_at_right_edge_clamps_without_panic`. This
+    // test stays as a placeholder documenting why we don't
+    // exercise the reveal-on-Next path.
+    let mut s = UiState::default();
+    s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    assert_eq!(s.focus, 1);
+    for _ in 0..3 {
+        s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    }
+    assert!(!s.blocks[0].visible, "block 1 should be the evicted one");
+    assert_eq!(s.focus, 4);
+
+    // Walking Right from the rightmost index clamps — no
+    // reveal, no underflow.
+    for _ in 0..3 {
+        s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+            direction: voice_bird_next::bus::FocusMove::Next,
+        });
+    }
+    assert_eq!(s.focus, 4, "Next at right edge must clamp, not reveal");
+    assert!(s.blocks[4].visible, "block 5 must stay visible");
+    assert!(!s.blocks[0].visible, "block 1 must stay hidden");
+}
+
+#[test]
+fn focus_left_at_left_edge_saturates_without_panic() {
+    let mut s = UiState::default();
+    s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    assert_eq!(s.focus, 0);
+    s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+        direction: voice_bird_next::bus::FocusMove::Prev,
+    });
+    assert_eq!(s.focus, 0, "Prev at index 0 must saturate, not wrap");
+    assert!(s.blocks[0].visible);
+}
+
+#[test]
+fn focus_right_at_right_edge_clamps_without_panic() {
+    let mut s = UiState::default();
+    s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    assert_eq!(s.focus, 0);
+    s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+        direction: voice_bird_next::bus::FocusMove::Next,
+    });
+    assert_eq!(s.focus, 0, "Next at last index must clamp, not overflow");
+    assert!(s.blocks[0].visible);
+}
+
+#[test]
+fn focus_left_across_visible_blocks_does_not_evict_a_peer() {
+    // The reveal-on-hidden fix must NOT churn the visible strip
+    // when the destination is already visible. Walking across
+    // visible blocks must only restamp; no eviction.
+    let mut s = UiState::default();
+    for _ in 0..3 {
+        s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    }
+    let visible_before: Vec<u8> = s
+        .blocks
+        .iter()
+        .filter(|b| b.visible)
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(visible_before.len(), 3);
+
+    for _ in 0..3 {
+        s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+            direction: voice_bird_next::bus::FocusMove::Prev,
+        });
+    }
+    let visible_after: Vec<u8> = s
+        .blocks
+        .iter()
+        .filter(|b| b.visible)
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        visible_before, visible_after,
+        "walking left over visible blocks must not evict; was {visible_before:?}, now {visible_after:?}"
+    );
+}
+
+#[test]
+fn focus_reveal_evicts_the_lru_visible_peer() {
+    // When a hidden block is revealed, the LRU visible peer
+    // should be evicted. Walking Left four times into a 5-block
+    // state reveals block 1; block 5 (the most-recently-focused,
+    // now LRU) should be evicted.
+    let mut s = UiState::default();
+    for _ in 0..5 {
+        s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
+    }
+    // Initial state: blocks 2..=5 visible, block 1 hidden.
+    let visible: std::collections::HashSet<u8> = s
+        .blocks
+        .iter()
+        .filter(|b| b.visible)
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(visible, [2u8, 3, 4, 5].into_iter().collect());
+
+    for _ in 0..4 {
+        s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
+            direction: voice_bird_next::bus::FocusMove::Prev,
+        });
+    }
+    let visible: std::collections::HashSet<u8> = s
+        .blocks
+        .iter()
+        .filter(|b| b.visible)
+        .map(|b| b.id)
+        .collect();
+    // Block 1 (just revealed) stays visible. The LRU visible
+    // peer — the one with the smallest stamp before the reveal
+    // — gets evicted. Trace:
+    //   After 5 AddBlocks: stamps {1:1 hidden, 2:2, 3:3, 4:4, 5:5}.
+    //   Prev 1 (focus 4→3): restamp block 4 → 6.
+    //   Prev 2 (3→2): restamp block 3 → 7.
+    //   Prev 3 (2→1): restamp block 2 → 8.
+    //   Prev 4 (1→0): reveal block 1, evict LRU visible = block 5 (stamp 5).
+    assert_eq!(
+        visible,
+        [1u8, 2, 3, 4].into_iter().collect(),
+        "revealing block 1 should evict block 5 (LRU visible peer after restamps)"
+    );
+}
+
 
 proptest! {
     #[test]

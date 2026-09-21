@@ -206,16 +206,6 @@ fn render_menu(
 
     let total = state.blocks.len();
     let (start, end) = menu_window(total, menu.index, inner.height as usize);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
-    for (idx, block) in state.blocks[start..end].iter().enumerate() {
-        let absolute = start + idx;
-        let marker = if absolute == menu.index { "▶" } else { "  " };
-        let mut line = Line::from(format!("{marker} session {}", block.id));
-        if !block.visible {
-            line = line.dim();
-        }
-        lines.push(line);
-    }
     if start >= end {
         // Nothing to render (e.g. zero blocks, zero-height panel).
         return;
