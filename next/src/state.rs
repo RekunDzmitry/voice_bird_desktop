@@ -255,31 +255,52 @@ impl UiState {
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
             AppEvent::AddBlock => {
-                let id = self.next_block_id;
-                // Push hidden. `show_block` is the single seam that
-                // decides whether the new block fits in the visible
-                // strip: if it does, it gets flipped visible (and
-                // stamped); if not, an oldest-focused peer is evicted
-                // first. Pushing with `visible: false` keeps the cap
-                // math in one place — without it the new block would
-                // always be visible before `show_block` runs, the
-                // eviction branch would never fire, and the cap
-                // would silently grow.
+                // Pick an id that is not in use. A naive `u8` wrap
+                // collides: after 256 additions, `next_block_id`
+                // rolls back to 1 while block 1 is still alive.
+                // `show_block(1)` then finds the *old* session and
+                // the new one stays hidden with the wrong focus.
+                //
+                // Scan from the candidate forward, then wrap and
+                // continue from 1, skipping any id already taken
+                // by a live block. The first free id wins. If
+                // every id in `1..=u8::MAX` is taken, we are at
+                // the realistic ceiling (~256 live sessions) and
+                // silently drop the AddBlock; the user can close
+                // one to make room. 0 is reserved (never issued)
+                // so an unset block has a distinguishable id.
+                let candidate = self.next_block_id;
+                let id = (candidate..=u8::MAX)
+                    .chain(1..candidate)
+                    .find(|&id| !self.blocks.iter().any(|b| b.id == id));
+                let Some(id) = id else {
+                    // Exhaustion: every id in 1..=255 is in use.
+                    // No-op; the user must close a block.
+                    return;
+                };
+                // Advance `next_block_id` past the issued id, so
+                // the *next* AddBlock starts scanning one higher.
+                // If `id == u8::MAX`, wrap back to 1; the scan
+                // above still finds a free slot.
+                self.next_block_id = if id == u8::MAX { 1 } else { id + 1 };
+                // Push hidden. `show_block` is the single seam
+                // that decides whether the new block fits in the
+                // visible strip: if it does, it gets flipped
+                // visible (and stamped); if not, an oldest-focused
+                // peer is evicted first. Pushing with
+                // `visible: false` keeps the cap math in one
+                // place - without it the new block would always be
+                // visible before `show_block` runs, the eviction
+                // branch would never fire, and the cap would
+                // silently grow.
                 self.blocks.push(Block::new_hidden(
                     id,
                     BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
                 ));
-                // Wrap the id after `u8::MAX`. A `u8` keeps the id
-                // small enough to fit on every screen — and to be
-                // honest about how many sessions a user really
-                // opens. After 255, we restart from 1: ids are
-                // unique-among-alive, not unique-forever, and a
-                // closed block's id is freed as soon as the user
-                // removes it.
-                self.next_block_id = if id == u8::MAX { 1 } else { id + 1 };
-                // `+` is the canonical "auto-show and focus, evict if
-                // full" path. Goes through `show_block` so the cap is
-                // enforced here too, not only on the menu's `Enter`.
+                // `+` is the canonical "auto-show and focus, evict
+                // if full" path. Goes through `show_block` so the
+                // cap is enforced here too, not only on the
+                // menu's `Enter`.
                 self.show_block(id);
             }
             AppEvent::FocusMoved { direction } => {
@@ -488,6 +509,147 @@ mod tests {
             }
         ));
         assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
+    }
+
+    /// Regression: after 256 `AddBlock` events the candidate id
+    /// `next_block_id` rolls back to 1, colliding with the still
+    /// alive block 1. Before the fix, `show_block(1)` matched
+    /// the *older* session, leaving the new one hidden and
+    /// focusing the wrong block.
+    #[test]
+    fn add_block_avoids_colliding_id_when_wrap_would_hit_a_live_block() {
+        let mut s = UiState::default();
+        // Add 256 blocks. The 256th would naively reuse id 1
+        // (since next_block_id wraps from 255 -> 1), but block 1
+        // is still alive.
+        for _ in 0..256 {
+            s.apply(&AppEvent::AddBlock);
+        }
+        // Block 1 is still alive at index 0 (the cap may have
+        // hidden it, but `show_block` keeps it focused).
+        let first = s.blocks.iter().find(|b| b.id == 1).expect("block 1");
+        let last = s.blocks.last().expect("newest block");
+        assert_eq!(first.id, 1);
+        assert_ne!(
+            last.id, 1,
+            "newest block must NOT reuse id 1 while block 1 is still alive"
+        );
+        // Every live id is unique.
+        let mut ids: Vec<u8> = s.blocks.iter().map(|b| b.id).collect();
+        ids.sort();
+        let original_len = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), original_len, "live blocks have duplicate ids");
+        // The newest block is the focused one — its id is what
+        // `show_block` last saw, so the focus must point at it,
+        // not at the older block with id 1.
+        let focused = s.focused().expect("some block is focused");
+        assert_eq!(
+            focused.id, last.id,
+            "focus must be on the newest block, not a stale id-1 collision"
+        );
+    }
+
+    /// After a wrap, AddBlock still finds a free id even when
+    /// the candidate collides. With `next_block_id = 1` and
+    /// block 1 alive, the candidate would naively collide; the
+    /// scan must skip id 1 and land on the first free slot.
+    #[test]
+    fn add_block_after_wrap_picks_the_next_free_id() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        // Block 1 is alive. Force the next candidate back to 1
+        // (the post-wrap value).
+        s.next_block_id = 1;
+        s.apply(&AppEvent::AddBlock);
+        // Scan starts at 1 (taken), then 2, 3, ... and picks
+        // the first free slot: id 2.
+        assert!(
+            s.blocks.iter().any(|b| b.id == 2),
+            "scan should have picked id 2; live ids: {:?}",
+            s.blocks.iter().map(|b| b.id).collect::<Vec<_>>()
+        );
+        // The candidate id 1 was NOT issued - exactly one
+        // block with id 1 (the original).
+        let ids: Vec<u8> = s.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(
+            ids.iter().filter(|&&i| i == 1).count(),
+            1,
+            "exactly one block with id 1 (the original); got {ids:?}"
+        );
+    }
+
+    /// When the candidate `next_block_id` is itself free, the
+    /// scan returns it unchanged. Specifically: after using id
+    /// 255, `next_block_id` wraps to 1; if id 1 has been
+    /// closed by then, the scan picks id 1 (the wrapped value).
+    #[test]
+    fn add_block_picks_wrapped_id_when_it_is_free() {
+        let mut s = UiState::default();
+        // Create block 1, then close it (frees id 1).
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&AppEvent::BlockClosed);
+        assert_eq!(s.blocks.len(), 0, "block 1 closed");
+        // next_block_id is now 2. Force it to the post-wrap
+        // value 1; id 1 is free, so the scan picks 1.
+        s.next_block_id = 1;
+        s.apply(&AppEvent::AddBlock);
+        assert_eq!(s.blocks[0].id, 1, "scan picked the wrapped id 1");
+    }
+
+    /// The scan must also skip a *block of holes* - if ids
+    /// 1..=N are all taken, the scan walks forward until it
+    /// finds the gap.
+    #[test]
+    fn add_block_skips_a_range_of_taken_ids() {
+        let mut s = UiState::default();
+        // Create blocks 1, 2, 3.
+        for _ in 0..3 {
+            s.apply(&AppEvent::AddBlock);
+        }
+        let live_ids: std::collections::HashSet<u8> =
+            s.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(live_ids, [1u8, 2, 3].into_iter().collect());
+        // Force next_block_id back to 1; the next AddBlock will
+        // scan past 1, 2, 3 and pick 4.
+        s.next_block_id = 1;
+        s.apply(&AppEvent::AddBlock);
+        let new_ids: std::collections::HashSet<u8> =
+            s.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(
+            new_ids,
+            [1u8, 2, 3, 4].into_iter().collect(),
+            "scan must skip taken ids 1..=3 and land on 4"
+        );
+    }
+
+    /// Exhaustion: if every id in `1..=u8::MAX` is taken,
+    /// AddBlock is a silent no-op (the user must close a block
+    /// first). We can't actually create 255 live blocks in a
+    /// unit test cheaply, so we set `next_block_id` to a value
+    /// that, combined with a manually populated `blocks` vector
+    /// covering the full id range, makes the scan find nothing.
+    #[test]
+    fn add_block_is_a_noop_when_all_ids_are_exhausted() {
+        let mut s = UiState {
+            title: "Voice Bird".to_string(),
+            should_quit: false,
+            blocks: (1..=u8::MAX)
+                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .collect(),
+            focus: 0,
+            downloads: BTreeMap::new(),
+            next_block_id: 1,
+            menu: None,
+            focus_clock: 0,
+        };
+        let len_before = s.blocks.len();
+        s.apply(&AppEvent::AddBlock);
+        assert_eq!(
+            s.blocks.len(),
+            len_before,
+            "AddBlock must not push when every id 1..=255 is taken"
+        );
     }
 
     #[test]
