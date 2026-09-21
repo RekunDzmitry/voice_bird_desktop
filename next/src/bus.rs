@@ -98,6 +98,17 @@ pub enum AppEvent {
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
     DownloadCancelled { attempt: u32, model: &'static str },
+    /// `Tab`: open (or close, if already open) the session menu.
+    MenuOpened,
+    /// `Esc` (or `Tab` again) while the menu is open.
+    MenuClosed,
+    /// `↑` / `↓` while the menu is open. Reuses the picker's move
+    /// direction so clamp semantics live in one place.
+    MenuMoved { direction: PickerMove },
+    /// `Enter` on a menu row: reveal the selected session on screen,
+    /// FIFO-evicting the oldest-focused visible one. Reducer closes
+    /// the menu itself.
+    SessionShown { id: u8 },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 }
@@ -137,12 +148,10 @@ impl EventBus {
         Self { sender, receiver }
     }
 
-    /// Cloneable handle that producers use to publish.
     pub fn sender(&self) -> EventSender {
         EventSender::from_mpsc(self.sender.clone())
     }
 
-    /// Non-blocking: yields every queued event in publish order, then stops.
     pub fn drain(&mut self) -> impl Iterator<Item = AppEvent> + '_ {
         self.receiver.try_iter()
     }
@@ -235,5 +244,26 @@ mod tests {
 
         let mut fresh = EventBus::new();
         assert_eq!(fresh.drain().count(), 0);
+    }
+
+    #[test]
+    fn menu_events_serialize_under_the_event_tag() {
+        // The on-disk event log replays via the `event` discriminator
+        // that `#[serde(tag = "event")]` writes onto every variant.
+        // New variants must keep that contract — see bus.rs header.
+        let events = vec![
+            AppEvent::MenuOpened,
+            AppEvent::MenuClosed,
+            AppEvent::MenuMoved {
+                direction: PickerMove::Down,
+            },
+            AppEvent::SessionShown { id: 4 },
+        ];
+        let json = serde_json::to_string(&events).expect("serialize");
+        assert!(json.contains("\"event\":\"MenuOpened\""), "{json}");
+        assert!(json.contains("\"event\":\"MenuClosed\""), "{json}");
+        assert!(json.contains("\"event\":\"MenuMoved\""), "{json}");
+        assert!(json.contains("\"event\":\"SessionShown\""), "{json}");
+        assert!(json.contains("\"id\":4"), "{json}");
     }
 }

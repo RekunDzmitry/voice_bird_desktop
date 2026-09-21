@@ -1,0 +1,30 @@
+┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
+││ 2 · pick a model      ││ 3 · pick a model     ││ 4 · pick a model      │┌ 5 · pick a model ────┐│
+││▶ distil-small.en      ││▶ distil-small.en     ││▶ distil-small.en      ││▶ distil-small.en     ││
+││   distil-large-v3     ││   distil-large-v3    ││   distil-large-v3     ││   distil-large-v3    ││
+││   large-v3-turbo      ││   large-v3-turbo     ││   large-v3-turbo      ││   large-v3-turbo     ││
+││   nemotron-3.5-asr-str││   nemotron-3.5-asr-st││   nemotron-3.5-asr-str││   nemotron-3.5-asr-st││
+││eaming-0.6b            ││reaming-0.6b          ││eaming-0.6b            ││reaming-0.6b          ││
+││   base.en             ││   base.en            ││   base.en             ││   base.en            ││
+││   tiny.en             ││   tiny.en            ││   tiny.en             ││   tiny.en            ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       ││                      ││
+││                       ││                      ││                       │└──────────────────────┘│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
