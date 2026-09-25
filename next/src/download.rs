@@ -1,23 +1,4 @@
 //! Download transport and orchestration.
-//!
-//! [`Downloader`] is the trait a thread runs to fetch bytes to a
-//! staging file. [`HttpDownloader`] is the live reqwest-based impl,
-//! gated behind the `net` feature. Tests use the
-//! [`crate::testing::FixtureDownloader`], which keeps the flow off the
-//! network entirely.
-//!
-//! [`begin`] is the single entry point for Enter and for retry. It
-//! owns the "is it on disk" decision and asks [`crate::db::downloads::Downloads`]
-//! for an atomic claim; on `Start` the caller spawns a worker
-//! passing the claimed [`crate::db::downloads::CancelProbe`], on
-//! `Join` the caller only publishes the join event. The table
-//! owns the lifecycle row, and the worker reads the table to learn
-//! it was cancelled — the `Arc<AtomicBool>` is gone.
-//!
-//! [`DownloadError::Cancelled`] is event-silent in the producer —
-//! the worker publishes [`AppEvent::DownloadCancelled`] when the
-//! probe flips, and the table applies that event under the
-//! attempt gate.
 
 use std::fmt;
 use std::fs;
@@ -266,10 +247,6 @@ impl Throttle {
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-/// Single entry point for Enter and for retry. Owns the "is it on
-/// disk" decision and reads the table for a `Claim`. On `Start` the
-/// caller spawns a worker with a [`CancelProbe`] for `(entry, attempt)`;
-/// on `Join` the caller only publishes the join event.
 pub fn begin(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
