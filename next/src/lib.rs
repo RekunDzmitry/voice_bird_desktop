@@ -16,7 +16,6 @@ pub mod state;
 pub mod db;
 pub mod producer;
 pub mod download;
-pub mod store;
 pub mod transcription_models;
 pub mod testing;
 pub mod ui;
