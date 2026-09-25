@@ -31,9 +31,6 @@ use crate::db::downloads::{CancelCheck, CancelProbe, Claim, Downloads};
 use crate::picker::ModelEntry;
 use crate::transcription_models::ModelStore;
 
-/// Failure vocabulary for the download pipeline. Seven variants cover
-/// the observed failure modes without falling back to `anyhow` —
-/// tests match on the variant, not on a substring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadError {
     NoCacheDir,
@@ -63,8 +60,6 @@ impl fmt::Display for DownloadError {
 
 impl std::error::Error for DownloadError {}
 
-/// Truncate a possibly-long error message to what the user actually
-/// sees on a single line in a narrow column.
 pub fn truncate_error(s: &str) -> String {
     const MAX: usize = 160;
     if s.chars().count() <= MAX {
@@ -75,19 +70,6 @@ pub fn truncate_error(s: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
-/// Fetch bytes from `url` into a staging file, verify the SHA, report
-/// progress. The downloader is the only thing that talks to the
-/// network; everything else (throttle, install, cancel) is format
-/// agnostic.
-///
-/// `cancel` is a [`CancelCheck`] the worker polls between chunks.
-/// The live pipeline passes a [`CancelProbe`] that observes the
-/// SQLite row; tests can pass any `&mut dyn CancelCheck` (including
-/// a plain `AtomicBool`) to pre-arm a cancel.
 pub trait Downloader: Send + Sync + 'static {
     fn fetch(
         &self,
@@ -99,9 +81,6 @@ pub trait Downloader: Send + Sync + 'static {
     ) -> Result<(), DownloadError>;
 }
 
-/// Stream `src` into `staged` while hashing and watching the cancel
-/// check. Used directly by tests against a `&[u8]` cursor; the live
-/// HttpDownloader is the only place that calls `reqwest::blocking::get`.
 pub fn stream_to<R: std::io::Read>(
     mut src: R,
     staged: &Path,
@@ -143,8 +122,6 @@ pub fn stream_to<R: std::io::Read>(
     Ok(())
 }
 
-/// The live HTTP downloader. Only constructed in `main.rs` so tests
-/// never touch the network.
 #[cfg(feature = "net")]
 pub struct HttpDownloader;
 
@@ -167,15 +144,6 @@ impl Downloader for HttpDownloader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Throttle
-// ---------------------------------------------------------------------------
-
-/// Throttle progress callbacks to keep event traffic bounded. Without
-/// this, a 1.6 GB download at 64 KiB chunks would emit ~25 000 events;
-/// the throttle caps it at ~101 (one per percentage point, or every
-/// 250 ms when no `total` is known). The last progress is always
-/// emitted so the bar reaches 100% / final byte count.
 pub struct Throttle {
     last_pct: i32,
     last_bytes: u64,
@@ -298,19 +266,10 @@ impl Throttle {
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-// begin — the resolver's single entry point
-// ---------------------------------------------------------------------------
-
 /// Single entry point for Enter and for retry. Owns the "is it on
 /// disk" decision and reads the table for a `Claim`. On `Start` the
 /// caller spawns a worker with a [`CancelProbe`] for `(entry, attempt)`;
-/// on `Join` the caller only publishes the join event. No separate
-/// registry, no separate row insert — one table-driven `Claim`
-/// replaces the previous `is_active` + `token` pair.
-///
-/// `store` and `downloader` are passed as `Arc<dyn _>` because the
-/// worker thread needs `'static` references and the loop already
-/// keeps the originals alive on its stack.
+/// on `Join` the caller only publishes the join event.
 pub fn begin(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
@@ -319,23 +278,14 @@ pub fn begin(
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
-        // Log the cache-hit reason before transitioning the block,
-        // so a reader of the event log can distinguish "downloaded
-        // and now recording" from "already on disk, skip download".
         tx.publish(AppEvent::ModelAlreadyCached(entry));
         tx.publish(AppEvent::RecordingStarted(entry));
         return;
     }
-    // Every requester publishes DownloadRequested so the event log
-    // records the join even when the underlying worker was already
-    // started by an earlier request. Only the Start claim spawns.
     tx.publish(AppEvent::DownloadRequested(entry));
     let row = match downloads.get(entry.id) {
         Ok(r) => r,
         Err(e) => {
-            // Table is unreadable — surface as a Failed event so
-            // the reducer transitions the block to Failed and the
-            // user sees an actionable message instead of a hang.
             tx.publish(AppEvent::DownloadFailed {
                 attempt: 0,
                 model: entry.id,
@@ -357,13 +307,6 @@ pub fn begin(
             );
         }
         Claim::Restart { attempt } => {
-            // A previous attempt is still unwinding (its row is in
-            // `Cancelling` state and its worker hasn't acked yet).
-            // The previous worker publishes its terminal event
-            // with the OLD attempt; the table's attempt gate
-            // discards it. We thread the NEW attempt through to
-            // the staging path and every event this attempt
-            // publishes.
             let attempt = downloads.start(entry.id).unwrap_or(attempt);
             spawn(
                 entry,
@@ -378,16 +321,6 @@ pub fn begin(
     }
 }
 
-/// Spawn one download thread. Resolves the staging path, fetches with
-/// throttled progress, publishes `DownloadInstalling` for slow formats,
-/// installs, publishes `DownloadSucceeded`. Any error publishes
-/// `DownloadFailed` with the message truncated to 160 chars.
-///
-/// `Cancelled` now publishes `DownloadCancelled { attempt }` so the
-/// table can move the row under the attempt gate. If the attempt
-/// has since been superseded by a `Restart`, the gate discards the
-/// event and the row stays — the new attempt's progress remains
-/// visible.
 pub fn spawn(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
@@ -500,10 +433,7 @@ mod tests {
         )
         .unwrap();
         assert!(staged.is_file());
-        assert!(
-            seen_bytes.is_empty(),
-            "no chunks emitted for empty source"
-        );
+        assert!(seen_bytes.is_empty(), "no chunks for empty source");
     }
 
     #[test]
