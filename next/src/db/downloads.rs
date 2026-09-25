@@ -34,7 +34,7 @@
 //! data, not stragglers.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -75,9 +75,14 @@ impl Table for DownloadsTable {
 
 /// One row of the `downloads` table. Read-only view used by callers
 /// (`get`, `active`) and by `decide` to pick Start / Join / Restart.
+///
+/// `model` is an owned `Arc<str>` so the row can outlive the
+/// `Connection` borrow that produced it. Callers compare by
+/// `model.as_ref()` against the catalog; the orchestrator only ever
+/// passes the catalog's `&'static str` ids to `start`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadRow {
-    pub model: &'static str,
+    pub model: Arc<str>,
     pub attempt: u32,
     pub status: DownloadStatus,
     pub error: Option<String>,
@@ -94,7 +99,7 @@ impl DownloadRow {
         let created_at: String = row.get("created_at")?;
         let updated_at: String = row.get("updated_at")?;
         Ok(DownloadRow {
-            model: leak_static(model),
+            model: Arc::from(model),
             attempt,
             status: status_from_sql(&status)?,
             error,
@@ -102,16 +107,6 @@ impl DownloadRow {
             updated_at: parse_ts(&updated_at)?,
         })
     }
-}
-
-/// Lend a `&'static str` to a String by leaking. The strings come
-/// from a small, bounded catalog (six models) and the OS data dir
-/// rows never outlive the process, so a per-row leak here costs
-/// nothing on long-running sessions. The whole row is `Clone`, so
-/// callers can't accidentally pin the underlying `Connection`
-/// borrow past its scope.
-fn leak_static(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
 }
 
 fn status_to_sql(s: DownloadStatus) -> &'static str {
@@ -186,7 +181,7 @@ impl Downloads {
     pub fn open(path: &Path, tx: EventSender) -> rusqlite::Result<Self> {
         let conn = super::open(path)?;
         super::migrate(&conn, &[DownloadsTable])?;
-        let downloads = Self {
+        let mut downloads = Self {
             conn,
             path: path.to_path_buf(),
             tx,
@@ -249,7 +244,7 @@ impl Downloads {
         )?;
         let from = prior.map(|r| r.status);
         self.tx.publish(AppEvent::DownloadStatusChanged {
-            model,
+            model: Arc::from(model),
             attempt,
             from,
             to: DownloadStatus::Downloading,
@@ -282,7 +277,7 @@ impl Downloads {
             ],
         )?;
         self.tx.publish(AppEvent::DownloadStatusChanged {
-            model: leak_static(row.model.to_string()),
+            model: row.model.clone(),
             attempt: row.attempt,
             from: Some(row.status),
             to: DownloadStatus::Cancelling,
@@ -310,8 +305,8 @@ impl Downloads {
             AppEvent::DownloadProgress {
                 attempt,
                 model,
-                bytes,
-                total,
+                bytes: _,
+                total: _,
                 ..
             } => {
                 // Progress is intentionally not persisted: the
@@ -447,7 +442,7 @@ impl Downloads {
             // Row gone or attempt mismatch — log the rejection and
             // skip the publish.
             self.tx.publish(AppEvent::DownloadEventRejected {
-                model: leak_static(model.to_string()),
+                model: Arc::from(model),
                 event: "transition",
                 event_attempt: attempt,
                 row_attempt: None,
@@ -455,7 +450,7 @@ impl Downloads {
             return Ok(());
         }
         self.tx.publish(AppEvent::DownloadStatusChanged {
-            model: leak_static(model.to_string()),
+            model: Arc::from(model),
             attempt,
             from,
             to,
@@ -490,7 +485,7 @@ impl Downloads {
         // log the rejection with `None`.
         let row_attempt = self.get(model).ok().flatten().map(|r| r.attempt);
         self.tx.publish(AppEvent::DownloadEventRejected {
-            model: leak_static(model.to_string()),
+            model: Arc::from(model),
             event: name,
             event_attempt,
             row_attempt,
@@ -518,26 +513,18 @@ impl Downloads {
                 params![
                     status_to_sql(DownloadStatus::Interrupted),
                     now_s,
-                    row.model,
+                    row.model.as_ref(),
                     row.attempt
                 ],
             )?;
             self.tx.publish(AppEvent::DownloadStatusChanged {
-                model: row.model,
+                model: row.model.clone(),
                 attempt: row.attempt,
                 from: Some(row.status),
                 to: DownloadStatus::Interrupted,
             });
         }
         Ok(())
-    }
-
-    /// Drop the `pub` accessor for the inner connection — exposed
-    /// only for tests that need to inspect WAL state directly. Not
-    /// used by production code.
-    #[cfg(test)]
-    pub(crate) fn raw_conn(&self) -> &Connection {
-        &self.conn
     }
 }
 
@@ -573,15 +560,6 @@ pub fn decide(row: Option<&DownloadRow>) -> Claim {
                 attempt: r.attempt + 1,
             },
         },
-    }
-}
-
-/// Helper for callers that need `Start { attempt }` materialised
-/// already — calls `start` on the table. Convenience over
-/// `match decide(&downloads.get(...)?)`.
-impl Downloads {
-    pub fn start_with_attempt(&mut self, model: &'static str) -> rusqlite::Result<u32> {
-        self.start(model)
     }
 }
 
@@ -652,16 +630,11 @@ pub trait CancelCheck {
 mod tests {
     use super::*;
     use crate::bus::EventBus;
-    use std::sync::{Arc, Mutex};
 
     fn bus() -> (EventBus, EventSender) {
         let bus = EventBus::new();
         let tx = bus.sender();
         (bus, tx)
-    }
-
-    fn collect(bus: &Mutex<EventBus>) -> Vec<AppEvent> {
-        bus.lock().unwrap().drain().collect()
     }
 
     fn tmp_db() -> (tempfile::TempDir, PathBuf) {
@@ -679,7 +652,7 @@ mod tests {
         }
         // Downloading → Join
         let row = DownloadRow {
-            model: "tiny.en",
+            model: Arc::from("tiny.en"),
             attempt: 3,
             status: DownloadStatus::Downloading,
             error: None,
@@ -734,7 +707,7 @@ mod tests {
         let d = Downloads::open(&path, tx).unwrap();
         let row = d.get("tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Interrupted);
-        let events = collect(&Mutex::new(bus));
+        let events: Vec<AppEvent> = bus.drain().collect();
         let transitions: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -941,7 +914,7 @@ mod tests {
         .unwrap();
         let active = d.active().unwrap();
         assert_eq!(active.len(), 1, "only tiny.en is active");
-        assert_eq!(active[0].model, "tiny.en");
+        assert_eq!(active[0].model.as_ref(), "tiny.en");
     }
 }
 
