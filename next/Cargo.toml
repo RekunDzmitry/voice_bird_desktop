@@ -28,7 +28,7 @@ chrono = "0.4"
 directories = "5"
 ratatui = "0.29"
 crossterm = "0.28"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # Format-specific unpack for the Nemotron tarball. Always-on: a
 # verified staging file is meaningless if we can't actually install it.
