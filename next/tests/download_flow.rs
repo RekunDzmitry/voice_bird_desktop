@@ -20,7 +20,9 @@ use voice_bird_next::picker::{ModelEntry, ModelFormat, CATALOG};
 use voice_bird_next::producer;
 use voice_bird_next::state::{BlockState, DownloadPhase, DownloadState, UiState};
 use voice_bird_next::testing::{render_to_string, FixtureDownloader, FixtureStore, Outcome};
-use voice_bird_next::transcription_models::{handler_for, ModelStore};
+use voice_bird_next::transcription_models::{
+    handler_for, ModelStore, NemotronPackageHandler,
+};
 
 fn tiny() -> &'static voice_bird_next::picker::ModelEntry {
     &CATALOG[5]
@@ -74,26 +76,6 @@ fn settle(bus: &mut EventBus, state: &mut UiState, downloads: &mut Downloads) {
             return;
         }
     }
-}
-
-fn fixture_world() -> (
-    EventBus,
-    tempfile::TempDir,
-    Arc<FixtureStore>,
-    Arc<FixtureDownloader>,
-    DownloadsHandle,
-) {
-    let bus = EventBus::new();
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(FixtureStore::new(PathBuf::from(tmp.path()), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader = Arc::new(FixtureDownloader::new(
-        Vec::new(),
-        Outcome::Ok,
-        Arc::clone(&calls),
-    ));
-    let handle = downloads_with(&bus);
-    (bus, tmp, store, downloader, handle)
 }
 
 #[test]
@@ -159,8 +141,6 @@ fn cache_hit_publishes_model_already_cached_then_recording_started() {
         &tx,
     );
 
-    // Drain the bus without folding into state/repo so we observe
-    // the raw event sequence the resolver published.
     let events: Vec<AppEvent> = bus.drain().collect();
     assert_eq!(
         events.len(),
@@ -212,15 +192,14 @@ fn two_blocks_same_model_share_one_download() {
     );
     begin(
         tiny(),
-        store.clone(),
+        store,
         &mut downloads_h.downloads,
-        downloader.clone(),
+        downloader,
         &tx,
     );
     settle(&mut bus, &mut state, &mut downloads_h.downloads);
 
     assert_eq!(calls.load(Ordering::SeqCst), 1, "only one fetch ran");
-    // Both blocks should be Recording.
     assert!(state.blocks.iter().all(|b| matches!(
         b.state,
         BlockState::Recording { model: "tiny.en" }
@@ -244,7 +223,6 @@ fn progress_updates_flow_into_ui_state() {
     state.apply(&AppEvent::AddBlock);
     tick_drain(&mut bus, &mut state, &mut downloads_h.downloads);
 
-    let attempt = 1;
     begin(
         tiny(),
         store,
@@ -252,9 +230,8 @@ fn progress_updates_flow_into_ui_state() {
         downloader,
         &tx,
     );
-    // Publish a progress event manually — the fixture doesn't tick.
     bus.sender().publish(AppEvent::DownloadProgress {
-        attempt,
+        attempt: 1,
         model: tiny().id,
         bytes: 50,
         total: Some(100),
@@ -272,7 +249,6 @@ fn progress_updates_flow_into_ui_state() {
 
 #[test]
 fn downloads_table_round_trip() {
-    // Pure table test: open, start, observe, cancel.
     let mut bus = EventBus::new();
     let mut h = downloads_with(&bus);
     h.downloads.start(tiny().id).unwrap();
@@ -287,10 +263,6 @@ fn downloads_table_round_trip() {
 
 #[test]
 fn download_progress_event_carries_bytes_per_sec() {
-    // Progress events are no longer persisted to the table — the
-    // bus is the source of truth for the renderer. This test pins
-    // that contract: the event flows through, the table accepts it,
-    // and the UI projection updates.
     let mut bus = EventBus::new();
     let mut h = downloads_with(&bus);
     h.downloads.start(tiny().id).unwrap();
@@ -332,13 +304,11 @@ fn cancel_event_moves_row_to_cancelled() {
 
 #[test]
 fn stale_terminal_event_is_rejected_and_row_unchanged() {
-    // New attempt supersedes the old. The old worker's terminal
-    // event is gated out and publishes a DownloadEventRejected.
     let mut bus = EventBus::new();
     let mut h = downloads_with(&bus);
-    h.downloads.start(tiny().id).unwrap(); // attempt 1
+    h.downloads.start(tiny().id).unwrap();
     h.downloads.cancel(tiny().id).unwrap();
-    h.downloads.start(tiny().id).unwrap(); // attempt 2
+    h.downloads.start(tiny().id).unwrap();
     let accepted = h
         .downloads
         .apply(&AppEvent::DownloadSucceeded {
@@ -350,7 +320,6 @@ fn stale_terminal_event_is_rejected_and_row_unchanged() {
     let row = h.downloads.get(tiny().id).unwrap().unwrap();
     assert_eq!(row.attempt, 2);
     assert_eq!(row.status, DownloadStatus::Downloading);
-    // A DownloadEventRejected was published for the audit log.
     let rejections: Vec<_> = bus
         .drain()
         .filter(|e| matches!(e, AppEvent::DownloadEventRejected { .. }))
@@ -363,17 +332,12 @@ fn stale_terminal_event_is_rejected_and_row_unchanged() {
 
 #[test]
 fn user_scenario_pick_cancel_during_install_retry_does_full_fetch() {
-    // Repro from the plan: pick a model, close the block mid-install,
-    // pick again. The second pick must produce a full fetch (the
-    // CancelProbe on the new worker sees the new attempt; the old
-    // attempt's worker acks Cancelled and stops).
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
     let tmp = tempfile::tempdir().unwrap();
     let nemotron = &CATALOG[3];
     let store_concrete = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    // Build a real tar.gz for the nemotron package so install runs.
     let pkg = tmp.path().join("pkg");
     std::fs::create_dir_all(&pkg).unwrap();
     std::fs::write(pkg.join("encoder.onnx"), b"e").unwrap();
@@ -408,27 +372,20 @@ fn user_scenario_pick_cancel_during_install_retry_does_full_fetch() {
         downloader.clone(),
         &tx,
     );
-    // Wait briefly for fetch to start.
     std::thread::sleep(Duration::from_millis(40));
-    // Close the focused block mid-install: producer flips Cancelling.
     state.focus = 0;
     producer::resolve_intent(
         Intent::BlockClosed,
         &state,
-        &*store,
+        store.clone(),
         &mut downloads_h.downloads,
-        &*downloader,
+        downloader.clone(),
         &tx,
     );
     settle(&mut bus, &mut state, &mut downloads_h.downloads);
     let calls_after_first = calls.load(Ordering::SeqCst);
-    assert_eq!(
-        calls_after_first, 1,
-        "first attempt fetched exactly once"
-    );
+    assert_eq!(calls_after_first, 1, "first attempt fetched exactly once");
 
-    // Retry: pick again. A fresh attempt row is inserted and a
-    // second fetch runs.
     state.apply(&AppEvent::AddBlock);
     tick_drain(&mut bus, &mut state, &mut downloads_h.downloads);
     begin(
@@ -487,9 +444,7 @@ fn quit_during_install_leaves_cache_clean() {
         downloader,
         &tx,
     );
-    // Wait until the worker reaches install.
     std::thread::sleep(Duration::from_millis(80));
-    // Quit: simulate the production cleanup loop.
     let active = downloads_h.downloads.active().unwrap();
     for row in &active {
         let _ = downloads_h.downloads.cancel(row.model.as_ref());
@@ -499,12 +454,8 @@ fn quit_during_install_leaves_cache_clean() {
             store.discard_inflight(entry);
         }
     }
-    // Drain the bus so the Cancelling transitions reach the audit log.
     let _drained: Vec<_> = bus.drain().collect();
-    // Allow the worker to observe Cancelling and unwind.
     std::thread::sleep(Duration::from_millis(200));
-    // No .part or .tmp leftovers in the cache dir (the install
-    // prologue and the discard_inflight sweep both clean up).
     let leftover: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .flatten()
@@ -521,13 +472,8 @@ fn quit_during_install_leaves_cache_clean() {
 
 #[test]
 fn cancel_and_immediate_retry_two_attempts_run_concurrently() {
-    use std::io::Cursor;
-
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    // Two distinct payloads so the SHA differs and a fresh fetch is
-    // observable. The slow downloader keeps attempt A in flight long
-    // enough for attempt B to start.
     let payload_a = vec![1u8; 4096];
     let payload_b = vec![2u8; 4096];
     let calls = Arc::new(AtomicUsize::new(0));
@@ -552,20 +498,15 @@ fn cancel_and_immediate_retry_two_attempts_run_concurrently() {
         &tx,
     );
     std::thread::sleep(Duration::from_millis(20));
-    // Cancel attempt A's row, then pick again — attempt B spawns
-    // under a fresh attempt id.
     state.focus = 0;
     producer::resolve_intent(
         Intent::BlockClosed,
         &state,
-        &*store,
+        store.clone(),
         &mut downloads_h.downloads,
-        &*downloader_a,
+        downloader_a.clone(),
         &tx,
     );
-    // Now pick again with a fast downloader — this is the
-    // cancel-immediate-retry path. Note we replace the downloader to
-    // make B fast.
     begin(
         tiny(),
         store,
@@ -574,19 +515,15 @@ fn cancel_and_immediate_retry_two_attempts_run_concurrently() {
         &tx,
     );
     settle(&mut bus, &mut state, &mut downloads_h.downloads);
-    // Both downloaders saw at least one fetch.
     assert!(
         calls.load(Ordering::SeqCst) >= 2,
         "both attempts must have fetched at least once; got {}",
         calls.load(Ordering::SeqCst)
     );
-    let _ = Cursor::new(Vec::<u8>::new()); // touch unused import in some configs
 }
 
 #[test]
 fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
-    use std::io::Cursor;
-
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -609,14 +546,13 @@ fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
         &tx,
     );
     std::thread::sleep(Duration::from_millis(10));
-    // Restart: cancel then pick again.
     state.focus = 0;
     producer::resolve_intent(
         Intent::BlockClosed,
         &state,
-        &*store,
+        store.clone(),
         &mut downloads_h.downloads,
-        &*slow,
+        slow.clone(),
         &tx,
     );
     begin(
@@ -628,7 +564,6 @@ fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
     );
     settle(&mut bus, &mut state, &mut downloads_h.downloads);
 
-    // Drain any residual stale events; they must not change the row.
     let final_row = downloads_h.downloads.get(tiny().id).unwrap().unwrap();
     assert!(
         matches!(
@@ -638,7 +573,6 @@ fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
         "row must reflect attempt B's status; got {:?}",
         final_row.status
     );
-    let _ = Cursor::new(Vec::<u8>::new()); // touch unused import
 }
 
 #[test]
@@ -672,7 +606,6 @@ fn nemotron_install_aborts_when_cancel_is_prearmed() {
 
 #[test]
 fn render_smoke_blocked_paths() {
-    // Smoke: the renderer must accept the new UiState shape.
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
     state.apply(&AppEvent::ModelSelected(tiny()));
