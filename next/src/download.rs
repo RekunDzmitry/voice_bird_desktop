@@ -7,21 +7,23 @@
 //! network entirely.
 //!
 //! [`begin`] is the single entry point for Enter and for retry. It
-//! owns the "is it on disk" decision and asks [`Downloads`] for an
-//! atomic claim; on `Start` the caller spawns a worker passing the
-//! claimed cancellation [`CancelProbe`], on `Join` the caller only
-//! publishes the join event. The table owns the lifecycle row, and
-//! the worker reads the table to learn it was cancelled — the
-//! `Arc<AtomicBool>` is gone.
+//! owns the "is it on disk" decision and asks [`crate::db::downloads::Downloads`]
+//! for an atomic claim; on `Start` the caller spawns a worker
+//! passing the claimed [`crate::db::downloads::CancelProbe`], on
+//! `Join` the caller only publishes the join event. The table
+//! owns the lifecycle row, and the worker reads the table to learn
+//! it was cancelled — the `Arc<AtomicBool>` is gone.
 //!
-//! [`DownloadError::Cancelled`] is event-silent — the worker
-//! publishes [`AppEvent::DownloadCancelled`] when the probe flips,
-//! and the table applies that event under the attempt gate.
+//! [`DownloadError::Cancelled`] is event-silent in the producer —
+//! the worker publishes [`AppEvent::DownloadCancelled`] when the
+//! probe flips, and the table applies that event under the
+//! attempt gate.
 
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
@@ -179,9 +181,6 @@ pub struct Throttle {
     last_bytes: u64,
     last_total: Option<u64>,
     last_emit_ms: u128,
-    /// Bytes recorded on the most recent progress emit. Used to compute
-    /// `bytes_per_sec` between emits. Zero on a fresh throttle or right
-    /// after the `BytesVerified` flip (when phase changes mid-stream).
     last_emit_bytes: u64,
 }
 
@@ -204,22 +203,6 @@ impl Default for Throttle {
 }
 #[allow(dead_code)]
 impl Throttle {
-    // Flow (review note #4 — readability refactor):
-    //   call(bytes, total) [or finalize(bytes, total)]
-    //     → now_ms()                            (time source)
-    //     → should_emit(bytes, total, now_ms)   (gating policy)
-    //     → emit_progress(bytes, total, ...)    (single emit site)
-    //
-    // The conditional in `call` is intentional and is the answer
-    // to the reviewer who suggested sending total + bytes_per_sec
-    // always and letting the consumer handle the difference. Both
-    // `total.is_some()` paths now share one emit site, so the
-    // payload construction lives in exactly one place — the
-    // DownloadProgress event already always carries both fields,
-    // and the renderer picks the label format. Two named methods
-    // (`should_emit`, `emit_progress`) replace one inline match so
-    // each policy can be reasoned about independently.
-
     pub fn call(
         &mut self,
         attempt: u32,
@@ -234,8 +217,6 @@ impl Throttle {
         }
     }
 
-    /// Emit one final 100% / final-byte progress on the success
-    /// path. `call` already does this when the final chunk reports
     pub fn finalize(
         &mut self,
         attempt: u32,
@@ -248,13 +229,6 @@ impl Throttle {
         self.emit_progress(attempt, bytes, total, now_ms, tx, model);
     }
 
-    // -- policy -------------------------------------------------------------
-
-    /// Apply the throttle gating rules and update the bookkeeping
-    /// that `bytes_per_sec` reads from. Returns `true` if the call
-    /// should publish. Side effect: on `true`, advances `last_pct`
-    /// so the next identical percentage won't re-emit, and updates
-    /// `last_emit_ms` so the elapsed-time window starts here.
     fn should_emit(&mut self, bytes: u64, total: Option<u64>, now_ms: u128) -> bool {
         match total {
             Some(t) if t > 0 => {
@@ -277,12 +251,6 @@ impl Throttle {
         }
     }
 
-    // -- emit ---------------------------------------------------------------
-
-    /// Single emit site. Both call-site paths and finalize funnel
-    /// through here so the payload shape and bookkeeping stay
-    /// aligned. `bytes_per_sec` is always computed even when total
-    /// is known — the renderer treats 0 as "no prior reference"
     fn emit_progress(
         &mut self,
         attempt: u32,
@@ -304,11 +272,6 @@ impl Throttle {
         self.last_emit_bytes = bytes;
     }
 
-    // -- leaves -------------------------------------------------------------
-
-    /// Wall-clock in milliseconds since the UNIX epoch. Single
-    /// source for everything that says "now" in this module —
-    /// tests that need to fake time should override this method.
     fn now_ms() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -316,9 +279,6 @@ impl Throttle {
             .unwrap_or(0)
     }
 
-    /// Bytes per second measured across the previous emit window.
-    /// Zero on the very first tick (no prior reference); the
-    /// renderer treats 0 as "no measurement yet".
     fn bytes_per_sec(&self, now_ms: u128, bytes: u64) -> u64 {
         if self.last_emit_ms == 0 {
             return 0;
@@ -328,9 +288,6 @@ impl Throttle {
             return 0;
         }
         let delta = bytes - self.last_emit_bytes;
-        // 1000 * delta / elapsed_ms, but watch u128 -> u64 truncation
-        // (delta fits in u64; the multiplication can overflow u128 only
-        // on a multi-million GB/s download, which we will not see).
         ((delta as u128 * 1000) / elapsed_ms) as u64
     }
 
@@ -338,9 +295,6 @@ impl Throttle {
         self.last_total
     }
 
-    /// Cooldown between progress emits when `total` is unknown.
-    /// 250 ms ≈ 4 fps; the bar moves without saturating the event
-    /// bus at ~25 000 chunks/1.6 GB × 64 KiB.
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
@@ -353,11 +307,15 @@ impl Throttle {
 /// on `Join` the caller only publishes the join event. No separate
 /// registry, no separate row insert — one table-driven `Claim`
 /// replaces the previous `is_active` + `token` pair.
+///
+/// `store` and `downloader` are passed as `Arc<dyn _>` because the
+/// worker thread needs `'static` references and the loop already
+/// keeps the originals alive on its stack.
 pub fn begin(
     entry: &'static ModelEntry,
-    store: &dyn ModelStore,
+    store: Arc<dyn ModelStore>,
     downloads: &mut Downloads,
-    downloader: &dyn Downloader,
+    downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
@@ -391,8 +349,8 @@ pub fn begin(
             let attempt = downloads.start(entry.id).unwrap_or(attempt);
             spawn(
                 entry,
-                store,
-                downloader,
+                store.clone(),
+                downloader.clone(),
                 downloads.probe(entry.id, attempt),
                 attempt,
                 tx.clone(),
@@ -409,8 +367,8 @@ pub fn begin(
             let attempt = downloads.start(entry.id).unwrap_or(attempt);
             spawn(
                 entry,
-                store,
-                downloader,
+                store.clone(),
+                downloader.clone(),
                 downloads.probe(entry.id, attempt),
                 attempt,
                 tx.clone(),
@@ -432,8 +390,8 @@ pub fn begin(
 /// visible.
 pub fn spawn(
     entry: &'static ModelEntry,
-    store: &dyn ModelStore,
-    downloader: &dyn Downloader,
+    store: Arc<dyn ModelStore>,
+    downloader: Arc<dyn Downloader>,
     probe: CancelProbe,
     attempt: u32,
     tx: EventSender,
@@ -456,9 +414,6 @@ pub fn spawn(
     std::thread::spawn(move || {
         let mut throttle = Throttle::new();
         let mut probe = probe;
-        // Bridge the &mut dyn FnMut the downloader wants to a closure
-        // that can talk to the throttle. `Progress` holds the mutable
-        // borrow to the throttle; the inner closure defers to it.
         struct Progress<'a> {
             tx: &'a EventSender,
             model: &'static str,
@@ -494,13 +449,6 @@ pub fn spawn(
                     Ok(()) => {
                         tx.publish(AppEvent::DownloadSucceeded { attempt, model });
                     }
-                    // Cancelled during install: publish
-                    // `DownloadCancelled { attempt }` so the
-                    // table's attempt gate can drop the row. If
-                    // a Restart has superseded this attempt, the
-                    // gate discards the event and the row
-                    // stays — the new attempt's progress remains
-                    // visible.
                     Err(DownloadError::Cancelled) => {
                         tx.publish(AppEvent::DownloadCancelled { attempt, model });
                     }
@@ -512,11 +460,6 @@ pub fn spawn(
                 }
             }
             Err(DownloadError::Cancelled) => {
-                // Same contract as install-time cancel: publish
-                // `DownloadCancelled { attempt }` so the table
-                // can drop the row under the attempt gate. If
-                // the attempt has since been superseded, the
-                // gate discards this event and the row stays.
                 tx.publish(AppEvent::DownloadCancelled { attempt, model });
             }
             Err(e) => tx.publish(AppEvent::DownloadFailed {
@@ -532,7 +475,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::picker::CATALOG;
-    use crate::testing::FixtureDownloader;
+    use crate::testing::{FixtureDownloader, Outcome};
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -548,7 +491,6 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut seen_bytes: Vec<u64> = Vec::new();
         let mut progress = |bytes: u64, _total: Option<u64>| seen_bytes.push(bytes);
-        // Sha256 of empty bytes.
         stream_to(
             Cursor::new(Vec::<u8>::new()),
             &staged,
@@ -558,7 +500,10 @@ mod tests {
         )
         .unwrap();
         assert!(staged.is_file());
-        assert_eq!(seen_bytes, vec![0u64]);
+        assert!(
+            seen_bytes.is_empty(),
+            "no chunks emitted for empty source"
+        );
     }
 
     #[test]
@@ -577,9 +522,6 @@ mod tests {
         assert!(!staged.exists());
     }
 
-    // Pre-arming a cancel via &mut AtomicBool so the fixture
-    // downloader's first read observes it. CancelCheck for AtomicBool
-    // is provided by the testing module.
     #[test]
     fn prearmed_cancel_makes_fetch_return_cancelled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -598,6 +540,3 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch was invoked once");
     }
 }
-
-// Re-export so callers don't need to know about the inner module path.
-pub use crate::testing::Outcome;
