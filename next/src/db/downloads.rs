@@ -443,7 +443,7 @@ impl Downloads {
             // skip the publish.
             self.tx.publish(AppEvent::DownloadEventRejected {
                 model: Arc::from(model),
-                event: "transition",
+                rejected: "transition",
                 event_attempt: attempt,
                 row_attempt: None,
             });
@@ -486,7 +486,7 @@ impl Downloads {
         let row_attempt = self.get(model).ok().flatten().map(|r| r.attempt);
         self.tx.publish(AppEvent::DownloadEventRejected {
             model: Arc::from(model),
-            event: name,
+                rejected: name,
             event_attempt,
             row_attempt,
         });
@@ -498,14 +498,14 @@ impl Downloads {
     /// reach `apply`" in the JSONL event log.
     fn recover_interrupted(&mut self) -> rusqlite::Result<()> {
         let now_s = format_ts(Utc::now());
-        let prior = self.conn.query_map(
+        let mut stmt = self.conn.prepare(
             "SELECT model, attempt, status, error, created_at, updated_at \
              FROM downloads \
              WHERE status IN ('Downloading','Installing','Cancelling')",
-            [],
-            DownloadRow::from_row,
         )?;
-        let rows: Vec<DownloadRow> = prior.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([], DownloadRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in rows {
             self.conn.execute(
                 "UPDATE downloads SET status = ?1, updated_at = ?2 \
@@ -703,7 +703,7 @@ mod tests {
         }
         // Re-open: the Cancelling row must become Interrupted, and
         // the event log must observe the transition.
-        let (bus, tx) = bus();
+        let (mut bus, tx) = bus();
         let d = Downloads::open(&path, tx).unwrap();
         let row = d.get("tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Interrupted);
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn apply_succeed_emits_terminal_transition() {
         let (_tmp, path) = tmp_db();
-        let (bus, tx) = bus();
+        let (mut bus, tx) = bus();
         let mut d = Downloads::open(&path, tx).unwrap();
         d.start("tiny.en").unwrap();
         let accepted = d
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn apply_stale_event_publishes_rejection() {
         let (_tmp, path) = tmp_db();
-        let (bus, tx) = bus();
+        let (mut bus, tx) = bus();
         let mut d = Downloads::open(&path, tx).unwrap();
         d.start("tiny.en").unwrap(); // attempt = 1
                                        // Bump to attempt 2: cancel then start again.

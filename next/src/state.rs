@@ -2,7 +2,16 @@ use std::collections::BTreeMap;
 
 use crate::bus::{AppEvent, FocusMove};
 use crate::picker::{ModelPicker, PickerEvent, PickerIntent, SessionMenu};
-use crate::store::DownloadPhase;
+
+/// Render-side phase for one download. Lives in `state.rs` (UI
+/// only) because the SQLite `DownloadStatus` enum carries the
+/// matching lifecycle for the table — the renderer doesn't need
+/// the full enum, only the two phases it renders distinctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadPhase {
+    Fetching,
+    Installing,
+}
 
 /// Hard cap on the number of blocks rendered side-by-side. Sessions
 /// past this count stay alive (hidden); the user reaches them via
@@ -447,6 +456,18 @@ impl UiState {
                 }
             }
             AppEvent::BlockClosed => {
+                // Capture the removed block's model BEFORE the
+                // remove — the producer flipped the table row to
+                // Cancelling when this was the last waiter, and
+                // the reducer removes the corresponding UI entry
+                // so the gauge disappears while the worker
+                // unwinds. If other blocks are still waiting on
+                // the same model, leave `downloads[model]` alone
+                // so they keep rendering the shared progress.
+                let removed_model = self
+                    .blocks
+                    .get(self.focus)
+                    .and_then(|b| b.model());
                 if !self.blocks.is_empty() {
                     self.blocks.remove(self.focus);
                     if !self.blocks.is_empty() {
@@ -456,6 +477,14 @@ impl UiState {
                     // expects the window to stay at the cap while
                     // hidden sessions still exist.
                     self.promote_hidden();
+                }
+                if let Some(model) = removed_model {
+                    let still_waiting = self.blocks.iter().any(|b| {
+                        matches!(&b.state, BlockState::Waiting { model: m } if *m == model)
+                    });
+                    if !still_waiting {
+                        self.downloads.remove(model);
+                    }
                 }
                 // If the warning was the id-exhaustion message and
                 // we now have a free id slot, clear it. Any other
@@ -491,11 +520,16 @@ impl UiState {
                 self.show_block(*id);
                 self.menu = None;
             }
+            // Lifecycle observability events: the table is the
+            // source of truth, so the reducer doesn't fold them
+            // into `downloads`. The event log already captures
+            // them via the same drain loop.
+            AppEvent::DownloadStatusChanged { .. }
+            | AppEvent::DownloadEventRejected { .. } => {}
             AppEvent::Quit => self.should_quit = true,
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

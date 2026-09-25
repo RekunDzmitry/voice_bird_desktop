@@ -1,8 +1,8 @@
 //! Binary entry point: the only file that touches a real terminal.
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::Duration;
-
 use crossterm::{
     cursor,
     event::{self, Event, KeyEvent},
@@ -76,9 +76,9 @@ fn main() -> io::Result<()> {
 fn handle_key(
     key: KeyEvent,
     state: &UiState,
-    store: &dyn ModelStore,
+    store: Arc<dyn ModelStore>,
     downloads: &mut Downloads,
-    downloader: &dyn Downloader,
+    downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
     if let Some(intent) = input::map_key(key) {
@@ -99,10 +99,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 
     // Wired only in `main` — the live HTTP downloader. Tests use
     // `FixtureDownloader` through the same trait.
-    let store: Box<dyn ModelStore> = match CacheDirStore::new() {
+    let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
         Ok(s) => {
             let _ = s.sweep_staging();
-            Box::new(s)
+            Arc::new(s)
         }
         Err(e) => {
             eprintln!("voice-bird-next: cannot resolve cache dir: {e}");
@@ -125,7 +125,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    let downloader: Box<dyn Downloader> = cfg_build_downloader();
+    let downloader: Arc<dyn Downloader> = cfg_build_downloader();
 
     let mut dirty = true;
     loop {
@@ -135,7 +135,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
-                handle_key(k, &state, &*store, &mut downloads, &*downloader, &tx);
+                handle_key(k, &state, store.clone(), &mut downloads, downloader.clone(), &tx);
                 dirty = true;
             }
         }
@@ -201,13 +201,12 @@ fn cleanup_inflight(store: &dyn ModelStore, downloads: &mut Downloads, bus: &mut
 }
 
 #[cfg(feature = "net")]
-fn cfg_build_downloader() -> Box<dyn Downloader> {
-    Box::new(HttpDownloader)
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
+    Arc::new(HttpDownloader)
 }
 
 #[cfg(not(feature = "net"))]
-fn cfg_build_downloader() -> Box<dyn Downloader> {
-    // Without the `net` feature the binary can't download. Tests
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
     // exercise the full flow through FixtureDownloader; the binary
     // is the production switch and exits early here.
     eprintln!("voice-bird-next: built without the `net` feature, downloads are disabled");

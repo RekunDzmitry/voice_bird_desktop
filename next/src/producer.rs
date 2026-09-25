@@ -8,13 +8,14 @@
 
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
-use crate::db::downloads::Downloads;
-use crate::download::{begin, Downloader};
+use std::sync::Arc;
+
 use crate::input::Intent;
 use crate::picker::{self, CATALOG};
-use crate::state::{BlockState, UiState};
+use crate::db::downloads::Downloads;
+use crate::download::{begin, Downloader};
 use crate::transcription_models::ModelStore;
-
+use crate::state::{BlockState, UiState};
 /// Stamp the `from_model`/`to_model` fields onto `PickerMoved` using
 /// the focused block's current `picker_index` plus a non-mutating peek
 /// at the target index. The input layer has no catalog context, so the
@@ -50,12 +51,11 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
 pub fn resolve_intent(
     intent: Intent,
     state: &UiState,
-    store: &dyn ModelStore,
+    store: Arc<dyn ModelStore>,
     downloads: &mut Downloads,
-    downloader: &dyn Downloader,
+    downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
-    // The session menu is a small modal: while it's open, certain
     // intents are hijacked to drive the menu instead of falling
     // through to their default reducer. Branch on `state.menu.is_some()`
     // FIRST so the menu's behaviour is local and obvious; everything
