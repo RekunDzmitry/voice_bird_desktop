@@ -1,7 +1,6 @@
 //! Binary entry point: the only file that touches a real terminal.
 
 use std::io::{self, Stdout};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
@@ -17,10 +16,10 @@ use voice_bird_next::download::HttpDownloader;
 use voice_bird_next::picker::CATALOG;
 use voice_bird_next::{
     bus::{EventBus, EventSender},
+    db::downloads::Downloads,
     download::Downloader,
     input, producer,
     state::UiState,
-    store::{DownloadRepository, InMemoryDownloadRepository},
     transcription_models::{CacheDirStore, ModelStore},
 };
 
@@ -77,13 +76,13 @@ fn main() -> io::Result<()> {
 fn handle_key(
     key: KeyEvent,
     state: &UiState,
-    store: &Arc<dyn ModelStore>,
-    repo: &Arc<dyn DownloadRepository>,
-    downloader: &Arc<dyn Downloader>,
+    store: &dyn ModelStore,
+    downloads: &mut Downloads,
+    downloader: &dyn Downloader,
     tx: &EventSender,
 ) {
     if let Some(intent) = input::map_key(key) {
-        producer::resolve_intent(intent, state, store, repo, downloader, tx);
+        producer::resolve_intent(intent, state, store, downloads, downloader, tx);
     }
 }
 
@@ -100,18 +99,33 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 
     // Wired only in `main` — the live HTTP downloader. Tests use
     // `FixtureDownloader` through the same trait.
-    let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
+    let store: Box<dyn ModelStore> = match CacheDirStore::new() {
         Ok(s) => {
             let _ = s.sweep_staging();
-            Arc::new(s)
+            Box::new(s)
         }
         Err(e) => {
             eprintln!("voice-bird-next: cannot resolve cache dir: {e}");
             std::process::exit(2);
         }
     };
-    let repo: Arc<dyn DownloadRepository> = Arc::new(InMemoryDownloadRepository::new());
-    let downloader: Arc<dyn Downloader> = cfg_build_downloader();
+    // Open the SQLite downloads table at the platform data dir.
+    // Mirrors how `CacheDirStore` failures are handled: exit 2 with a
+    // readable error so the failure mode is unambiguous.
+    let mut downloads = match voice_bird_next::db::db_path() {
+        Some(path) => match Downloads::open(&path, tx.clone()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("voice-bird-next: cannot open downloads table at {path:?}: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => {
+            eprintln!("voice-bird-next: cannot resolve downloads table path");
+            std::process::exit(2);
+        }
+    };
+    let downloader: Box<dyn Downloader> = cfg_build_downloader();
 
     let mut dirty = true;
     loop {
@@ -121,7 +135,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
-                handle_key(k, &state, &store, &repo, &downloader, &tx);
+                handle_key(k, &state, &*store, &mut downloads, &*downloader, &tx);
                 dirty = true;
             }
         }
@@ -129,20 +143,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             if let Some(l) = log.as_mut() {
                 l.append(&ev);
             }
-            // `apply_event` returns `true` for non-stale events
+            // `downloads.apply` returns `true` for non-stale events
             // (non-download events pass through; download events
             // whose attempt matches the current row pass; stale
             // download events return `false`). Only accepted
             // events touch `UiState` so a cancelled-but-still-
             // running worker cannot repaint the new attempt's
             // gauge or move attempt B's blocks out of Waiting.
-            if repo.apply_event(&ev) {
-                state.apply(&ev);
+            if let Ok(accepted) = downloads.apply(&ev) {
+                if accepted {
+                    state.apply(&ev);
+                }
             }
             dirty = true;
         }
         if state.should_quit {
-            cleanup_inflight(&store, &repo);
+            cleanup_inflight(&*store, &mut downloads, &mut bus);
             break;
         }
     }
@@ -157,30 +173,40 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 /// from it (the `install: unpack: failed to unpack ...tmp/...`
 /// error the user observed on 2026-09-16).
 ///
-/// Workers are NOT joined. Setting cancel on each active claim
-/// first means any worker that survives long enough to publish
-/// another event finds its row already gone (terminal is no-op on
-/// absent rows) and the late event is filtered out of the log.
-/// Process exit then kills any workers still running.
-fn cleanup_inflight(store: &Arc<dyn ModelStore>, repo: &Arc<dyn DownloadRepository>) {
-    let active: Vec<&'static str> = repo.all().into_iter().map(|r| r.model).collect();
-    for model in &active {
-        repo.cancel(model);
+/// The active rows flip to `Cancelling` synchronously here; the
+/// worker probes will see the change and stop. Process exit then
+/// kills any workers still running.
+///
+/// The final `bus.drain()` loop only logs: it doesn't touch
+/// state. This guarantees the Cancelling transitions reach the
+/// JSONL event log even though the loop is about to exit.
+fn cleanup_inflight(store: &dyn ModelStore, downloads: &mut Downloads, bus: &mut EventBus) {
+    let active = match downloads.active() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    for row in &active {
+        let _ = downloads.cancel(row.model.as_ref());
     }
-    for model in &active {
-        if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
+    for row in &active {
+        if let Some(entry) = CATALOG.iter().find(|e| e.id == row.model.as_ref()) {
             store.discard_inflight(entry);
+        }
+    }
+    for ev in bus.drain() {
+        if let Some(l) = voice_bird_next::event_log::EventLog::open().as_mut() {
+            l.append(&ev);
         }
     }
 }
 
 #[cfg(feature = "net")]
-fn cfg_build_downloader() -> Arc<dyn Downloader> {
-    Arc::new(HttpDownloader)
+fn cfg_build_downloader() -> Box<dyn Downloader> {
+    Box::new(HttpDownloader)
 }
 
 #[cfg(not(feature = "net"))]
-fn cfg_build_downloader() -> Arc<dyn Downloader> {
+fn cfg_build_downloader() -> Box<dyn Downloader> {
     // Without the `net` feature the binary can't download. Tests
     // exercise the full flow through FixtureDownloader; the binary
     // is the production switch and exits early here.
