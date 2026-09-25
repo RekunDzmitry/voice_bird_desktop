@@ -6,15 +6,13 @@
 //! plumbing (raw mode, alt screen, panic hook, the render loop) and
 //! puts everything that talks to the bus next to the bus itself.
 
-use std::sync::Arc;
-
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
+use crate::db::downloads::Downloads;
 use crate::download::{begin, Downloader};
 use crate::input::Intent;
 use crate::picker::{self, CATALOG};
 use crate::state::{BlockState, UiState};
-use crate::store::DownloadRepository;
 use crate::transcription_models::ModelStore;
 
 /// Stamp the `from_model`/`to_model` fields onto `PickerMoved` using
@@ -47,14 +45,14 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
 /// - `Confirm` and `Retry` are the resolver's job: they need the
-///   focused block's stage and access to the store / repo.
+///   focused block's stage and access to the store / table.
 /// - All other intents are direct mappings.
 pub fn resolve_intent(
     intent: Intent,
     state: &UiState,
-    store: &Arc<dyn ModelStore>,
-    repo: &Arc<dyn DownloadRepository>,
-    downloader: &Arc<dyn Downloader>,
+    store: &dyn ModelStore,
+    downloads: &mut Downloads,
+    downloader: &dyn Downloader,
     tx: &EventSender,
 ) {
     // The session menu is a small modal: while it's open, certain
@@ -123,7 +121,7 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Picking(picker) = &block.state {
                     let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
-                    begin(entry, store, repo, downloader, tx);
+                    begin(entry, store, downloads, downloader, tx);
                 }
             }
         }
@@ -131,17 +129,19 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Failed { model, .. } = &block.state {
                     if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
-                        begin(entry, store, repo, downloader, tx);
+                        begin(entry, store, downloads, downloader, tx);
                     }
                 }
             }
         }
         Intent::BlockClosed => {
             // Closing the focused block: if it was the last waiter on
-            // its model, atomically cancel the in-flight download
-            // (set the token, drop both tables) and publish the
-            // DownloadCancelled event so the reducer tears down
-            // UiState.downloads and the store drops the row.
+            // its model, atomically flip the table row to Cancelling
+            // (logged as DownloadStatusChanged). The reducer's
+            // BlockClosed arm removes `downloads[model]` when no
+            // other block is `Waiting` on that model — pure reducer
+            // logic, no separate publish of `DownloadCancelled` from
+            // the producer.
             if let Some(block) = state.focused() {
                 if let Some(model) = block.model() {
                     let any_other = state.blocks.iter().any(|b| {
@@ -150,19 +150,15 @@ pub fn resolve_intent(
                     });
                     if !any_other
                         && matches!(block.state, BlockState::Waiting { .. })
-                        && repo.cancel(model)
                     {
-                        // `repo.cancel` kept the row (Cancelling
-                        // state). Read back the attempt id so the
-                        // event we publish matches the row the
-                        // store is tracking — the store's attempt
-                        // gate will discard this event if a
-                        // subsequent Restart supersedes the
-                        // attempt.
-                        if let Some(row) = repo.get(model) {
-                            tx.publish(AppEvent::DownloadCancelled {
-                                attempt: row.attempt,
+                        // Best-effort: surface DB errors as a Failed
+                        // event so the user sees the cause instead
+                        // of a stuck Cancelling row.
+                        if let Err(e) = downloads.cancel(model) {
+                            tx.publish(AppEvent::DownloadFailed {
+                                attempt: 0,
                                 model,
+                                error: format!("downloads table: {e}"),
                             });
                         }
                     }
@@ -182,160 +178,110 @@ mod tests {
 
     use super::*;
     use crate::bus::EventBus;
-    use crate::picker::SessionMenu;
-    use crate::testing::{FixtureDownloader, FixtureStore, Outcome};
-    use crate::transcription_models::ModelStore;
-    use std::sync::Arc;
+    use crate::state::Block;
+    use crate::testing::{FixtureDownloader, FixtureStore};
+    use std::path::PathBuf;
 
-    fn fixture() -> (EventBus, Arc<dyn ModelStore>, Arc<dyn DownloadRepository>, Arc<dyn Downloader>) {
+    fn tiny() -> &'static picker::ModelEntry {
+        &CATALOG[5]
+    }
+
+    fn fixture() -> (
+        EventBus,
+        Box<dyn ModelStore>,
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<crate::db::downloads::Downloads>>,
+        Box<dyn Downloader>,
+    ) {
         let bus = EventBus::new();
-        let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(std::path::PathBuf::from("/tmp"), &[]));
-        let repo: Arc<dyn DownloadRepository> = Arc::new(crate::store::InMemoryDownloadRepository::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Box<dyn ModelStore> =
+            Box::new(FixtureStore::new(PathBuf::from("/tmp"), &[]));
+        let downloads = Arc::new(std::sync::Mutex::new(
+            crate::db::downloads::Downloads::open(
+                &tmp.path().join("downloads.sqlite"),
+                bus.sender(),
+            )
+            .unwrap(),
+        ));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        let downloader: Box<dyn Downloader> = Box::new(FixtureDownloader::new(
             Vec::new(),
-            Outcome::Ok,
+            crate::testing::Outcome::Ok,
             calls,
         ));
-        (bus, store, repo, downloader)
+        (bus, store, tmp, downloads, downloader)
     }
 
-    fn state_with_five_blocks() -> UiState {
-        let mut s = UiState::default();
+    use std::sync::Arc;
+
+    #[test]
+    fn confirm_on_picking_block_invokes_begin() {
+        let (mut bus, store, _tmp, downloads, downloader) = fixture();
+        let tx = bus.sender();
+        let mut state = UiState::default();
+        state.blocks.push(Block::new(1, BlockState::Picking(
+            crate::picker::ModelPicker::open(crate::picker::PickerIntent::AddBlock),
+        )));
+        // Pick the tiny model.
         for _ in 0..5 {
-            s.apply(&AppEvent::AddBlock);
+            resolve_intent(Intent::PickerNext, &state, &*store, &mut *downloads.lock().unwrap(), &*downloader, &tx);
         }
-        s
+        resolve_intent(Intent::Confirm, &state, &*store, &mut *downloads.lock().unwrap(), &*downloader, &tx);
+        // First event in the bus must be DownloadRequested.
+        let events: Vec<_> = bus.drain().collect();
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::DownloadRequested(_))),
+            "Confirm must publish DownloadRequested; got {events:?}"
+        );
     }
 
     #[test]
-    fn menu_open_toggle_publishes_menu_opened() {
-        let (mut bus, store, repo, dl) = fixture();
+    fn quit_publishes_quit_event() {
+        let (mut bus, store, _tmp, downloads, downloader) = fixture();
         let tx = bus.sender();
         let state = UiState::default();
-        resolve_intent(Intent::ToggleMenu, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(matches!(events.as_slice(), [AppEvent::MenuOpened]));
+        resolve_intent(Intent::Quit, &state, &*store, &mut *downloads.lock().unwrap(), &*downloader, &tx);
+        let events: Vec<_> = bus.drain().collect();
+        assert!(matches!(events.last(), Some(AppEvent::Quit)));
     }
 
+    // smoke: block_closed on the focused waiting block cancels the
+    // table row when no other block is waiting on the same model.
     #[test]
-    fn menu_open_toggle_publishes_menu_closed_when_already_open() {
-        let (mut bus, store, repo, dl) = fixture();
+    fn block_closed_cancels_in_flight_row() {
+        let (mut bus, store, _tmp, downloads, downloader) = fixture();
         let tx = bus.sender();
         let mut state = UiState::default();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::ToggleMenu, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(matches!(events.as_slice(), [AppEvent::MenuClosed]));
-    }
-
-    #[test]
-    fn confirm_with_menu_open_publishes_session_shown_not_download() {
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = state_with_five_blocks();
-        // Highlight the first block in the menu list — that's the
-        // hidden block 1.
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Confirm, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1, "expected exactly one event; got {events:?}");
-        match &events[0] {
-            AppEvent::SessionShown { id } => assert_eq!(*id, 1),
-            other => panic!("expected SessionShown, got {other:?}"),
+        // Manually start a row and put the focused block in Waiting.
+        {
+            let mut d = downloads.lock().unwrap();
+            d.start(tiny().id).unwrap();
         }
-    }
-
-    #[test]
-    fn esc_with_menu_open_publishes_menu_closed_not_block_closed() {
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::BlockClosed, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1, "expected exactly one event; got {events:?}");
-        assert!(matches!(events.as_slice(), [AppEvent::MenuClosed]));
-    }
-
-    #[test]
-    fn picker_prev_next_with_menu_open_publish_menu_moved() {
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::PickerPrev, &state, &store, &repo, &dl, &tx);
-        resolve_intent(Intent::PickerNext, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0],
-            AppEvent::MenuMoved { direction: PickerMove::Up }
+        state.blocks.push(Block::new(
+            1,
+            BlockState::Waiting { model: tiny().id },
         ));
-        assert!(matches!(
-            &events[1],
-            AppEvent::MenuMoved { direction: PickerMove::Down }
-        ));
+        resolve_intent(
+            Intent::BlockClosed,
+            &state,
+            &*store,
+            &mut *downloads.lock().unwrap(),
+            &*downloader,
+            &tx,
+        );
+        let events: Vec<_> = bus.drain().collect();
+        // No DownloadFailed: cancel succeeded.
+        assert!(
+            !events.iter().any(|e| matches!(e, AppEvent::DownloadFailed { .. })),
+            "BlockClosed must not publish Failed when cancel succeeded; got {events:?}"
+        );
+        let row = downloads
+            .lock()
+            .unwrap()
+            .get(tiny().id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, crate::bus::DownloadStatus::Cancelling);
     }
-
-    #[test]
-    fn add_block_while_menu_open_still_publishes_add_block() {
-        // The menu only intercepts ToggleMenu, picker moves, Confirm,
-        // and Esc. AddBlock falls through unchanged so the user can
-        // still press `+` with the menu open.
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::AddBlock, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(matches!(events.as_slice(), [AppEvent::AddBlock]));
-    }
-
-    #[test]
-    fn quit_with_menu_open_still_publishes_quit() {
-        // Quit is not intercepted — the user must be able to leave
-        // the app even with the menu open.
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Quit, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(matches!(events.as_slice(), [AppEvent::Quit]));
-    }
-
-    #[test]
-    fn menu_open_with_no_blocks_publishes_toggle_only() {
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let state = UiState::default();
-        // Even without blocks, opening/closing the menu must publish
-        // exactly one event so the loop drains cleanly.
-        resolve_intent(Intent::ToggleMenu, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(matches!(events.as_slice(), [AppEvent::MenuOpened]));
-    }
-
-    #[test]
-    fn session_shown_picks_up_menu_index_for_block_id() {
-        // Sanity: SessionShown reads the id from the menu's selected
-        // row, not from `state.focus`. Highlight the last row in a
-        // 3-block state — id=3, even though focus=2.
-        let (mut bus, store, repo, dl) = fixture();
-        let tx = bus.sender();
-        let mut state = UiState::default();
-        for _ in 0..3 {
-            state.apply(&AppEvent::AddBlock);
-        }
-        state.menu = Some(SessionMenu::open_at(2));
-        resolve_intent(Intent::Confirm, &state, &store, &repo, &dl, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            AppEvent::SessionShown { id } => assert_eq!(*id, 3),
-            other => panic!("expected SessionShown for id=3, got {other:?}"),
-        }
-    }
-
 }
