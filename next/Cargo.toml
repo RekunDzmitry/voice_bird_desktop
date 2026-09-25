@@ -23,6 +23,7 @@ default = ["net"]
 net = ["dep:reqwest"]
 
 [dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = "0.4"
 directories = "5"
 ratatui = "0.29"
