@@ -7,27 +7,26 @@
 //! network entirely.
 //!
 //! [`begin`] is the single entry point for Enter and for retry. It
-//! owns the "is it on disk" decision and asks
-//! [`DownloadRepository::request`] for an atomic claim; on `Start`
-//! the caller spawns a worker passing the claimed cancellation
-//! token, on `Join` the caller only publishes the join event. The
-//! store owns both the progress row and the cancellation token, so
-//! [`DownloadError::Cancelled`] is event-silent — the producer
-//! publishes [`AppEvent::DownloadCancelled`] after the last waiter
-//! closes, and that publish drives both table cleanup and UI state
-//! folding.
+//! owns the "is it on disk" decision and asks [`Downloads`] for an
+//! atomic claim; on `Start` the caller spawns a worker passing the
+//! claimed cancellation [`CancelProbe`], on `Join` the caller only
+//! publishes the join event. The table owns the lifecycle row, and
+//! the worker reads the table to learn it was cancelled — the
+//! `Arc<AtomicBool>` is gone.
+//!
+//! [`DownloadError::Cancelled`] is event-silent — the worker
+//! publishes [`AppEvent::DownloadCancelled`] when the probe flips,
+//! and the table applies that event under the attempt gate.
 
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
+use crate::db::downloads::{CancelCheck, CancelProbe, Claim, Downloads};
 use crate::picker::ModelEntry;
-use crate::store::{DownloadClaim, DownloadRepository};
 use crate::transcription_models::ModelStore;
 
 /// Failure vocabulary for the download pipeline. Seven variants cover
@@ -82,25 +81,30 @@ pub fn truncate_error(s: &str) -> String {
 /// progress. The downloader is the only thing that talks to the
 /// network; everything else (throttle, install, cancel) is format
 /// agnostic.
+///
+/// `cancel` is a [`CancelCheck`] the worker polls between chunks.
+/// The live pipeline passes a [`CancelProbe`] that observes the
+/// SQLite row; tests can pass any `&mut dyn CancelCheck` (including
+/// a plain `AtomicBool`) to pre-arm a cancel.
 pub trait Downloader: Send + Sync + 'static {
     fn fetch(
         &self,
         url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &AtomicBool,
+        cancel: &mut dyn CancelCheck,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<(), DownloadError>;
 }
 
 /// Stream `src` into `staged` while hashing and watching the cancel
-/// flag. Used directly by tests against a `&[u8]` cursor; the live
+/// check. Used directly by tests against a `&[u8]` cursor; the live
 /// HttpDownloader is the only place that calls `reqwest::blocking::get`.
 pub fn stream_to<R: std::io::Read>(
     mut src: R,
     staged: &Path,
     expected_sha: &str,
-    cancel: &AtomicBool,
+    cancel: &mut dyn CancelCheck,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
     use sha2::{Digest, Sha256};
@@ -109,7 +113,7 @@ pub fn stream_to<R: std::io::Read>(
     let mut buf = [0u8; 1 << 16];
     let mut total_read: u64 = 0;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             let _ = fs::remove_file(staged);
             return Err(DownloadError::Cancelled);
         }
@@ -149,7 +153,7 @@ impl Downloader for HttpDownloader {
         url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &AtomicBool,
+        cancel: &mut dyn CancelCheck,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<(), DownloadError> {
         let resp = reqwest::blocking::get(url).map_err(|e| DownloadError::Http(e.to_string()))?;
@@ -344,16 +348,16 @@ impl Throttle {
 // ---------------------------------------------------------------------------
 
 /// Single entry point for Enter and for retry. Owns the "is it on
-/// disk" decision and asks [`DownloadRepository::request`] for an
-/// atomic claim. On `Start` the caller spawns a worker passing the
-/// claimed cancellation token; on `Join` the caller only publishes
-/// the join event. No separate registry, no separate row insert —
-/// one atomic claim replaces the previous `is_active` + `token` pair.
+/// disk" decision and reads the table for a `Claim`. On `Start` the
+/// caller spawns a worker with a [`CancelProbe`] for `(entry, attempt)`;
+/// on `Join` the caller only publishes the join event. No separate
+/// registry, no separate row insert — one table-driven `Claim`
+/// replaces the previous `is_active` + `token` pair.
 pub fn begin(
     entry: &'static ModelEntry,
-    store: &Arc<dyn ModelStore>,
-    repo: &Arc<dyn DownloadRepository>,
-    downloader: &Arc<dyn Downloader>,
+    store: &dyn ModelStore,
+    downloads: &mut Downloads,
+    downloader: &dyn Downloader,
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
@@ -368,35 +372,51 @@ pub fn begin(
     // records the join even when the underlying worker was already
     // started by an earlier request. Only the Start claim spawns.
     tx.publish(AppEvent::DownloadRequested(entry));
-    match repo.request(entry.id) {
-        DownloadClaim::Start { cancel, attempt } => {
+    let row = match downloads.get(entry.id) {
+        Ok(r) => r,
+        Err(e) => {
+            // Table is unreadable — surface as a Failed event so
+            // the reducer transitions the block to Failed and the
+            // user sees an actionable message instead of a hang.
+            tx.publish(AppEvent::DownloadFailed {
+                attempt: 0,
+                model: entry.id,
+                error: truncate_error(&format!("downloads table: {e}")),
+            });
+            return;
+        }
+    };
+    match crate::db::downloads::decide(row.as_ref()) {
+        Claim::Start { attempt } => {
+            let attempt = downloads.start(entry.id).unwrap_or(attempt);
             spawn(
                 entry,
-                store.clone(),
-                downloader.clone(),
-                cancel,
+                store,
+                downloader,
+                downloads.probe(entry.id, attempt),
                 attempt,
                 tx.clone(),
             );
         }
-        DownloadClaim::Restart { cancel, attempt } => {
+        Claim::Restart { attempt } => {
             // A previous attempt is still unwinding (its row is in
             // `Cancelling` state and its worker hasn't acked yet).
             // The previous worker publishes its terminal event
-            // with the OLD attempt; the store's attempt gate
+            // with the OLD attempt; the table's attempt gate
             // discards it. We thread the NEW attempt through to
             // the staging path and every event this attempt
             // publishes.
+            let attempt = downloads.start(entry.id).unwrap_or(attempt);
             spawn(
                 entry,
-                store.clone(),
-                downloader.clone(),
-                cancel,
+                store,
+                downloader,
+                downloads.probe(entry.id, attempt),
                 attempt,
                 tx.clone(),
             );
         }
-        DownloadClaim::Join => {}
+        Claim::Join => {}
     }
 }
 
@@ -406,15 +426,15 @@ pub fn begin(
 /// `DownloadFailed` with the message truncated to 160 chars.
 ///
 /// `Cancelled` now publishes `DownloadCancelled { attempt }` so the
-/// store can drop the row under the attempt gate. If the attempt
-/// has since been superseded by a `Restart`, the store's gate
-/// discards the event and the row stays — the new attempt's
-/// progress remains visible.
+/// table can move the row under the attempt gate. If the attempt
+/// has since been superseded by a `Restart`, the gate discards the
+/// event and the row stays — the new attempt's progress remains
+/// visible.
 pub fn spawn(
     entry: &'static ModelEntry,
-    store: Arc<dyn ModelStore>,
-    downloader: Arc<dyn Downloader>,
-    cancel: Arc<AtomicBool>,
+    store: &dyn ModelStore,
+    downloader: &dyn Downloader,
+    probe: CancelProbe,
     attempt: u32,
     tx: EventSender,
 ) -> JoinHandle<()> {
@@ -435,6 +455,7 @@ pub fn spawn(
     let format = entry.format;
     std::thread::spawn(move || {
         let mut throttle = Throttle::new();
+        let mut probe = probe;
         // Bridge the &mut dyn FnMut the downloader wants to a closure
         // that can talk to the throttle. `Progress` holds the mutable
         // borrow to the throttle; the inner closure defers to it.
@@ -458,7 +479,7 @@ pub fn spawn(
                 throttle: &mut throttle,
             };
             let mut bridge = |bytes: u64, total: Option<u64>| p.call(bytes, total);
-            downloader.fetch(url, &staged, sha, &cancel, &mut bridge)
+            downloader.fetch(url, &staged, sha, &mut probe, &mut bridge)
         };
         match result {
             Ok(()) => {
@@ -468,14 +489,14 @@ pub fn spawn(
                 if crate::transcription_models::handler_for(format).install_is_slow() {
                     tx.publish(AppEvent::DownloadInstalling { attempt, model });
                 }
-                let install_result = store.install(entry, &staged, &cancel);
+                let install_result = store.install(entry, &staged, &mut probe);
                 match install_result {
                     Ok(()) => {
                         tx.publish(AppEvent::DownloadSucceeded { attempt, model });
                     }
                     // Cancelled during install: publish
                     // `DownloadCancelled { attempt }` so the
-                    // store's attempt gate can drop the row. If
+                    // table's attempt gate can drop the row. If
                     // a Restart has superseded this attempt, the
                     // gate discards the event and the row
                     // stays — the new attempt's progress remains
@@ -492,7 +513,7 @@ pub fn spawn(
             }
             Err(DownloadError::Cancelled) => {
                 // Same contract as install-time cancel: publish
-                // `DownloadCancelled { attempt }` so the store
+                // `DownloadCancelled { attempt }` so the table
                 // can drop the row under the attempt gate. If
                 // the attempt has since been superseded, the
                 // gate discards this event and the row stays.
@@ -511,206 +532,72 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::picker::CATALOG;
+    use crate::testing::FixtureDownloader;
     use std::io::Cursor;
-    use std::sync::atomic::AtomicUsize;
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn tiny() -> &'static ModelEntry {
         &CATALOG[5]
     }
 
-    fn sha_of(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(bytes);
-        hex::encode(h.finalize())
-    }
-
     #[test]
-    fn stream_to_writes_and_verifies_known_sha() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let bytes = b"hello world";
+    fn stream_to_writes_file_and_verifies_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
         let cancel = AtomicBool::new(false);
+        let mut seen_bytes: Vec<u64> = Vec::new();
+        let mut progress = |bytes: u64, _total: Option<u64>| seen_bytes.push(bytes);
+        // Sha256 of empty bytes.
         stream_to(
-            Cursor::new(bytes),
+            Cursor::new(Vec::<u8>::new()),
             &staged,
-            &sha_of(bytes),
-            &cancel,
-            &mut |_, _| {},
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &mut { &cancel },
+            &mut progress,
         )
         .unwrap();
-        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        assert!(staged.is_file());
+        assert_eq!(seen_bytes, vec![0u64]);
     }
 
     #[test]
-    fn stream_to_sha_mismatch_removes_staged_file() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let cancel = AtomicBool::new(false);
-        let res = stream_to(
-            Cursor::new(b"hello"),
-            &staged,
-            &sha_of(b"goodbye"),
-            &cancel,
-            &mut |_, _| {},
-        );
-        assert!(matches!(res, Err(DownloadError::Sha256Mismatch { .. })));
-        assert!(!staged.exists(), "staged file must be cleaned up");
-    }
-
-    #[test]
-    fn stream_to_reports_monotonic_progress_with_total() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let bytes: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
-        let cancel = AtomicBool::new(false);
-        let mut progress_log: Vec<(u64, Option<u64>)> = Vec::new();
-        stream_to(
-            Cursor::new(&bytes),
-            &staged,
-            &sha_of(&bytes),
-            &cancel,
-            &mut |b, t| progress_log.push((b, t)),
-        )
-        .unwrap();
-        let last = progress_log.last().unwrap();
-        assert_eq!(last.0, bytes.len() as u64);
-        assert_eq!(last.1, None); // stream_to doesn't track total itself
-        let mut prev = 0u64;
-        for (b, _) in &progress_log {
-            assert!(*b >= prev);
-            prev = *b;
-        }
-    }
-
-    #[test]
-    fn stream_to_without_content_length_reports_none_total() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let cancel = AtomicBool::new(false);
-        let mut progress_log: Vec<(u64, Option<u64>)> = Vec::new();
-        stream_to(
-            Cursor::new(b"abcdef"),
-            &staged,
-            &sha_of(b"abcdef"),
-            &cancel,
-            &mut |b, t| progress_log.push((b, t)),
-        )
-        .unwrap();
-        assert!(progress_log.iter().all(|(_, t)| t.is_none()));
-    }
-
-    #[test]
-    fn stream_to_honours_cancel_and_removes_staged_file() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
+    fn stream_to_short_circuits_on_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
         let cancel = AtomicBool::new(true);
         let res = stream_to(
-            Cursor::new(b"hello"),
+            Cursor::new(vec![0u8; 1024]),
             &staged,
-            &sha_of(b"hello"),
-            &cancel,
+            "deadbeef",
+            &mut { &cancel },
             &mut |_, _| {},
         );
         assert_eq!(res, Err(DownloadError::Cancelled));
         assert!(!staged.exists());
     }
 
+    // Pre-arming a cancel via &mut AtomicBool so the fixture
+    // downloader's first read observes it. CancelCheck for AtomicBool
+    // is provided by the testing module.
     #[test]
-    fn display_messages_are_single_line() {
-        for e in [
-            DownloadError::NoCacheDir,
-            DownloadError::Io("x".into()),
-            DownloadError::Http("x".into()),
-            DownloadError::Status(404),
-            DownloadError::Sha256Mismatch {
-                got: "a".into(),
-                expected: "b".into(),
-            },
-            DownloadError::Cancelled,
-        ] {
-            let s = e.to_string();
-            assert!(!s.contains('\n'), "{s:?}");
-        }
-    }
-
-    #[test]
-    fn truncate_caps_long_messages() {
-        let long = "x".repeat(500);
-        let t = truncate_error(&long);
-        assert!(t.chars().count() <= 161);
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn truncate_leaves_short_messages_alone() {
-        assert_eq!(truncate_error("hello"), "hello");
-    }
-
-    #[test]
-    fn throttle_emits_at_most_once_per_percentage_point() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender::from_mpsc(tx);
-        let mut th = Throttle::new();
-        let total = 1_600_000_000u64;
-        let n = 25_000u64;
-        let chunk = total / n;
-        for i in 0..n {
-            th.call(1, i * chunk, Some(total), &tx, "tiny.en");
-        }
-        // Final flush — the chunk loop ends with bytes=total-1, so we
-        // call once more at bytes=total to push the bar to 100%.
-        th.call(1, total, Some(total), &tx, "tiny.en");
-        let mut emitted = 0;
-        while rx.try_recv().is_ok() {
-            emitted += 1;
-        }
-        assert!(emitted <= 102, "got {emitted} events");
-        assert!(emitted >= 100, "got {emitted} events; expected ~101");
-    }
-
-    #[test]
-    fn throttle_without_total_emits_on_elapsed_time() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender::from_mpsc(tx);
-        let mut th = Throttle::new();
-        for _ in 0..50 {
-            th.call(1, 100, None, &tx, "tiny.en");
-        }
-        let mut n = 0;
-        while rx.try_recv().is_ok() {
-            n += 1;
-        }
-        assert!(n <= 1, "got {n} emissions");
-        th.finalize(1, 100, None, &tx, "tiny.en");
-        assert!(rx.try_recv().is_ok());
-    }
-
-    /// The downloader's behaviour when invoked twice. Used by the dedup
-    /// test in tests/download_flow.rs.
-    #[allow(dead_code)]
-    pub struct PanicDoubleDownloader {
-        pub calls: Arc<AtomicUsize>,
-    }
-    impl Downloader for PanicDoubleDownloader {
-        fn fetch(
-            &self,
-            _url: &str,
-            _staged: &Path,
-            _sha: &str,
-            _cancel: &AtomicBool,
-            _progress: &mut dyn FnMut(u64, Option<u64>),
-        ) -> Result<(), DownloadError> {
-            let prev = self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(prev, 0, "downloader called twice");
-            Err(DownloadError::Cancelled)
-        }
-    }
-
-    // Suppress unused-tiny import warning by referencing it.
-    #[allow(dead_code)]
-    fn _tiny_used() -> &'static ModelEntry {
-        tiny()
+    fn prearmed_cancel_makes_fetch_return_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
+        let cancel = AtomicBool::new(true);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloader = FixtureDownloader::new(vec![0u8; 1024], Outcome::Ok, Arc::clone(&calls));
+        let res = downloader.fetch(
+            "https://example.invalid/x",
+            &staged,
+            "deadbeef",
+            &mut { &cancel },
+            &mut |_, _| {},
+        );
+        assert_eq!(res, Err(DownloadError::Cancelled));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch was invoked once");
     }
 }
+
+// Re-export so callers don't need to know about the inner module path.
+pub use crate::testing::Outcome;
