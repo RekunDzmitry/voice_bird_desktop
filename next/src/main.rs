@@ -154,7 +154,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             dirty = true;
         }
         if state.should_quit {
-            cleanup_inflight(&mut db, &mut bus);
+            cleanup_inflight(&mut db, &mut bus, &dispatcher);
             break;
         }
     }
@@ -175,7 +175,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 /// `DiscardInflight { model }` is published for each active
 /// claim instead of reaching into the model store directly. The
 /// dispatcher that owns the store answers it on the next drain.
-fn cleanup_inflight(db: &mut Database, bus: &mut EventBus) {
+fn cleanup_inflight(db: &mut Database, bus: &mut EventBus, dispatcher: &Dispatcher) {
     let active = match downloads::active(db) {
         Ok(a) => a,
         Err(_) => return,
@@ -187,11 +187,21 @@ fn cleanup_inflight(db: &mut Database, bus: &mut EventBus) {
     for model in models {
         bus.sender().publish(AppEvent::DiscardInflight { model });
     }
-    for ev in bus.drain() {
+    // Drain the DiscardInflight events we just published and run
+    // them through the dispatcher so `ModelStore::discard_inflight`
+    // is actually called. Without this dispatch step, the staged
+    // archive and unpack scratch directory for every in-flight
+    // attempt would survive process exit, and the next session's
+    // first pick on the same model would attempt to unpack from
+    // a half-written `.tmp/` (the user-observed 2026-09-16
+    // `install: unpack: failed to unpack ...tmp/...` error).
+    let events: Vec<AppEvent> = bus.drain().collect();
+    for ev in &events {
         if let Some(l) = voice_bird_next::event_log::EventLog::open().as_mut() {
-            l.append(&ev);
+            l.append(ev);
         }
     }
+    dispatcher.dispatch(&events, db, &bus.sender());
 }
 
 #[cfg(feature = "net")]

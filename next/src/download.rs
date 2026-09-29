@@ -280,30 +280,59 @@ pub fn begin(
         }
     };
     match downloads::decide(row.as_ref()) {
-        Claim::Start { attempt } => {
-            let attempt = downloads::start(db, entry.id).unwrap_or(attempt);
-            spawn(
-                entry,
-                store.clone(),
-                downloader.clone(),
-                downloads::probe(db, entry.id, attempt),
-                attempt,
-                tx.clone(),
-            );
-        }
-        Claim::Restart { attempt } => {
-            let attempt = downloads::start(db, entry.id).unwrap_or(attempt);
-            spawn(
-                entry,
-                store.clone(),
-                downloader.clone(),
-                downloads::probe(db, entry.id, attempt),
-                attempt,
-                tx.clone(),
-            );
-        }
+        Claim::Start { attempt } => start_or_fail(
+            entry,
+            store,
+            db,
+            downloader,
+            attempt,
+            tx,
+        ),
+        Claim::Restart { attempt } => start_or_fail(
+            entry,
+            store,
+            db,
+            downloader,
+            attempt,
+            tx,
+        ),
         Claim::Join => {}
     }
+}
+
+/// Claim a fresh attempt and spawn the worker. If `downloads::start`
+/// fails (disk full, lock timeout, write error), publish
+/// `DownloadFailed` with the underlying error and return without
+/// spawning — otherwise the worker would start with no row in the
+/// table, the attempt gate would reject every event it publishes,
+/// and the UI would be stuck on `DownloadRequested` forever.
+fn start_or_fail(
+    entry: &'static ModelEntry,
+    store: Arc<dyn ModelStore>,
+    db: &mut Database,
+    downloader: Arc<dyn Downloader>,
+    attempt: u32,
+    tx: &EventSender,
+) {
+    let attempt = match downloads::start(db, entry.id) {
+        Ok(a) => a,
+        Err(e) => {
+            tx.publish(AppEvent::DownloadFailed {
+                attempt,
+                model: entry.id,
+                error: truncate_error(&format!("downloads table: {e}")),
+            });
+            return;
+        }
+    };
+    spawn(
+        entry,
+        store,
+        downloader,
+        downloads::probe(db, entry.id, attempt),
+        attempt,
+        tx.clone(),
+    );
 }
 
 pub fn spawn(
@@ -522,5 +551,95 @@ mod tests {
         throttle.last_emit_ms = 1_000;
         assert!(!throttle.should_emit(2048, None, 1_100), "100 ms later is inside the gate");
         assert!(throttle.should_emit(4096, None, 1_260), "260 ms later is past the gate");
+    }
+    // Regression for the silent `unwrap_or(attempt)` bug: when
+    // `downloads::start` fails (disk full, lock timeout, write
+    // error), the orchestrator must publish `DownloadFailed` with
+    // the underlying error and return without spawning a worker.
+    // Otherwise the worker would start without a row in the table,
+    // the attempt gate would reject every event it publishes, and
+    // the UI would be stuck on `DownloadRequested` forever.
+    //
+    // Drive the failure with a `Database` whose writer connection
+    // is opened `SQLITE_OPEN_READ_ONLY`: every `execute()` write
+    // returns `SQLITE_READONLY`. This mirrors the production
+    // failure mode without an OS-level chmod dance and without
+    // consuming the `Connection` via `close` (which would prevent
+    // us from embedding it back into `Database::conn`).
+    #[test]
+    fn start_or_fail_surfaces_db_write_failure_as_download_failed() {
+        use crate::bus::EventBus;
+        use crate::db::Database;
+        use crate::picker::{CATALOG, ModelEntry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("downloads.sqlite");
+        // Bootstrap: open the file, run the migration, drop the
+        let bootstrap = rusqlite::Connection::open(&path).unwrap();
+        bootstrap
+            .execute_batch(
+                <crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION,
+            )
+            .unwrap();
+        bootstrap.close().map_err(|(_, e)| e).unwrap();
+        // Re-open with `SQLITE_OPEN_READ_ONLY`. Every subsequent
+        // write from `downloads::start` returns `SQLITE_READONLY`.
+        let readonly = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only");
+        let mut bus = EventBus::new();
+        let tiny: &'static ModelEntry = &CATALOG[5];
+        let store: Arc<dyn crate::transcription_models::ModelStore> =
+            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
+        let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            Arc::clone(&calls),
+        ));
+
+        // Call the private helper directly so we know exactly
+        // where the failure surfaces. The same `start_or_fail` is
+        // invoked by `download::begin` for both `Claim::Start` and
+        // `Claim::Restart`.
+        start_or_fail(
+            tiny,
+            store,
+            &mut db,
+            downloader,
+            /* attempt = */ 1,
+            &bus.sender(),
+        );
+
+        // The fetcher must not have been touched — the failure
+        // happens at the row-write step, before `spawn` runs.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "worker must not spawn when downloads::start fails"
+        );
+
+        // The bus must carry `DownloadFailed` with the model id and
+        // an error message derived from the underlying SQL error.
+        let events: Vec<AppEvent> = bus.drain().collect();
+        let failed = events.iter().find_map(|ev| match ev {
+            AppEvent::DownloadFailed { model, error, .. } => {
+                Some((*model, error.clone()))
+            }
+            _ => None,
+        });
+        let (model, error) = failed.expect("DownloadFailed must be published");
+        assert_eq!(model, tiny.id);
+        assert!(
+            !error.is_empty(),
+            "DownloadFailed must carry the underlying SQL error message"
+        );
+        assert!(
+            error.contains("downloads table"),
+            "error must be prefixed by the table name; got {error:?}"
+        );
     }
 }

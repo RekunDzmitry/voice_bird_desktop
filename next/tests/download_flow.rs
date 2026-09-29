@@ -590,8 +590,17 @@ fn user_scenario_pick_cancel_during_install_retry_does_full_fetch() {
 fn quit_during_install_leaves_cache_clean() {
     // Production cleanup path: when the user quits mid-install, the
     // active rows are cancelled and `discard_inflight` drops the
-    // staged archive / unpack scratch directory for each model.
+    // staged archive and unpack scratch directory for each model.
     // No `.part` / `.tmp` artifacts may survive in the cache dir.
+    //
+    // This test exercises the *exact* `main::cleanup_inflight`
+    // logic by publishing `DiscardInflight` for every active row
+    // and running the drained events through `Dispatcher::dispatch`.
+    // The previous version called `store.discard_inflight` directly,
+    // which bypassed the dispatcher and silently passed even when
+    // the production code path was broken (Sep 2026 regression:
+    // `cleanup_inflight` published events but never dispatched
+    // them, so the cache dir was never cleaned on quit).
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
@@ -618,6 +627,8 @@ fn quit_during_install_leaves_cache_clean() {
         )
         .with_delay(20),
     );
+    let dispatcher =
+        voice_bird_next::dispatcher::Dispatcher::new(downloader.clone(), store.clone());
     let mut bus = EventBus::new();
     let tx = bus.sender();
     let mut downloads_h = downloads_with(&bus);
@@ -632,17 +643,26 @@ fn quit_during_install_leaves_cache_clean() {
         &tx,
     );
     std::thread::sleep(Duration::from_millis(120));
-    // Production cleanup path.
+    // Production cleanup path: cancel every active row, publish a
+    // DiscardInflight for each, drain the bus, and run the events
+    // through the dispatcher. This is the same code that
+    // `main::cleanup_inflight` runs at Quit; if any step is missing
+    // the staged archive / scratch dir would survive.
     let active = downloads::active(&downloads_h.db).unwrap();
+    assert!(
+        !active.is_empty(),
+        "begin should leave at least one in-flight row"
+    );
     for row in &active {
         let _ = downloads::cancel(&mut downloads_h.db, row.model.as_ref());
     }
-    for row in &active {
-        if let Some(entry) = CATALOG.iter().find(|e| e.id == row.model.as_ref()) {
-            store.discard_inflight(entry);
-        }
+    let models: Vec<std::sync::Arc<str>> =
+        active.iter().map(|r| r.model.clone()).collect();
+    for model in models {
+        tx.publish(AppEvent::DiscardInflight { model });
     }
-    let _drained: Vec<_> = bus.drain().collect();
+    let events: Vec<AppEvent> = bus.drain().collect();
+    dispatcher.dispatch(&events, &mut downloads_h.db, &tx);
     std::thread::sleep(Duration::from_millis(200));
     let leftover: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
