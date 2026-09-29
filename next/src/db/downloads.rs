@@ -20,29 +20,28 @@
 //!
 //! ## Lifecycle transitions
 //!
-//! Every state change funnels through [`Downloads::transition`],
+//! Every state change funnels through [`transition`],
 //! which is the only path that publishes
 //! [`AppEvent::DownloadStatusChanged`]. Because the publish happens
 //! *after* the SQL `UPDATE` returns, the SQL state and the bus log
 //! can never disagree — the row is the truth, the log is the audit
 //! trail, and the publish lives where both can see it.
 //!
-//! On startup, [`Downloads::open`] rewrites every leftover
+//! On startup, [`Database::open`] rewrites every leftover
 //! non-terminal row (Downloading / Installing / Cancelling) to
 //! `Interrupted` and logs each transition. Rows in a terminal state
 //! (Cancelled / Succeeded / Failed) are left alone — they're audit
 //! data, not stragglers.
-
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-
-use crate::bus::{AppEvent, DownloadStatus, EventSender};
-
-use super::Table;
+use super::{Database, Table};
+#[cfg(test)]
+use crate::bus::EventSender;
+use crate::bus::{AppEvent, DownloadStatus};
 
 /// Cooldown between probes. A download worker checks
 /// `is_cancelled()` between chunks; querying the table on every
@@ -158,374 +157,373 @@ fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
         })
 }
 
-/// The download lifecycle store. Owns one writer connection and a
-/// cloneable [`EventSender`] so every transition can publish
-/// `DownloadStatusChanged` without crossing thread boundaries.
+/// The downloads table lives behind the [`Database`] handle. The
+/// handle owns the connection and the event sender; this module's
+/// free functions take `&Database` / `&mut Database` so callers
+/// don't grow their signatures as more tables land. New operations
+/// are added here as free fns that borrow the same `Database`.
+/// The `Downloads` struct that previously owned the connection is
+/// gone — there is now exactly one writer per process.
+/// workers don't touch it directly; they hold a [`CancelProbe`]
+/// instead. All access goes through free functions in this module
+/// that borrow the [`Database`] handle.
 ///
-/// Constructed once at startup ([`Downloads::open`]) and held on the
-/// loop stack as `&mut Downloads`. Workers don't touch it directly;
-/// they hold a [`CancelProbe`] instead.
-pub struct Downloads {
-    conn: Connection,
-    #[allow(dead_code)]
-    path: PathBuf,
-    tx: EventSender,
+/// ## Free functions on `Database`
+///
+/// Every operation the loop used to call as `downloads.apply(...)`
+/// or `downloads.cancel(...)` is now a free function that takes
+/// `&Database` / `&mut Database`:
+///
+/// - [`get`] / [`active`] / [`start`] / [`cancel`] / [`apply`]
+/// - [`probe`] (read-only; used by workers)
+/// - [`recover_interrupted`] (run once from [`Database::open`])
+///
+/// Callers pass the whole database, then pick the table they need.
+/// Adding a second table later is one new module of free functions
+/// and one more `&Database` borrow — no signature churn in
+/// `producer::resolve_intent`, `download::begin`,
+/// `main::handle_key`, etc.
+pub fn get(db: &Database, model: &str) -> rusqlite::Result<Option<DownloadRow>> {
+    db.conn_ref()
+        .query_row(
+            "SELECT model, attempt, status, error, created_at, updated_at \
+             FROM downloads WHERE model = ?1",
+            params![model],
+            DownloadRow::from_row,
+        )
+        .optional()
 }
 
-impl Downloads {
-    /// Open (or create) the downloads table at `path` and recover
-    /// any rows left in a non-terminal state by a previous crashed
-    /// session. The recovery is logged per row — a Cancelling row
-    /// at startup means the previous Quit didn't reach `apply`, so
-    /// the audit log records the upgrade.
-    pub fn open(path: &Path, tx: EventSender) -> rusqlite::Result<Self> {
-        let conn = super::open(path)?;
-        super::migrate(&conn, &[DownloadsTable])?;
-        let mut downloads = Self {
-            conn,
-            path: path.to_path_buf(),
-            tx,
-        };
-        downloads.recover_interrupted()?;
-        Ok(downloads)
-    }
+/// Rows that are NOT in a terminal state. Used at Quit to find
+/// every in-flight model so the cleanup loop can flip them to
+/// `Cancelling` before process exit.
+pub fn active(db: &Database) -> rusqlite::Result<Vec<DownloadRow>> {
+    let mut stmt = db.conn_ref().prepare(
+        "SELECT model, attempt, status, error, created_at, updated_at \
+         FROM downloads \
+         WHERE status NOT IN ('Cancelled','Succeeded','Failed','Interrupted')",
+    )?;
+    let rows = stmt
+        .query_map([], DownloadRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 
-    /// Read one row by model id.
-    pub fn get(&self, model: &str) -> rusqlite::Result<Option<DownloadRow>> {
-        self.conn
-            .query_row(
-                "SELECT model, attempt, status, error, created_at, updated_at \
-                 FROM downloads WHERE model = ?1",
-                params![model],
-                DownloadRow::from_row,
-            )
-            .optional()
-    }
+/// Upsert a row for `model`: bump the attempt (so a new
+/// supersedes any old), set `Downloading`, and reset
+/// `created_at` to "now". The publish happens after the SQL
+/// returns so the bus log records the transition.
+pub fn start(db: &mut Database, model: &'static str) -> rusqlite::Result<u32> {
+    let now = Utc::now();
+    let now_s = format_ts(now);
+    let prior = get(db, model)?;
+    let attempt = match prior.as_ref() {
+        Some(row) => row.attempt + 1,
+        None => 1,
+    };
+    db.conn_mut().execute(
+        "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?4) \
+         ON CONFLICT(model) DO UPDATE SET \
+            attempt = excluded.attempt, \
+            status = excluded.status, \
+            error = NULL, \
+            created_at = excluded.created_at, \
+            updated_at = excluded.updated_at",
+        params![model, attempt, status_to_sql(DownloadStatus::Downloading), now_s],
+    )?;
+    let from = prior.map(|r| r.status);
+    db.tx().publish(AppEvent::DownloadStatusChanged {
+        model: Arc::from(model),
+        attempt,
+        from,
+        to: DownloadStatus::Downloading,
+    });
+    Ok(attempt)
+}
 
-    /// Rows that are NOT in a terminal state. Used at Quit to find
-    /// every in-flight model so the cleanup loop can flip them to
-    /// `Cancelling` before process exit.
-    pub fn active(&self) -> rusqlite::Result<Vec<DownloadRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT model, attempt, status, error, created_at, updated_at \
-             FROM downloads \
-             WHERE status NOT IN ('Cancelled','Succeeded','Failed','Interrupted')",
-        )?;
-        let rows = stmt
-            .query_map([], DownloadRow::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+/// Active row → Cancelling. Returns true on the first
+/// transition; false if the row is already non-Active (so a
+/// second cancel from a duplicate close is a no-op publish).
+pub fn cancel(db: &mut Database, model: &str) -> rusqlite::Result<bool> {
+    let row = match get(db, model)? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    if !matches!(
+        row.status,
+        DownloadStatus::Downloading | DownloadStatus::Installing
+    ) {
+        return Ok(false);
     }
+    let now_s = format_ts(Utc::now());
+    db.conn_mut().execute(
+        "UPDATE downloads SET status = ?1, updated_at = ?2 WHERE model = ?3 AND attempt = ?4",
+        params![
+            status_to_sql(DownloadStatus::Cancelling),
+            now_s,
+            model,
+            row.attempt,
+        ],
+    )?;
+    db.tx().publish(AppEvent::DownloadStatusChanged {
+        model: row.model.clone(),
+        attempt: row.attempt,
+        from: Some(row.status),
+        to: DownloadStatus::Cancelling,
+    });
+    Ok(true)
+}
 
-    /// Upsert a row for `model`: bump the attempt (so a new
-    /// supersedes any old), set `Downloading`, and reset
-    /// `created_at` to "now". The publish happens after the SQL
-    /// returns so the bus log records the transition.
-    pub fn start(&mut self, model: &'static str) -> rusqlite::Result<u32> {
-        let now = Utc::now();
-        let now_s = format_ts(now);
-        // Upsert: if a row exists, advance attempt and reset
-        // created_at; otherwise insert at attempt 1.
-        let prior = self.get(model)?;
-        let attempt = match prior.as_ref() {
-            Some(row) => row.attempt + 1,
-            None => 1,
-        };
-        self.conn.execute(
-            "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, NULL, ?4, ?4) \
-             ON CONFLICT(model) DO UPDATE SET \
-                attempt = excluded.attempt, \
-                status = excluded.status, \
-                error = NULL, \
-                created_at = excluded.created_at, \
-                updated_at = excluded.updated_at",
-            params![model, attempt, status_to_sql(DownloadStatus::Downloading), now_s],
-        )?;
-        let from = prior.map(|r| r.status);
-        self.tx.publish(AppEvent::DownloadStatusChanged {
-            model: Arc::from(model),
-            attempt,
-            from,
-            to: DownloadStatus::Downloading,
-        });
-        Ok(attempt)
-    }
-
-    /// Active row → Cancelling. Returns true on the first
-    /// transition; false if the row is already non-Active (so a
-    /// second cancel from a duplicate close is a no-op publish).
-    pub fn cancel(&mut self, model: &str) -> rusqlite::Result<bool> {
-        let row = match self.get(model)? {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-        if !matches!(
-            row.status,
-            DownloadStatus::Downloading | DownloadStatus::Installing
-        ) {
-            return Ok(false);
+/// Fold one drained [`AppEvent`] into the table. Returns
+/// `true` if the event was applied to the row, `false` if the
+/// event was stale (attempt mismatch) or a no-op (the reducer
+/// skips UI state changes for `false` returns).
+///
+/// Stale events publish [`AppEvent::DownloadEventRejected`]
+/// before returning `false`, so the JSONL event log records the
+/// drop instead of silently filtering it.
+pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
+    match ev {
+        AppEvent::DownloadRequested(_) => {
+            // `DownloadRequested` is published by the resolver
+            // *after* a successful claim — `start` already
+            // inserted the row. The event itself carries no
+            // attempt, so it's not a transition.
+            Ok(true)
         }
-        let now_s = format_ts(Utc::now());
-        self.conn.execute(
-            "UPDATE downloads SET status = ?1, updated_at = ?2 WHERE model = ?3 AND attempt = ?4",
-            params![
-                status_to_sql(DownloadStatus::Cancelling),
-                now_s,
+        AppEvent::DownloadProgress {
+            attempt,
+            model,
+            bytes: _,
+            total: _,
+            ..
+        } => {
+            // Progress is intentionally not persisted: the
+            // renderer reads bytes/total straight off the
+            // bus, and writing the table at 10 Hz per download
+            // adds nothing. Return `true` so the reducer still
+            // applies the gauge update.
+            if matches_attempt(db, model, *attempt)? {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
+        }
+        AppEvent::DownloadInstalling { attempt, model } => {
+            if !matches_attempt(db, model, *attempt)? {
+                reject(db, ev, *attempt);
+                return Ok(false);
+            }
+            transition(
+                db,
                 model,
-                row.attempt,
+                *attempt,
+                Some(DownloadStatus::Downloading),
+                DownloadStatus::Installing,
+                None,
+            )?;
+            Ok(true)
+        }
+        AppEvent::DownloadSucceeded { attempt, model } => {
+            if !matches_attempt(db, model, *attempt)? {
+                reject(db, ev, *attempt);
+                return Ok(false);
+            }
+            transition(
+                db,
+                model,
+                *attempt,
+                Some(DownloadStatus::Installing),
+                DownloadStatus::Succeeded,
+                None,
+            )?;
+            Ok(true)
+        }
+        AppEvent::DownloadFailed {
+            attempt,
+            model,
+            error,
+        } => {
+            if !matches_attempt(db, model, *attempt)? {
+                reject(db, ev, *attempt);
+                return Ok(false);
+            }
+            let prior = get(db, model)?;
+            let from = prior.as_ref().map(|r| r.status);
+            transition(
+                db,
+                model,
+                *attempt,
+                from,
+                DownloadStatus::Failed,
+                Some(error.clone()),
+            )?;
+            Ok(true)
+        }
+        AppEvent::DownloadCancelled { attempt, model } => {
+            if !matches_attempt(db, model, *attempt)? {
+                reject(db, ev, *attempt);
+                return Ok(false);
+            }
+            transition(
+                db,
+                model,
+                *attempt,
+                Some(DownloadStatus::Cancelling),
+                DownloadStatus::Cancelled,
+                None,
+            )?;
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+/// Open a worker-side read-only connection bound to `(model,
+/// attempt)`. The worker polls `is_cancelled()` between
+/// chunks; the probe throttles itself to
+/// [`CANCEL_PROBE_INTERVAL_MS`] and reports cancelled when the
+/// row's status moves out of Downloading/Installing OR when
+/// the row's attempt no longer matches (a `Restart` superseded
+/// this attempt while it was still running).
+pub fn probe(db: &Database, model: &'static str, attempt: u32) -> CancelProbe {
+    let conn = db.open_probe_connection();
+    CancelProbe {
+        conn,
+        model,
+        attempt,
+        last: Instant::now() - Duration::from_millis(CANCEL_PROBE_INTERVAL_MS),
+        cached: false,
+    }
+}
+
+/// Single UPDATE path. Used by `apply` (transitions driven by
+/// worker events) and `cancel` (driver-driven). Returns the
+/// prior status so the publish can stamp `from` correctly.
+fn transition(
+    db: &mut Database,
+    model: &str,
+    attempt: u32,
+    from: Option<DownloadStatus>,
+    to: DownloadStatus,
+    error: Option<String>,
+) -> rusqlite::Result<()> {
+    let now_s = format_ts(Utc::now());
+    // The UPDATE is gated by attempt so a stale event whose
+    // attempt has been superseded cannot repaint the new row.
+    // `apply` already pre-checked, but checking again here is
+    // cheap and means `transition` is safe to call directly.
+    let changed = db.conn_mut().execute(
+        "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
+         WHERE model = ?4 AND attempt = ?5",
+        params![status_to_sql(to), error, now_s, model, attempt],
+    )?;
+    if changed == 0 {
+        // Row gone or attempt mismatch — log the rejection and
+        // skip the publish.
+        db.tx().publish(AppEvent::DownloadEventRejected {
+            model: Arc::from(model),
+            rejected: "transition",
+            event_attempt: attempt,
+            row_attempt: None,
+        });
+        return Ok(());
+    }
+    db.tx().publish(AppEvent::DownloadStatusChanged {
+        model: Arc::from(model),
+        attempt,
+        from,
+        to,
+    });
+    Ok(())
+}
+
+/// Returns true if the row exists and its `attempt` matches
+/// `attempt`. A no-row is treated as `false` (the worker is
+/// publishing a terminal event for a row the producer already
+/// removed).
+fn matches_attempt(db: &Database, model: &str, attempt: u32) -> rusqlite::Result<bool> {
+    let row = get(db, model)?;
+    Ok(matches!(row, Some(r) if r.attempt == attempt))
+}
+
+/// Build and publish a `DownloadEventRejected`. Called by
+/// `apply` when an event's attempt doesn't match the row's.
+/// Logging the rejection here (instead of inside `apply`) keeps
+/// the rejection's row-attempt field accurate.
+fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
+    let (model, name): (&str, &'static str) = match ev {
+        AppEvent::DownloadProgress { model, .. } => (*model, "DownloadProgress"),
+        AppEvent::DownloadInstalling { model, .. } => (*model, "DownloadInstalling"),
+        AppEvent::DownloadSucceeded { model, .. } => (*model, "DownloadSucceeded"),
+        AppEvent::DownloadFailed { model, .. } => (*model, "DownloadFailed"),
+        AppEvent::DownloadCancelled { model, .. } => (*model, "DownloadCancelled"),
+        _ => ("", "Unknown"),
+    };
+    // Best-effort: re-read the row to capture the live attempt
+    // the gate saw. A failure here is non-fatal; we still
+    // log the rejection with `None`.
+    let row_attempt = get(db, model).ok().flatten().map(|r| r.attempt);
+    db.tx().publish(AppEvent::DownloadEventRejected {
+        model: Arc::from(model),
+        rejected: name,
+        event_attempt,
+        row_attempt,
+    });
+}
+
+/// Walk every row and flip leftover non-terminal rows to
+/// `Interrupted`. Called once from [`Database::open`]. The
+/// transitions are logged so a Cancelling row at startup reads
+/// as "Quit didn't reach `apply`" in the JSONL event log.
+pub(crate) fn recover_interrupted(db: &mut Database) -> rusqlite::Result<()> {
+    let now_s = format_ts(Utc::now());
+    // Materialize the rows in a helper so the prepared-statement
+    // borrow on `db` ends before we ask `db` for a mutable borrow
+    // to UPDATE.
+    let rows = collect_recover_rows(db.conn_ref())?;
+    for row in rows {
+        db.conn_mut().execute(
+            "UPDATE downloads SET status = ?1, updated_at = ?2 \
+             WHERE model = ?3 AND attempt = ?4",
+            params![
+                status_to_sql(DownloadStatus::Interrupted),
+                now_s,
+                row.model.as_ref(),
+                row.attempt
             ],
         )?;
-        self.tx.publish(AppEvent::DownloadStatusChanged {
+        db.tx().publish(AppEvent::DownloadStatusChanged {
             model: row.model.clone(),
             attempt: row.attempt,
             from: Some(row.status),
-            to: DownloadStatus::Cancelling,
-        });
-        Ok(true)
-    }
-
-    /// Fold one drained [`AppEvent`] into the table. Returns
-    /// `true` if the event was applied to the row, `false` if the
-    /// event was stale (attempt mismatch) or a no-op (the reducer
-    /// skips UI state changes for `false` returns).
-    ///
-    /// Stale events publish [`AppEvent::DownloadEventRejected`]
-    /// before returning `false`, so the JSONL event log records the
-    /// drop instead of silently filtering it.
-    pub fn apply(&mut self, ev: &AppEvent) -> rusqlite::Result<bool> {
-        match ev {
-            AppEvent::DownloadRequested(_) => {
-                // `DownloadRequested` is published by the resolver
-                // *after* a successful claim — `start` already
-                // inserted the row. The event itself carries no
-                // attempt, so it's not a transition.
-                Ok(true)
-            }
-            AppEvent::DownloadProgress {
-                attempt,
-                model,
-                bytes: _,
-                total: _,
-                ..
-            } => {
-                // Progress is intentionally not persisted: the
-                // renderer reads bytes/total straight off the
-                // bus, and writing the table at 10 Hz per download
-                // adds nothing. Return `true` so the reducer still
-                // applies the gauge update.
-                if self.matches_attempt(model, *attempt)? {
-                    Ok(true)
-                } else {
-                    self.reject(ev, *attempt);
-                    Ok(false)
-                }
-            }
-            AppEvent::DownloadInstalling { attempt, model } => {
-                if !self.matches_attempt(model, *attempt)? {
-                    self.reject(ev, *attempt);
-                    return Ok(false);
-                }
-                self.transition(
-                    model,
-                    *attempt,
-                    Some(DownloadStatus::Downloading),
-                    DownloadStatus::Installing,
-                    None,
-                )?;
-                Ok(true)
-            }
-            AppEvent::DownloadSucceeded { attempt, model } => {
-                if !self.matches_attempt(model, *attempt)? {
-                    self.reject(ev, *attempt);
-                    return Ok(false);
-                }
-                self.transition(
-                    model,
-                    *attempt,
-                    Some(DownloadStatus::Installing),
-                    DownloadStatus::Succeeded,
-                    None,
-                )?;
-                Ok(true)
-            }
-            AppEvent::DownloadFailed {
-                attempt,
-                model,
-                error,
-            } => {
-                if !self.matches_attempt(model, *attempt)? {
-                    self.reject(ev, *attempt);
-                    return Ok(false);
-                }
-                let prior = self.get(model)?;
-                let from = prior.as_ref().map(|r| r.status);
-                self.transition(
-                    model,
-                    *attempt,
-                    from,
-                    DownloadStatus::Failed,
-                    Some(error.clone()),
-                )?;
-                Ok(true)
-            }
-            AppEvent::DownloadCancelled { attempt, model } => {
-                if !self.matches_attempt(model, *attempt)? {
-                    self.reject(ev, *attempt);
-                    return Ok(false);
-                }
-                self.transition(
-                    model,
-                    *attempt,
-                    Some(DownloadStatus::Cancelling),
-                    DownloadStatus::Cancelled,
-                    None,
-                )?;
-                Ok(true)
-            }
-            _ => Ok(true),
-        }
-    }
-
-    /// Open a worker-side read-only connection bound to `(model,
-    /// attempt)`. The worker polls `is_cancelled()` between
-    /// chunks; the probe throttles itself to
-    /// [`CANCEL_PROBE_INTERVAL_MS`] and reports cancelled when the
-    /// row's status moves out of Downloading/Installing OR when
-    /// the row's attempt no longer matches (a `Restart` superseded
-    /// this attempt while it was still running).
-    pub fn probe(&self, model: &'static str, attempt: u32) -> CancelProbe {
-        // Open a fresh read connection to the same file. WAL mode
-        // lets it read alongside the main writer; `busy_timeout`
-        // keeps it from erroring on transient write-lock hits.
-        let conn = Connection::open(self.path.as_path()).unwrap_or_else(|e| {
-            // Falling back to a transient in-memory connection is
-            // better than panicking: a read failure must NOT
-            // crash the worker. The probe returns `false` on
-            // query errors and the attempt gate on the main
-            // thread still discards stale publishes.
-            eprintln!("downloads: probe open failed: {e}");
-            Connection::open_in_memory().expect("in-memory sqlite")
-        });
-        let _ = conn.pragma_update(None, "busy_timeout", 5_000);
-        CancelProbe {
-            conn,
-            model,
-            attempt,
-            last: Instant::now() - Duration::from_millis(CANCEL_PROBE_INTERVAL_MS),
-            cached: false,
-        }
-    }
-
-    /// Single UPDATE path. Used by `apply` (transitions driven by
-    /// worker events) and `cancel` (driver-driven). Returns the
-    /// prior status so the publish can stamp `from` correctly.
-    fn transition(
-        &mut self,
-        model: &str,
-        attempt: u32,
-        from: Option<DownloadStatus>,
-        to: DownloadStatus,
-        error: Option<String>,
-    ) -> rusqlite::Result<()> {
-        let now_s = format_ts(Utc::now());
-        // The UPDATE is gated by attempt so a stale event whose
-        // attempt has been superseded cannot repaint the new row.
-        // `apply` already pre-checked, but checking again here is
-        // cheap and means `transition` is safe to call directly.
-        let changed = self.conn.execute(
-            "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
-             WHERE model = ?4 AND attempt = ?5",
-            params![status_to_sql(to), error, now_s, model, attempt],
-        )?;
-        if changed == 0 {
-            // Row gone or attempt mismatch — log the rejection and
-            // skip the publish.
-            self.tx.publish(AppEvent::DownloadEventRejected {
-                model: Arc::from(model),
-                rejected: "transition",
-                event_attempt: attempt,
-                row_attempt: None,
-            });
-            return Ok(());
-        }
-        self.tx.publish(AppEvent::DownloadStatusChanged {
-            model: Arc::from(model),
-            attempt,
-            from,
-            to,
-        });
-        Ok(())
-    }
-
-    /// Returns true if the row exists and its `attempt` matches
-    /// `attempt`. A no-row is treated as `false` (the worker is
-    /// publishing a terminal event for a row the producer already
-    /// removed).
-    fn matches_attempt(&self, model: &str, attempt: u32) -> rusqlite::Result<bool> {
-        let row = self.get(model)?;
-        Ok(matches!(row, Some(r) if r.attempt == attempt))
-    }
-
-    /// Build and publish a `DownloadEventRejected`. Called by
-    /// `apply` when an event's attempt doesn't match the row's.
-    /// Logging the rejection here (instead of inside `apply`) keeps
-    /// the rejection's row-attempt field accurate.
-    fn reject(&self, ev: &AppEvent, event_attempt: u32) {
-        let (model, name): (&str, &'static str) = match ev {
-            AppEvent::DownloadProgress { model, .. } => (*model, "DownloadProgress"),
-            AppEvent::DownloadInstalling { model, .. } => (*model, "DownloadInstalling"),
-            AppEvent::DownloadSucceeded { model, .. } => (*model, "DownloadSucceeded"),
-            AppEvent::DownloadFailed { model, .. } => (*model, "DownloadFailed"),
-            AppEvent::DownloadCancelled { model, .. } => (*model, "DownloadCancelled"),
-            _ => ("", "Unknown"),
-        };
-        // Best-effort: re-read the row to capture the live attempt
-        // the gate saw. A failure here is non-fatal; we still
-        // log the rejection with `None`.
-        let row_attempt = self.get(model).ok().flatten().map(|r| r.attempt);
-        self.tx.publish(AppEvent::DownloadEventRejected {
-            model: Arc::from(model),
-                rejected: name,
-            event_attempt,
-            row_attempt,
+            to: DownloadStatus::Interrupted,
         });
     }
+    Ok(())
+}
 
-    /// Walk every row and flip leftover non-terminal rows to
-    /// `Interrupted`. Called once from `open`. The transitions are
-    /// logged so a Cancelling row at startup reads as "Quit didn't
-    /// reach `apply`" in the JSONL event log.
-    fn recover_interrupted(&mut self) -> rusqlite::Result<()> {
-        let now_s = format_ts(Utc::now());
-        let mut stmt = self.conn.prepare(
-            "SELECT model, attempt, status, error, created_at, updated_at \
-             FROM downloads \
-             WHERE status IN ('Downloading','Installing','Cancelling')",
-        )?;
-        let rows = stmt
-            .query_map([], DownloadRow::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for row in rows {
-            self.conn.execute(
-                "UPDATE downloads SET status = ?1, updated_at = ?2 \
-                 WHERE model = ?3 AND attempt = ?4",
-                params![
-                    status_to_sql(DownloadStatus::Interrupted),
-                    now_s,
-                    row.model.as_ref(),
-                    row.attempt
-                ],
-            )?;
-            self.tx.publish(AppEvent::DownloadStatusChanged {
-                model: row.model.clone(),
-                attempt: row.attempt,
-                from: Some(row.status),
-                to: DownloadStatus::Interrupted,
-            });
-        }
-        Ok(())
+/// Read every row still in a non-terminal state and return owned
+/// copies. The owned `Vec<DownloadRow>` has no lifetime tied to the
+/// borrowed connection, so callers can keep using the connection
+/// (mutable) after this returns.
+fn collect_recover_rows(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<DownloadRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, attempt, status, error, created_at, updated_at \
+         FROM downloads \
+         WHERE status IN ('Downloading','Installing','Cancelling')",
+    )?;
+    let mut rows = Vec::new();
+    let iter = stmt.query_map([], DownloadRow::from_row)?;
+    for row in iter {
+        rows.push(row?);
     }
+    drop(stmt);
+    Ok(rows)
 }
 
 /// Result of `decide`: tells the orchestrator whether to start a
@@ -629,6 +627,7 @@ pub trait CancelCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use crate::bus::EventBus;
 
     fn bus() -> (EventBus, EventSender) {
@@ -694,9 +693,9 @@ mod tests {
         // Pre-create a file with a leftover Cancelling row.
         {
             let (bus, tx) = bus();
-            let mut d = Downloads::open(&path, tx).unwrap();
-            d.start("tiny.en").unwrap();
-            d.cancel("tiny.en").unwrap();
+            let mut d = Database::open(&path, tx).unwrap();
+            start(&mut d, "tiny.en").unwrap();
+            cancel(&mut d, "tiny.en").unwrap();
             // Don't drop — leave the row in Cancelling.
             drop(d);
             drop(bus);
@@ -704,8 +703,8 @@ mod tests {
         // Re-open: the Cancelling row must become Interrupted, and
         // the event log must observe the transition.
         let (mut bus, tx) = bus();
-        let d = Downloads::open(&path, tx).unwrap();
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let d = Database::open(&path, tx).unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Interrupted);
         let events: Vec<AppEvent> = bus.drain().collect();
         let transitions: Vec<_> = events
@@ -725,14 +724,14 @@ mod tests {
     fn start_upserts_and_increments_attempt() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        let a1 = d.start("tiny.en").unwrap();
+        let mut d = Database::open(&path, tx).unwrap();
+        let a1 = start(&mut d, "tiny.en").unwrap();
         assert_eq!(a1, 1);
         // Mark Cancelling so the next start is a Restart-bump.
-        d.cancel("tiny.en").unwrap();
-        let a2 = d.start("tiny.en").unwrap();
+        cancel(&mut d, "tiny.en").unwrap();
+        let a2 = start(&mut d, "tiny.en").unwrap();
         assert_eq!(a2, 2, "Start after Cancelling must increment attempt");
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.attempt, 2);
         assert_eq!(row.status, DownloadStatus::Downloading);
     }
@@ -741,11 +740,11 @@ mod tests {
     fn cancel_flips_active_row_to_cancelling_publishes_event() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        let changed = d.cancel("tiny.en").unwrap();
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        let changed = cancel(&mut d, "tiny.en").unwrap();
         assert!(changed);
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Cancelling);
     }
 
@@ -753,31 +752,30 @@ mod tests {
     fn cancel_on_terminal_row_is_noop() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        d.apply(&AppEvent::DownloadCancelled {
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        apply(&mut d, &AppEvent::DownloadCancelled {
             attempt: 1,
             model: "tiny.en",
         })
         .unwrap();
         // Now in Cancelled — a second cancel returns false.
-        assert!(!d.cancel("tiny.en").unwrap());
+        assert!(!cancel(&mut d, "tiny.en").unwrap());
     }
 
     #[test]
     fn apply_succeed_emits_terminal_transition() {
         let (_tmp, path) = tmp_db();
         let (mut bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        let accepted = d
-            .apply(&AppEvent::DownloadSucceeded {
-                attempt: 1,
-                model: "tiny.en",
-            })
-            .unwrap();
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        let accepted = apply(&mut d, &AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: "tiny.en",
+        })
+        .unwrap();
         assert!(accepted);
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Succeeded);
         let events: Vec<_> = bus
             .drain()
@@ -797,19 +795,17 @@ mod tests {
     fn apply_stale_event_publishes_rejection() {
         let (_tmp, path) = tmp_db();
         let (mut bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap(); // attempt = 1
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap(); // attempt = 1
                                        // Bump to attempt 2: cancel then start again.
-        d.cancel("tiny.en").unwrap();
-        d.start("tiny.en").unwrap();
+        cancel(&mut d, "tiny.en").unwrap();
+        start(&mut d, "tiny.en").unwrap();
         // Old worker (attempt 1) publishes a stale terminal.
-        let accepted = d
-            .apply(&AppEvent::DownloadSucceeded {
-                attempt: 1,
-                model: "tiny.en",
-            })
-            .unwrap();
-        assert!(!accepted);
+        apply(&mut d, &AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: "tiny.en",
+        })
+        .unwrap();
         let rejections: Vec<_> = bus
             .drain()
             .filter(|e| matches!(e, AppEvent::DownloadEventRejected { .. }))
@@ -820,7 +816,7 @@ mod tests {
             "exactly one rejection; got {rejections:?}"
         );
         // Row stays at the new attempt, unaffected by the stale event.
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.attempt, 2);
         assert_eq!(row.status, DownloadStatus::Downloading);
     }
@@ -829,15 +825,15 @@ mod tests {
     fn apply_failed_stores_error_in_row() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        d.apply(&AppEvent::DownloadFailed {
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        apply(&mut d, &AppEvent::DownloadFailed {
             attempt: 1,
             model: "tiny.en",
             error: "boom".into(),
         })
         .unwrap();
-        let row = d.get("tiny.en").unwrap().unwrap();
+        let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Failed);
         assert_eq!(row.error.as_deref(), Some("boom"));
     }
@@ -846,19 +842,19 @@ mod tests {
     fn created_at_resets_on_new_attempt_updated_at_advances() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        let first_created = d.get("tiny.en").unwrap().unwrap().created_at;
-        let first_updated = d.get("tiny.en").unwrap().unwrap().updated_at;
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        let first_created = get(&d, "tiny.en").unwrap().unwrap().created_at;
+        let first_updated = get(&d, "tiny.en").unwrap().unwrap().updated_at;
         std::thread::sleep(std::time::Duration::from_millis(5));
-        d.cancel("tiny.en").unwrap();
-        let mid_updated = d.get("tiny.en").unwrap().unwrap().updated_at;
+        cancel(&mut d, "tiny.en").unwrap();
+        let mid_updated = get(&d, "tiny.en").unwrap().unwrap().updated_at;
         assert!(
             mid_updated >= first_updated,
             "updated_at must advance on transition"
         );
-        d.start("tiny.en").unwrap();
-        let second_created = d.get("tiny.en").unwrap().unwrap().created_at;
+        start(&mut d, "tiny.en").unwrap();
+        let second_created = get(&d, "tiny.en").unwrap().unwrap().created_at;
         assert!(
             second_created > first_created,
             "created_at must reset on new attempt; first={first_created} second={second_created}"
@@ -869,12 +865,12 @@ mod tests {
     fn probe_reports_cancelled_after_status_change() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        let mut probe = d.probe("tiny.en", 1);
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        let mut probe = probe(&d, "tiny.en", 1);
         assert!(!probe.is_cancelled(), "active row is not cancelled");
         // Cancel the row.
-        d.cancel("tiny.en").unwrap();
+        cancel(&mut d, "tiny.en").unwrap();
         // Wait past the probe throttle.
         std::thread::sleep(Duration::from_millis(CANCEL_PROBE_INTERVAL_MS + 5));
         assert!(
@@ -887,12 +883,12 @@ mod tests {
     fn probe_reports_cancelled_when_attempt_superseded() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap();
-        let mut probe = d.probe("tiny.en", 1);
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap();
+        let mut probe = probe(&d, "tiny.en", 1);
         // Simulate a Restart: cancel then start bumps attempt to 2.
-        d.cancel("tiny.en").unwrap();
-        d.start("tiny.en").unwrap();
+        cancel(&mut d, "tiny.en").unwrap();
+        start(&mut d, "tiny.en").unwrap();
         std::thread::sleep(Duration::from_millis(CANCEL_PROBE_INTERVAL_MS + 5));
         assert!(
             probe.is_cancelled(),
@@ -904,24 +900,16 @@ mod tests {
     fn active_returns_only_non_terminal_rows() {
         let (_tmp, path) = tmp_db();
         let (_bus, tx) = bus();
-        let mut d = Downloads::open(&path, tx).unwrap();
-        d.start("tiny.en").unwrap(); // active
-        d.start("base.en").unwrap();
-        d.apply(&AppEvent::DownloadSucceeded {
+        let mut d = Database::open(&path, tx).unwrap();
+        start(&mut d, "tiny.en").unwrap(); // active
+        start(&mut d, "base.en").unwrap();
+        apply(&mut d, &AppEvent::DownloadSucceeded {
             attempt: 1,
             model: "base.en",
         })
         .unwrap();
-        let active = d.active().unwrap();
+        let active = active(&d, ).unwrap();
         assert_eq!(active.len(), 1, "only tiny.en is active");
         assert_eq!(active[0].model.as_ref(), "tiny.en");
     }
-}
-
-// Helper for test isolation: ensures no worker can keep a
-// connection alive past the test by binding `Drop` semantics.
-#[allow(dead_code)]
-fn _channel_drop_check() {
-    let (tx, _rx): (mpsc::Sender<i32>, _) = mpsc::channel();
-    drop(tx);
 }

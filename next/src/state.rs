@@ -527,6 +527,10 @@ impl UiState {
             AppEvent::DownloadStatusChanged { .. }
             | AppEvent::DownloadEventRejected { .. } => {}
             AppEvent::Quit => self.should_quit = true,
+            // Bus commands aimed at the loop-thread dispatcher.
+            // Reducer ignores them; the dispatcher is the only
+            // consumer.
+            AppEvent::BeginDownload(_) | AppEvent::DiscardInflight { .. } => {}
         }
     }
 }

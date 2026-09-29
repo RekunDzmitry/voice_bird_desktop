@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::db::downloads::{CancelCheck, CancelProbe, Claim, Downloads};
+use crate::db::{downloads, Database};
+use crate::db::downloads::{CancelCheck, CancelProbe, Claim};
 use crate::picker::ModelEntry;
 use crate::transcription_models::ModelStore;
 
@@ -257,7 +258,7 @@ impl Throttle {
 pub fn begin(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
-    downloads: &mut Downloads,
+    db: &mut Database,
     downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
@@ -267,7 +268,7 @@ pub fn begin(
         return;
     }
     tx.publish(AppEvent::DownloadRequested(entry));
-    let row = match downloads.get(entry.id) {
+    let row = match downloads::get(db, entry.id) {
         Ok(r) => r,
         Err(e) => {
             tx.publish(AppEvent::DownloadFailed {
@@ -278,25 +279,25 @@ pub fn begin(
             return;
         }
     };
-    match crate::db::downloads::decide(row.as_ref()) {
+    match downloads::decide(row.as_ref()) {
         Claim::Start { attempt } => {
-            let attempt = downloads.start(entry.id).unwrap_or(attempt);
+            let attempt = downloads::start(db, entry.id).unwrap_or(attempt);
             spawn(
                 entry,
                 store.clone(),
                 downloader.clone(),
-                downloads.probe(entry.id, attempt),
+                downloads::probe(db, entry.id, attempt),
                 attempt,
                 tx.clone(),
             );
         }
         Claim::Restart { attempt } => {
-            let attempt = downloads.start(entry.id).unwrap_or(attempt);
+            let attempt = downloads::start(db, entry.id).unwrap_or(attempt);
             spawn(
                 entry,
                 store.clone(),
                 downloader.clone(),
-                downloads.probe(entry.id, attempt),
+                downloads::probe(db, entry.id, attempt),
                 attempt,
                 tx.clone(),
             );
@@ -391,15 +392,13 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::CATALOG;
+
     use crate::testing::{FixtureDownloader, Outcome};
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    fn tiny() -> &'static ModelEntry {
-        &CATALOG[5]
-    }
+
 
     #[test]
     fn stream_to_writes_file_and_verifies_sha() {

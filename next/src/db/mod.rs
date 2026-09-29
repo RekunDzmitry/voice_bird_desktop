@@ -3,18 +3,21 @@
 //! One file per machine, opened at the OS data directory (the same
 //! resolution [`crate::event_log`] uses). The module is kept small
 //! on purpose: every table is an implementation of [`Table`], and
-//! [`open`] / [`migrate`] / [`db_path`] are the only entry points.
-//! Adding a new table is one impl of the trait and one line in
-//! [`Downloads::open`].
+//! [`Database::open`] / [`migrate`] / [`db_path`] are the only entry
+//! points. Adding a new table is one impl of the trait, one line in
+//! `Database::open`'s `migrate` call, and one module of free
+//! functions that take `&mut Database`.
 
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use rusqlite::Connection;
 
+use crate::bus::EventSender;
+
 /// A table in the local SQLite file. Implementing this trait is the
 /// only obligation: name + definition. New tables plug into
-/// [`migrate`] and `Downloads::open` without growing this module.
+/// [`migrate`] and `Database::open` without growing this module.
 pub trait Table {
     /// SQL identifier for the table. Referenced by other tables'
     /// definitions and by indexers.
@@ -51,8 +54,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// Run every table's `CREATE TABLE IF NOT EXISTS` definition on
-/// `conn`. Each [`Table::DEFINITION`] is idempotent so this is safe to
-/// call on an existing database — the call is the entire migration
+/// `conn`. Each [`Table::DEFINITION`] is idempotent so this is safe
+/// to call on an existing database — the call is the entire migration
 /// surface today.
 pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()> {
     for t in tables {
@@ -83,5 +86,79 @@ pub trait TableExt: Table {
     }
 }
 impl<T: Table> TableExt for T {}
+
+/// The local SQLite database.
+///
+/// Owns one writer connection, the path it was opened from, and the
+/// cloneable [`EventSender`] used to publish status changes. Every
+/// per-table operation is a free function in its module that takes
+/// `&Database` / `&mut Database` so callers don't have to grow their
+/// signatures as new tables land: they pass the whole database and
+/// pull out the table they need (today [`downloads`]).
+///
+/// The connection is wrapped here rather than at each table call so
+/// `Database::open` can run migration once, recover leftover
+/// non-terminal rows once, and hand callers a handle that's ready to
+/// read or write. Tables never construct their own connection.
+pub struct Database {
+    conn: Connection,
+    path: PathBuf,
+    tx: EventSender,
+}
+
+impl Database {
+    /// Open (or create) the SQLite file at `path`, run the migration
+    /// for every known [`Table`], and recover any rows left in a
+    /// non-terminal state by a previous crashed session. The
+    /// recovery is logged per row — a Cancelling row at startup
+    /// means the previous Quit didn't reach `apply`, so the audit
+    /// log records the upgrade.
+    ///
+    /// Adding a new table is one line in the [`migrate`] call below.
+    pub fn open(path: &Path, tx: EventSender) -> rusqlite::Result<Self> {
+        let conn = open(path)?;
+        migrate(&conn, &[downloads::DownloadsTable])?;
+        let mut db = Self {
+            conn,
+            path: path.to_path_buf(),
+            tx,
+        };
+        downloads::recover_interrupted(&mut db)?;
+        Ok(db)
+    }
+
+    /// Borrow the writer connection. Exposed only to per-table
+    /// modules; callers outside `db/` use the table free functions.
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
+    /// Borrow the writer connection read-only. Exposed only to
+    /// per-table modules.
+    pub(crate) fn conn_ref(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Reference to the event sender. Per-table transitions publish
+    /// status changes through this.
+    pub(crate) fn tx(&self) -> &EventSender {
+        &self.tx
+    }
+
+    /// Open a worker-side read-only connection bound to the same
+    /// file. Probes poll cancellation between fetch chunks. The
+    /// fallback to an in-memory connection is intentional: a probe
+    /// failure must NOT crash the worker, and the attempt gate on
+    /// the main thread still discards stale publishes if the probe
+    /// returns `false` on every call.
+    pub(crate) fn open_probe_connection(&self) -> Connection {
+        let conn = Connection::open(self.path.as_path()).unwrap_or_else(|e| {
+            eprintln!("downloads: probe open failed: {e}");
+            Connection::open_in_memory().expect("in-memory sqlite")
+        });
+        let _ = conn.pragma_update(None, "busy_timeout", 5_000);
+        conn
+    }
+}
 
 pub mod downloads;

@@ -153,6 +153,23 @@ pub enum AppEvent {
     SessionShown { id: u8 },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
+
+    // -----------------------------------------------------------------
+    // Bus commands: aimed at the loop-thread dispatcher that owns the
+    // long-lived `Downloader` / `ModelStore` collaborators. The
+    // reducer treats them as observability (the `Downloads::apply`
+    // catch-all returns `Ok(true)` and `UiState::apply` ignores
+    // them); only the dispatcher's `dispatch` consumes them. Reply
+    // channels are `mpsc::sync_channel(1)` oneshots.
+    // -----------------------------------------------------------------
+
+    /// Resolver saw Enter/Retry on a focused block. The dispatcher
+    /// answers by calling `download::begin` with the
+    /// collaborators it owns.
+    BeginDownload(&'static ModelEntry),
+    /// Quit-time cleanup: drop the staged archive and unpack
+    /// scratch directory for `model`. The dispatcher answers with a
+    DiscardInflight { model: std::sync::Arc<str> },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the

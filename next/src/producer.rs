@@ -5,16 +5,12 @@
 //! out of `main.rs` keeps the binary entry point focused on terminal
 //! plumbing (raw mode, alt screen, panic hook, the render loop) and
 //! puts everything that talks to the bus next to the bus itself.
-
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
-use std::sync::Arc;
 
+use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::picker::{self, CATALOG};
-use crate::db::downloads::Downloads;
-use crate::download::{begin, Downloader};
-use crate::transcription_models::ModelStore;
 use crate::state::{BlockState, UiState};
 /// Stamp the `from_model`/`to_model` fields onto `PickerMoved` using
 /// the focused block's current `picker_index` plus a non-mutating peek
@@ -42,18 +38,19 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
         to_model,
     });
 }
-
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
-/// - `Confirm` and `Retry` are the resolver's job: they need the
-///   focused block's stage and access to the store / table.
+/// - `Confirm` and `Retry` publish [`AppEvent::BeginDownload`] for
+///   the picked entry. The dispatcher that owns the collaborators is
+///   the only thing that calls [`download::begin`] — this
+///   resolver never sees a `Downloader` or `ModelStore`.
 /// - All other intents are direct mappings.
+///
+/// [`AppEvent::BeginDownload`]: crate::bus::AppEvent::BeginDownload
 pub fn resolve_intent(
     intent: Intent,
     state: &UiState,
-    store: Arc<dyn ModelStore>,
-    downloads: &mut Downloads,
-    downloader: Arc<dyn Downloader>,
+    db: &mut Database,
     tx: &EventSender,
 ) {
     // intents are hijacked to drive the menu instead of falling
@@ -121,7 +118,7 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Picking(picker) = &block.state {
                     let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
-                    begin(entry, store, downloads, downloader, tx);
+                    tx.publish(AppEvent::BeginDownload(entry));
                 }
             }
         }
@@ -129,7 +126,7 @@ pub fn resolve_intent(
             if let Some(block) = state.focused() {
                 if let BlockState::Failed { model, .. } = &block.state {
                     if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
-                        begin(entry, store, downloads, downloader, tx);
+                        tx.publish(AppEvent::BeginDownload(entry));
                     }
                 }
             }
@@ -154,7 +151,7 @@ pub fn resolve_intent(
                         // Best-effort: surface DB errors as a Failed
                         // event so the user sees the cause instead
                         // of a stuck Cancelling row.
-                        if let Err(e) = downloads.cancel(model) {
+                        if let Err(e) = downloads::cancel(db, model) {
                             tx.publish(AppEvent::DownloadFailed {
                                 attempt: 0,
                                 model,
@@ -170,3 +167,4 @@ pub fn resolve_intent(
         Intent::ToggleMenu => unreachable!("handled above"),
     }
 }
+

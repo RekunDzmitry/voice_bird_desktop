@@ -13,18 +13,14 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 #[cfg(feature = "net")]
 use voice_bird_next::download::HttpDownloader;
-use voice_bird_next::picker::CATALOG;
-use voice_bird_next::{
-    bus::{EventBus, EventSender},
-    db::downloads::Downloads,
-    download::Downloader,
-    input, producer,
-    state::UiState,
-    transcription_models::{CacheDirStore, ModelStore},
-};
-
-/// Runs `restore` on drop. Constructed as soon as the first irreversible
-/// terminal step (raw mode) has succeeded.
+use voice_bird_next::dispatcher::Dispatcher;
+use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
+use voice_bird_next::db::{downloads, Database};
+use voice_bird_next::download::Downloader;
+use voice_bird_next::{input, producer};
+use voice_bird_next::state::UiState;
+use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
+/// Runs `restore` on drop.
 struct RestoreGuard<F: FnMut()> {
     restore: F,
 }
@@ -73,19 +69,20 @@ fn main() -> io::Result<()> {
 /// Map one key press to bus events via the [`producer`] module.
 /// [`producer::resolve_intent`] is the single seam where user
 /// intent becomes [`AppEvent`]s; the reducer does the rest.
+///
+/// The resolver does NOT hold `Downloader` or `ModelStore` — it
+/// only publishes `BeginDownload` on Enter/Retry. The dispatcher
+/// that owns the collaborators answers it.
 fn handle_key(
     key: KeyEvent,
     state: &UiState,
-    store: Arc<dyn ModelStore>,
-    downloads: &mut Downloads,
-    downloader: Arc<dyn Downloader>,
+    db: &mut Database,
     tx: &EventSender,
 ) {
     if let Some(intent) = input::map_key(key) {
-        producer::resolve_intent(intent, state, store, downloads, downloader, tx);
+        producer::resolve_intent(intent, state, db, tx);
     }
 }
-
 /// Drive one tick: draw if dirty, drain events, fold into state. The
 /// 100 ms poll bounds bar latency at 10 fps while the dirty flag keeps
 /// an idle app from spamming the terminal.
@@ -97,8 +94,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut log = voice_bird_next::event_log::EventLog::open();
     let mut state = UiState::default();
 
-    // Wired only in `main` — the live HTTP downloader. Tests use
-    // `FixtureDownloader` through the same trait.
     let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
         Ok(s) => {
             let _ = s.sweep_staging();
@@ -109,11 +104,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    // Open the SQLite downloads table at the platform data dir.
-    // Mirrors how `CacheDirStore` failures are handled: exit 2 with a
-    // readable error so the failure mode is unambiguous.
-    let mut downloads = match voice_bird_next::db::db_path() {
-        Some(path) => match Downloads::open(&path, tx.clone()) {
+    let mut db = match voice_bird_next::db::db_path() {
+        Some(path) => match Database::open(&path, tx.clone()) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("voice-bird-next: cannot open downloads table at {path:?}: {e}");
@@ -126,45 +118,48 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-
+    let dispatcher = Dispatcher::new(downloader.clone(), store.clone());
     let mut dirty = true;
     loop {
         if dirty {
             terminal.draw(|f| voice_bird_next::ui::render(f, &state))?;
-            dirty = false;
         }
+        // Drain once, fold UI events, then dispatch the same
+        // events to the dispatcher. The dispatcher answers
+        // `BeginDownload` by calling `download::begin` and
+        // `DiscardInflight` by calling
+        // `ModelStore::discard_inflight`. Command variants
+        // published during dispatch (cache-hit replies,
+        // `DownloadRequested`) appear in `events` on the next
+        // tick.
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
-                handle_key(k, &state, store.clone(), &mut downloads, downloader.clone(), &tx);
+                handle_key(k, &state, &mut db, &tx);
                 dirty = true;
             }
         }
-        for ev in bus.drain() {
-            if let Some(l) = log.as_mut() {
-                l.append(&ev);
-            }
-            // `downloads.apply` returns `true` for non-stale events
-            // (non-download events pass through; download events
-            // whose attempt matches the current row pass; stale
-            // download events return `false`). Only accepted
-            // events touch `UiState` so a cancelled-but-still-
-            // running worker cannot repaint the new attempt's
-            // gauge or move attempt B's blocks out of Waiting.
-            if let Ok(accepted) = downloads.apply(&ev) {
-                if accepted {
-                    state.apply(&ev);
+        let events: Vec<AppEvent> = bus.drain().collect();
+        if !events.is_empty() {
+            for ev in &events {
+                if let Some(l) = log.as_mut() {
+                    l.append(ev);
+                }
+                if let Ok(accepted) = downloads::apply(&mut db, ev) {
+                    if accepted {
+                        state.apply(ev);
+                    }
                 }
             }
+            dispatcher.dispatch(&events, &mut db, &tx);
             dirty = true;
         }
         if state.should_quit {
-            cleanup_inflight(&*store, &mut downloads, &mut bus);
+            cleanup_inflight(&mut db, &mut bus);
             break;
         }
     }
     Ok(())
 }
-
 /// Drop staged archives and unpack scratch directories for every
 /// model with an active claim. Called at Quit so the cache dir is
 /// left clean for the next session — without this, a half-written
@@ -177,21 +172,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 /// worker probes will see the change and stop. Process exit then
 /// kills any workers still running.
 ///
-/// The final `bus.drain()` loop only logs: it doesn't touch
-/// state. This guarantees the Cancelling transitions reach the
-/// JSONL event log even though the loop is about to exit.
-fn cleanup_inflight(store: &dyn ModelStore, downloads: &mut Downloads, bus: &mut EventBus) {
-    let active = match downloads.active() {
+/// `DiscardInflight { model }` is published for each active
+/// claim instead of reaching into the model store directly. The
+/// dispatcher that owns the store answers it on the next drain.
+fn cleanup_inflight(db: &mut Database, bus: &mut EventBus) {
+    let active = match downloads::active(db) {
         Ok(a) => a,
         Err(_) => return,
     };
     for row in &active {
-        let _ = downloads.cancel(row.model.as_ref());
+        let _ = downloads::cancel(db, row.model.as_ref());
     }
-    for row in &active {
-        if let Some(entry) = CATALOG.iter().find(|e| e.id == row.model.as_ref()) {
-            store.discard_inflight(entry);
-        }
+    let models: Vec<std::sync::Arc<str>> = active.iter().map(|r| r.model.clone()).collect();
+    for model in models {
+        bus.sender().publish(AppEvent::DiscardInflight { model });
     }
     for ev in bus.drain() {
         if let Some(l) = voice_bird_next::event_log::EventLog::open().as_mut() {
@@ -207,8 +201,9 @@ fn cfg_build_downloader() -> Arc<dyn Downloader> {
 
 #[cfg(not(feature = "net"))]
 fn cfg_build_downloader() -> Arc<dyn Downloader> {
-    // exercise the full flow through FixtureDownloader; the binary
-    // is the production switch and exits early here.
+    // Without the `net` feature the binary can't download. Tests
+    // exercise the full flow through FixtureDownloader; the
+    // binary is the production switch and exits early here.
     eprintln!("voice-bird-next: built without the `net` feature, downloads are disabled");
     std::process::exit(2);
 }
