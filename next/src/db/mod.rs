@@ -13,16 +13,16 @@ use directories::ProjectDirs;
 use rusqlite::Connection;
 
 /// A table in the local SQLite file. Implementing this trait is the
-/// only obligation: name + schema. New tables plug into
+/// only obligation: name + definition. New tables plug into
 /// [`migrate`] and `Downloads::open` without growing this module.
 pub trait Table {
     /// SQL identifier for the table. Referenced by other tables'
-    /// schemas and by indexers.
+    /// definitions and by indexers.
     const NAME: &'static str;
     /// `CREATE TABLE IF NOT EXISTS …` statement, run verbatim on
     /// every connection that opens the file. Keep it idempotent so
     /// re-opening an existing file is a no-op.
-    const SCHEMA: &'static str;
+    const DEFINITION: &'static str;
 }
 
 /// Open (or create) the SQLite file at `path`. WAL mode lets a
@@ -50,13 +50,13 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Run every table's `CREATE TABLE IF NOT EXISTS` schema on
-/// `conn`. Each [`Table::SCHEMA`] is idempotent so this is safe to
+/// Run every table's `CREATE TABLE IF NOT EXISTS` definition on
+/// `conn`. Each [`Table::DEFINITION`] is idempotent so this is safe to
 /// call on an existing database — the call is the entire migration
 /// surface today.
 pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()> {
     for t in tables {
-        conn.execute_batch(t.schema())?;
+        conn.execute_batch(t.definition())?;
     }
     Ok(())
 }
@@ -73,13 +73,13 @@ pub fn db_path() -> Option<PathBuf> {
     Some(std::env::temp_dir().join("voice-bird-next").join("downloads.sqlite"))
 }
 
-/// Extension trait so each `Table` impl can hand its `SCHEMA` /
+/// Extension trait so each `Table` impl can hand its `DEFINITION` /
 /// `NAME` to `migrate` without re-typing the strings. Defined here
 /// rather than on `Table` because `Table` itself only describes
 /// what's constant.
 pub trait TableExt: Table {
-    fn schema(&self) -> &'static str {
-        Self::SCHEMA
+    fn definition(&self) -> &'static str {
+        Self::DEFINITION
     }
 }
 impl<T: Table> TableExt for T {}

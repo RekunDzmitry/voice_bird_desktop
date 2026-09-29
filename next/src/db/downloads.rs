@@ -63,7 +63,7 @@ pub struct DownloadsTable;
 
 impl Table for DownloadsTable {
     const NAME: &'static str = "downloads";
-    const SCHEMA: &'static str = "CREATE TABLE IF NOT EXISTS downloads (
+    const DEFINITION: &'static str = "CREATE TABLE IF NOT EXISTS downloads (
         model       TEXT PRIMARY KEY,
         attempt     INTEGER NOT NULL,
         status      TEXT NOT NULL,
