@@ -11,11 +11,12 @@
 pub mod bus;
 pub mod event_log;
 pub mod input;
+pub mod dispatcher;
 pub mod picker;
 pub mod state;
-pub mod store;
-pub mod download;
+pub mod db;
 pub mod producer;
+pub mod download;
 pub mod transcription_models;
 pub mod testing;
 pub mod ui;

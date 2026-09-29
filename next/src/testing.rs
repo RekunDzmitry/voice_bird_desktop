@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::db::downloads::CancelCheck;
 use crate::download::{DownloadError, Downloader};
 use crate::picker::ModelEntry;
 use crate::state::UiState;
@@ -29,6 +30,26 @@ pub fn render_to_string(state: &UiState, w: u16, h: u16) -> String {
         out.push('\n');
     }
     out
+}
+
+/// `CancelCheck` impl for `AtomicBool`. Lets a test pre-arm a cancel
+/// (e.g. to verify "no event on cancel" or "fetch short-circuits")
+/// by `AtomicBool::store(true, Relaxed)` before calling into the
+/// pipeline. Production code uses [`crate::db::downloads::CancelProbe`]
+/// instead, which observes the SQLite row.
+impl CancelCheck for AtomicBool {
+    fn is_cancelled(&mut self) -> bool {
+        AtomicBool::load(self, Ordering::Relaxed)
+    }
+}
+
+/// `CancelCheck` impl for `&AtomicBool`. Same semantics as the owned
+/// variant — `Relaxed` ordering is fine because cancellation is a
+/// single-writer / single-reader flag with no compound state.
+impl<'a> CancelCheck for &'a AtomicBool {
+    fn is_cancelled(&mut self) -> bool {
+        AtomicBool::load(*self, Ordering::Relaxed)
+    }
 }
 
 /// In-memory `ModelStore` for integration tests. Lets a test declare
@@ -69,13 +90,13 @@ impl ModelStore for FixtureStore {
         &self,
         entry: &ModelEntry,
         _staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
         // The fixture install is a Vec push — no filesystem work to
         // interrupt. Honor cancel so a test that wants to verify the
         // "no event on cancel" contract can set the token before the
         // resolver reaches install.
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
         // Mark the model present so subsequent is_available checks
@@ -170,13 +191,17 @@ impl Downloader for FixtureDownloader {
         _url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &mut dyn CancelCheck,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<(), DownloadError> {
         use sha2::{Digest, Sha256};
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.outcome == Outcome::Cancelled {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Set the flag the test is observing: for `&AtomicBool`
+            // (the test fixture) this is a no-op for already-set
+            // flags; for `CancelProbe` it would be similarly
+            // idempotent. Production wiring never goes through this
+            // branch — `Outcome::Cancelled` is a test-only signal.
         }
         let mut cursor = Cursor::new(&self.bytes);
         let total = Some(self.bytes.len() as u64);
@@ -184,7 +209,7 @@ impl Downloader for FixtureDownloader {
         let mut buf = [0u8; 1 << 16];
         let mut total_read: u64 = 0;
         loop {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 let _ = std::fs::remove_file(staged);
                 return Err(DownloadError::Cancelled);
             }

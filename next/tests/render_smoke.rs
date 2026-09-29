@@ -2,8 +2,7 @@ use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 use voice_bird_next::{
     picker::{ModelPicker, PickerIntent, SessionMenu},
-    state::{Block, BlockState, DownloadState, UiState},
-    store::DownloadPhase,
+    state::{Block, BlockState, DownloadPhase, DownloadState, UiState},
     testing::render_to_string,
 };
 

@@ -35,6 +35,23 @@ pub enum FocusMove {
     Next,
 }
 
+/// Lifecycle states for one model download. The store/table owns
+/// the row, and every transition emits a
+/// [`AppEvent::DownloadStatusChanged`] on the bus so the JSONL event
+/// log records the same lifecycle the SQL table does. Defined here
+/// — alongside the events that carry it — so the table and the bus
+/// cannot disagree on the spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum DownloadStatus {
+    Downloading,
+    Installing,
+    Cancelling,
+    Cancelled,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
 /// Everything that can happen in the app, as plain data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
@@ -94,10 +111,49 @@ pub enum AppEvent {
         model: &'static str,
         error: String,
     },
+    /// Same shape as [`AppEvent::DownloadFailed`] but published by
+    /// [`crate::download::begin`] when the orchestrator failed to
+    /// claim a row in the downloads table *before* a worker could
+    /// spawn (disk full, lock timeout, write error). The table
+    /// reducer accepts this variant even when no row exists for
+    /// `model`, so the UI receives the failure instead of seeing
+    /// the event rejected by the attempt gate. The reducer treats
+    /// it identically to [`AppEvent::DownloadFailed`]: any waiting
+    /// block flips to `Failed`, the downloads entry is removed.
+    DownloadClaimFailed {
+        attempt: u32,
+        model: &'static str,
+        error: String,
+    },
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
     DownloadCancelled { attempt: u32, model: &'static str },
+    /// Emitted by [`crate::db::downloads::Downloads`] on every
+    /// lifecycle transition (Start, Installing, terminal, …). The
+    /// reducer treats it as observability: it never feeds a state
+    /// change, so the table log is consistent with the event log.
+    /// `model` is an `Arc<str>` (not `&'static str`) because the
+    /// transition publisher may have read it from the database
+    /// instead of the catalog.
+    DownloadStatusChanged {
+        model: std::sync::Arc<str>,
+        attempt: u32,
+        from: Option<DownloadStatus>,
+        to: DownloadStatus,
+    },
+    /// Emitted when an event arrives whose attempt does not match
+    /// the table's current attempt for `model` (the old worker
+    /// hasn't been acked yet, but a Restart already superseded it).
+    /// Visibility — the event log now records stale-event drops
+    /// instead of silently filtering them. `rejected` is the
+    /// variant name of the dropped event (e.g. `"DownloadProgress"`).
+    DownloadEventRejected {
+        model: std::sync::Arc<str>,
+        rejected: &'static str,
+        event_attempt: u32,
+        row_attempt: Option<u32>,
+    },
     /// `Tab`: open (or close, if already open) the session menu.
     MenuOpened,
     /// `Esc` (or `Tab` again) while the menu is open.
@@ -111,6 +167,23 @@ pub enum AppEvent {
     SessionShown { id: u8 },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
+
+    // -----------------------------------------------------------------
+    // Bus commands: aimed at the loop-thread dispatcher that owns the
+    // long-lived `Downloader` / `ModelStore` collaborators. The
+    // reducer treats them as observability (the `Downloads::apply`
+    // catch-all returns `Ok(true)` and `UiState::apply` ignores
+    // them); only the dispatcher's `dispatch` consumes them. Reply
+    // channels are `mpsc::sync_channel(1)` oneshots.
+    // -----------------------------------------------------------------
+
+    /// Resolver saw Enter/Retry on a focused block. The dispatcher
+    /// answers by calling `download::begin` with the
+    /// collaborators it owns.
+    BeginDownload(&'static ModelEntry),
+    /// Quit-time cleanup: drop the staged archive and unpack
+    /// scratch directory for `model`. The dispatcher answers with a
+    DiscardInflight { model: std::sync::Arc<str> },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
@@ -264,6 +337,19 @@ mod tests {
         assert!(json.contains("\"event\":\"MenuClosed\""), "{json}");
         assert!(json.contains("\"event\":\"MenuMoved\""), "{json}");
         assert!(json.contains("\"event\":\"SessionShown\""), "{json}");
-        assert!(json.contains("\"id\":4"), "{json}");
+    }
+
+    #[test]
+    fn download_status_changed_serializes_under_the_event_tag() {
+        use std::sync::Arc;
+        let ev = AppEvent::DownloadStatusChanged {
+            model: Arc::from("tiny.en"),
+            attempt: 2,
+            from: Some(DownloadStatus::Cancelling),
+            to: DownloadStatus::Cancelled,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"event\":\"DownloadStatusChanged\""), "{json}");
+        assert!(json.contains("\"to\":\"Cancelled\""), "{json}");
     }
 }

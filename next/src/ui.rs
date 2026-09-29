@@ -16,8 +16,7 @@ use ratatui::{
 };
 
 use crate::picker::{ModelEntry, ModelPicker};
-use crate::state::{BlockState, DownloadState, UiState};
-use crate::store::DownloadPhase;
+use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
 
 /// Draw one frame: outer window with `state.title` in its top border,
 /// then `state.blocks` evenly-distributed columns inside.

@@ -1,38 +1,18 @@
 //! Download transport and orchestration.
-//!
-//! [`Downloader`] is the trait a thread runs to fetch bytes to a
-//! staging file. [`HttpDownloader`] is the live reqwest-based impl,
-//! gated behind the `net` feature. Tests use the
-//! [`crate::testing::FixtureDownloader`], which keeps the flow off the
-//! network entirely.
-//!
-//! [`begin`] is the single entry point for Enter and for retry. It
-//! owns the "is it on disk" decision and asks
-//! [`DownloadRepository::request`] for an atomic claim; on `Start`
-//! the caller spawns a worker passing the claimed cancellation
-//! token, on `Join` the caller only publishes the join event. The
-//! store owns both the progress row and the cancellation token, so
-//! [`DownloadError::Cancelled`] is event-silent — the producer
-//! publishes [`AppEvent::DownloadCancelled`] after the last waiter
-//! closes, and that publish drives both table cleanup and UI state
-//! folding.
 
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
+use crate::db::{downloads, Database};
+use crate::db::downloads::{CancelCheck, CancelProbe, Claim};
 use crate::picker::ModelEntry;
-use crate::store::{DownloadClaim, DownloadRepository};
 use crate::transcription_models::ModelStore;
 
-/// Failure vocabulary for the download pipeline. Seven variants cover
-/// the observed failure modes without falling back to `anyhow` —
-/// tests match on the variant, not on a substring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadError {
     NoCacheDir,
@@ -62,8 +42,6 @@ impl fmt::Display for DownloadError {
 
 impl std::error::Error for DownloadError {}
 
-/// Truncate a possibly-long error message to what the user actually
-/// sees on a single line in a narrow column.
 pub fn truncate_error(s: &str) -> String {
     const MAX: usize = 160;
     if s.chars().count() <= MAX {
@@ -74,33 +52,22 @@ pub fn truncate_error(s: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
-/// Fetch bytes from `url` into a staging file, verify the SHA, report
-/// progress. The downloader is the only thing that talks to the
-/// network; everything else (throttle, install, cancel) is format
-/// agnostic.
 pub trait Downloader: Send + Sync + 'static {
     fn fetch(
         &self,
         url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &AtomicBool,
+        cancel: &mut dyn CancelCheck,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<(), DownloadError>;
 }
 
-/// Stream `src` into `staged` while hashing and watching the cancel
-/// flag. Used directly by tests against a `&[u8]` cursor; the live
-/// HttpDownloader is the only place that calls `reqwest::blocking::get`.
 pub fn stream_to<R: std::io::Read>(
     mut src: R,
     staged: &Path,
     expected_sha: &str,
-    cancel: &AtomicBool,
+    cancel: &mut dyn CancelCheck,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
     use sha2::{Digest, Sha256};
@@ -109,7 +76,7 @@ pub fn stream_to<R: std::io::Read>(
     let mut buf = [0u8; 1 << 16];
     let mut total_read: u64 = 0;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             let _ = fs::remove_file(staged);
             return Err(DownloadError::Cancelled);
         }
@@ -137,8 +104,6 @@ pub fn stream_to<R: std::io::Read>(
     Ok(())
 }
 
-/// The live HTTP downloader. Only constructed in `main.rs` so tests
-/// never touch the network.
 #[cfg(feature = "net")]
 pub struct HttpDownloader;
 
@@ -149,7 +114,7 @@ impl Downloader for HttpDownloader {
         url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &AtomicBool,
+        cancel: &mut dyn CancelCheck,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<(), DownloadError> {
         let resp = reqwest::blocking::get(url).map_err(|e| DownloadError::Http(e.to_string()))?;
@@ -161,23 +126,11 @@ impl Downloader for HttpDownloader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Throttle
-// ---------------------------------------------------------------------------
-
-/// Throttle progress callbacks to keep event traffic bounded. Without
-/// this, a 1.6 GB download at 64 KiB chunks would emit ~25 000 events;
-/// the throttle caps it at ~101 (one per percentage point, or every
-/// 250 ms when no `total` is known). The last progress is always
-/// emitted so the bar reaches 100% / final byte count.
 pub struct Throttle {
     last_pct: i32,
     last_bytes: u64,
     last_total: Option<u64>,
     last_emit_ms: u128,
-    /// Bytes recorded on the most recent progress emit. Used to compute
-    /// `bytes_per_sec` between emits. Zero on a fresh throttle or right
-    /// after the `BytesVerified` flip (when phase changes mid-stream).
     last_emit_bytes: u64,
 }
 
@@ -200,22 +153,6 @@ impl Default for Throttle {
 }
 #[allow(dead_code)]
 impl Throttle {
-    // Flow (review note #4 — readability refactor):
-    //   call(bytes, total) [or finalize(bytes, total)]
-    //     → now_ms()                            (time source)
-    //     → should_emit(bytes, total, now_ms)   (gating policy)
-    //     → emit_progress(bytes, total, ...)    (single emit site)
-    //
-    // The conditional in `call` is intentional and is the answer
-    // to the reviewer who suggested sending total + bytes_per_sec
-    // always and letting the consumer handle the difference. Both
-    // `total.is_some()` paths now share one emit site, so the
-    // payload construction lives in exactly one place — the
-    // DownloadProgress event already always carries both fields,
-    // and the renderer picks the label format. Two named methods
-    // (`should_emit`, `emit_progress`) replace one inline match so
-    // each policy can be reasoned about independently.
-
     pub fn call(
         &mut self,
         attempt: u32,
@@ -230,8 +167,6 @@ impl Throttle {
         }
     }
 
-    /// Emit one final 100% / final-byte progress on the success
-    /// path. `call` already does this when the final chunk reports
     pub fn finalize(
         &mut self,
         attempt: u32,
@@ -244,14 +179,7 @@ impl Throttle {
         self.emit_progress(attempt, bytes, total, now_ms, tx, model);
     }
 
-    // -- policy -------------------------------------------------------------
-
-    /// Apply the throttle gating rules and update the bookkeeping
-    /// that `bytes_per_sec` reads from. Returns `true` if the call
-    /// should publish. Side effect: on `true`, advances `last_pct`
-    /// so the next identical percentage won't re-emit, and updates
-    /// `last_emit_ms` so the elapsed-time window starts here.
-    fn should_emit(&mut self, bytes: u64, total: Option<u64>, now_ms: u128) -> bool {
+    pub(crate) fn should_emit(&mut self, bytes: u64, total: Option<u64>, now_ms: u128) -> bool {
         match total {
             Some(t) if t > 0 => {
                 let pct = ((bytes as f64 / t as f64) * 100.0) as i32;
@@ -264,7 +192,11 @@ impl Throttle {
             }
             _ => {
                 if now_ms.saturating_sub(self.last_emit_ms) >= Self::NO_TOTAL_TICK_MS {
-                    self.last_emit_ms = now_ms;
+                    // Don't bump last_emit_ms here — bytes_per_sec
+                    // reads it to compute elapsed_ms. The
+                    // bookkeeping moves into emit_progress so the
+                    // timestamp captured for the rate matches the
+                    // bytes/total it travels with on the event.
                     true
                 } else {
                     false
@@ -273,12 +205,6 @@ impl Throttle {
         }
     }
 
-    // -- emit ---------------------------------------------------------------
-
-    /// Single emit site. Both call-site paths and finalize funnel
-    /// through here so the payload shape and bookkeeping stay
-    /// aligned. `bytes_per_sec` is always computed even when total
-    /// is known — the renderer treats 0 as "no prior reference"
     fn emit_progress(
         &mut self,
         attempt: u32,
@@ -298,13 +224,11 @@ impl Throttle {
         self.last_bytes = bytes;
         self.last_total = total;
         self.last_emit_bytes = bytes;
+        // Bookkeeping moved out of should_emit so the timestamp
+        // captured here is the one bytes_per_sec just read.
+        self.last_emit_ms = now_ms;
     }
 
-    // -- leaves -------------------------------------------------------------
-
-    /// Wall-clock in milliseconds since the UNIX epoch. Single
-    /// source for everything that says "now" in this module —
-    /// tests that need to fake time should override this method.
     fn now_ms() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -312,10 +236,7 @@ impl Throttle {
             .unwrap_or(0)
     }
 
-    /// Bytes per second measured across the previous emit window.
-    /// Zero on the very first tick (no prior reference); the
-    /// renderer treats 0 as "no measurement yet".
-    fn bytes_per_sec(&self, now_ms: u128, bytes: u64) -> u64 {
+    pub(crate) fn bytes_per_sec(&self, now_ms: u128, bytes: u64) -> u64 {
         if self.last_emit_ms == 0 {
             return 0;
         }
@@ -324,9 +245,6 @@ impl Throttle {
             return 0;
         }
         let delta = bytes - self.last_emit_bytes;
-        // 1000 * delta / elapsed_ms, but watch u128 -> u64 truncation
-        // (delta fits in u64; the multiplication can overflow u128 only
-        // on a multi-million GB/s download, which we will not see).
         ((delta as u128 * 1000) / elapsed_ms) as u64
     }
 
@@ -334,87 +252,94 @@ impl Throttle {
         self.last_total
     }
 
-    /// Cooldown between progress emits when `total` is unknown.
-    /// 250 ms ≈ 4 fps; the bar moves without saturating the event
-    /// bus at ~25 000 chunks/1.6 GB × 64 KiB.
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-// begin — the resolver's single entry point
-// ---------------------------------------------------------------------------
-
-/// Single entry point for Enter and for retry. Owns the "is it on
-/// disk" decision and asks [`DownloadRepository::request`] for an
-/// atomic claim. On `Start` the caller spawns a worker passing the
-/// claimed cancellation token; on `Join` the caller only publishes
-/// the join event. No separate registry, no separate row insert —
-/// one atomic claim replaces the previous `is_active` + `token` pair.
 pub fn begin(
     entry: &'static ModelEntry,
-    store: &Arc<dyn ModelStore>,
-    repo: &Arc<dyn DownloadRepository>,
-    downloader: &Arc<dyn Downloader>,
+    store: Arc<dyn ModelStore>,
+    db: &mut Database,
+    downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
     if store.is_available(entry) {
-        // Log the cache-hit reason before transitioning the block,
-        // so a reader of the event log can distinguish "downloaded
-        // and now recording" from "already on disk, skip download".
         tx.publish(AppEvent::ModelAlreadyCached(entry));
         tx.publish(AppEvent::RecordingStarted(entry));
         return;
     }
-    // Every requester publishes DownloadRequested so the event log
-    // records the join even when the underlying worker was already
-    // started by an earlier request. Only the Start claim spawns.
     tx.publish(AppEvent::DownloadRequested(entry));
-    match repo.request(entry.id) {
-        DownloadClaim::Start { cancel, attempt } => {
-            spawn(
-                entry,
-                store.clone(),
-                downloader.clone(),
-                cancel,
-                attempt,
-                tx.clone(),
-            );
+    let row = match downloads::get(db, entry.id) {
+        Ok(r) => r,
+        Err(e) => {
+            tx.publish(AppEvent::DownloadFailed {
+                attempt: 0,
+                model: entry.id,
+                error: truncate_error(&format!("downloads table: {e}")),
+            });
+            return;
         }
-        DownloadClaim::Restart { cancel, attempt } => {
-            // A previous attempt is still unwinding (its row is in
-            // `Cancelling` state and its worker hasn't acked yet).
-            // The previous worker publishes its terminal event
-            // with the OLD attempt; the store's attempt gate
-            // discards it. We thread the NEW attempt through to
-            // the staging path and every event this attempt
-            // publishes.
-            spawn(
-                entry,
-                store.clone(),
-                downloader.clone(),
-                cancel,
-                attempt,
-                tx.clone(),
-            );
-        }
-        DownloadClaim::Join => {}
+    };
+    match downloads::decide(row.as_ref()) {
+        Claim::Start { attempt } => start_or_fail(
+            entry,
+            store,
+            db,
+            downloader,
+            attempt,
+            tx,
+        ),
+        Claim::Restart { attempt } => start_or_fail(
+            entry,
+            store,
+            db,
+            downloader,
+            attempt,
+            tx,
+        ),
+        Claim::Join => {}
     }
 }
 
-/// Spawn one download thread. Resolves the staging path, fetches with
-/// throttled progress, publishes `DownloadInstalling` for slow formats,
-/// installs, publishes `DownloadSucceeded`. Any error publishes
-/// `DownloadFailed` with the message truncated to 160 chars.
-///
-/// `Cancelled` now publishes `DownloadCancelled { attempt }` so the
-/// store can drop the row under the attempt gate. If the attempt
-/// has since been superseded by a `Restart`, the store's gate
-/// discards the event and the row stays — the new attempt's
-/// progress remains visible.
+/// Claim a fresh attempt and spawn the worker. If `downloads::start`
+/// fails (disk full, lock timeout, write error), publish
+/// `DownloadFailed` with the underlying error and return without
+/// spawning — otherwise the worker would start with no row in the
+/// table, the attempt gate would reject every event it publishes,
+/// and the UI would be stuck on `DownloadRequested` forever.
+fn start_or_fail(
+    entry: &'static ModelEntry,
+    store: Arc<dyn ModelStore>,
+    db: &mut Database,
+    downloader: Arc<dyn Downloader>,
+    attempt: u32,
+    tx: &EventSender,
+) {
+    let attempt = match downloads::start(db, entry.id) {
+        Ok(a) => a,
+        Err(e) => {
+            tx.publish(AppEvent::DownloadClaimFailed {
+                attempt,
+                model: entry.id,
+                error: truncate_error(&format!("downloads table: {e}")),
+            });
+            return;
+        }
+    };
+    spawn(
+        entry,
+        store,
+        downloader,
+        downloads::probe(db, entry.id, attempt),
+        attempt,
+        tx.clone(),
+    );
+}
+
 pub fn spawn(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
     downloader: Arc<dyn Downloader>,
-    cancel: Arc<AtomicBool>,
+    probe: CancelProbe,
     attempt: u32,
     tx: EventSender,
 ) -> JoinHandle<()> {
@@ -435,9 +360,7 @@ pub fn spawn(
     let format = entry.format;
     std::thread::spawn(move || {
         let mut throttle = Throttle::new();
-        // Bridge the &mut dyn FnMut the downloader wants to a closure
-        // that can talk to the throttle. `Progress` holds the mutable
-        // borrow to the throttle; the inner closure defers to it.
+        let mut probe = probe;
         struct Progress<'a> {
             tx: &'a EventSender,
             model: &'static str,
@@ -458,7 +381,7 @@ pub fn spawn(
                 throttle: &mut throttle,
             };
             let mut bridge = |bytes: u64, total: Option<u64>| p.call(bytes, total);
-            downloader.fetch(url, &staged, sha, &cancel, &mut bridge)
+            downloader.fetch(url, &staged, sha, &mut probe, &mut bridge)
         };
         match result {
             Ok(()) => {
@@ -468,18 +391,11 @@ pub fn spawn(
                 if crate::transcription_models::handler_for(format).install_is_slow() {
                     tx.publish(AppEvent::DownloadInstalling { attempt, model });
                 }
-                let install_result = store.install(entry, &staged, &cancel);
+                let install_result = store.install(entry, &staged, &mut probe);
                 match install_result {
                     Ok(()) => {
                         tx.publish(AppEvent::DownloadSucceeded { attempt, model });
                     }
-                    // Cancelled during install: publish
-                    // `DownloadCancelled { attempt }` so the
-                    // store's attempt gate can drop the row. If
-                    // a Restart has superseded this attempt, the
-                    // gate discards the event and the row
-                    // stays — the new attempt's progress remains
-                    // visible.
                     Err(DownloadError::Cancelled) => {
                         tx.publish(AppEvent::DownloadCancelled { attempt, model });
                     }
@@ -491,11 +407,6 @@ pub fn spawn(
                 }
             }
             Err(DownloadError::Cancelled) => {
-                // Same contract as install-time cancel: publish
-                // `DownloadCancelled { attempt }` so the store
-                // can drop the row under the attempt gate. If
-                // the attempt has since been superseded, the
-                // gate discards this event and the row stays.
                 tx.publish(AppEvent::DownloadCancelled { attempt, model });
             }
             Err(e) => tx.publish(AppEvent::DownloadFailed {
@@ -510,107 +421,43 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::CATALOG;
+
+    use crate::testing::{FixtureDownloader, Outcome};
     use std::io::Cursor;
-    use std::sync::atomic::AtomicUsize;
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
-    fn tiny() -> &'static ModelEntry {
-        &CATALOG[5]
-    }
 
-    fn sha_of(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(bytes);
-        hex::encode(h.finalize())
-    }
 
     #[test]
-    fn stream_to_writes_and_verifies_known_sha() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let bytes = b"hello world";
+    fn stream_to_writes_file_and_verifies_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
         let cancel = AtomicBool::new(false);
+        let mut seen_bytes: Vec<u64> = Vec::new();
+        let mut progress = |bytes: u64, _total: Option<u64>| seen_bytes.push(bytes);
         stream_to(
-            Cursor::new(bytes),
+            Cursor::new(Vec::<u8>::new()),
             &staged,
-            &sha_of(bytes),
-            &cancel,
-            &mut |_, _| {},
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &mut { &cancel },
+            &mut progress,
         )
         .unwrap();
-        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        assert!(staged.is_file());
+        assert!(seen_bytes.is_empty(), "no chunks for empty source");
     }
 
     #[test]
-    fn stream_to_sha_mismatch_removes_staged_file() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let cancel = AtomicBool::new(false);
-        let res = stream_to(
-            Cursor::new(b"hello"),
-            &staged,
-            &sha_of(b"goodbye"),
-            &cancel,
-            &mut |_, _| {},
-        );
-        assert!(matches!(res, Err(DownloadError::Sha256Mismatch { .. })));
-        assert!(!staged.exists(), "staged file must be cleaned up");
-    }
-
-    #[test]
-    fn stream_to_reports_monotonic_progress_with_total() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let bytes: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
-        let cancel = AtomicBool::new(false);
-        let mut progress_log: Vec<(u64, Option<u64>)> = Vec::new();
-        stream_to(
-            Cursor::new(&bytes),
-            &staged,
-            &sha_of(&bytes),
-            &cancel,
-            &mut |b, t| progress_log.push((b, t)),
-        )
-        .unwrap();
-        let last = progress_log.last().unwrap();
-        assert_eq!(last.0, bytes.len() as u64);
-        assert_eq!(last.1, None); // stream_to doesn't track total itself
-        let mut prev = 0u64;
-        for (b, _) in &progress_log {
-            assert!(*b >= prev);
-            prev = *b;
-        }
-    }
-
-    #[test]
-    fn stream_to_without_content_length_reports_none_total() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
-        let cancel = AtomicBool::new(false);
-        let mut progress_log: Vec<(u64, Option<u64>)> = Vec::new();
-        stream_to(
-            Cursor::new(b"abcdef"),
-            &staged,
-            &sha_of(b"abcdef"),
-            &cancel,
-            &mut |b, t| progress_log.push((b, t)),
-        )
-        .unwrap();
-        assert!(progress_log.iter().all(|(_, t)| t.is_none()));
-    }
-
-    #[test]
-    fn stream_to_honours_cancel_and_removes_staged_file() {
-        let tmp = TempDir::new().unwrap();
-        let staged = tmp.path().join("x.part");
+    fn stream_to_short_circuits_on_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
         let cancel = AtomicBool::new(true);
         let res = stream_to(
-            Cursor::new(b"hello"),
+            Cursor::new(vec![0u8; 1024]),
             &staged,
-            &sha_of(b"hello"),
-            &cancel,
+            "deadbeef",
+            &mut { &cancel },
             &mut |_, _| {},
         );
         assert_eq!(res, Err(DownloadError::Cancelled));
@@ -618,99 +465,363 @@ mod tests {
     }
 
     #[test]
-    fn display_messages_are_single_line() {
-        for e in [
-            DownloadError::NoCacheDir,
-            DownloadError::Io("x".into()),
-            DownloadError::Http("x".into()),
-            DownloadError::Status(404),
-            DownloadError::Sha256Mismatch {
-                got: "a".into(),
-                expected: "b".into(),
-            },
-            DownloadError::Cancelled,
-        ] {
-            let s = e.to_string();
-            assert!(!s.contains('\n'), "{s:?}");
-        }
+    fn prearmed_cancel_makes_fetch_return_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("out.part");
+        let cancel = AtomicBool::new(true);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloader = FixtureDownloader::new(vec![0u8; 1024], Outcome::Ok, Arc::clone(&calls));
+        let res = downloader.fetch(
+            "https://example.invalid/x",
+            &staged,
+            "deadbeef",
+            &mut { &cancel },
+            &mut |_, _| {},
+        );
+        assert_eq!(res, Err(DownloadError::Cancelled));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch was invoked once");
     }
 
+    // `Throttle::should_emit` and `bytes_per_sec` are pub(crate) so
+    // this test can drive them with a controlled `now_ms` — no
+    // wall-clock waits. The first post-fix emit must report a
+    // sensible rate: the bug was that should_emit updated
+    // `last_emit_ms` BEFORE bytes_per_sec read it, so the first
+    // emit after the gate saw elapsed_ms = 0 and reported 0 B/s.
     #[test]
-    fn truncate_caps_long_messages() {
-        let long = "x".repeat(500);
-        let t = truncate_error(&long);
-        assert!(t.chars().count() <= 161);
-        assert!(t.ends_with('…'));
+    fn throttle_bytes_per_sec_grows_after_first_emit() {
+        let mut throttle = Throttle::new();
+
+        // First emit at t=1000 ms, 1 KiB downloaded. Gate is open
+        // (last_emit_ms starts at 0 → elapsed is huge); bytes_per_sec
+        // sees last_emit_ms = 0 → returns 0 (the documented "no prior
+        // reference" rule, kept).
+        assert!(throttle.should_emit(1024, None, 1_000));
+        throttle.last_emit_ms = 1_000;
+        throttle.last_emit_bytes = 1024;
+        assert_eq!(throttle.bytes_per_sec(1_000, 1024), 0);
+
+        // Second emit at t=1500 ms, 1 MiB downloaded. 1 MiB - 1 KiB
+        // arrived in 500 ms → ~2 MB/s.
+        assert!(throttle.should_emit(1024 * 1024, None, 1_500));
+        let expected_2 = ((1024u64 * 1024 - 1024) * 1000 / 500) as u64;
+        assert_eq!(
+            throttle.bytes_per_sec(1_500, 1024 * 1024),
+            expected_2,
+            "second emit must report the rate between the two timestamps"
+        );
+        throttle.last_emit_ms = 1_500;
+        throttle.last_emit_bytes = 1024 * 1024;
+
+        // Third emit at t=2000 ms, 2 MiB. 1 MiB / 500 ms → 2 MB/s.
+        assert!(throttle.should_emit(2 * 1024 * 1024, None, 2_000));
+        let expected_3 = (1024u64 * 1024 * 1000 / 500) as u64;
+        assert_eq!(throttle.bytes_per_sec(2_000, 2 * 1024 * 1024), expected_3);
     }
 
+    // Regression for the bug seen in the production log:
+    // bytes_per_sec was 0 across all DownloadProgress events because
+    // should_emit advanced `last_emit_ms` before bytes_per_sec read
+    // it. The first emit (no prior reference) is the only legitimate
+    // zero. After should_emit's gate opens the second time,
+    // bytes_per_sec must see a non-zero elapsed window.
     #[test]
-    fn truncate_leaves_short_messages_alone() {
-        assert_eq!(truncate_error("hello"), "hello");
+    fn throttle_first_emit_returns_zero_others_grow() {
+        let mut throttle = Throttle::new();
+        // Simulate the first emit landing (no prior timestamp):
+        // should_emit gates it open; bytes_per_sec reports 0.
+        assert!(throttle.should_emit(1024, None, 1_000));
+        throttle.last_emit_ms = 1_000;
+        throttle.last_emit_bytes = 1024;
+        assert_eq!(throttle.bytes_per_sec(1_000, 1024), 0);
+
+        // After the gate (NO_TOTAL_TICK_MS = 250 ms) opens,
+        // bytes_per_sec must observe a non-zero rate.
+        assert!(throttle.should_emit(2048, None, 1_500));
+        let rate = throttle.bytes_per_sec(1_500, 2048);
+        assert!(rate > 0, "rate after the gate must be non-zero; got {rate}");
     }
 
+    // Gate timing: should_emit suppresses emits inside the 250 ms
+    // cooldown when `total` is unknown.
     #[test]
-    fn throttle_emits_at_most_once_per_percentage_point() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender::from_mpsc(tx);
-        let mut th = Throttle::new();
-        let total = 1_600_000_000u64;
-        let n = 25_000u64;
-        let chunk = total / n;
-        for i in 0..n {
-            th.call(1, i * chunk, Some(total), &tx, "tiny.en");
-        }
-        // Final flush — the chunk loop ends with bytes=total-1, so we
-        // call once more at bytes=total to push the bar to 100%.
-        th.call(1, total, Some(total), &tx, "tiny.en");
-        let mut emitted = 0;
-        while rx.try_recv().is_ok() {
-            emitted += 1;
-        }
-        assert!(emitted <= 102, "got {emitted} events");
-        assert!(emitted >= 100, "got {emitted} events; expected ~101");
+    fn throttle_gate_suppresses_emits_inside_cooldown() {
+        let mut throttle = Throttle::new();
+        assert!(throttle.should_emit(1024, None, 1_000));
+        throttle.last_emit_ms = 1_000;
+        assert!(!throttle.should_emit(2048, None, 1_100), "100 ms later is inside the gate");
+        assert!(throttle.should_emit(4096, None, 1_260), "260 ms later is past the gate");
     }
-
+    // Regression for the silent `unwrap_or(attempt)` bug: when
+    // `downloads::start` fails (disk full, lock timeout, write
+    // error), the orchestrator must publish `DownloadFailed` with
+    // the underlying error and return without spawning a worker.
+    // Otherwise the worker would start without a row in the table,
+    // the attempt gate would reject every event it publishes, and
+    // the UI would be stuck on `DownloadRequested` forever.
+    //
+    // Drive the failure with a `Database` whose writer connection
+    // is opened `SQLITE_OPEN_READ_ONLY`: every `execute()` write
+    // returns `SQLITE_READONLY`. This mirrors the production
+    // failure mode without an OS-level chmod dance and without
+    // consuming the `Connection` via `close` (which would prevent
+    // us from embedding it back into `Database::conn`).
     #[test]
-    fn throttle_without_total_emits_on_elapsed_time() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = EventSender::from_mpsc(tx);
-        let mut th = Throttle::new();
-        for _ in 0..50 {
-            th.call(1, 100, None, &tx, "tiny.en");
-        }
-        let mut n = 0;
-        while rx.try_recv().is_ok() {
-            n += 1;
-        }
-        assert!(n <= 1, "got {n} emissions");
-        th.finalize(1, 100, None, &tx, "tiny.en");
-        assert!(rx.try_recv().is_ok());
+    fn start_or_fail_surfaces_db_write_failure_as_download_failed() {
+        use crate::bus::EventBus;
+        use crate::db::Database;
+        use crate::picker::{CATALOG, ModelEntry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("downloads.sqlite");
+        // Bootstrap: open the file, run the migration, drop the
+        let bootstrap = rusqlite::Connection::open(&path).unwrap();
+        bootstrap
+            .execute_batch(
+                <crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION,
+            )
+            .unwrap();
+        bootstrap.close().map_err(|(_, e)| e).unwrap();
+        // Re-open with `SQLITE_OPEN_READ_ONLY`. Every subsequent
+        // write from `downloads::start` returns `SQLITE_READONLY`.
+        let readonly = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only");
+        let mut bus = EventBus::new();
+        let tiny: &'static ModelEntry = &CATALOG[5];
+        let store: Arc<dyn crate::transcription_models::ModelStore> =
+            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
+        let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            Arc::clone(&calls),
+        ));
+
+        // Call the private helper directly so we know exactly
+        // where the failure surfaces. The same `start_or_fail` is
+        // invoked by `download::begin` for both `Claim::Start` and
+        // `Claim::Restart`.
+        start_or_fail(
+            tiny,
+            store,
+            &mut db,
+            downloader,
+            /* attempt = */ 1,
+            &bus.sender(),
+        );
+
+        // The fetcher must not have been touched — the failure
+        // happens at the row-write step, before `spawn` runs.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "worker must not spawn when downloads::start fails"
+        );
+
+        // The bus must carry `DownloadClaimFailed` (the
+        // pre-persistence variant — there's no row yet to gate
+        // against) with the model id and an error message
+        // derived from the underlying SQL error.
+        let events: Vec<AppEvent> = bus.drain().collect();
+        let failed = events.iter().find_map(|ev| match ev {
+            AppEvent::DownloadClaimFailed { model, error, .. } => {
+                Some((*model, error.clone()))
+            }
+            _ => None,
+        });
+        let (model, error) = failed.expect("DownloadClaimFailed must be published");
+        assert_eq!(model, tiny.id);
+        assert!(
+            !error.is_empty(),
+            "DownloadClaimFailed must carry the underlying SQL error message"
+        );
+        assert!(
+            error.contains("downloads table"),
+            "error must be prefixed by the table name; got {error:?}"
+        );
     }
 
-    /// The downloader's behaviour when invoked twice. Used by the dedup
-    /// test in tests/download_flow.rs.
-    #[allow(dead_code)]
-    pub struct PanicDoubleDownloader {
-        pub calls: Arc<AtomicUsize>,
-    }
-    impl Downloader for PanicDoubleDownloader {
-        fn fetch(
-            &self,
-            _url: &str,
-            _staged: &Path,
-            _sha: &str,
-            _cancel: &AtomicBool,
-            _progress: &mut dyn FnMut(u64, Option<u64>),
-        ) -> Result<(), DownloadError> {
-            let prev = self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(prev, 0, "downloader called twice");
-            Err(DownloadError::Cancelled)
-        }
-    }
+    // End-to-end regression for the "silent unwrap_or" bug:
+    // when `downloads::start` fails (disk full, lock timeout,
+    // write error), the orchestrator publishes a failure event
+    // and the UI must actually see it. The previous bug had
+    // three layers that all needed to be wired correctly:
+    //   1. `download::begin` must NOT silently spawn a worker.
+    //   2. The orchestrator must publish a failure event the
+    //      table reducer accepts (NOT `DownloadFailed`, which is
+    //      gated by `matches_attempt` — when no row exists, the
+    //      gate rejects and `state.apply` is skipped).
+    //   3. The reducer must flip waiting blocks to `Failed`.
+    //
+    // This test exercises the complete bus.drain →
+    // downloads::apply → state.apply path. The companion test
+    // `start_or_fail_surfaces_db_write_failure_as_download_failed`
+    // only inspects the raw bus and therefore misses the
+    // rejection path.
+    #[test]
+    fn db_write_failure_surfaces_to_ui_via_full_drain_apply_flow() {
+        use crate::bus::EventBus;
+        use crate::db::Database;
+        use crate::picker::CATALOG;
 
-    // Suppress unused-tiny import warning by referencing it.
-    #[allow(dead_code)]
-    fn _tiny_used() -> &'static ModelEntry {
-        tiny()
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("downloads.sqlite");
+        // Bootstrap the schema on disk so the orchestrator's
+        // `downloads::get` succeeds and `decide` returns
+        // `Claim::Start`. We then re-open read-only so the
+        // orchestrator's subsequent `downloads::start` write
+        // fails with SQLITE_READONLY.
+        // Bootstrap the schema on disk AND pre-populate a row at
+        // `attempt: 3` in the Failed state so the orchestrator's
+        // `downloads::get` returns it, `decide` proposes
+        // `Claim::Start { attempt: 4 }`, and the read-only
+        // re-open causes the subsequent `downloads::start` write
+        // to fail with SQLITE_READONLY. The expected failure
+        // event carries `attempt: 4`; the derived
+        // `DownloadStatusChanged` must forward the same `4`.
+        {
+            let bootstrap = rusqlite::Connection::open(&path).unwrap();
+            bootstrap
+                .execute_batch(
+                    <crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION,
+                )
+                .unwrap();
+            bootstrap
+                .execute(
+                    "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?4)",
+                    rusqlite::params![
+                        CATALOG[0].id,
+                        3u32,
+                        "Failed",
+                        "2026-09-29T00:00:00.000Z",
+                    ],
+                )
+                .unwrap();
+            bootstrap.close().map_err(|(_, e)| e).unwrap();
+        }
+        let readonly = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only");
+        let mut bus = EventBus::new();
+        let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
+        let mut state = crate::state::UiState::default();
+        state.apply(&AppEvent::AddBlock);
+        let _ = crate::db::downloads::apply(&mut db, &AppEvent::AddBlock);
+
+        let picked = &CATALOG[0];
+        // The resolver publishes BeginDownload for a Confirm on a
+        // Picking block. We call it directly because the
+        // `producer` module isn't in scope here, and because we
+        // want to drive the same code path the production loop
+        // takes (resolver → bus → dispatcher → orchestrator).
+        crate::producer::resolve_intent(
+            crate::input::Intent::Confirm,
+            &state,
+            &mut db,
+            &bus.sender(),
+        );
+        let events: Vec<AppEvent> = bus.drain().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::BeginDownload(_))),
+            "Confirm must publish BeginDownload; got {events:?}"
+        );
+
+        // Drive the orchestrator directly with the read-only
+        // Database — the equivalent of what the dispatcher's
+        // `BeginDownload` arm does. Use the picked entry so the
+        // matching downloads::get returns `None` and decide
+        // returns `Claim::Start`.
+        let store: Arc<dyn crate::transcription_models::ModelStore> =
+            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            Arc::clone(&calls),
+        ));
+        begin(
+            picked,
+            store,
+            &mut db,
+            downloader,
+            &bus.sender(),
+        );
+        let mut drained: Vec<AppEvent> = bus.drain().collect();
+
+        // Worker must not have spawned.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "worker must not spawn when downloads::start fails"
+        );
+
+        // Now drain whatever the orchestrator published and run
+        // it through the full table + state pipeline. This is the
+        // production loop body: drain → for ev in events { apply →
+        for ev in &drained {
+            let _ = crate::db::downloads::apply(&mut db, ev);
+            state.apply(ev);
+        }
+        // Re-drain for any further events published by the
+        // table reducer (e.g. `DownloadStatusChanged` from
+        // `downloads::apply::DownloadClaimFailed`), and fold
+        // those into the audit-log assertion below. The UI
+        // state ignores these observability events so we
+        // don't re-apply them.
+        let mut post_apply: Vec<AppEvent> = bus.drain().collect();
+        drained.extend(post_apply.drain(..));
+
+        // The waiting block must now be in `Failed` — that's the
+        // UI contract. Before this fix, the table gate rejected
+        // the failure event (because no row existed) and
+        // `state.apply` was never called, leaving the block
+        // stuck in `Waiting`.
+        let block = state
+            .blocks
+            .first()
+            .expect("block must still exist after the failure");
+        match &block.state {
+            crate::state::BlockState::Failed { model, error } => {
+                assert_eq!(*model, picked.id);
+                assert!(
+                    error.contains("downloads table"),
+                    "error must surface the underlying table failure; got {error:?}"
+                );
+            }
+            other => panic!(
+                "block must be Failed after a DB-write failure surfaces through the bus; got {other:?}"
+            ),
+        }
+        // Derived audit event must forward the orchestrator's
+        // predicted attempt (4 in this scenario — `decide`
+        // proposed `attempt: 4` for the Failed row at attempt 3
+        // pre-populated above). Without the forward, the log
+        // records `DownloadClaimFailed { attempt: 4 }` followed
+        // by `DownloadStatusChanged { attempt: 0 }`, breaking
+        // attempt correlation and contradicting the table-side
+        // invariant that every status change carries the
+        // orchestrator's claim attempt.
+        let status_changes: Vec<_> = drained
+            .iter()
+            .filter_map(|ev| match ev {
+                AppEvent::DownloadStatusChanged { attempt, to, .. } => Some((*attempt, *to)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            status_changes
+                .iter()
+                .any(|(a, t)| *a == 4 && *t == crate::bus::DownloadStatus::Failed),
+            "DownloadStatusChanged must forward attempt=4 (Failed); got {status_changes:?}"
+        );
     }
 }

@@ -14,23 +14,22 @@
 //! ## Attempt-scoped staging paths
 //!
 //! `ModelFormatHandler::staging_path` takes an `attempt: u32`. The
-//! store picks a fresh attempt id every time a request returns
+//! table picks a fresh attempt id every time a request returns
 //! `Restart` (after a `Cancelling` row has not yet been acked). The
 //! handlers suffix the attempt into the staging filename so two
 //! concurrent attempts of the same model cannot write to the same
-//! `.part` file or unpack into the same scratch directory. The store
+//! `.part` file or unpack into the same scratch directory. The table
 //! filters every event by attempt id, so a stale `DownloadInstalling`
 //! from a superseded attempt cannot repaint the new attempt's
 //! progress row either.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+use crate::db::downloads::CancelCheck;
 use crate::picker::{ModelEntry, ModelFormat};
 
 /// Result type for the model-store surface. `DownloadError` lives in
@@ -42,11 +41,11 @@ pub use crate::download::DownloadError;
 /// deciding whether it is already there.
 pub trait ModelFormatHandler: Send + Sync {
     /// Resolve the on-disk staging path for `(dir, id, attempt)`.
-    /// `attempt` is the `DownloadClaim`'s monotonic id, supplied
-    /// by the store so two concurrent attempts of the same model
-    /// cannot write to the same staging file. Each handler picks
-    /// its own attempt-suffixing scheme; the store never inspects
-    /// the path.
+    /// `attempt` is the `Claim`'s monotonic id, supplied by the
+    /// table so two concurrent attempts of the same model cannot
+    /// write to the same staging file. Each handler picks its
+    /// own attempt-suffixing scheme; the table never inspects the
+    /// path.
     fn staging_path(&self, dir: &Path, id: &str, attempt: u32) -> PathBuf;
     /// Final installed path. Stable across attempts: this is the path
     /// the renderer reports as "available" once install finishes, and
@@ -55,19 +54,20 @@ pub trait ModelFormatHandler: Send + Sync {
     /// Present *and usable* — not merely "a path exists".
     fn is_installed(&self, dir: &Path, id: &str) -> bool;
     /// Move/unpack the verified staging file into place. The cancel
-    /// token is the same one `spawn()` passed to the downloader; it
-    /// is polled between unpack and rename so closing the last
-    /// waiting block during the install phase actually stops the
-    /// worker instead of leaving a half-unpacked directory on disk.
-    /// Returning `DownloadError::Cancelled` is the contract the
-    /// worker relies on to publish nothing — the producer already
-    /// dropped the row when it set the token.
+    /// check is the same [`crate::db::downloads::CancelProbe`] the
+    /// worker polled during fetch; it is observed between unpack
+    /// and rename so closing the last waiting block during the
+    /// install phase actually stops the worker instead of leaving a
+    /// half-unpacked directory on disk. Returning
+    /// `DownloadError::Cancelled` is the contract the worker relies
+    /// on to publish nothing — the producer already flipped the row
+    /// to `Cancelling` when it set the cancel state.
     fn install(
         &self,
         dir: &Path,
         id: &str,
         staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError>;
 
     /// Whether `install` is slow enough to deserve its own UI phase
@@ -91,7 +91,7 @@ pub fn handler_for(format: ModelFormat) -> &'static dyn ModelFormatHandler {
 ///
 /// The attempt suffix on the staging filename is what keeps two
 /// concurrent attempts of the same model from racing on the same
-/// `.part` file: even if the store issues `Restart` under a new
+/// `.part` file: even if the table issues `Restart` under a new
 /// attempt while the previous worker is still alive, the in-flight
 /// GGUF rename for the previous attempt operates on a different
 /// filename. Without the suffix, the rename would have promoted a
@@ -114,9 +114,9 @@ impl ModelFormatHandler for GgufHandler {
         dir: &Path,
         id: &str,
         staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
-        // GGUF install is a single atomic rename; the cancel token
+        // GGUF install is a single atomic rename; the cancel check
         // can only be observed once the worker re-enters its outer
         // loop, so it has no useful check point here. The handler
         // still takes the parameter so the trait stays uniform
@@ -164,7 +164,7 @@ impl ModelFormatHandler for NemotronPackageHandler {
         dir: &Path,
         id: &str,
         staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
         // The unpack scratch dir mirrors the staging file's attempt
         // suffix by stripping the trailing `.part` off `staged`'s
@@ -190,7 +190,7 @@ impl ModelFormatHandler for NemotronPackageHandler {
             let _ = fs::remove_dir_all(&target);
         }
         fs::create_dir_all(&tmp_dir).map_err(|e| DownloadError::Io(e.to_string()))?;
-        // Unpack entry by entry so the cancel token can be polled
+        // Unpack entry by entry so the cancel check can be polled
         // between entries. `Archive::unpack` would have run straight
         // through with no observation point, which is exactly the
         // bug the cancel-during-install repro exposed.
@@ -202,11 +202,11 @@ impl ModelFormatHandler for NemotronPackageHandler {
                 .entries()
                 .map_err(|e| DownloadError::Install(format!("unpack: {e}")))?;
             for entry in entries {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // The producer already dropped the row when it
-                    // set the token; the worker treats this the
-                    // same as the fetch-time Cancelled and
-                    // publishes nothing.
+                if cancel.is_cancelled() {
+                    // The producer already flipped the row to
+                    // Cancelling when it set the token; the worker
+                    // treats this the same as the fetch-time
+                    // Cancelled and publishes nothing.
                     return Err(DownloadError::Cancelled);
                 }
                 let mut entry =
@@ -235,7 +235,7 @@ impl ModelFormatHandler for NemotronPackageHandler {
                     "Nemotron package did not contain encoder.onnx and decoder_joint.onnx".into(),
                 )
             })?;
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
             fs::rename(model_dir, &target).map_err(|e| DownloadError::Io(e.to_string()))?;
@@ -307,16 +307,16 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
 pub trait ModelStore: Send + Sync + 'static {
     fn is_available(&self, entry: &ModelEntry) -> bool;
     /// Resolve the staging path for the supplied attempt id. The
-    /// caller is the worker that just received a `DownloadClaim` from
-    /// the store; it threads the attempt through to the handler so
-    /// two concurrent attempts of the same model never share a
+    /// caller is the worker that just received a `Claim` from the
+    /// table; it threads the attempt through to the handler so two
+    /// concurrent attempts of the same model never share a
     /// `.part` file.
     fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError>;
     fn install(
         &self,
         entry: &ModelEntry,
         staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError>;
     /// Delete a leftover staging file (cancellation, and the startup sweep).
     fn clear_staging(&self, entry: &ModelEntry);
@@ -397,7 +397,7 @@ impl ModelStore for CacheDirStore {
         &self,
         entry: &ModelEntry,
         staged: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
         handler_for(entry.format).install(&self.root, entry.id, staged, cancel)
     }
@@ -441,6 +441,7 @@ mod tests {
     use super::*;
     use crate::picker::CATALOG;
     use std::io::Write;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn tiny_entry() -> &'static ModelEntry {
@@ -488,13 +489,9 @@ mod tests {
         let h = GgufHandler;
         let staged = h.staging_path(tmp.path(), "tiny.en", 1);
         write(&staged, b"GGUF");
-        h.install(
-            tmp.path(),
-            "tiny.en",
-            &staged,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+        let cancel = AtomicBool::new(false);
+        h.install(tmp.path(), "tiny.en", &staged, &mut { &cancel })
+            .unwrap();
         assert!(!staged.exists());
         assert!(h.installed_path(tmp.path(), "tiny.en").is_file());
     }
@@ -551,11 +548,12 @@ mod tests {
 
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
+        let cancel = AtomicBool::new(false);
         h.install(
             dst.path(),
             nemotron_entry().id,
             &archive,
-            &Arc::new(AtomicBool::new(false)),
+            &mut { &cancel },
         )
         .unwrap();
         let installed = h.installed_path(dst.path(), nemotron_entry().id);
@@ -583,11 +581,12 @@ mod tests {
 
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
+        let cancel = AtomicBool::new(false);
         let res = h.install(
             dst.path(),
             nemotron_entry().id,
             &archive,
-            &Arc::new(AtomicBool::new(false)),
+            &mut { &cancel },
         );
         assert!(res.is_err());
         assert!(!h.installed_path(dst.path(), nemotron_entry().id).exists());
