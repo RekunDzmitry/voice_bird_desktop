@@ -341,7 +341,38 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
             )?;
             Ok(true)
         }
-        AppEvent::DownloadFailed {
+        AppEvent::DownloadClaimFailed {
+            attempt,
+            model,
+            error: _,
+        } => {
+            // Pre-persistence failure: `downloads::start` failed
+            // before any row was written, so there is nothing in
+            // the table for this `model` to gate against. The
+            // attempt gate is irrelevant here — the orchestrator
+            // never reached the worker stage. Return `true` so the
+            // reducer applies the failure to every waiting block
+            // (mirroring the existing `DownloadFailed` UI
+            // behaviour) instead of rejecting the event silently.
+            // Publish `DownloadStatusChanged { to: Failed }` so the
+            // event log records the same Failed terminal that a
+            // successful claim + later failure would have produced;
+            // `attempt` is forwarded from the caller's event so
+            // the JSONL log correlates the failure with the
+            // retry that caused it (a failed retry after attempt
+            // 3 logs `DownloadClaimFailed { attempt: 4 }` followed
+            // by `DownloadStatusChanged { attempt: 4 }`, not a
+            // placeholder `attempt: 0`). `from` is `None` because
+            // no row ever existed.
+            db.tx().publish(AppEvent::DownloadStatusChanged {
+                model: Arc::from(*model),
+                attempt: *attempt,
+                from: None,
+                to: DownloadStatus::Failed,
+            });
+            Ok(true)
+        },
+         AppEvent::DownloadFailed {
             attempt,
             model,
             error,

@@ -455,6 +455,27 @@ impl UiState {
                     }
                 }
             }
+            AppEvent::DownloadClaimFailed {
+                attempt: _,
+                model,
+                error,
+            } => {
+                // Same UI semantics as `DownloadFailed` — any
+                // waiting block flips to `Failed` with the
+                // pre-persistence error message. The downloads
+                // entry may or may not exist (the orchestrator
+                // failed before `start` wrote a row), so the
+                // `remove` is a no-op when absent.
+                self.downloads.remove(*model);
+                for block in &mut self.blocks {
+                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
+                        block.state = BlockState::Failed {
+                            model,
+                            error: error.clone(),
+                        };
+                    }
+                }
+            }
             AppEvent::BlockClosed => {
                 // Capture the removed block's model BEFORE the
                 // remove — the producer flipped the table row to

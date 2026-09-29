@@ -111,6 +111,20 @@ pub enum AppEvent {
         model: &'static str,
         error: String,
     },
+    /// Same shape as [`AppEvent::DownloadFailed`] but published by
+    /// [`crate::download::begin`] when the orchestrator failed to
+    /// claim a row in the downloads table *before* a worker could
+    /// spawn (disk full, lock timeout, write error). The table
+    /// reducer accepts this variant even when no row exists for
+    /// `model`, so the UI receives the failure instead of seeing
+    /// the event rejected by the attempt gate. The reducer treats
+    /// it identically to [`AppEvent::DownloadFailed`]: any waiting
+    /// block flips to `Failed`, the downloads entry is removed.
+    DownloadClaimFailed {
+        attempt: u32,
+        model: &'static str,
+        error: String,
+    },
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.

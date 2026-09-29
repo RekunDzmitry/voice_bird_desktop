@@ -317,7 +317,7 @@ fn start_or_fail(
     let attempt = match downloads::start(db, entry.id) {
         Ok(a) => a,
         Err(e) => {
-            tx.publish(AppEvent::DownloadFailed {
+            tx.publish(AppEvent::DownloadClaimFailed {
                 attempt,
                 model: entry.id,
                 error: truncate_error(&format!("downloads table: {e}")),
@@ -622,24 +622,206 @@ mod tests {
             "worker must not spawn when downloads::start fails"
         );
 
-        // The bus must carry `DownloadFailed` with the model id and
-        // an error message derived from the underlying SQL error.
+        // The bus must carry `DownloadClaimFailed` (the
+        // pre-persistence variant — there's no row yet to gate
+        // against) with the model id and an error message
+        // derived from the underlying SQL error.
         let events: Vec<AppEvent> = bus.drain().collect();
         let failed = events.iter().find_map(|ev| match ev {
-            AppEvent::DownloadFailed { model, error, .. } => {
+            AppEvent::DownloadClaimFailed { model, error, .. } => {
                 Some((*model, error.clone()))
             }
             _ => None,
         });
-        let (model, error) = failed.expect("DownloadFailed must be published");
+        let (model, error) = failed.expect("DownloadClaimFailed must be published");
         assert_eq!(model, tiny.id);
         assert!(
             !error.is_empty(),
-            "DownloadFailed must carry the underlying SQL error message"
+            "DownloadClaimFailed must carry the underlying SQL error message"
         );
         assert!(
             error.contains("downloads table"),
             "error must be prefixed by the table name; got {error:?}"
+        );
+    }
+
+    // End-to-end regression for the "silent unwrap_or" bug:
+    // when `downloads::start` fails (disk full, lock timeout,
+    // write error), the orchestrator publishes a failure event
+    // and the UI must actually see it. The previous bug had
+    // three layers that all needed to be wired correctly:
+    //   1. `download::begin` must NOT silently spawn a worker.
+    //   2. The orchestrator must publish a failure event the
+    //      table reducer accepts (NOT `DownloadFailed`, which is
+    //      gated by `matches_attempt` — when no row exists, the
+    //      gate rejects and `state.apply` is skipped).
+    //   3. The reducer must flip waiting blocks to `Failed`.
+    //
+    // This test exercises the complete bus.drain →
+    // downloads::apply → state.apply path. The companion test
+    // `start_or_fail_surfaces_db_write_failure_as_download_failed`
+    // only inspects the raw bus and therefore misses the
+    // rejection path.
+    #[test]
+    fn db_write_failure_surfaces_to_ui_via_full_drain_apply_flow() {
+        use crate::bus::EventBus;
+        use crate::db::Database;
+        use crate::picker::CATALOG;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("downloads.sqlite");
+        // Bootstrap the schema on disk so the orchestrator's
+        // `downloads::get` succeeds and `decide` returns
+        // `Claim::Start`. We then re-open read-only so the
+        // orchestrator's subsequent `downloads::start` write
+        // fails with SQLITE_READONLY.
+        // Bootstrap the schema on disk AND pre-populate a row at
+        // `attempt: 3` in the Failed state so the orchestrator's
+        // `downloads::get` returns it, `decide` proposes
+        // `Claim::Start { attempt: 4 }`, and the read-only
+        // re-open causes the subsequent `downloads::start` write
+        // to fail with SQLITE_READONLY. The expected failure
+        // event carries `attempt: 4`; the derived
+        // `DownloadStatusChanged` must forward the same `4`.
+        {
+            let bootstrap = rusqlite::Connection::open(&path).unwrap();
+            bootstrap
+                .execute_batch(
+                    <crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION,
+                )
+                .unwrap();
+            bootstrap
+                .execute(
+                    "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?4)",
+                    rusqlite::params![
+                        CATALOG[0].id,
+                        3u32,
+                        "Failed",
+                        "2026-09-29T00:00:00.000Z",
+                    ],
+                )
+                .unwrap();
+            bootstrap.close().map_err(|(_, e)| e).unwrap();
+        }
+        let readonly = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only");
+        let mut bus = EventBus::new();
+        let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
+        let mut state = crate::state::UiState::default();
+        state.apply(&AppEvent::AddBlock);
+        let _ = crate::db::downloads::apply(&mut db, &AppEvent::AddBlock);
+
+        let picked = &CATALOG[0];
+        // The resolver publishes BeginDownload for a Confirm on a
+        // Picking block. We call it directly because the
+        // `producer` module isn't in scope here, and because we
+        // want to drive the same code path the production loop
+        // takes (resolver → bus → dispatcher → orchestrator).
+        crate::producer::resolve_intent(
+            crate::input::Intent::Confirm,
+            &state,
+            &mut db,
+            &bus.sender(),
+        );
+        let events: Vec<AppEvent> = bus.drain().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::BeginDownload(_))),
+            "Confirm must publish BeginDownload; got {events:?}"
+        );
+
+        // Drive the orchestrator directly with the read-only
+        // Database — the equivalent of what the dispatcher's
+        // `BeginDownload` arm does. Use the picked entry so the
+        // matching downloads::get returns `None` and decide
+        // returns `Claim::Start`.
+        let store: Arc<dyn crate::transcription_models::ModelStore> =
+            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            Arc::clone(&calls),
+        ));
+        begin(
+            picked,
+            store,
+            &mut db,
+            downloader,
+            &bus.sender(),
+        );
+        let mut drained: Vec<AppEvent> = bus.drain().collect();
+
+        // Worker must not have spawned.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "worker must not spawn when downloads::start fails"
+        );
+
+        // Now drain whatever the orchestrator published and run
+        // it through the full table + state pipeline. This is the
+        // production loop body: drain → for ev in events { apply →
+        for ev in &drained {
+            let _ = crate::db::downloads::apply(&mut db, ev);
+            state.apply(ev);
+        }
+        // Re-drain for any further events published by the
+        // table reducer (e.g. `DownloadStatusChanged` from
+        // `downloads::apply::DownloadClaimFailed`), and fold
+        // those into the audit-log assertion below. The UI
+        // state ignores these observability events so we
+        // don't re-apply them.
+        let mut post_apply: Vec<AppEvent> = bus.drain().collect();
+        drained.extend(post_apply.drain(..));
+
+        // The waiting block must now be in `Failed` — that's the
+        // UI contract. Before this fix, the table gate rejected
+        // the failure event (because no row existed) and
+        // `state.apply` was never called, leaving the block
+        // stuck in `Waiting`.
+        let block = state
+            .blocks
+            .first()
+            .expect("block must still exist after the failure");
+        match &block.state {
+            crate::state::BlockState::Failed { model, error } => {
+                assert_eq!(*model, picked.id);
+                assert!(
+                    error.contains("downloads table"),
+                    "error must surface the underlying table failure; got {error:?}"
+                );
+            }
+            other => panic!(
+                "block must be Failed after a DB-write failure surfaces through the bus; got {other:?}"
+            ),
+        }
+        // Derived audit event must forward the orchestrator's
+        // predicted attempt (4 in this scenario — `decide`
+        // proposed `attempt: 4` for the Failed row at attempt 3
+        // pre-populated above). Without the forward, the log
+        // records `DownloadClaimFailed { attempt: 4 }` followed
+        // by `DownloadStatusChanged { attempt: 0 }`, breaking
+        // attempt correlation and contradicting the table-side
+        // invariant that every status change carries the
+        // orchestrator's claim attempt.
+        let status_changes: Vec<_> = drained
+            .iter()
+            .filter_map(|ev| match ev {
+                AppEvent::DownloadStatusChanged { attempt, to, .. } => Some((*attempt, *to)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            status_changes
+                .iter()
+                .any(|(a, t)| *a == 4 && *t == crate::bus::DownloadStatus::Failed),
+            "DownloadStatusChanged must forward attempt=4 (Failed); got {status_changes:?}"
         );
     }
 }
