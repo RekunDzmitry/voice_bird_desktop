@@ -342,6 +342,14 @@ impl CacheDirStore {
         fs::create_dir_all(&root).map_err(|e| DownloadError::Io(e.to_string()))?;
         Ok(Self { root })
     }
+    /// Build a store at an explicit models root.
+    ///
+    /// Production uses [`Self::new`]; callers that need an isolated persistent
+    /// cache can provide a temporary root and reopen it across sessions.
+    pub fn from_root(root: PathBuf) -> Result<Self, DownloadError> {
+        fs::create_dir_all(&root).map_err(|error| DownloadError::Io(error.to_string()))?;
+        Ok(Self { root })
+    }
 
     pub fn root(&self) -> &Path {
         &self.root
@@ -549,13 +557,8 @@ mod tests {
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
         let cancel = AtomicBool::new(false);
-        h.install(
-            dst.path(),
-            nemotron_entry().id,
-            &archive,
-            &mut { &cancel },
-        )
-        .unwrap();
+        h.install(dst.path(), nemotron_entry().id, &archive, &mut { &cancel })
+            .unwrap();
         let installed = h.installed_path(dst.path(), nemotron_entry().id);
         assert!(installed.is_dir());
         assert!(installed.join("encoder.onnx").is_file());
@@ -582,12 +585,7 @@ mod tests {
         let dst = TempDir::new().unwrap();
         let h = NemotronPackageHandler;
         let cancel = AtomicBool::new(false);
-        let res = h.install(
-            dst.path(),
-            nemotron_entry().id,
-            &archive,
-            &mut { &cancel },
-        );
+        let res = h.install(dst.path(), nemotron_entry().id, &archive, &mut { &cancel });
         assert!(res.is_err());
         assert!(!h.installed_path(dst.path(), nemotron_entry().id).exists());
         assert!(!dst

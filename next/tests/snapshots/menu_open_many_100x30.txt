@@ -1,12 +1,12 @@
 ┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
-││   session 4 ││ 28 · pick a model ││ 29 · pick a model ││ 30 · pick a model│┌ 31 · pick a model ┐│
-││   session 5 ││▶ distil-small.en  ││▶ distil-small.en  ││▶ distil-small.en ││▶ distil-small.en  ││
-││   session 6 ││   distil-large-v3 ││   distil-large-v3 ││   distil-large-v3││   distil-large-v3 ││
-││   session 7 ││   large-v3-turbo  ││   large-v3-turbo  ││   large-v3-turbo ││   large-v3-turbo  ││
-││   session 8 ││   nemotron-3.5-asr││   nemotron-3.5-asr││   nemotron-3.5-as││   nemotron-3.5-asr││
-││   session 9 ││-streaming-0.6b    ││-streaming-0.6b    ││r-streaming-0.6b  ││-streaming-0.6b    ││
-││   session 10││   base.en         ││   base.en         ││   base.en        ││   base.en         ││
-││   session 11││   tiny.en         ││   tiny.en         ││   tiny.en        ││   tiny.en         ││
+││   session 4 ││ 28 · pick a langua││ 29 · pick a langua││ 30 · pick a langu│┌ 31 · pick a langua┐│
+││   session 5 ││▶ en               ││▶ en               ││▶ en              ││▶ en               ││
+││   session 6 ││                   ││                   ││                  ││                   ││
+││   session 7 ││                   ││                   ││                  ││                   ││
+││   session 8 ││                   ││                   ││                  ││                   ││
+││   session 9 ││                   ││                   ││                  ││                   ││
+││   session 10││                   ││                   ││                  ││                   ││
+││   session 11││                   ││                   ││                  ││                   ││
 ││   session 12││                   ││                   ││                  ││                   ││
 ││   session 13││                   ││                   ││                  ││                   ││
 ││   session 14││                   ││                   ││                  ││                   ││

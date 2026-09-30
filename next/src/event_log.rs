@@ -40,11 +40,7 @@ impl EventLog {
         }
         let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
         let path = dir.join(format!("voice_bird_events_{stamp}.jsonl"));
-        let file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("event_log: cannot open {}: {e}", path.display());
@@ -68,7 +64,6 @@ impl EventLog {
             return Some(proj.data_dir().join("events"));
         }
         Some(std::env::temp_dir().join("voice-bird-next").join("events"))
-
     }
 
     /// Path the log was opened against. Exposed for diagnostics and for
@@ -79,16 +74,11 @@ impl EventLog {
 
     /// Format one event as a JSON line and append it. JSON shape:
     /// `{"ts":"<RFC3339>","event":"<variant>"}` for unit variants;
-    /// payload-bearing variants serialize their inner fields under
-    /// the same `"event"` key via serde's internal tagging, so
-    /// `ModelSelected(...)` becomes
-    /// `{"event":"ModelSelected","model":{...}}` alongside `ts`.
+    /// payload-bearing variants serialize their fields alongside `ts`.
     ///
     /// The shape is serialized by `serde_json` rather than formatted
-    /// by hand because a `Debug` dump of an event embedded inside a
-    /// quoted string isn't valid JSON (e.g. the inner quotes in
-    /// `id: "distil-small.en"`). Every line passes `serde_json::from_str`
-    /// back into the event.
+    /// by hand because a `Debug` dump embedded inside a quoted string
+    /// is not valid JSON.
     ///
     /// Errors are swallowed: a full disk or a rotated inode is not
     /// worth surfacing to the UI mid-frame. The next successful
@@ -142,7 +132,10 @@ mod tests {
             .append(true)
             .open(&path)
             .expect("open");
-        let mut log = EventLog { file, path: path.clone() };
+        let mut log = EventLog {
+            file,
+            path: path.clone(),
+        };
         log.append(&AppEvent::AddBlock);
         log.append(&AppEvent::Quit);
         drop(log);
@@ -195,7 +188,8 @@ mod tests {
     fn log_dir_lives_under_application_support_on_macos() {
         let dir = EventLog::log_dir().expect("dir");
         assert!(
-            dir.components().any(|c| c.as_os_str() == "Application Support"),
+            dir.components()
+                .any(|c| c.as_os_str() == "Application Support"),
             "expected Application Support on macOS, got {dir:?}"
         );
     }
@@ -213,7 +207,10 @@ mod tests {
             .append(true)
             .open(&path)
             .expect("open");
-        let mut log = EventLog { file, path: path.clone() };
+        let mut log = EventLog {
+            file,
+            path: path.clone(),
+        };
 
         let mut bus = EventBus::new();
         let a = bus.sender();
@@ -234,17 +231,12 @@ mod tests {
         assert_eq!(events, vec!["AddBlock", "Quit"]);
     }
 
-    /// `ModelSelected` carries a `&'static ModelEntry`. The previous
-    /// Debug-based format string embedded unescaped inner quotes
-    /// (`id: "distil-small.en"`) inside the `"event"` JSON value,
-    /// producing invalid JSONL. This test pins the contract: every
-    /// written line round-trips through `serde_json::from_str`
-    /// without errors, and the model payload fields survive as
-    /// well-typed JSON values rather than a Debug-formatted shape
-    /// smuggled inside a string.
+    /// Language selection and picker movement both carry structured payloads.
+    /// Every line must round-trip through `serde_json::from_str`.
     #[test]
-    fn model_selected_line_round_trips_through_serde_json() {
-        use crate::picker::{PickerMove, CATALOG};
+    fn language_selected_line_round_trips_through_serde_json() {
+        use crate::language::LANGUAGES;
+        use crate::picker::PickerMove;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("log.jsonl");
@@ -253,15 +245,22 @@ mod tests {
             .append(true)
             .open(&path)
             .expect("open");
-        let mut log = EventLog { file, path: path.clone() };
+        let mut log = EventLog {
+            file,
+            path: path.clone(),
+        };
 
-        // One of each interesting variant. `ModelSelected` is the
-        // reviewer-flagged case; `PickerMoved` is the other payload-
-        // bearing variant, paired here so a regression that fixed
-        // only one of them would fail this test.
         log.append(&AppEvent::AddBlock);
-        log.append(&AppEvent::PickerMoved { direction: PickerMove::Down, from_model: None, to_model: None });
-        log.append(&AppEvent::ModelSelected(&CATALOG[0]));
+        log.append(&AppEvent::PickerMoved {
+            direction: PickerMove::Down,
+            from_language: None,
+            to_language: None,
+        });
+        log.append(&AppEvent::LanguageSelected {
+            block: 3,
+            language: &LANGUAGES[0],
+            pending: vec![LANGUAGES[0].live.id],
+        });
         log.append(&AppEvent::BlockClosed);
         log.append(&AppEvent::Quit);
 
@@ -270,39 +269,23 @@ mod tests {
         eprintln!("RAW[1]={}", lines[1]);
         eprintln!("RAW[2]={}", lines[2]);
 
-        // Every line must be a fully-parsable JSON object — the
-        // JSONL file extension advertises that contract, and the
-        // previous Debug-embedded-in-string format produced
-        // unescaped inner quotes for `ModelSelected` and failed
-        // this step.
+        // Every line must be a fully-parsable JSON object.
         for (i, line) in lines.iter().enumerate() {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|e| panic!("line {i} not valid JSON: {e}\nline: {line}"));
         }
 
-        // Spec check: payload-bearing events keep their inner
-        // fields as flat sibling keys alongside `"event"` and
-        // `"ts"`. `#[serde(tag = "event")]` plus `#[serde(flatten)]`
-        // on the envelope flattens the tuple field's contents into
-        // the parent object. The crucial property — what protects
-        // the regression — is that those are proper JSON values
-        // (strings, numbers), not a Debug-formatted shape smuggled
-        // inside a string.
+        // Language profiles expose only the code in logs; model metadata is
+        // deliberately skipped so UI events do not leak model names.
         let parsed: serde_json::Value =
-            serde_json::from_str(lines[2]).expect("model line parses");
+            serde_json::from_str(lines[2]).expect("language line parses");
         assert!(parsed["ts"].as_str().expect("ts").len() > 10);
-        assert_eq!(parsed["event"], "ModelSelected");
-        assert_eq!(parsed["id"], CATALOG[0].id);
-        assert_eq!(parsed["size_mb"], CATALOG[0].size_mb);
-        assert_eq!(parsed["language"], CATALOG[0].language);
-        assert!(
-            parsed["id"].is_string(),
-            "id should be a JSON string; got {parsed:?}"
-        );
-        assert!(
-            parsed["size_mb"].is_number(),
-            "size_mb should be a JSON number; got {parsed:?}"
-        );
+        assert_eq!(parsed["event"], "LanguageSelected");
+        assert_eq!(parsed["block"], 3);
+        assert_eq!(parsed["language"]["code"], "en");
+        assert_eq!(parsed["pending"][0], LANGUAGES[0].live.id);
+        assert!(parsed["language"].get("live").is_none());
+        assert!(parsed["language"].get("refine").is_none());
 
         // PickerMoved line: payload variants serialize inner
         // fields directly (not as Debug strings), so `direction`
@@ -311,19 +294,12 @@ mod tests {
         // serializes to a sibling JSON key rather than the inner
         // enum-variant name, which is what makes the on-disk
         // record queryable: jq '.direction' selects the row.
-        let parsed: serde_json::Value =
-            serde_json::from_str(lines[1]).expect("moved line parses");
+        let parsed: serde_json::Value = serde_json::from_str(lines[1]).expect("moved line parses");
         assert_eq!(parsed["event"], "PickerMoved");
         assert_eq!(parsed["direction"], "Down");
     }
 
-    /// `ModelAlreadyCached` carries the same `&'static ModelEntry`
-    /// payload as `ModelSelected` and `RecordingStarted`, so it must
-    /// serialize with the same flattened shape and the same
-    /// well-typed payload fields (`id`, `size_mb`, `language`).
-    /// This pins the contract that adding a new tuple variant to
-    /// `AppEvent` doesn't accidentally regress into the
-    /// Debug-formatted string the previous incarnation produced.
+    /// `ModelAlreadyCached` retains its flattened model diagnostic payload.
     #[test]
     fn model_already_cached_line_round_trips_through_serde_json() {
         use crate::picker::CATALOG;
@@ -335,22 +311,21 @@ mod tests {
             .append(true)
             .open(&path)
             .expect("open");
-        let mut log = EventLog { file, path: path.clone() };
+        let mut log = EventLog {
+            file,
+            path: path.clone(),
+        };
 
         log.append(&AppEvent::ModelAlreadyCached(&CATALOG[0]));
 
         let body = std::fs::read_to_string(&path).expect("read");
-        let line = body
-            .lines()
-            .next()
-            .expect("at least one line written");
+        let line = body.lines().next().expect("at least one line written");
 
         // Round-trip through serde_json::Value -- the line must be a
         // valid JSON object (the JSONL contract), and the variant
         // tag must come out as "ModelAlreadyCached" rather than the
         // Debug-spel form.
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).expect("line parses");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("line parses");
         assert!(parsed["ts"].as_str().expect("ts").len() > 10);
         assert_eq!(parsed["event"], "ModelAlreadyCached");
         assert_eq!(parsed["id"], CATALOG[0].id);
