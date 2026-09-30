@@ -4,12 +4,18 @@ The incremental rewrite of the Voice Bird desktop TUI. It lives beside
 `voice-bird-cli` (the shipping app in `../src`) and grows by porting one
 piece at a time; the old binary is untouched until this one can replace it.
 
-A block is the unit of interaction. `+` opens a block in model-picker
-mode; arrows move the highlight inside the focused block; Enter runs
-the resolver, which downloads the model on the first time it's needed
-(or starts recording immediately when the weights are already on disk).
-Multiple blocks can be at multiple stages at once — two blocks on the
-same in-flight model share one download and one progress bar.
+A block is the unit of interaction. `+` opens a block in the language
+picker; arrows move the highlight inside the focused block; Enter resolves
+the selected language to its live and refine models. Recording starts only
+when both models are installed, or immediately when both already exist in
+the persistent cache. Multiple blocks can be at different stages at once;
+blocks waiting on the same language share each model download.
+
+The registry currently maps `en` to `distil-small.en` for live
+transcription and `large-v3-turbo` for refinement. Model identifiers remain
+an implementation detail: the UI shows the language code and labels download
+progress by `live` / `refine` role. Adding a language is one row in
+`src/language.rs`.
 
 ```bash
 cargo run  -p voice-bird-next          # empty bordered window, `q` / Ctrl-C to quit
@@ -32,26 +38,30 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
 | `+` | add a Picking block |
 | `←` / `→` | move focus between blocks |
 | `↑` / `↓` | move picker highlight in the focused Picking block |
-| `Enter` | run the resolver on the focused Picking block |
-| `r` / `R` | retry the focused Failed block |
-| `Esc` | close the focused block (last waiter on its model → cancel signal) |
+| `Enter` | resolve the selected language and prepare both models |
+| `r` / `R` | retry the focused Failed block, reusing any model that finished |
+| `Esc` | close the focused block (last waiter on each pending model → cancel signal) |
 | `q`, Ctrl-C | quit (always honoured, including mid-download) |
 
 ## Layout
 
 | path | role |
 |---|---|
-| `src/bus.rs`     | `AppEvent` enum (incl. download events) + `EventBus` / `EventSender` |
-| `src/state.rs`   | `UiState` + `BlockState` + pure reducer |
-| `src/ui.rs`      | `render(f, &UiState)` — picks, gauges, borders, all in-block |
-| `src/input.rs`   | `map_key(KeyEvent) -> Option<Intent>` |
-| `src/store.rs`   | `DownloadRepository` trait + `InMemoryDownloadRepository` + `apply` |
-| `src/model_store.rs` | format handlers (`GgufHandler`, `NemotronPackageHandler`), `CacheDirStore`, staging sweep |
-| `src/download.rs` | `Downloader`, `HttpDownloader`, `Throttle`, `CancelRegistry`, `begin` + `spawn` |
+| `src/language.rs` | language registry mapping each code to live + refine models |
+| `src/picker.rs` | `LanguagePicker` plus the internal model download catalog |
+| `src/bus.rs` | `AppEvent` commands/UI events + `EventBus` / `EventSender` |
+| `src/state.rs` | `UiState` + `BlockState` + pure reducer |
+| `src/ui.rs` | `render(f, &UiState)` — language rows, per-role gauges, borders |
+| `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
+| `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
+| `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
+| `src/download.rs` | `Downloader`, `HttpDownloader`, per-model workers, language orchestration |
+| `src/producer.rs` | intent-to-command resolution and last-waiter cancellation |
+| `src/dispatcher.rs` | command-side collaborator owner and `BeginLanguage` dispatch |
 | `src/event_log.rs` | append-only JSONL of every event |
-| `src/testing.rs` | `render_to_string`, `FixtureStore`, `FixtureDownloader` (compiled unconditionally so `tests/` can use them) |
-| `src/main.rs`    | terminal guard + event loop + resolver (the only file touching a real terminal) |
-| `tests/`         | `render_smoke` (goldens + proptest never-panics) and `download_flow` (end-to-end, no network) |
+| `src/testing.rs` | render/download/store fixtures used by integration tests |
+| `src/main.rs` | terminal guard and event loop (the only file touching a real terminal) |
+| `tests/` | render goldens/properties and end-to-end language download flows |
 
 ## Growth rules
 
@@ -64,15 +74,22 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
    `Option<Intent>`; the resolver in `main.rs` translates to bus events
    and `UiState::apply` folds them in. There is no direct input→state
    mutation.
-5. **The resolver is the only place that decides what to download.** It
-   is the dedup point (one thread per model), the presence check
-   (record or instantiate), and the cancel signal (clear staging when
-   the last waiter closes). Tests bypass it and drive events directly.
-6. **Two representations of download state** (repository + `UiState::downloads`)
-   are kept honest by a convention: decisions read the repository,
-   renders read `UiState`. Both fold from the same drained events.
+5. **The producer resolves user intent; the dispatcher owns side effects.**
+   `BeginLanguage` carries the target block id and registry profile. The
+   dispatcher checks both models, publishes `LanguageSelected` before worker
+   events, and deduplicates each per-model claim through SQLite. Closing the
+   last waiter cancels only that model's in-flight work.
+6. **SQLite owns download lifecycle; `UiState::downloads` is its render
+   projection.** Decisions read SQLite. Accepted worker events update the table
+   before the UI, and the table publishes `DownloadStatusChanged` after every
+   persisted transition. Terminal status events reconcile outcomes that raced
+   ahead of `LanguageSelected`, without a second ready/failed cache in
+   `UiState`.
 7. **No test may touch the network.** `HttpDownloader` is constructed
    only in `main.rs`; everything else uses `FixtureDownloader`.
+8. **Installed models outlive sessions.** `CacheDirStore` reuses completed
+   live and refine artifacts from `<cache_dir>/voice-bird/models/`.
+   SQLite tracks in-flight work; quit cleanup removes staging artifacts only.
 
 ## Refreshing the golden snapshot
 

@@ -10,22 +10,18 @@ use crate::picker::PickerMove;
 
 use crate::db::{downloads, Database};
 use crate::input::Intent;
-use crate::picker::{self, CATALOG};
+use crate::language::LANGUAGES;
+use crate::picker;
 use crate::state::{BlockState, UiState};
-/// Stamp the `from_model`/`to_model` fields onto `PickerMoved` using
-/// the focused block's current `picker_index` plus a non-mutating peek
-/// at the target index. The input layer has no catalog context, so the
-/// resolver carries it. If the focused block isn't `Picking` (e.g. the
-/// user pressed Up/Down while recording), the event logs both fields
-/// as `None` and the reducer still runs the move on the picker if one
-/// is open.
+/// Stamp the `from_language`/`to_language` codes onto `PickerMoved`.
+/// The input layer has no registry context, so the resolver reads the
+/// focused block's picker without mutating it.
 pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::PickerMove) {
-    let (from_model, to_model) = match state.focused() {
+    let (from_language, to_language) = match state.focused() {
         Some(block) => match &block.state {
             BlockState::Picking(picker) => {
-                let from = CATALOG[picker.index].id;
-                let to_idx = picker.peek_next(direction);
-                let to = CATALOG[to_idx].id;
+                let from = LANGUAGES[picker.index].code;
+                let to = LANGUAGES[picker.peek_next(direction)].code;
                 (Some(from), Some(to))
             }
             _ => (None, None),
@@ -34,25 +30,18 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
     };
     tx.publish(AppEvent::PickerMoved {
         direction,
-        from_model,
-        to_model,
+        from_language,
+        to_language,
     });
 }
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
-/// - `Confirm` and `Retry` publish [`AppEvent::BeginDownload`] for
-///   the picked entry. The dispatcher that owns the collaborators is
-///   the only thing that calls [`download::begin`] — this
-///   resolver never sees a `Downloader` or `ModelStore`.
+/// - `Confirm` and `Retry` publish [`AppEvent::BeginLanguage`] with the
+///   target block id. The dispatcher owns the downloader and model store.
 /// - All other intents are direct mappings.
 ///
-/// [`AppEvent::BeginDownload`]: crate::bus::AppEvent::BeginDownload
-pub fn resolve_intent(
-    intent: Intent,
-    state: &UiState,
-    db: &mut Database,
-    tx: &EventSender,
-) {
+/// [`AppEvent::BeginLanguage`]: crate::bus::AppEvent::BeginLanguage
+pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &EventSender) {
     // intents are hijacked to drive the menu instead of falling
     // through to their default reducer. Branch on `state.menu.is_some()`
     // FIRST so the menu's behaviour is local and obvious; everything
@@ -117,45 +106,35 @@ pub fn resolve_intent(
         Intent::Confirm => {
             if let Some(block) = state.focused() {
                 if let BlockState::Picking(picker) = &block.state {
-                    let entry: &'static picker::ModelEntry = &CATALOG[picker.index];
-                    tx.publish(AppEvent::BeginDownload(entry));
+                    tx.publish(AppEvent::BeginLanguage {
+                        block: block.id,
+                        language: &LANGUAGES[picker.index],
+                    });
                 }
             }
         }
         Intent::Retry => {
             if let Some(block) = state.focused() {
-                if let BlockState::Failed { model, .. } = &block.state {
-                    if let Some(entry) = CATALOG.iter().find(|e| e.id == *model) {
-                        tx.publish(AppEvent::BeginDownload(entry));
-                    }
+                if let BlockState::Failed { language, .. } = &block.state {
+                    tx.publish(AppEvent::BeginLanguage {
+                        block: block.id,
+                        language,
+                    });
                 }
             }
         }
         Intent::BlockClosed => {
-            // Closing the focused block: if it was the last waiter on
-            // its model, atomically flip the table row to Cancelling
-            // (logged as DownloadStatusChanged). The reducer's
-            // BlockClosed arm removes `downloads[model]` when no
-            // other block is `Waiting` on that model — pure reducer
-            // logic, no separate publish of `DownloadCancelled` from
-            // the producer.
             if let Some(block) = state.focused() {
-                if let Some(model) = block.model() {
-                    let any_other = state.blocks.iter().any(|b| {
-                        b.id != block.id
-                            && matches!(&b.state, BlockState::Waiting { model: m } if *m == model)
+                for &model in block.pending_models() {
+                    let any_other = state.blocks.iter().any(|other| {
+                        other.id != block.id && other.pending_models().contains(&model)
                     });
-                    if !any_other
-                        && matches!(block.state, BlockState::Waiting { .. })
-                    {
-                        // Best-effort: surface DB errors as a Failed
-                        // event so the user sees the cause instead
-                        // of a stuck Cancelling row.
-                        if let Err(e) = downloads::cancel(db, model) {
+                    if !any_other {
+                        if let Err(error) = downloads::cancel(db, model) {
                             tx.publish(AppEvent::DownloadFailed {
                                 attempt: 0,
                                 model,
-                                error: format!("downloads table: {e}"),
+                                error: format!("downloads table: {error}"),
                             });
                         }
                     }
@@ -173,12 +152,12 @@ mod tests {
     use super::*;
     use crate::bus::EventBus;
     use crate::db::Database;
+    use crate::language::{LanguageProfile, LANGUAGES};
     use crate::picker::SessionMenu;
     use crate::state::Block;
 
-
-    fn tiny() -> &'static picker::ModelEntry {
-        &CATALOG[5]
+    fn english() -> &'static LanguageProfile {
+        &LANGUAGES[0]
     }
 
     /// `downloads_with` in `tests/download_flow.rs`.
@@ -210,36 +189,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn confirm_on_picking_block_invokes_begin() {
-        // Pick the tiny model and confirm — the resolver must publish
-        // BeginDownload for the focused Picking block. The dispatcher
-        // (not the resolver) is the one that calls `begin`; this
-        // test only checks the publish.
+    fn confirm_on_picking_block_invokes_begin_language() {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
         let mut state = UiState::default();
         state.apply(&AppEvent::AddBlock);
-        // Pick the tiny model — AddBlock starts at picker index 0,
-        // and tiny.en is at CATALOG[5], so 5 PickerNext moves land
-        // there. The resolver only publishes `PickerMoved` events;
-        // the reducer applies them to update the picker's index, so
-        // we drain and apply after each move.
-        for _ in 0..5 {
-            resolve_intent(Intent::PickerNext, &state, &mut h.db, &tx);
-            for ev in bus.drain() {
-                state.apply(&ev);
-            }
-        }
         resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AppEvent::BeginDownload(entry) if entry.id == tiny().id)),
-            "Confirm must publish BeginDownload for {}; got {events:?}",
-            tiny().id
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [AppEvent::BeginLanguage { block: 1, language }]
+                if *language == english()
+        ));
     }
 
     #[test]
@@ -257,34 +219,51 @@ mod tests {
     }
 
     #[test]
-    fn block_closed_cancels_in_flight_row() {
-        // Smoke test: BlockClosed on the focused Waiting block
-        // (when no other block is waiting on the same model) flips
-        // the row to Cancelling without publishing a Failed event.
+    fn block_closed_cancels_both_pending_models() {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
         let mut state = UiState::default();
-        // Manually start a row and put the focused block in Waiting.
-        crate::db::downloads::start(&mut h.db, tiny().id).unwrap();
+        for model in english().models() {
+            crate::db::downloads::start(&mut h.db, model.id).unwrap();
+        }
         state.blocks.push(Block::new(
             1,
-            BlockState::Waiting { model: tiny().id },
+            BlockState::Waiting {
+                language: english(),
+                pending: english().models().map(|model| model.id).to_vec(),
+            },
         ));
-        resolve_intent(
-            Intent::BlockClosed,
-            &state,
-            &mut h.db,
-            &tx,
-        );
+        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AppEvent::DownloadFailed { .. })),
-            "BlockClosed must not publish Failed when cancel succeeded; got {events:?}"
-        );
-        let row = crate::db::downloads::get(&h.db, tiny().id)
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AppEvent::DownloadFailed { .. })));
+        for model in english().models() {
+            let row = crate::db::downloads::get(&h.db, model.id).unwrap().unwrap();
+            assert_eq!(row.status, crate::bus::DownloadStatus::Cancelling);
+        }
+    }
+
+    #[test]
+    fn block_closed_cancels_the_sibling_still_running_after_failure() {
+        let bus = EventBus::new();
+        let tx = bus.sender();
+        let mut h = db_with(&bus);
+        crate::db::downloads::start(&mut h.db, english().refine.id).unwrap();
+        let mut state = UiState::default();
+        state.blocks.push(Block::new(
+            1,
+            BlockState::Failed {
+                language: english(),
+                error: "live model failed".to_string(),
+                pending: vec![english().refine.id],
+            },
+        ));
+
+        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
+
+        let row = crate::db::downloads::get(&h.db, english().refine.id)
             .unwrap()
             .unwrap();
         assert_eq!(row.status, crate::bus::DownloadStatus::Cancelling);
@@ -334,7 +313,11 @@ mod tests {
         state.menu = Some(SessionMenu::open_at(0));
         resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1, "expected exactly one event; got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event; got {events:?}"
+        );
         match &events[0] {
             AppEvent::SessionShown { id } => assert_eq!(*id, 1),
             other => panic!("expected SessionShown, got {other:?}"),
@@ -350,7 +333,11 @@ mod tests {
         state.menu = Some(SessionMenu::open_at(0));
         resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1, "expected exactly one event; got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event; got {events:?}"
+        );
         assert!(
             matches!(events.as_slice(), [AppEvent::MenuClosed]),
             "Esc with the menu open must publish MenuClosed, not BlockClosed; got {events:?}"
@@ -371,7 +358,9 @@ mod tests {
         assert!(
             matches!(
                 &events[0],
-                AppEvent::MenuMoved { direction: PickerMove::Up }
+                AppEvent::MenuMoved {
+                    direction: PickerMove::Up
+                }
             ),
             "first event must be MenuMoved Up; got {:?}",
             events[0]
@@ -379,7 +368,9 @@ mod tests {
         assert!(
             matches!(
                 &events[1],
-                AppEvent::MenuMoved { direction: PickerMove::Down }
+                AppEvent::MenuMoved {
+                    direction: PickerMove::Down
+                }
             ),
             "second event must be MenuMoved Down; got {:?}",
             events[1]
@@ -452,7 +443,11 @@ mod tests {
         state.menu = Some(SessionMenu::open_at(2));
         resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 1, "expected exactly one event; got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event; got {events:?}"
+        );
         match &events[0] {
             AppEvent::SessionShown { id } => assert_eq!(*id, 3),
             other => panic!("expected SessionShown for id=3, got {other:?}"),

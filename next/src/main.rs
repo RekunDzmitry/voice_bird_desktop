@@ -1,8 +1,5 @@
 //! Binary entry point: the only file that touches a real terminal.
 
-use std::io::{self, Stdout};
-use std::sync::Arc;
-use std::time::Duration;
 use crossterm::{
     cursor,
     event::{self, Event, KeyEvent},
@@ -10,16 +7,19 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::time::Duration;
 
-#[cfg(feature = "net")]
-use voice_bird_next::download::HttpDownloader;
-use voice_bird_next::dispatcher::Dispatcher;
 use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
 use voice_bird_next::db::{downloads, Database};
+use voice_bird_next::dispatcher::Dispatcher;
 use voice_bird_next::download::Downloader;
-use voice_bird_next::{input, producer};
+#[cfg(feature = "net")]
+use voice_bird_next::download::HttpDownloader;
 use voice_bird_next::state::UiState;
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
+use voice_bird_next::{input, producer};
 /// Runs `restore` on drop.
 struct RestoreGuard<F: FnMut()> {
     restore: F,
@@ -71,14 +71,9 @@ fn main() -> io::Result<()> {
 /// intent becomes [`AppEvent`]s; the reducer does the rest.
 ///
 /// The resolver does NOT hold `Downloader` or `ModelStore` — it
-/// only publishes `BeginDownload` on Enter/Retry. The dispatcher
+/// only publishes `BeginLanguage` on Enter/Retry. The dispatcher
 /// that owns the collaborators answers it.
-fn handle_key(
-    key: KeyEvent,
-    state: &UiState,
-    db: &mut Database,
-    tx: &EventSender,
-) {
+fn handle_key(key: KeyEvent, state: &UiState, db: &mut Database, tx: &EventSender) {
     if let Some(intent) = input::map_key(key) {
         producer::resolve_intent(intent, state, db, tx);
     }
@@ -126,12 +121,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
         // Drain once, fold UI events, then dispatch the same
         // events to the dispatcher. The dispatcher answers
-        // `BeginDownload` by calling `download::begin` and
+        // `BeginLanguage` by calling `download::begin_language` and
         // `DiscardInflight` by calling
         // `ModelStore::discard_inflight`. Command variants
-        // published during dispatch (cache-hit replies,
-        // `DownloadRequested`) appear in `events` on the next
-        // tick.
+        // published during dispatch (language selection, cache-hit
+        // diagnostics, `DownloadRequested`) appear in `events` on the
+        // next tick.
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
                 handle_key(k, &state, &mut db, &tx);

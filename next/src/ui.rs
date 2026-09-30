@@ -15,20 +15,18 @@ use ratatui::{
     Frame,
 };
 
-use crate::picker::{ModelEntry, ModelPicker};
+use crate::language::LanguageProfile;
+use crate::picker::LanguagePicker;
 use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
 
 /// Draw one frame: outer window with `state.title` in its top border,
 /// then `state.blocks` evenly-distributed columns inside.
 ///
 /// Each column renders its own stage:
-/// - `Picking(p)`     → the catalog list, `▶` on `p.index`.
-/// - `Waiting{m}`     → a `Gauge` from `state.downloads[m]`. With
-///   - `Fetching` + known `total` it shows `bytes/total`; with no
-///     `total` it shows `MB/s · bytes`. `Installing` renders the
-///     label `Unpacking m…` left-aligned.
-/// - `Recording{m}`   → `● recording (mocked)`.
-/// - `Failed{m,e}`    → the error wrapped, plus `r retry · Esc close`.
+/// - `Picking(p)` → the language list, `▶` on `p.index`.
+/// - `Waiting` → one gauge per model role.
+/// - `Recording` → `● recording (mocked)`.
+/// - `Failed` → the error wrapped, plus `r retry · Esc close`.
 pub fn render(f: &mut Frame, state: &UiState) {
     // When the reducer sets a transient warning (e.g. "session
     // limit reached; close a session to make room"), append it to
@@ -72,11 +70,7 @@ pub fn render(f: &mut Frame, state: &UiState) {
     // enforced in the reducer's `show_block`, so the renderer never
     // has to clamp. If no block is visible (e.g. nothing has been
     // created yet), skip the layout entirely.
-    let visible: Vec<&crate::state::Block> = state
-        .blocks
-        .iter()
-        .filter(|b| b.visible)
-        .collect();
+    let visible: Vec<&crate::state::Block> = state.blocks.iter().filter(|b| b.visible).collect();
     if !visible.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
@@ -115,20 +109,12 @@ fn render_block(
     f.render_widget(border, area);
 
     match &block.state {
-        BlockState::Waiting { model } => {
-            // The model name is already in the block title, so the body
-            // shows only the progress indicator. `render_gauge` picks
-            // the right shape (Installing → label, Fetching with total
-            // → filled bar with `bytes/total`, Fetching without total
-            // → pulsing bar with `MB/s`).
-            render_gauge(f, model, state.downloads.get(model), inner);
+        BlockState::Waiting { language, pending } => {
+            render_waiting(f, language, pending, state, inner);
         }
         _ => {
             let lines = block_body_lines(block, state);
-            f.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }),
-                inner,
-            );
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
 }
@@ -152,10 +138,13 @@ fn block_border(focused: bool) -> Block<'static> {
 
 fn block_title(block: &crate::state::Block) -> String {
     match &block.state {
-        BlockState::Picking(_) => format!("{} · pick a model", block.id),
-        BlockState::Waiting { model } => format!("{} · {model}", block.id),
-        BlockState::Recording { model } => format!("{} · {model}", block.id),
-        BlockState::Failed { model, .. } => format!("{} · {model} · error", block.id),
+        BlockState::Picking(_) => format!("{} · pick a language", block.id),
+        BlockState::Waiting { language, .. } | BlockState::Recording { language } => {
+            format!("{} · {}", block.id, language.code)
+        }
+        BlockState::Failed { language, .. } => {
+            format!("{} · {} · error", block.id, language.code)
+        }
     }
 }
 
@@ -205,12 +194,7 @@ fn menu_window(total: usize, selected: usize, height: usize) -> (usize, usize) {
 /// every keystroke. This makes the menu responsive to terminal
 /// resizes (the window follows `inner.height`) without needing
 /// a separate scroll state on the menu itself.
-fn render_menu(
-    f: &mut Frame,
-    state: &UiState,
-    menu: &crate::picker::SessionMenu,
-    area: Rect,
-) {
+fn render_menu(f: &mut Frame, state: &UiState, menu: &crate::picker::SessionMenu, area: Rect) {
     let border = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().bold());
@@ -226,7 +210,11 @@ fn render_menu(
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
     for (idx, block) in state.blocks[start..end].iter().enumerate() {
         let absolute = start + idx;
-        let marker = if absolute == menu.index { "\u{25b6}" } else { "  " };
+        let marker = if absolute == menu.index {
+            "\u{25b6}"
+        } else {
+            "  "
+        };
         // Sketch contract: plain `session N` per row — the menu is
         // a navigation list, not a status readout. Model names,
         // picker state, and progress live in the column strip on
@@ -246,32 +234,69 @@ fn block_body_lines(block: &crate::state::Block, _state: &UiState) -> Vec<Line<'
         // Waiting is rendered directly by render_block (Gauge widget).
         BlockState::Waiting { .. } => Vec::new(),
         BlockState::Recording { .. } => vec![Line::from("● recording (mocked)")],
-        BlockState::Failed { error, .. } => vec![
-            Line::from(error.clone()),
-            Line::from("r retry · Esc close"),
-        ],
+        BlockState::Failed { error, .. } => {
+            vec![Line::from(error.clone()), Line::from("r retry · Esc close")]
+        }
     }
 }
 
-fn render_gauge(f: &mut Frame, model: &'static str, state: Option<&DownloadState>, area: Rect) {
+fn render_waiting(
+    f: &mut Frame,
+    language: &'static LanguageProfile,
+    pending: &[&'static str],
+    state: &UiState,
+    area: Rect,
+) {
+    let rows = Layout::new(
+        Direction::Vertical,
+        vec![Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)],
+    )
+    .split(area);
+    for ((role, model), row) in [("live", language.live), ("refine", language.refine)]
+        .into_iter()
+        .zip(rows.iter())
+    {
+        render_model_gauge(
+            f,
+            role,
+            pending.contains(&model.id),
+            state.downloads.get(model.id),
+            *row,
+        );
+    }
+}
+
+fn render_model_gauge(
+    f: &mut Frame,
+    role: &str,
+    pending: bool,
+    state: Option<&DownloadState>,
+    area: Rect,
+) {
+    if !pending {
+        f.render_widget(
+            Gauge::default()
+                .gauge_style(Style::default().bold())
+                .ratio(1.0)
+                .label(format!("{role} · ready")),
+            area,
+        );
+        return;
+    }
+
     match state {
         Some(s) if s.phase == DownloadPhase::Installing => {
-            // Unpacking is a left-aligned label so the user sees that
-            // *something* is happening but no fake bar slides to 100%.
             f.render_widget(
-                Paragraph::new(format!("Unpacking {model}…")),
+                Gauge::default()
+                    .gauge_style(Style::default().bold())
+                    .ratio(s.ratio().unwrap_or(0.0))
+                    .label(format!("{role} · Preparing…")),
                 area,
             );
         }
         Some(s) => {
-            // Fetching. Two label shapes:
-            //   - known total  → filled bar + "bytes / total"
-            //   - no total yet → pulsing bar (ratio=0) + MB/s + bytes
-            // The MB/s line is meaningful precisely because `total`
-            // is None — without it, the user sees only a widthless
-            // bar with no end in sight.
             let ratio = s.ratio().unwrap_or(0.0);
-            let label = match s.total {
+            let progress = match s.total {
                 Some(t) => format!("{} / {}", human_bytes(s.bytes), human_bytes(t)),
                 None => format!(
                     "{} · {:.2} MB/s",
@@ -279,33 +304,32 @@ fn render_gauge(f: &mut Frame, model: &'static str, state: Option<&DownloadState
                     s.bytes_per_sec as f64 / 1_000_000.0
                 ),
             };
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().bold())
-                .ratio(ratio)
-                .label(label);
-            f.render_widget(gauge, area);
+            f.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().bold())
+                    .ratio(ratio)
+                    .label(format!("{role} · {progress}")),
+                area,
+            );
         }
         None => {
-            f.render_widget(Gauge::default().ratio(0.0).label(" "), area);
+            f.render_widget(Gauge::default().ratio(0.0).label(role.to_string()), area);
         }
     }
 }
 
-fn picker_lines(picker: &ModelPicker) -> Vec<Line<'static>> {
+fn picker_lines(picker: &LanguagePicker) -> Vec<Line<'static>> {
     picker
-        .catalog()
+        .languages()
         .iter()
         .enumerate()
-        .map(|(i, entry)| picker_row(i, picker.index, entry))
+        .map(|(i, language)| picker_row(i, picker.index, language))
         .collect()
 }
 
-fn picker_row(index: usize, selected: usize, entry: &ModelEntry) -> Line<'static> {
-    // Rows are just the marker and the model id. Earlier revisions
-    // appended size and language; the rows grew too wide and the
-    // additional columns weren't worth a second look.
+fn picker_row(index: usize, selected: usize, language: &'static LanguageProfile) -> Line<'static> {
     let marker = if index == selected { "\u{25b6}" } else { "  " };
-    Line::from(format!("{marker} {}", entry.id))
+    Line::from(format!("{marker} {}", language.code))
 }
 
 /// Human-readable byte count.
@@ -331,6 +355,7 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::LANGUAGES;
     use crate::state::Block;
     use crate::testing::render_to_string;
 
@@ -364,12 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn one_block_picking_lists_catalog_with_marker() {
+    fn one_block_picking_lists_languages_with_marker() {
         let state = UiState {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Picking(ModelPicker::open(crate::picker::PickerIntent::AddBlock)),
-
+                state: BlockState::Picking(LanguagePicker::open(
+                    crate::picker::PickerIntent::AddBlock,
+                )),
                 ..Default::default()
             }],
             focus: 0,
@@ -377,18 +403,24 @@ mod tests {
             ..Default::default()
         };
         let out = render_to_string(&state, 100, 30);
-        assert!(out.contains("\u{25b6} distil-small.en"));
-        assert!(out.contains("  distil-large-v3"));
-        assert!(out.contains("pick a model"));
+        assert!(out.contains("\u{25b6} en"));
+        assert!(out.contains("pick a language"));
+        for model in LANGUAGES[0].models() {
+            assert!(
+                !out.contains(model.id),
+                "model id leaked into picker: {out}"
+            );
+        }
     }
 
     #[test]
-    fn one_block_recording_shows_recording_marker() {
+    fn recording_title_uses_language_code() {
         let state = UiState {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Recording { model: "tiny.en" },
-
+                state: BlockState::Recording {
+                    language: &LANGUAGES[0],
+                },
                 ..Default::default()
             }],
             focus: 0,
@@ -397,72 +429,47 @@ mod tests {
         };
         let out = render_to_string(&state, 80, 10);
         assert!(out.contains("recording"), "{out}");
-        assert!(out.contains("tiny.en"), "{out}");
+        assert!(out.contains("1 · en"), "{out}");
     }
 
     #[test]
     fn focused_block_border_differs_from_unfocused() {
         let state = UiState {
-            blocks: vec![
-                Block {
-                    id: 1,
-                    state: BlockState::Recording { model: "tiny.en" },
-
+            blocks: (1..=3)
+                .map(|id| Block {
+                    id,
+                    state: BlockState::Recording {
+                        language: &LANGUAGES[0],
+                    },
                     ..Default::default()
-                },
-                Block {
-                    id: 2,
-                    state: BlockState::Recording { model: "base.en" },
-
-                    ..Default::default()
-                },
-                Block {
-                    id: 3,
-                    state: BlockState::Recording { model: "large-v3-turbo" },
-
-                    ..Default::default()
-                },
-            ],
+                })
+                .collect(),
             focus: 1,
             next_block_id: 4,
             ..Default::default()
         };
         let out = render_to_string(&state, 100, 10);
-        assert!(
-            out.matches('─').count() >= 3,
-            "expected focused block top border; got:\n{out}"
-        );
+        assert!(out.matches('─').count() >= 3);
     }
 
     #[test]
-    fn three_blocks_split_into_three_columns_with_titles() {
+    fn three_blocks_split_into_language_titled_columns() {
         let state = UiState {
-            blocks: vec![
-                Block {
-                    id: 1,
-                    state: BlockState::Recording { model: "distil-small.en" },
-
+            blocks: (1..=3)
+                .map(|id| Block {
+                    id,
+                    state: BlockState::Recording {
+                        language: &LANGUAGES[0],
+                    },
                     ..Default::default()
-                },
-                Block {
-                    id: 2,
-                    state: BlockState::Recording { model: "distil-large-v3" },
-
-                    ..Default::default()
-                },
-                Block {
-                    id: 3,
-                    state: BlockState::Recording { model: "large-v3-turbo" },
-
-                    ..Default::default()
-                },
-            ],
+                })
+                .collect(),
             focus: 0,
             next_block_id: 4,
             ..Default::default()
         };
         let out = render_to_string(&state, 100, 30);
-        for label in ["1 · distil-small.en", "2 · distil-large-v3", "3 · large-v3-turbo"] {
+        for label in ["1 · en", "2 · en", "3 · en"] {
             assert!(out.contains(label), "missing {label} in:\n{out}");
         }
     }
@@ -471,10 +478,11 @@ mod tests {
     fn many_blocks_in_a_tiny_terminal_do_not_panic() {
         let state = UiState {
             blocks: (1..=5)
-                .map(|i| Block {
-                    id: i,
-                    state: BlockState::Recording { model: "tiny.en" },
-
+                .map(|id| Block {
+                    id,
+                    state: BlockState::Recording {
+                        language: &LANGUAGES[0],
+                    },
                     ..Default::default()
                 })
                 .collect(),
@@ -486,153 +494,116 @@ mod tests {
     }
 
     #[test]
-    fn picker_row_renders_marker_and_id() {
-        let line = picker_row(0, 0, &crate::picker::CATALOG[0]);
-        assert_eq!(line.to_string(), "\u{25b6} distil-small.en");
+    fn picker_row_renders_only_language_code() {
+        let line = picker_row(0, 0, &LANGUAGES[0]);
+        assert_eq!(line.to_string(), "\u{25b6} en");
+        for model in LANGUAGES[0].models() {
+            assert!(!line.to_string().contains(model.id));
+        }
     }
 
     #[test]
-    fn picker_row_unselected_row_has_no_marker() {
-        let line = picker_row(1, 0, &crate::picker::CATALOG[0]);
-        // The first two chars are padding (no marker), then the id.
-        let s = line.to_string();
-        assert!(s.starts_with("  "), "expected two-space indent; got {s:?}");
-        assert!(s.contains("distil-small.en"), "expected id; got {s:?}");
-    }
-
-    #[test]
-    fn picker_row_does_not_include_size_or_language() {
-        let line = picker_row(2, 2, &crate::picker::CATALOG[2]);
-        let s = line.to_string();
-        assert!(!s.contains("MB"), "size column should be gone; got {s:?}");
-        assert!(!s.contains("multi"), "language column should be gone; got {s:?}");
-        assert!(s.contains("large-v3-turbo"), "id should still be present; got {s:?}");
-    }
-
-    #[test]
-    fn waiting_block_draws_filled_cells_at_half() {
-        let mut state = UiState {
-            blocks: vec![Block {
-                id: 1,
-                state: BlockState::Waiting { model: "tiny.en" },
-
-                ..Default::default()
-            }],
-            focus: 0,
-            next_block_id: 2,
-            ..Default::default()
-        };
-        state.downloads.insert(
-            "tiny.en",
-            DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 50,
-                total: Some(100),
-                bytes_per_sec: 0,
-            },
-        );
-        let out = render_to_string(&state, 100, 10);
-        assert!(out.contains('█'), "expected filled gauge cells; got:\n{out}");
-        assert!(out.contains("tiny.en"), "expected model id; got:\n{out}");
-    }
-
-    #[test]
-    fn waiting_blocks_on_the_same_model_render_identical_bodies() {
-        let mut state = UiState {
-            blocks: vec![
-                Block {
-                    id: 1,
-                    state: BlockState::Waiting { model: "tiny.en" },
-
-                    ..Default::default()
-                },
-                Block {
-                    id: 2,
-                    state: BlockState::Waiting { model: "tiny.en" },
-
-                    ..Default::default()
-                },
-            ],
-            focus: 0,
-            next_block_id: 3,
-            ..Default::default()
-        };
-        state.downloads.insert(
-            "tiny.en",
-            DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 50,
-                total: Some(100),
-                bytes_per_sec: 0,
-            },
-        );
-        let out = render_to_string(&state, 100, 10);
-        let count = out.matches('█').count();
-        assert!(count >= 2, "expected at least two cells of `█`; got {count} in:\n{out}");
-    }
-
-    #[test]
-    fn waiting_block_without_a_record_does_not_panic() {
-        let state = UiState {
-            blocks: vec![Block {
-                id: 1,
-                state: BlockState::Waiting { model: "tiny.en" },
-
-                ..Default::default()
-            }],
-            focus: 0,
-            next_block_id: 2,
-            ..Default::default()
-        };
-        let _ = render_to_string(&state, 40, 5);
-    }
-
-    #[test]
-    fn waiting_block_installing_phase_says_unpacking_left_aligned() {
+    fn waiting_block_draws_separate_role_gauges() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
-                    model: "nemotron-3.5-asr-streaming-0.6b",
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
                 },
-
                 ..Default::default()
             }],
             focus: 0,
             next_block_id: 2,
             ..Default::default()
         };
-        state.downloads.insert(
-            "nemotron-3.5-asr-streaming-0.6b",
-            DownloadState {
-                phase: DownloadPhase::Installing,
-                bytes: 0,
-                total: Some(740 * 1024 * 1024),
-                bytes_per_sec: 0,
-            },
-        );
+        for model in LANGUAGES[0].models() {
+            state.downloads.insert(
+                model.id,
+                DownloadState {
+                    phase: DownloadPhase::Fetching,
+                    bytes: 50,
+                    total: Some(100),
+                    bytes_per_sec: 0,
+                },
+            );
+        }
         let out = render_to_string(&state, 100, 10);
-        assert!(out.contains("Unpacking"), "got:\n{out}");
-        // No filled bar — Installing should not draw a █ anywhere.
-        assert!(!out.contains('\u{2588}'), "Installing must not draw a filled bar; got:\n{out}");
+        assert!(
+            out.contains('█'),
+            "expected filled gauge cells; got:\n{out}"
+        );
+        assert!(out.contains("1 · en"));
+        assert!(out.contains("live · 50 B / 100 B"), "{out}");
+        assert!(out.contains("refine · 50 B / 100 B"), "{out}");
+        for model in LANGUAGES[0].models() {
+            assert!(!out.contains(model.id));
+        }
     }
 
     #[test]
-    fn waiting_block_without_content_length_uses_mb_per_sec_label() {
+    fn waiting_block_shows_completed_role_as_ready() {
+        let state = UiState {
+            blocks: vec![Block {
+                id: 1,
+                state: BlockState::Waiting {
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id],
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = render_to_string(&state, 40, 8);
+        assert!(out.contains("live"), "{out}");
+        assert!(out.contains("refine · ready"), "{out}");
+    }
+
+    #[test]
+    fn waiting_block_installing_phase_says_preparing_by_role() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Waiting { model: "tiny.en" },
-
+                state: BlockState::Waiting {
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
+                },
                 ..Default::default()
             }],
-            focus: 0,
-            next_block_id: 2,
             ..Default::default()
         };
-        // 2 MiB/s over the previous tick.
+        for model in LANGUAGES[0].models() {
+            state.downloads.insert(
+                model.id,
+                DownloadState {
+                    phase: DownloadPhase::Installing,
+                    bytes: 0,
+                    total: Some(100),
+                    bytes_per_sec: 0,
+                },
+            );
+        }
+        let out = render_to_string(&state, 100, 10);
+        assert!(out.contains("live · Preparing…"), "got:\n{out}");
+        assert!(out.contains("refine · Preparing…"), "got:\n{out}");
+        assert!(!out.contains('\u{2588}'));
+    }
+
+    #[test]
+    fn waiting_block_without_content_length_uses_model_rate() {
+        let mut state = UiState {
+            blocks: vec![Block {
+                id: 1,
+                state: BlockState::Waiting {
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id],
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         state.downloads.insert(
-            "tiny.en",
+            LANGUAGES[0].live.id,
             DownloadState {
                 phase: DownloadPhase::Fetching,
                 bytes: 1024,
@@ -640,38 +611,29 @@ mod tests {
                 bytes_per_sec: 2 * 1024 * 1024,
             },
         );
-        let out = render_to_string(&state, 40, 5);
-        assert!(out.contains("MB/s"), "expected MB/s readout; got:
-{out}");
-        // The model name lives only in the title — the body must not
-        // repeat it (only the gauge fills the body now).
-        let gauge_rows: Vec<&str> = out
-            .lines()
-            .filter(|l| l.contains("MB/s") || l.contains("█"))
-            .collect();
-        assert!(
-            gauge_rows.iter().all(|l| !l.contains("tiny.en")),
-            "gauge body must not repeat the model id; rows: {gauge_rows:?}"
-        );
+        let out = render_to_string(&state, 40, 8);
+        assert!(out.contains("MB/s"), "{out}");
+        assert!(out.contains("live"), "{out}");
+        assert!(out.contains("refine · ready"), "{out}");
+        assert!(!out.contains(LANGUAGES[0].live.id));
     }
 
     #[test]
-    fn failed_block_shows_error_and_retry_hint() {
+    fn failed_block_shows_language_error_and_retry_hint() {
         let state = UiState {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Failed {
-                    model: "tiny.en",
+                    language: &LANGUAGES[0],
                     error: "HTTP 404".to_string(),
+                    pending: Vec::new(),
                 },
-
                 ..Default::default()
             }],
-            focus: 0,
-            next_block_id: 2,
             ..Default::default()
         };
         let out = render_to_string(&state, 100, 10);
+        assert!(out.contains("1 · en · error"), "{out}");
         assert!(out.contains("HTTP 404"), "{out}");
         assert!(out.contains("retry"), "{out}");
     }
@@ -697,16 +659,27 @@ mod tests {
             s.apply(&crate::bus::AppEvent::AddBlock);
         }
         let out = render_to_string(&s, 100, 30);
-        for label in ["2 · pick a model", "3 · pick a model", "4 · pick a model", "5 · pick a model"] {
+        for label in [
+            "2 · pick a language",
+            "3 · pick a language",
+            "4 · pick a language",
+            "5 · pick a language",
+        ] {
             assert!(out.contains(label), "missing {label} in:\n{out}");
         }
         // Block 1 is hidden — its title must not appear in the
         // column-strip portion of the layout.
-        assert!(!out.contains("1 · pick a model"), "hidden block 1 leaked into columns; got:\n{out}");
+        assert!(
+            !out.contains("1 · pick a language"),
+            "hidden block 1 leaked into columns; got:\n{out}"
+        );
         // The menu is closed, so the panel rows must NOT be drawn.
         // (`session 1` lives only in the menu; the column strip
         // for the visible blocks starts at `session 2`.)
-        assert!(!out.contains("session 1"), "menu panel rendered while closed; got:\n{out}");
+        assert!(
+            !out.contains("session 1"),
+            "menu panel rendered while closed; got:\n{out}"
+        );
     }
 
     #[test]

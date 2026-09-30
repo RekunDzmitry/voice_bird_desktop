@@ -9,25 +9,18 @@
 //!
 //! ## Bus commands consumed
 //!
-//! - [`AppEvent::BeginDownload`](crate::bus::AppEvent::BeginDownload) —
-//!   the resolver saw `Confirm` on a focused `Picking` block or
-//!   `Retry` on a focused `Failed` block. The dispatcher calls
-//!   [`download::begin`](crate::download::begin) with the
-//!   collaborators it owns.
+//! - [`AppEvent::BeginLanguage`](crate::bus::AppEvent::BeginLanguage) —
+//!   the resolver saw `Confirm` or `Retry`. The dispatcher calls
+//!   [`download::begin_language`](crate::download::begin_language).
 //! - [`AppEvent::DiscardInflight`] — Quit-time cleanup asks the
 //!   dispatcher to drop the staged archive and unpack scratch
 //!   directory for one model. No reply (best-effort).
 //!
 //! ## Why a loop-thread dispatcher, not a side-thread one?
 //!
-//! `download::begin` (called from the dispatcher) does the
-//! `ModelStore::is_available` cache-hit check synchronously.
-//! Routing that through a bus reply would deadlock: `begin` would
-//! park on the oneshot, but the loop is already inside the
-//! dispatcher's `dispatch` and can't drain the bus to answer.
-//! Keeping the dispatcher on the loop thread lets `dispatch` call
-//! `begin` directly, with the collaborators it owns, and the
-//! loop continues normally.
+//! `download::begin_language` checks the model store synchronously. Keeping
+//! the dispatcher on the loop thread avoids a bus-reply deadlock while the
+//! loop is already inside `dispatch`.
 //!
 //! [`AppEvent::DiscardInflight`]: crate::bus::AppEvent::DiscardInflight
 
@@ -35,7 +28,7 @@ use std::sync::Arc;
 
 use crate::bus::AppEvent;
 use crate::db::Database;
-use crate::download::begin;
+use crate::download::begin_language;
 use crate::picker::{ModelEntry, CATALOG};
 use crate::transcription_models::ModelStore;
 
@@ -64,20 +57,15 @@ impl Dispatcher {
     /// events. UI events are silently ignored — only the command
     /// variants do anything here.
     ///
-    /// `db` is borrowed mutably for the lifetime of each
-    /// `download::begin` call. The borrow is scoped to the call,
+    /// `db` is borrowed mutably for each `download::begin_language` call,
     /// so the next tick gets a fresh `&mut`.
-    pub fn dispatch(
-        &self,
-        events: &[AppEvent],
-        db: &mut Database,
-        tx: &crate::bus::EventSender,
-    ) {
+    pub fn dispatch(&self, events: &[AppEvent], db: &mut Database, tx: &crate::bus::EventSender) {
         for ev in events {
             match ev {
-                AppEvent::BeginDownload(entry) => {
-                    begin(
-                        entry,
+                AppEvent::BeginLanguage { block, language } => {
+                    begin_language(
+                        *block,
+                        language,
                         self.model_store.clone(),
                         db,
                         self.downloader.clone(),

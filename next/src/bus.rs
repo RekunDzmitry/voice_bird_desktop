@@ -25,6 +25,7 @@
 
 use std::sync::mpsc;
 
+use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 
 /// Direction focus travelled between blocks. The reducer saturates at
@@ -61,32 +62,30 @@ pub enum AppEvent {
     /// `←` / `→`: move focus between blocks.
     FocusMoved { direction: FocusMove },
     /// `↑` / `↓` while the focused block is `Picking`: move the
-    /// highlight inside that block's catalog list. `from_model` and
-    /// `to_model` are stamped by the resolver; the input layer has
-    /// no catalog context. Tests (and any future event source that
-    /// doesn't know the focused block) pass `None, None`.
+    /// highlight inside that block's language list. The language
+    /// codes are stamped by the resolver for the event log.
     PickerMoved {
         direction: PickerMove,
-        from_model: Option<&'static str>,
-        to_model: Option<&'static str>,
+        from_language: Option<&'static str>,
+        to_language: Option<&'static str>,
     },
-    /// Enter on a focused `Picking` block. Today this transitions
-    /// straight to `Recording`; step 8 routes it through the resolver
-    /// (`begin`).
-    ModelSelected(&'static ModelEntry),
+    /// The dispatcher resolved both model-presence checks for a language.
+    /// The block id is explicit because focus may move before this reply is
+    /// reduced.
+    LanguageSelected {
+        block: u8,
+        language: &'static LanguageProfile,
+        pending: Vec<&'static str>,
+    },
     /// Esc on the focused block: remove it.
     BlockClosed,
-    /// Model is on disk and ready.
-    RecordingStarted(&'static ModelEntry),
-    /// Resolver detected the model is already on disk before any
-    /// download was attempted. Published alongside `RecordingStarted`
-    /// on the cache-hit path so the event log records *why* the
-    /// block transitioned straight to `Recording` without a
-    /// `DownloadRequested`. Reducer treats this as an alias for
-    /// `RecordingStarted`.
+    /// Model was already installed when the language was selected. The
+    /// reducer fans this availability out to any existing waiter; the
+    /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
 
-    /// The focused block now waits on this model.
+    /// One model needed by the selected language is not on disk yet.
+    /// Seeds the shared per-model download projection.
     DownloadRequested(&'static ModelEntry),
     /// Progress on a download. `bytes_per_sec` is a per-tick average
     /// over the throttle window — used by the renderer to label the
@@ -112,8 +111,8 @@ pub enum AppEvent {
         error: String,
     },
     /// Same shape as [`AppEvent::DownloadFailed`] but published by
-    /// [`crate::download::begin`] when the orchestrator failed to
-    /// claim a row in the downloads table *before* a worker could
+    /// [`crate::download::begin_language`] when the orchestrator failed
+    /// to claim a row in the downloads table *before* a worker could
     /// spawn (disk full, lock timeout, write error). The table
     /// reducer accepts this variant even when no row exists for
     /// `model`, so the UI receives the failure instead of seeing
@@ -129,18 +128,22 @@ pub enum AppEvent {
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
     DownloadCancelled { attempt: u32, model: &'static str },
-    /// Emitted by [`crate::db::downloads::Downloads`] on every
-    /// lifecycle transition (Start, Installing, terminal, …). The
-    /// reducer treats it as observability: it never feeds a state
-    /// change, so the table log is consistent with the event log.
-    /// `model` is an `Arc<str>` (not `&'static str`) because the
-    /// transition publisher may have read it from the database
-    /// instead of the catalog.
+    /// Emitted after the downloads table accepts and persists every lifecycle
+    /// transition. The reducer uses terminal transitions to reconcile worker
+    /// outcomes that raced ahead of `LanguageSelected`; the event log records
+    /// the same lifecycle the SQL table does.
+    ///
+    /// `model` is an `Arc<str>` (not `&'static str`) because the transition
+    /// publisher may have read it from the database instead of the catalog.
+    /// `error` is populated for `Failed` so a late waiter receives the same
+    /// actionable message as blocks that observed the worker event directly.
     DownloadStatusChanged {
         model: std::sync::Arc<str>,
         attempt: u32,
         from: Option<DownloadStatus>,
         to: DownloadStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Emitted when an event arrives whose attempt does not match
     /// the table's current attempt for `model` (the old worker
@@ -176,11 +179,12 @@ pub enum AppEvent {
     // them); only the dispatcher's `dispatch` consumes them. Reply
     // channels are `mpsc::sync_channel(1)` oneshots.
     // -----------------------------------------------------------------
-
-    /// Resolver saw Enter/Retry on a focused block. The dispatcher
-    /// answers by calling `download::begin` with the
-    /// collaborators it owns.
-    BeginDownload(&'static ModelEntry),
+    /// Resolver saw Enter/Retry on a block. The dispatcher ensures both
+    /// models for the language and targets the reply by block id.
+    BeginLanguage {
+        block: u8,
+        language: &'static LanguageProfile,
+    },
     /// Quit-time cleanup: drop the staged archive and unpack
     /// scratch directory for `model`. The dispatcher answers with a
     DiscardInflight { model: std::sync::Arc<str> },
@@ -347,9 +351,36 @@ mod tests {
             attempt: 2,
             from: Some(DownloadStatus::Cancelling),
             to: DownloadStatus::Cancelled,
+            error: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
-        assert!(json.contains("\"event\":\"DownloadStatusChanged\""), "{json}");
+        assert!(
+            json.contains("\"event\":\"DownloadStatusChanged\""),
+            "{json}"
+        );
         assert!(json.contains("\"to\":\"Cancelled\""), "{json}");
+    }
+
+    #[test]
+    fn language_events_serialize_codes_without_model_metadata() {
+        let language = &crate::language::LANGUAGES[0];
+        let selected = AppEvent::LanguageSelected {
+            block: 3,
+            language,
+            pending: language.models().map(|model| model.id).to_vec(),
+        };
+        let selected: serde_json::Value =
+            serde_json::to_value(selected).expect("serialize language selection");
+        assert_eq!(selected["event"], "LanguageSelected");
+        assert_eq!(selected["block"], 3);
+        assert_eq!(selected["language"]["code"], language.code);
+        assert!(selected["language"].get("live").is_none());
+        assert!(selected["language"].get("refine").is_none());
+
+        let command = serde_json::to_value(AppEvent::BeginLanguage { block: 3, language })
+            .expect("serialize language command");
+        assert_eq!(command["event"], "BeginLanguage");
+        assert_eq!(command["block"], 3);
+        assert_eq!(command["language"]["code"], language.code);
     }
 }

@@ -1,28 +1,40 @@
 use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 use voice_bird_next::{
-    picker::{ModelPicker, PickerIntent, SessionMenu},
+    language::LANGUAGES,
+    picker::{LanguagePicker, PickerIntent, SessionMenu, CATALOG},
     state::{Block, BlockState, DownloadPhase, DownloadState, UiState},
     testing::render_to_string,
 };
 
-const IDLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/idle_100x30.txt");
-const THREE_BLOCKS: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/three_blocks_100x30.txt");
-const PICKING: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/picking_100x30.txt");
+const IDLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/idle_100x30.txt"
+);
+const THREE_BLOCKS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/three_blocks_100x30.txt"
+);
+const PICKING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/picking_100x30.txt"
+);
 const DOWNLOADING_TWO_BLOCKS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/downloading_two_blocks_100x30.txt"
 );
-const FAILED: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/failed_100x30.txt");
+const FAILED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/failed_100x30.txt"
+);
 const FIVE_BLOCKS_CAPPED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/five_blocks_capped_100x30.txt"
 );
-const MENU_OPEN: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/menu_open_100x30.txt");
+const MENU_OPEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/menu_open_100x30.txt"
+);
 const MENU_OPEN_MANY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/menu_open_many_100x30.txt"
@@ -41,32 +53,15 @@ fn idle_100x30_matches_golden() {
 #[test]
 fn three_blocks_100x30_matches_golden() {
     let state = UiState {
-        blocks: vec![
-            Block {
-                id: 1,
+        blocks: (1..=3)
+            .map(|id| Block {
+                id,
                 state: BlockState::Recording {
-                    model: "distil-small.en",
+                    language: &LANGUAGES[0],
                 },
-
                 ..Default::default()
-            },
-            Block {
-                id: 2,
-                state: BlockState::Recording {
-                    model: "distil-large-v3",
-                },
-
-                ..Default::default()
-            },
-            Block {
-                id: 3,
-                state: BlockState::Recording {
-                    model: "large-v3-turbo",
-                },
-
-                ..Default::default()
-            },
-        ],
+            })
+            .collect(),
         focus: 0,
         next_block_id: 4,
         ..Default::default()
@@ -84,7 +79,7 @@ fn picking_100x30_matches_golden() {
     let state = UiState {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
+            state: BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
 
             ..Default::default()
         }],
@@ -103,33 +98,31 @@ fn picking_100x30_matches_golden() {
 #[test]
 fn downloading_two_blocks_100x30_matches_golden() {
     let mut state = UiState {
-        blocks: vec![
-            Block {
-                id: 1,
-                state: BlockState::Waiting { model: "tiny.en" },
-
+        blocks: (1..=2)
+            .map(|id| Block {
+                id,
+                state: BlockState::Waiting {
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
+                },
                 ..Default::default()
-            },
-            Block {
-                id: 2,
-                state: BlockState::Waiting { model: "tiny.en" },
-
-                ..Default::default()
-            },
-        ],
+            })
+            .collect(),
         focus: 0,
         next_block_id: 3,
         ..Default::default()
     };
-    state.downloads.insert(
-        "tiny.en",
-        DownloadState {
-            phase: DownloadPhase::Fetching,
-            bytes: 50,
-            total: Some(100),
-            bytes_per_sec: 0,
-        },
-    );
+    for model in LANGUAGES[0].models() {
+        state.downloads.insert(
+            model.id,
+            DownloadState {
+                phase: DownloadPhase::Fetching,
+                bytes: 50,
+                total: Some(100),
+                bytes_per_sec: 0,
+            },
+        );
+    }
     let out = render_to_string(&state, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(DOWNLOADING_TWO_BLOCKS, &out).expect("write golden");
@@ -144,8 +137,9 @@ fn failed_100x30_matches_golden() {
         blocks: vec![Block {
             id: 1,
             state: BlockState::Failed {
-                model: "tiny.en",
+                language: &LANGUAGES[0],
                 error: "HTTP 404".to_string(),
+                pending: Vec::new(),
             },
 
             ..Default::default()
@@ -163,12 +157,11 @@ fn failed_100x30_matches_golden() {
 }
 
 #[test]
-fn picker_renders_catalog_inside_focused_block() {
+fn picker_renders_languages_without_model_ids() {
     let state = UiState {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
-
+            state: BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
             ..Default::default()
         }],
         focus: 0,
@@ -176,9 +169,11 @@ fn picker_renders_catalog_inside_focused_block() {
         ..Default::default()
     };
     let out = render_to_string(&state, 100, 30);
-    assert!(out.contains("\u{25b6} distil-small.en"));
-    assert!(out.contains("  distil-large-v3"));
-    assert!(out.contains("pick a model"));
+    assert!(out.contains(&format!("\u{25b6} {}", LANGUAGES[0].code)));
+    assert!(out.contains("pick a language"));
+    for model in CATALOG {
+        assert!(!out.contains(model.id));
+    }
 }
 
 #[test]
@@ -192,8 +187,17 @@ fn five_blocks_capped_100x30_matches_golden() {
     }
     // The reducer's clock has moved: dump the visible ids for
     // sanity (no assertion here — the golden does the rest).
-    let visible_ids: Vec<u8> = s.blocks.iter().filter(|b| b.visible).map(|b| b.id).collect();
-    assert_eq!(visible_ids, vec![2, 3, 4, 5], "block 1 hidden after 5th AddBlock");
+    let visible_ids: Vec<u8> = s
+        .blocks
+        .iter()
+        .filter(|b| b.visible)
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        visible_ids,
+        vec![2, 3, 4, 5],
+        "block 1 hidden after 5th AddBlock"
+    );
     let out = render_to_string(&s, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(FIVE_BLOCKS_CAPPED, &out).expect("write golden");
@@ -239,7 +243,10 @@ fn menu_open_many_100x30_matches_golden() {
     let expected = std::fs::read_to_string(MENU_OPEN_MANY).expect("read golden");
     assert_eq!(out, expected);
     // Sanity: the highlighted row IS in the rendered window.
-    assert!(out.contains("▶ session 27"), "selected row not in window; got:\n{out}");
+    assert!(
+        out.contains("▶ session 27"),
+        "selected row not in window; got:\n{out}"
+    );
     // And the rows above/below the selection are also present.
     // `session 1` (the bare row, with the marker or two-space indent)
     // is NOT in the rendered window — that's the bug we're fixing.
@@ -249,9 +256,18 @@ fn menu_open_many_100x30_matches_golden() {
         !out.contains(" session 1\n") && !out.contains("▶ session 1\n"),
         "session 1 row leaked into window; got:\n{out}"
     );
-    assert!(out.contains(" session 14"), "expected session 14 in window; got:\n{out}");
-    assert!(out.contains("▶ session 27"), "expected session 27 highlighted; got:\n{out}");
-    assert!(out.contains(" session 31"), "expected session 31 in window; got:\n{out}");
+    assert!(
+        out.contains(" session 14"),
+        "expected session 14 in window; got:\n{out}"
+    );
+    assert!(
+        out.contains("▶ session 27"),
+        "expected session 27 highlighted; got:\n{out}"
+    );
+    assert!(
+        out.contains(" session 31"),
+        "expected session 31 in window; got:\n{out}"
+    );
 }
 
 #[test]
@@ -336,12 +352,12 @@ fn focus_left_into_hidden_block_reveals_it() {
     // line; unfocused neighbours share │ dividers and have no
     // top border. Assert BOTH: focused block 1 IS wrapped,
     // AND no column carries the unfocused form for block 1.
-    let focused_title = "\u{250C} 1 \u{00B7} pick a model";
+    let focused_title = "\u{250C} 1 \u{00B7} pick a language";
     assert!(
         out.contains(focused_title),
         "focused block 1 missing top border; expected substring {focused_title:?}; got:\n{out}"
     );
-    let unfocused_title = "\u{2502} 1 \u{00B7} pick a model";
+    let unfocused_title = "\u{2502} 1 \u{00B7} pick a language";
     assert!(
         !out.contains(unfocused_title),
         "block 1 still rendering as unfocused; rejected substring {unfocused_title:?}; got:\n{out}"
@@ -517,7 +533,6 @@ fn focus_reveal_evicts_the_lru_visible_peer() {
     );
 }
 
-
 proptest! {
     #[test]
     fn render_never_panics_for_any_size(w in 1u16..200, h in 1u16..80) {
@@ -534,7 +549,9 @@ proptest! {
             blocks: (1..=blocks as u8)
                 .map(|i| Block {
                     id: i,
-                    state: BlockState::Recording { model: "tiny.en" },
+                    state: BlockState::Recording {
+                        language: &LANGUAGES[0],
+                    },
 
                     ..Default::default()
                 })
@@ -563,7 +580,10 @@ proptest! {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Waiting { model: "tiny.en" },
+                state: BlockState::Waiting {
+                    language: &LANGUAGES[0],
+                    pending: vec![LANGUAGES[0].live.id],
+                },
 
                 ..Default::default()
             }],
@@ -572,7 +592,7 @@ proptest! {
             ..Default::default()
         };
         state.downloads.insert(
-            "tiny.en",
+            LANGUAGES[0].live.id,
             DownloadState {
                 phase: DownloadPhase::Fetching,
                 bytes,

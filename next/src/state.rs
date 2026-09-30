@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::bus::{AppEvent, FocusMove};
-use crate::picker::{ModelPicker, PickerEvent, PickerIntent, SessionMenu};
+use crate::language::LanguageProfile;
+use crate::picker::{LanguagePicker, PickerEvent, PickerIntent, SessionMenu};
 
 /// Render-side phase for one download. Lives in `state.rs` (UI
 /// only) because the SQLite `DownloadStatus` enum carries the
@@ -19,21 +20,26 @@ pub enum DownloadPhase {
 pub const MAX_VISIBLE_BLOCKS: usize = 4;
 
 /// State of one block. The block is the unit of interaction: it picks a
-/// model, waits for it, then records with it. Every stage renders inside
-/// the block's own column.
+/// language, waits for both of its models, then records with that language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockState {
-    /// Choosing a model. Carries its own picker — no shared overlay.
-    Picking(ModelPicker),
-    /// Waiting on `model`'s download. Progress is NOT stored here: it is
-    /// read from [`UiState::downloads`], which is what lets two blocks on
-    /// the same model render one shared bar.
-    Waiting { model: &'static str },
-    /// Mocked in this PR — no audio device; the state only changes
-    /// rendering.
-    Recording { model: &'static str },
-    /// Last download for `model` failed. The resolver retries via `r`.
-    Failed { model: &'static str, error: String },
+    /// Choosing a language. Carries its own picker — no shared overlay.
+    Picking(LanguagePicker),
+    /// Waiting until every model id in `pending` is present on disk.
+    /// Progress stays in [`UiState::downloads`] so blocks share per-model state.
+    Waiting {
+        language: &'static LanguageProfile,
+        pending: Vec<&'static str>,
+    },
+    /// Mocked in this PR — no audio device; the state only changes rendering.
+    Recording { language: &'static LanguageProfile },
+    /// A required model failed. Retry re-checks both models on disk.
+    Failed {
+        language: &'static LanguageProfile,
+        error: String,
+        /// Required models that are still running after the failure.
+        pending: Vec<&'static str>,
+    },
 }
 
 /// A single inner column. Pure data — no threads, no handles, no clock.
@@ -82,12 +88,19 @@ impl Block {
         }
     }
 
-    pub fn model(&self) -> Option<&'static str> {
+    pub fn language(&self) -> Option<&'static LanguageProfile> {
         match &self.state {
             BlockState::Picking(_) => None,
-            BlockState::Waiting { model }
-            | BlockState::Recording { model }
-            | BlockState::Failed { model, .. } => Some(model),
+            BlockState::Waiting { language, .. }
+            | BlockState::Recording { language }
+            | BlockState::Failed { language, .. } => Some(language),
+        }
+    }
+
+    pub fn pending_models(&self) -> &[&'static str] {
+        match &self.state {
+            BlockState::Waiting { pending, .. } | BlockState::Failed { pending, .. } => pending,
+            _ => &[],
         }
     }
 }
@@ -97,15 +110,16 @@ impl Default for Block {
     /// ..Default::default() }`. Not used by production code; the
     /// reducer constructs blocks via [`Block::new`].
     fn default() -> Self {
-        Self::new(0, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)))
+        Self::new(
+            0,
+            BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+        )
     }
 }
 
-/// Render-side projection of one download. Mirrors
-/// [`crate::store::DownloadRecord`] one-for-one; both are folded from
-/// the same drained events so they cannot disagree. The renderer reads
-/// from `UiState` (a pure data struct) and cannot reach the
-/// `Mutex`-guarded repository.
+/// Render-side projection of one download. The SQLite downloads table and
+/// this map fold the same accepted bus events: decisions read SQLite while
+/// rendering remains a pure function of `UiState`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadState {
     pub phase: DownloadPhase,
@@ -266,6 +280,49 @@ impl UiState {
             self.blocks[idx].visible = true;
         }
     }
+    fn fail_waiters(&mut self, model: &str, error: &str) {
+        self.downloads.remove(model);
+        for block in &mut self.blocks {
+            let failed = match &mut block.state {
+                BlockState::Waiting { language, pending } if pending.contains(&model) => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    Some((*language, pending.clone()))
+                }
+                BlockState::Failed { pending, .. } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    None
+                }
+                _ => None,
+            };
+            if let Some((language, pending)) = failed {
+                block.state = BlockState::Failed {
+                    language,
+                    pending,
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn mark_ready(&mut self, model: &str) {
+        self.downloads.remove(model);
+        for block in &mut self.blocks {
+            let completed_language = match &mut block.state {
+                BlockState::Waiting { language, pending } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    pending.is_empty().then_some(*language)
+                }
+                BlockState::Failed { pending, .. } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(language) = completed_language {
+                block.state = BlockState::Recording { language };
+            }
+        }
+    }
 
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
@@ -297,10 +354,8 @@ impl UiState {
                     // user-visible warning instead; the renderer
                     // shows `state.warning` in the title bar, and
                     // BlockClosed clears it once a slot is free.
-                    self.warning = Some(
-                        "session limit reached; close a session to make room"
-                            .to_string(),
-                    );
+                    self.warning =
+                        Some("session limit reached; close a session to make room".to_string());
                     return;
                 };
                 // Advance `next_block_id` past the issued id, so
@@ -320,7 +375,7 @@ impl UiState {
                 // silently grow.
                 self.blocks.push(Block::new_hidden(
                     id,
-                    BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock)),
+                    BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
                 ));
                 // `+` is the canonical "auto-show and focus, evict
                 // if full" path. Goes through `show_block` so the
@@ -367,46 +422,33 @@ impl UiState {
                     }
                 }
             }
-            AppEvent::ModelSelected(entry) => {
-                if let Some(block) = self.focused_mut() {
-                    if matches!(block.state, BlockState::Picking(_)) {
-                        block.state = BlockState::Recording { model: entry.id };
-                    }
-                }
-            }
-            AppEvent::RecordingStarted(entry) => {
-                if let Some(block) = self.focused_mut() {
+            AppEvent::LanguageSelected {
+                block,
+                language,
+                pending,
+            } => {
+                if let Some(block) = self
+                    .blocks
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *block)
+                {
                     if matches!(
                         block.state,
                         BlockState::Picking(_) | BlockState::Failed { .. }
                     ) {
-                        block.state = BlockState::Recording { model: entry.id };
+                        block.state = if pending.is_empty() {
+                            BlockState::Recording { language }
+                        } else {
+                            BlockState::Waiting {
+                                language,
+                                pending: pending.clone(),
+                            }
+                        };
                     }
                 }
             }
-            AppEvent::ModelAlreadyCached(entry) => {
-                // Alias for RecordingStarted: the resolver already
-                // published the cache-hit diagnostic immediately
-                // before this event; the reducer's only job is to
-                // flip the focused block to Recording.
-                if let Some(block) = self.focused_mut() {
-                    if matches!(
-                        block.state,
-                        BlockState::Picking(_) | BlockState::Failed { .. }
-                    ) {
-                        block.state = BlockState::Recording { model: entry.id };
-                    }
-                }
-            }
+            AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::DownloadRequested(entry) => {
-                if let Some(block) = self.focused_mut() {
-                    if matches!(
-                        block.state,
-                        BlockState::Picking(_) | BlockState::Failed { .. }
-                    ) {
-                        block.state = BlockState::Waiting { model: entry.id };
-                    }
-                }
                 self.downloads.entry(entry.id).or_insert(DownloadState {
                     phase: DownloadPhase::Fetching,
                     bytes: 0,
@@ -432,78 +474,36 @@ impl UiState {
                     row.phase = DownloadPhase::Installing;
                 }
             }
-            AppEvent::DownloadSucceeded { attempt: _, model } => {
-                self.downloads.remove(*model);
-                for block in &mut self.blocks {
-                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
-                        block.state = BlockState::Recording { model };
-                    }
-                }
-            }
+            AppEvent::DownloadSucceeded { attempt: _, model } => self.mark_ready(model),
             AppEvent::DownloadFailed {
                 attempt: _,
                 model,
                 error,
-            } => {
-                self.downloads.remove(*model);
-                for block in &mut self.blocks {
-                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
-                        block.state = BlockState::Failed {
-                            model,
-                            error: error.clone(),
-                        };
-                    }
-                }
             }
-            AppEvent::DownloadClaimFailed {
+            | AppEvent::DownloadClaimFailed {
                 attempt: _,
                 model,
                 error,
-            } => {
-                // Same UI semantics as `DownloadFailed` — any
-                // waiting block flips to `Failed` with the
-                // pre-persistence error message. The downloads
-                // entry may or may not exist (the orchestrator
-                // failed before `start` wrote a row), so the
-                // `remove` is a no-op when absent.
-                self.downloads.remove(*model);
-                for block in &mut self.blocks {
-                    if matches!(&block.state, BlockState::Waiting { model: m } if **m == **model) {
-                        block.state = BlockState::Failed {
-                            model,
-                            error: error.clone(),
-                        };
-                    }
-                }
-            }
+            } => self.fail_waiters(model, error),
             AppEvent::BlockClosed => {
-                // Capture the removed block's model BEFORE the
-                // remove — the producer flipped the table row to
-                // Cancelling when this was the last waiter, and
-                // the reducer removes the corresponding UI entry
-                // so the gauge disappears while the worker
-                // unwinds. If other blocks are still waiting on
-                // the same model, leave `downloads[model]` alone
-                // so they keep rendering the shared progress.
-                let removed_model = self
+                let removed_pending = self
                     .blocks
                     .get(self.focus)
-                    .and_then(|b| b.model());
+                    .map(|block| block.pending_models().to_vec())
+                    .unwrap_or_default();
                 if !self.blocks.is_empty() {
                     self.blocks.remove(self.focus);
                     if !self.blocks.is_empty() {
                         self.focus = self.focus.min(self.blocks.len() - 1);
                     }
-                    // Fill any slot a removal opened: the user
-                    // expects the window to stay at the cap while
-                    // hidden sessions still exist.
                     self.promote_hidden();
                 }
-                if let Some(model) = removed_model {
-                    let still_waiting = self.blocks.iter().any(|b| {
-                        matches!(&b.state, BlockState::Waiting { model: m } if *m == model)
-                    });
-                    if !still_waiting {
+                for model in removed_pending {
+                    let still_pending = self
+                        .blocks
+                        .iter()
+                        .any(|block| block.pending_models().contains(&model));
+                    if !still_pending {
                         self.downloads.remove(model);
                     }
                 }
@@ -512,7 +512,8 @@ impl UiState {
                 // warning (future use) stays put — only the
                 // exhaustion warning auto-clears on BlockClosed,
                 // because only BlockClosed frees an id.
-                if self.warning.as_deref() == Some("session limit reached; close a session to make room")
+                if self.warning.as_deref()
+                    == Some("session limit reached; close a session to make room")
                     && self.blocks.len() < u8::MAX as usize
                 {
                     self.warning = None;
@@ -541,24 +542,45 @@ impl UiState {
                 self.show_block(*id);
                 self.menu = None;
             }
-            // Lifecycle observability events: the table is the
-            // source of truth, so the reducer doesn't fold them
-            // into `downloads`. The event log already captures
-            // them via the same drain loop.
-            AppEvent::DownloadStatusChanged { .. }
-            | AppEvent::DownloadEventRejected { .. } => {}
+            // The table publishes these after persisting a lifecycle
+            // transition. Replaying terminal outcomes here reconciles a worker
+            // event that was reduced while a new block was still Picking.
+            AppEvent::DownloadStatusChanged {
+                model, to, error, ..
+            } => match to {
+                crate::bus::DownloadStatus::Succeeded => self.mark_ready(model.as_ref()),
+                crate::bus::DownloadStatus::Failed => self.fail_waiters(
+                    model.as_ref(),
+                    error.as_deref().unwrap_or("download failed"),
+                ),
+                _ => {}
+            },
+            AppEvent::DownloadEventRejected { .. } => {}
             AppEvent::Quit => self.should_quit = true,
             // Bus commands aimed at the loop-thread dispatcher.
             // Reducer ignores them; the dispatcher is the only
             // consumer.
-            AppEvent::BeginDownload(_) | AppEvent::DiscardInflight { .. } => {}
+            AppEvent::BeginLanguage { .. } | AppEvent::DiscardInflight { .. } => {}
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::{PickerMove, CATALOG};
+    use crate::language::{LanguageProfile, LANGUAGES};
+    use crate::picker::PickerMove;
+
+    fn english() -> &'static LanguageProfile {
+        &LANGUAGES[0]
+    }
+
+    fn select(block: u8, pending: Vec<&'static str>) -> AppEvent {
+        AppEvent::LanguageSelected {
+            block,
+            language: english(),
+            pending,
+        }
+    }
 
     #[test]
     fn apply_quit_sets_should_quit() {
@@ -583,15 +605,13 @@ mod tests {
     fn apply_add_block_works_while_a_download_is_in_flight() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
+        s.apply(&select(1, Vec::new()));
         s.apply(&AppEvent::AddBlock);
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 1);
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording {
-                model: "distil-small.en"
-            }
+            BlockState::Recording { language } if language == english()
         ));
         assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
     }
@@ -692,15 +712,13 @@ mod tests {
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
-        let live_ids: std::collections::HashSet<u8> =
-            s.blocks.iter().map(|b| b.id).collect();
+        let live_ids: std::collections::HashSet<u8> = s.blocks.iter().map(|b| b.id).collect();
         assert_eq!(live_ids, [1u8, 2, 3].into_iter().collect());
         // Force next_block_id back to 1; the next AddBlock will
         // scan past 1, 2, 3 and pick 4.
         s.next_block_id = 1;
         s.apply(&AppEvent::AddBlock);
-        let new_ids: std::collections::HashSet<u8> =
-            s.blocks.iter().map(|b| b.id).collect();
+        let new_ids: std::collections::HashSet<u8> = s.blocks.iter().map(|b| b.id).collect();
         assert_eq!(
             new_ids,
             [1u8, 2, 3, 4].into_iter().collect(),
@@ -722,7 +740,12 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .map(|id| {
+                    Block::new(
+                        id,
+                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+                    )
+                })
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -750,7 +773,12 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .map(|id| {
+                    Block::new(
+                        id,
+                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+                    )
+                })
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -781,7 +809,12 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ModelPicker::open(PickerIntent::AddBlock))))
+                .map(|id| {
+                    Block::new(
+                        id,
+                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+                    )
+                })
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -853,60 +886,46 @@ mod tests {
     fn picker_moved_targets_only_the_focused_block() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
+        s.apply(&select(1, Vec::new()));
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::PickerMoved {
             direction: PickerMove::Down,
-            from_model: None,
-            to_model: None,
-        });
-        s.apply(&AppEvent::PickerMoved {
-            direction: PickerMove::Down,
-            from_model: None,
-            to_model: None,
+            from_language: None,
+            to_language: None,
         });
         let picker_index = match &s.blocks[1].state {
-            BlockState::Picking(p) => p.index,
+            BlockState::Picking(picker) => picker.index,
             _ => panic!("block 2 should still be picking"),
         };
-        assert_eq!(picker_index, 2);
+        assert_eq!(picker_index, 0);
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording {
-                model: "distil-small.en"
-            }
+            BlockState::Recording { language } if language == english()
         ));
     }
 
     #[test]
-    fn model_selected_flips_focused_block() {
+    fn language_selected_targets_block_id_and_records_when_ready() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::PickerMoved {
-            direction: PickerMove::Down,
-            from_model: None,
-            to_model: None,
-        });
-        s.apply(&AppEvent::ModelSelected(&CATALOG[2]));
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, Vec::new()));
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording {
-                model: "large-v3-turbo"
-            }
+            BlockState::Recording { language } if language == english()
         ));
+        assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
     }
 
     #[test]
-    fn model_selected_is_noop_when_focused_block_is_recording() {
+    fn language_selected_is_noop_when_target_block_is_recording() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
-        s.apply(&AppEvent::ModelSelected(&CATALOG[1]));
+        s.apply(&select(1, Vec::new()));
+        s.apply(&select(1, vec![english().live.id]));
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording {
-                model: "distil-small.en"
-            }
+            BlockState::Recording { language } if language == english()
         ));
     }
 
@@ -951,7 +970,7 @@ mod tests {
         let mut s = UiState::default();
         for expected in 1u8..=3 {
             s.apply(&AppEvent::AddBlock);
-            s.apply(&AppEvent::ModelSelected(&CATALOG[0]));
+            s.apply(&select(expected, Vec::new()));
             assert_eq!(s.blocks.last().unwrap().id, expected);
             assert_eq!(s.next_block_id, expected + 1);
         }
@@ -994,251 +1013,280 @@ mod tests {
     }
 
     #[test]
-    fn download_requested_creates_one_record_for_two_blocks() {
+    fn download_requested_creates_one_shared_record() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&AppEvent::DownloadRequested(english().live));
         s.apply(&AppEvent::DownloadProgress {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
             bytes: 100,
             total: Some(200),
-            bytes_per_sec: 0,
+            bytes_per_sec: 12,
         });
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        let row = s.downloads.get("tiny.en").unwrap();
+        s.apply(&AppEvent::DownloadRequested(english().live));
+        let row = s.downloads.get(english().live.id).unwrap();
         assert_eq!(row.bytes, 100);
         assert_eq!(row.total, Some(200));
-        assert_eq!(s.blocks.len(), 2);
-        assert!(matches!(
-            s.blocks[0].state,
-            BlockState::Waiting { model: "tiny.en" }
-        ));
-        assert!(matches!(
-            s.blocks[1].state,
-            BlockState::Waiting { model: "tiny.en" }
-        ));
-    }
-
-    #[test]
-    fn download_progress_updates_the_shared_record() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::DownloadProgress {
-            attempt: 1,
-            model: "tiny.en",
-            bytes: 50,
-            total: Some(100),
-            bytes_per_sec: 0,
-        });
-        let row = s.downloads.get("tiny.en").unwrap();
-        assert_eq!(row.bytes, 50);
-        assert_eq!(row.total, Some(100));
+        assert_eq!(row.bytes_per_sec, 12);
     }
 
     #[test]
     fn download_progress_after_success_is_ignored() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&AppEvent::DownloadRequested(english().live));
         s.apply(&AppEvent::DownloadSucceeded {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
         });
-        assert!(!s.downloads.contains_key("tiny.en"));
         s.apply(&AppEvent::DownloadProgress {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
             bytes: 10,
             total: None,
             bytes_per_sec: 0,
         });
-        assert!(!s.downloads.contains_key("tiny.en"));
+        assert!(!s.downloads.contains_key(english().live.id));
     }
 
     #[test]
     fn download_installing_sets_phase() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&AppEvent::DownloadRequested(english().refine));
         s.apply(&AppEvent::DownloadInstalling {
             attempt: 1,
-            model: "tiny.en",
+            model: english().refine.id,
         });
         assert_eq!(
-            s.downloads.get("tiny.en").unwrap().phase,
+            s.downloads.get(english().refine.id).unwrap().phase,
             DownloadPhase::Installing
         );
     }
 
     #[test]
-    fn download_succeeded_flips_every_waiting_block() {
+    fn block_records_only_after_both_models_succeed() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadSucceeded {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
+        });
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Waiting { pending, .. }
+                if pending.as_slice() == [english().refine.id]
+        ));
+        s.apply(&AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: english().refine.id,
         });
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { model: "tiny.en" }
+            BlockState::Recording { language } if language == english()
         ));
-        assert!(matches!(
-            s.blocks[1].state,
-            BlockState::Recording { model: "tiny.en" }
-        ));
-        assert!(!s.downloads.contains_key("tiny.en"));
     }
 
     #[test]
-    fn download_failed_flips_every_waiting_block_with_the_message() {
+    fn table_status_reconciles_success_that_preceded_selection() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: english().live.id,
+        });
+        s.apply(&select(1, vec![english().live.id]));
+        assert!(matches!(s.blocks[0].state, BlockState::Waiting { .. }));
+
+        s.apply(&AppEvent::DownloadStatusChanged {
+            model: english().live.id.into(),
+            attempt: 1,
+            from: Some(crate::bus::DownloadStatus::Downloading),
+            to: crate::bus::DownloadStatus::Succeeded,
+            error: None,
+        });
+
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording { language } if language == english()
+        ));
+    }
+
+    #[test]
+    fn table_status_reconciles_failure_that_preceded_selection() {
+        let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
         s.apply(&AppEvent::DownloadFailed {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
+            error: "HTTP 404".to_string(),
+        });
+        s.apply(&select(1, vec![english().live.id]));
+        assert!(matches!(s.blocks[0].state, BlockState::Waiting { .. }));
+
+        s.apply(&AppEvent::DownloadStatusChanged {
+            model: english().live.id.into(),
+            attempt: 1,
+            from: Some(crate::bus::DownloadStatus::Downloading),
+            to: crate::bus::DownloadStatus::Failed,
+            error: Some("HTTP 404".to_string()),
+        });
+
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Failed { language, error, .. }
+                if *language == english() && error == "HTTP 404"
+        ));
+    }
+
+    #[test]
+    fn model_failure_fails_every_waiter_with_the_message() {
+        let mut s = UiState::default();
+        for id in 1..=2 {
+            s.apply(&AppEvent::AddBlock);
+            s.apply(&select(id, vec![english().refine.id]));
+        }
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().refine.id,
             error: "HTTP 404".to_string(),
         });
         for block in &s.blocks {
             match &block.state {
-                BlockState::Failed { model, error } => {
-                    assert_eq!(*model, "tiny.en");
+                BlockState::Failed {
+                    language, error, ..
+                } => {
+                    assert_eq!(*language, english());
                     assert_eq!(error, "HTTP 404");
                 }
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
-        assert!(!s.downloads.contains_key("tiny.en"));
     }
 
     #[test]
-    fn retry_from_failed_transitions_to_waiting() {
+    fn failed_block_retains_only_other_running_models() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadFailed {
             attempt: 1,
-            model: "tiny.en",
+            model: english().live.id,
+            error: "HTTP 404".to_string(),
+        });
+
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Failed { pending, .. }
+                if pending.as_slice() == [english().refine.id]
+        ));
+        assert_eq!(s.blocks[0].pending_models(), &[english().refine.id]);
+    }
+
+    #[test]
+    fn claim_failure_has_the_same_ui_semantics() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, vec![english().live.id]));
+        s.apply(&AppEvent::DownloadClaimFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "database locked".to_string(),
+        });
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Failed {
+                language, error, ..
+            } if *language == english() && error == "database locked"
+        ));
+    }
+
+    #[test]
+    fn retry_selection_replaces_failed_state_with_current_pending_models() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, vec![english().live.id]));
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
             error: "boom".into(),
         });
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&select(1, vec![english().refine.id]));
         assert!(matches!(
-            s.blocks[0].state,
-            BlockState::Waiting { model: "tiny.en" }
+            &s.blocks[0].state,
+            BlockState::Waiting { pending, .. }
+                if pending.as_slice() == [english().refine.id]
         ));
     }
 
     #[test]
-    fn block_closed_drops_the_record_when_no_waiters_remain() {
+    fn block_closed_drops_only_unshared_pending_downloads() {
         let mut s = UiState::default();
+        for model in english().models() {
+            s.apply(&AppEvent::DownloadRequested(model));
+        }
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        assert!(s.downloads.contains_key("tiny.en"));
-        // The resolver publishes BlockClosed + DownloadCancelled when
-        // the last waiter is dropped — split the test across both.
-        s.apply(&AppEvent::BlockClosed);
-        s.apply(&AppEvent::DownloadCancelled {
-            attempt: 1,
-            model: "tiny.en",
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(2, vec![english().live.id]));
+        s.apply(&AppEvent::FocusMoved {
+            direction: FocusMove::Prev,
         });
-        assert!(!s.downloads.contains_key("tiny.en"));
+        s.apply(&AppEvent::BlockClosed);
+        assert!(s.downloads.contains_key(english().live.id));
+        assert!(!s.downloads.contains_key(english().refine.id));
     }
 
     #[test]
-    fn block_closed_keeps_the_record_while_another_block_waits() {
+    fn block_closed_keeps_download_needed_by_a_failed_block() {
         let mut s = UiState::default();
+        s.apply(&AppEvent::DownloadRequested(english().refine));
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "live failed".to_string(),
+        });
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
+        s.apply(&select(2, vec![english().refine.id]));
+
         s.apply(&AppEvent::BlockClosed);
-        assert!(s.downloads.contains_key("tiny.en"));
-        assert!(matches!(
-            s.blocks[0].state,
-            BlockState::Waiting { model: "tiny.en" }
-        ));
+
+        assert!(matches!(s.blocks[0].state, BlockState::Failed { .. }));
+        assert!(s.downloads.contains_key(english().refine.id));
     }
 
     #[test]
     fn ratio_clamps_when_bytes_exceed_total() {
-        let r = DownloadState {
+        let state = DownloadState {
             phase: DownloadPhase::Fetching,
             bytes: 200,
             total: Some(100),
             bytes_per_sec: 0,
         };
-        let ratio = r.ratio().unwrap();
-        assert!((0.0..=1.0).contains(&ratio));
-        assert!((ratio - 1.0).abs() < 1e-9);
+        assert_eq!(state.ratio(), Some(1.0));
     }
 
     #[test]
     fn ratio_is_none_without_total() {
-        let r = DownloadState {
+        let state = DownloadState {
             phase: DownloadPhase::Fetching,
             bytes: 100,
             total: None,
             bytes_per_sec: 0,
         };
-        assert!(r.ratio().is_none());
+        assert!(state.ratio().is_none());
     }
 
     #[test]
     fn ratio_with_zero_total_is_one() {
-        let r = DownloadState {
+        let state = DownloadState {
             phase: DownloadPhase::Fetching,
             bytes: 0,
             total: Some(0),
             bytes_per_sec: 0,
         };
-        assert_eq!(r.ratio(), Some(1.0));
-    }
-
-    #[test]
-    fn ratio_zero_bytes_zero_total_is_one() {
-        let r = DownloadState {
-            phase: DownloadPhase::Fetching,
-            bytes: 0,
-            total: Some(0),
-            bytes_per_sec: 0,
-        };
-        assert_eq!(r.ratio(), Some(1.0));
-    }
-
-    #[test]
-    fn recording_started_flips_focused_block() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::RecordingStarted(&CATALOG[5]));
-        assert!(matches!(
-            s.blocks[0].state,
-            BlockState::Recording { model: "tiny.en" }
-        ));
-    }
-
-    #[test]
-    fn recording_started_flips_focused_failed_block() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::DownloadRequested(&CATALOG[5]));
-        s.apply(&AppEvent::DownloadFailed {
-            attempt: 1,
-            model: "tiny.en",
-            error: "boom".into(),
-        });
-        s.apply(&AppEvent::RecordingStarted(&CATALOG[5]));
-        assert!(matches!(
-            s.blocks[0].state,
-            BlockState::Recording { model: "tiny.en" }
-        ));
+        assert_eq!(state.ratio(), Some(1.0));
     }
 
     // ----- visible-cap and menu reducer arms -----
@@ -1250,8 +1298,18 @@ mod tests {
             s.apply(&AppEvent::AddBlock);
         }
         assert_eq!(s.blocks.len(), 5);
-        let visible: Vec<u8> = s.blocks.iter().filter(|b| b.visible).map(|b| b.id).collect();
-        let hidden: Vec<u8> = s.blocks.iter().filter(|b| !b.visible).map(|b| b.id).collect();
+        let visible: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| b.visible)
+            .map(|b| b.id)
+            .collect();
+        let hidden: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| !b.visible)
+            .map(|b| b.id)
+            .collect();
         // The cap (4) evicts the oldest-focused visible peer when a
         // 5th block arrives. Block 1 was the first to be focused
         // (and never re-focused) so it carries the smallest stamp
@@ -1272,8 +1330,18 @@ mod tests {
         for _ in 0..6 {
             s.apply(&AppEvent::AddBlock);
         }
-        let visible: Vec<u8> = s.blocks.iter().filter(|b| b.visible).map(|b| b.id).collect();
-        let hidden: Vec<u8> = s.blocks.iter().filter(|b| !b.visible).map(|b| b.id).collect();
+        let visible: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| b.visible)
+            .map(|b| b.id)
+            .collect();
+        let hidden: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| !b.visible)
+            .map(|b| b.id)
+            .collect();
         assert_eq!(visible, vec![3, 4, 5, 6]);
         assert_eq!(hidden, vec![1, 2]);
         assert!(!s.blocks[0].visible, "block 1 evicted first");
@@ -1306,9 +1374,19 @@ mod tests {
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
-        let before: Vec<u8> = s.blocks.iter().filter(|b| b.visible).map(|b| b.id).collect();
+        let before: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| b.visible)
+            .map(|b| b.id)
+            .collect();
         s.apply(&AppEvent::SessionShown { id: 1 });
-        let after: Vec<u8> = s.blocks.iter().filter(|b| b.visible).map(|b| b.id).collect();
+        let after: Vec<u8> = s
+            .blocks
+            .iter()
+            .filter(|b| b.visible)
+            .map(|b| b.id)
+            .collect();
         assert_eq!(before, vec![1, 2, 3]);
         assert_eq!(after, vec![1, 2, 3]);
     }
@@ -1349,7 +1427,10 @@ mod tests {
         assert_eq!(s.blocks.len(), 4);
         let visible_count = s.blocks.iter().filter(|b| b.visible).count();
         assert_eq!(visible_count, 4, "the window stays at the cap");
-        assert!(s.blocks[0].visible, "block 1 (the only hidden one) was promoted");
+        assert!(
+            s.blocks[0].visible,
+            "block 1 (the only hidden one) was promoted"
+        );
         assert!(s.menu.is_none());
     }
 

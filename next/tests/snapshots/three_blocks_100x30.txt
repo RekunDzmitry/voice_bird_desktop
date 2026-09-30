@@ -1,5 +1,5 @@
 ┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
-│┌ 1 · distil-small.en ──────────┐│ 2 · distil-large-v3          ││ 3 · large-v3-turbo            ││
+│┌ 1 · en ───────────────────────┐│ 2 · en                       ││ 3 · en                        ││
 ││● recording (mocked)           ││● recording (mocked)          ││● recording (mocked)           ││
 ││                               ││                              ││                               ││
 ││                               ││                              ││                               ││

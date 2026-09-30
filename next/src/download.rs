@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::db::{downloads, Database};
 use crate::db::downloads::{CancelCheck, CancelProbe, Claim};
+use crate::db::{downloads, Database};
+use crate::language::LanguageProfile;
 use crate::picker::ModelEntry;
 use crate::transcription_models::ModelStore;
 
@@ -255,48 +256,66 @@ impl Throttle {
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-pub fn begin(
+/// Start or join the download for one model known to be missing.
+///
+/// Availability is checked once by [`begin_language`] before it publishes the
+/// selection. Worker events can still overtake that selection on the shared
+/// bus; the table's subsequent `DownloadStatusChanged` event reconciles them.
+fn ensure_model(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
     db: &mut Database,
     downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
-    if store.is_available(entry) {
-        tx.publish(AppEvent::ModelAlreadyCached(entry));
-        tx.publish(AppEvent::RecordingStarted(entry));
-        return;
-    }
     tx.publish(AppEvent::DownloadRequested(entry));
     let row = match downloads::get(db, entry.id) {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(row) => row,
+        Err(error) => {
             tx.publish(AppEvent::DownloadFailed {
                 attempt: 0,
                 model: entry.id,
-                error: truncate_error(&format!("downloads table: {e}")),
+                error: truncate_error(&format!("downloads table: {error}")),
             });
             return;
         }
     };
     match downloads::decide(row.as_ref()) {
-        Claim::Start { attempt } => start_or_fail(
-            entry,
-            store,
-            db,
-            downloader,
-            attempt,
-            tx,
-        ),
-        Claim::Restart { attempt } => start_or_fail(
-            entry,
-            store,
-            db,
-            downloader,
-            attempt,
-            tx,
-        ),
+        Claim::Start { attempt } | Claim::Restart { attempt } => {
+            start_or_fail(entry, store, db, downloader, attempt, tx)
+        }
         Claim::Join => {}
+    }
+}
+
+/// Select a language after checking each model exactly once, then ensure every
+/// missing model has an active download.
+pub fn begin_language(
+    block: u8,
+    language: &'static LanguageProfile,
+    store: Arc<dyn ModelStore>,
+    db: &mut Database,
+    downloader: Arc<dyn Downloader>,
+    tx: &EventSender,
+) {
+    let models = language
+        .models()
+        .map(|model| (model, store.is_available(model)));
+    let pending = models
+        .iter()
+        .filter_map(|(model, available)| (!available).then_some(model.id))
+        .collect();
+    tx.publish(AppEvent::LanguageSelected {
+        block,
+        language,
+        pending,
+    });
+    for (model, available) in models {
+        if available {
+            tx.publish(AppEvent::ModelAlreadyCached(model));
+        } else {
+            ensure_model(model, store.clone(), db, downloader.clone(), tx);
+        }
     }
 }
 
@@ -427,8 +446,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-
-
     #[test]
     fn stream_to_writes_file_and_verifies_sha() {
         let tmp = tempfile::tempdir().unwrap();
@@ -549,8 +566,14 @@ mod tests {
         let mut throttle = Throttle::new();
         assert!(throttle.should_emit(1024, None, 1_000));
         throttle.last_emit_ms = 1_000;
-        assert!(!throttle.should_emit(2048, None, 1_100), "100 ms later is inside the gate");
-        assert!(throttle.should_emit(4096, None, 1_260), "260 ms later is past the gate");
+        assert!(
+            !throttle.should_emit(2048, None, 1_100),
+            "100 ms later is inside the gate"
+        );
+        assert!(
+            throttle.should_emit(4096, None, 1_260),
+            "260 ms later is past the gate"
+        );
     }
     // Regression for the silent `unwrap_or(attempt)` bug: when
     // `downloads::start` fails (disk full, lock timeout, write
@@ -570,16 +593,14 @@ mod tests {
     fn start_or_fail_surfaces_db_write_failure_as_download_failed() {
         use crate::bus::EventBus;
         use crate::db::Database;
-        use crate::picker::{CATALOG, ModelEntry};
+        use crate::picker::{ModelEntry, CATALOG};
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("downloads.sqlite");
         // Bootstrap: open the file, run the migration, drop the
         let bootstrap = rusqlite::Connection::open(&path).unwrap();
         bootstrap
-            .execute_batch(
-                <crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION,
-            )
+            .execute_batch(<crate::db::downloads::DownloadsTable as crate::db::Table>::DEFINITION)
             .unwrap();
         bootstrap.close().map_err(|(_, e)| e).unwrap();
         // Re-open with `SQLITE_OPEN_READ_ONLY`. Every subsequent
@@ -591,8 +612,9 @@ mod tests {
         .expect("open read-only");
         let mut bus = EventBus::new();
         let tiny: &'static ModelEntry = &CATALOG[5];
-        let store: Arc<dyn crate::transcription_models::ModelStore> =
-            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        let store: Arc<dyn crate::transcription_models::ModelStore> = Arc::new(
+            crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]),
+        );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
         let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
@@ -603,7 +625,7 @@ mod tests {
 
         // Call the private helper directly so we know exactly
         // where the failure surfaces. The same `start_or_fail` is
-        // invoked by `download::begin` for both `Claim::Start` and
+        // invoked by `ensure_model` for both `Claim::Start` and
         // `Claim::Restart`.
         start_or_fail(
             tiny,
@@ -628,9 +650,7 @@ mod tests {
         // derived from the underlying SQL error.
         let events: Vec<AppEvent> = bus.drain().collect();
         let failed = events.iter().find_map(|ev| match ev {
-            AppEvent::DownloadClaimFailed { model, error, .. } => {
-                Some((*model, error.clone()))
-            }
+            AppEvent::DownloadClaimFailed { model, error, .. } => Some((*model, error.clone())),
             _ => None,
         });
         let (model, error) = failed.expect("DownloadClaimFailed must be published");
@@ -645,28 +665,13 @@ mod tests {
         );
     }
 
-    // End-to-end regression for the "silent unwrap_or" bug:
-    // when `downloads::start` fails (disk full, lock timeout,
-    // write error), the orchestrator publishes a failure event
-    // and the UI must actually see it. The previous bug had
-    // three layers that all needed to be wired correctly:
-    //   1. `download::begin` must NOT silently spawn a worker.
-    //   2. The orchestrator must publish a failure event the
-    //      table reducer accepts (NOT `DownloadFailed`, which is
-    //      gated by `matches_attempt` — when no row exists, the
-    //      gate rejects and `state.apply` is skipped).
-    //   3. The reducer must flip waiting blocks to `Failed`.
-    //
-    // This test exercises the complete bus.drain →
-    // downloads::apply → state.apply path. The companion test
-    // `start_or_fail_surfaces_db_write_failure_as_download_failed`
-    // only inspects the raw bus and therefore misses the
-    // rejection path.
+    // End-to-end regression: a failed downloads-table claim must pass through
+    // the bus/table/state pipeline and fail the waiting language block.
     #[test]
     fn db_write_failure_surfaces_to_ui_via_full_drain_apply_flow() {
         use crate::bus::EventBus;
         use crate::db::Database;
-        use crate::picker::CATALOG;
+        use crate::language::LANGUAGES;
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("downloads.sqlite");
@@ -695,7 +700,7 @@ mod tests {
                     "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, NULL, ?4, ?4)",
                     rusqlite::params![
-                        CATALOG[0].id,
+                        LANGUAGES[0].live.id,
                         3u32,
                         "Failed",
                         "2026-09-29T00:00:00.000Z",
@@ -715,12 +720,7 @@ mod tests {
         state.apply(&AppEvent::AddBlock);
         let _ = crate::db::downloads::apply(&mut db, &AppEvent::AddBlock);
 
-        let picked = &CATALOG[0];
-        // The resolver publishes BeginDownload for a Confirm on a
-        // Picking block. We call it directly because the
-        // `producer` module isn't in scope here, and because we
-        // want to drive the same code path the production loop
-        // takes (resolver → bus → dispatcher → orchestrator).
+        let language = &LANGUAGES[0];
         crate::producer::resolve_intent(
             crate::input::Intent::Confirm,
             &state,
@@ -729,32 +729,25 @@ mod tests {
         );
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AppEvent::BeginDownload(_))),
-            "Confirm must publish BeginDownload; got {events:?}"
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::BeginLanguage { block: 1, language: selected }
+                    if *selected == language
+            )),
+            "Confirm must publish BeginLanguage; got {events:?}"
         );
 
-        // Drive the orchestrator directly with the read-only
-        // Database — the equivalent of what the dispatcher's
-        // `BeginDownload` arm does. Use the picked entry so the
-        // matching downloads::get returns `None` and decide
-        // returns `Claim::Start`.
-        let store: Arc<dyn crate::transcription_models::ModelStore> =
-            Arc::new(crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        // Drive the language orchestrator directly with the read-only database.
+        let store: Arc<dyn crate::transcription_models::ModelStore> = Arc::new(
+            crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]),
+        );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
             Vec::new(),
             Outcome::Ok,
             Arc::clone(&calls),
         ));
-        begin(
-            picked,
-            store,
-            &mut db,
-            downloader,
-            &bus.sender(),
-        );
+        begin_language(1, language, store, &mut db, downloader, &bus.sender());
         let mut drained: Vec<AppEvent> = bus.drain().collect();
 
         // Worker must not have spawned.
@@ -780,18 +773,17 @@ mod tests {
         let mut post_apply: Vec<AppEvent> = bus.drain().collect();
         drained.extend(post_apply.drain(..));
 
-        // The waiting block must now be in `Failed` — that's the
-        // UI contract. Before this fix, the table gate rejected
-        // the failure event (because no row existed) and
-        // `state.apply` was never called, leaving the block
-        // stuck in `Waiting`.
         let block = state
             .blocks
             .first()
             .expect("block must still exist after the failure");
         match &block.state {
-            crate::state::BlockState::Failed { model, error } => {
-                assert_eq!(*model, picked.id);
+            crate::state::BlockState::Failed {
+                language: failed_language,
+                error,
+                ..
+            } => {
+                assert_eq!(*failed_language, language);
                 assert!(
                     error.contains("downloads table"),
                     "error must surface the underlying table failure; got {error:?}"

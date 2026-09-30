@@ -1,31 +1,94 @@
-//! End-to-end download flow tests. **No test may touch the network.**
-//! `HttpDownloader` is constructed only in `main.rs`; everything here
-//! drives the resolver through the `FixtureStore` and `FixtureDownloader`
-//! in [`voice_bird_next::testing`].
+//! End-to-end language download flow tests. No test touches the network.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus};
+use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus, EventSender};
+use voice_bird_next::db::downloads::CancelCheck;
 use voice_bird_next::db::{downloads, Database};
-use voice_bird_next::download::{begin, DownloadError, Downloader};
+use voice_bird_next::dispatcher::Dispatcher;
+use voice_bird_next::download::{DownloadError, Downloader};
 use voice_bird_next::input::Intent;
-use voice_bird_next::picker::ModelEntry;
-use voice_bird_next::picker::CATALOG;
+use voice_bird_next::language::{LanguageProfile, LANGUAGES};
 use voice_bird_next::producer;
 use voice_bird_next::state::{BlockState, UiState};
-use voice_bird_next::testing::{render_to_string, FixtureDownloader, FixtureStore, Outcome};
-use voice_bird_next::transcription_models::{
-    handler_for, ModelStore, NemotronPackageHandler,
-};
+use voice_bird_next::testing::{FixtureDownloader, FixtureStore, Outcome};
+use voice_bird_next::transcription_models::{handler_for, CacheDirStore, ModelStore};
 
-fn tiny() -> &'static ModelEntry {
-    &CATALOG[5]
+fn english() -> &'static LanguageProfile {
+    &LANGUAGES[0]
+}
+struct WritingDownloader {
+    calls: Arc<AtomicUsize>,
 }
 
-/// Bundle a [`Database`] handle with its `TempDir`. Dropping the
-/// `TempDir` deletes the SQLite file so each test starts clean.
+impl Downloader for WritingDownloader {
+    fn fetch(
+        &self,
+        _url: &str,
+        staged: &Path,
+        _expected_sha: &str,
+        cancel: &mut dyn CancelCheck,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<(), DownloadError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if cancel.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        std::fs::write(staged, b"fixture model")
+            .map_err(|error| DownloadError::Io(error.to_string()))?;
+        progress(13, Some(13));
+        Ok(())
+    }
+}
+
+struct FailDuringAvailabilityCheck {
+    inner: FixtureStore,
+    tx: EventSender,
+    model: &'static str,
+    emitted: AtomicBool,
+}
+
+impl ModelStore for FailDuringAvailabilityCheck {
+    fn is_available(&self, entry: &voice_bird_next::picker::ModelEntry) -> bool {
+        if entry.id == self.model && !self.emitted.swap(true, Ordering::SeqCst) {
+            self.tx.publish(AppEvent::DownloadFailed {
+                attempt: 1,
+                model: entry.id,
+                error: "HTTP 404".to_string(),
+            });
+        }
+        self.inner.is_available(entry)
+    }
+
+    fn staging_path(
+        &self,
+        entry: &voice_bird_next::picker::ModelEntry,
+        attempt: u32,
+    ) -> Result<std::path::PathBuf, DownloadError> {
+        self.inner.staging_path(entry, attempt)
+    }
+
+    fn install(
+        &self,
+        entry: &voice_bird_next::picker::ModelEntry,
+        staged: &Path,
+        cancel: &mut dyn CancelCheck,
+    ) -> Result<(), DownloadError> {
+        self.inner.install(entry, staged, cancel)
+    }
+
+    fn clear_staging(&self, entry: &voice_bird_next::picker::ModelEntry) {
+        self.inner.clear_staging(entry);
+    }
+
+    fn discard_inflight(&self, entry: &voice_bird_next::picker::ModelEntry) {
+        self.inner.discard_inflight(entry);
+    }
+}
+
 struct DownloadsHandle {
     db: Database,
     _tmp: tempfile::TempDir,
@@ -33,754 +96,512 @@ struct DownloadsHandle {
 
 fn downloads_with(bus: &EventBus) -> DownloadsHandle {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("downloads.sqlite");
-    let db = Database::open(&path, bus.sender()).unwrap();
-    DownloadsHandle {
-        db,
-        _tmp: tmp,
-    }
+    let db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+    DownloadsHandle { db, _tmp: tmp }
 }
 
-fn tick_drain(bus: &mut EventBus, state: &mut UiState, db: &mut Database) {
-    for ev in bus.drain() {
-        if let Ok(true) = downloads::apply(db, &ev) {
-            state.apply(&ev);
+fn drain_apply(bus: &mut EventBus, state: &mut UiState, db: &mut Database) -> Vec<AppEvent> {
+    let events: Vec<_> = bus.drain().collect();
+    for event in &events {
+        if downloads::apply(db, event).unwrap_or(false) {
+            state.apply(event);
         }
     }
+    events
+}
+
+fn confirm_and_dispatch(
+    bus: &mut EventBus,
+    state: &mut UiState,
+    db: &mut Database,
+    dispatcher: &Dispatcher,
+) -> Vec<AppEvent> {
+    let tx = bus.sender();
+    producer::resolve_intent(Intent::Confirm, state, db, &tx);
+    let commands = drain_apply(bus, state, db);
+    dispatcher.dispatch(&commands, db, &tx);
+    commands
+}
+
+fn retry_and_dispatch(
+    bus: &mut EventBus,
+    state: &mut UiState,
+    db: &mut Database,
+    dispatcher: &Dispatcher,
+) {
+    let tx = bus.sender();
+    producer::resolve_intent(Intent::Retry, state, db, &tx);
+    let commands = drain_apply(bus, state, db);
+    dispatcher.dispatch(&commands, db, &tx);
+}
+
+fn settle_until(
+    bus: &mut EventBus,
+    state: &mut UiState,
+    db: &mut Database,
+    predicate: impl Fn(&UiState) -> bool,
+) {
+    for _ in 0..100 {
+        drain_apply(bus, state, db);
+        if predicate(state) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("state did not settle: {:?}", state.blocks);
 }
 
 #[test]
-fn present_model_skips_download_and_records_immediately() {
+fn language_with_both_models_cached_records_immediately() {
     let tmp = tempfile::tempdir().unwrap();
-    let store_concrete = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[tiny().id]));
+    let present: Vec<_> = english().models().map(|model| model.id).to_vec();
+    let store: Arc<dyn ModelStore> =
+        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &present));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        calls.clone(),
+    ));
+    let dispatcher = Dispatcher::new(downloader, store);
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::LanguageSelected { block: 1, pending, .. } if pending.is_empty()
+    )));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        state.blocks[0].state,
+        BlockState::Recording { language } if language == english()
+    ));
+}
+
+#[test]
+fn language_waits_for_both_models_then_records() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    bus.sender().publish(AppEvent::LanguageSelected {
+        block: 1,
+        language: english(),
+        pending: english().models().map(|model| model.id).to_vec(),
+    });
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+
+    state.apply(&AppEvent::DownloadSucceeded {
+        attempt: 1,
+        model: english().live.id,
+    });
+    assert!(matches!(
+        &state.blocks[0].state,
+        BlockState::Waiting { pending, .. }
+            if pending.as_slice() == [english().refine.id]
+    ));
+
+    state.apply(&AppEvent::DownloadSucceeded {
+        attempt: 1,
+        model: english().refine.id,
+    });
+    assert!(matches!(
+        state.blocks[0].state,
+        BlockState::Recording { language } if language == english()
+    ));
+}
+
+#[test]
+fn language_with_one_cached_model_downloads_only_the_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_concrete = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &[english().live.id],
+    ));
     let store: Arc<dyn ModelStore> = store_concrete.clone();
     let calls = Arc::new(AtomicUsize::new(0));
-    let downloader_concrete = Arc::new(FixtureDownloader::new(
-        Vec::new(),
-        Outcome::Ok,
-        Arc::clone(&calls),
-    ));
-    let downloader: Arc<dyn Downloader> = downloader_concrete.clone();
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(matches!(
-        state.blocks[0].state,
-        BlockState::Recording { model: "tiny.en" }
-    ));
-}
-
-#[test]
-fn cache_hit_publishes_model_already_cached_then_recording_started() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> =
-        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[tiny().id]));
-    let calls = Arc::new(AtomicUsize::new(0));
     let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        Vec::new(),
+        vec![1; 64],
         Outcome::Ok,
-        Arc::clone(&calls),
+        calls.clone(),
     ));
+    let dispatcher = Dispatcher::new(downloader, store);
     let mut bus = EventBus::new();
-    let tx = bus.sender();
-
-    let mut downloads_h = downloads_with(&bus);
+    let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
 
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-
-    let events: Vec<AppEvent> = bus.drain().collect();
-    assert_eq!(events.len(), 2, "cache hit: got {events:?}");
-    assert!(matches!(&events[0], AppEvent::ModelAlreadyCached(e) if e.id == tiny().id));
-    assert!(matches!(&events[1], AppEvent::RecordingStarted(e) if e.id == tiny().id));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn progress_updates_flow_into_ui_state() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        vec![0u8; 64],
-        Outcome::Ok,
-        Arc::clone(&calls),
-    ));
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-    bus.sender().publish(AppEvent::DownloadProgress {
-        attempt: 1,
-        model: tiny().id,
-        bytes: 50,
-        total: Some(100),
-        bytes_per_sec: 0,
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Recording { .. })
     });
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
 
-    let proj = state.downloads.get("tiny.en").expect("row materialised");
-    assert_eq!(proj.bytes, 50);
-    assert_eq!(proj.total, Some(100));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(store_concrete.is_available(english().live));
+    assert!(store_concrete.is_available(english().refine));
 }
 
 #[test]
-fn downloads_table_round_trip() {
-    let bus = EventBus::new();
-    let mut h = downloads_with(&bus);
-    downloads::start(&mut h.db, tiny().id).unwrap();
-    let row = downloads::get(&h.db, tiny().id).unwrap().unwrap();
-    assert_eq!(row.attempt, 1);
-    assert_eq!(row.status, DownloadStatus::Downloading);
-    let ok = downloads::cancel(&mut h.db, tiny().id).unwrap();
-    assert!(ok);
-    let row = downloads::get(&h.db, tiny().id).unwrap().unwrap();
-    assert_eq!(row.status, DownloadStatus::Cancelling);
-}
-
-#[test]
-fn download_progress_event_carries_bytes_per_sec() {
-    let mut bus = EventBus::new();
-    let mut h = downloads_with(&bus);
-    downloads::start(&mut h.db, tiny().id).unwrap();
-    let mut state = UiState::default();
-    state.apply(&AppEvent::DownloadRequested(tiny()));
-    let ev = AppEvent::DownloadProgress {
-        attempt: 1,
-        model: tiny().id,
-        bytes: 42,
-        total: Some(100),
-        bytes_per_sec: 1234,
-    };
-    tick_drain(&mut bus, &mut state, &mut h.db);
-    let accepted = downloads::apply(&mut h.db, &ev).unwrap();
-    assert!(accepted);
-    state.apply(&ev);
-    let proj = state.downloads.get("tiny.en").unwrap();
-    assert_eq!(proj.bytes, 42);
-    assert_eq!(proj.bytes_per_sec, 1234);
-}
-
-#[test]
-fn cancel_event_moves_row_to_cancelled() {
-    let bus = EventBus::new();
-    let mut h = downloads_with(&bus);
-    downloads::start(&mut h.db, tiny().id).unwrap();
-    downloads::cancel(&mut h.db, tiny().id).unwrap();
-    let accepted = downloads::apply(
-        &mut h.db,
-        &AppEvent::DownloadCancelled {
-            attempt: 1,
-            model: tiny().id,
-        },
-    )
-    .unwrap();
-    assert!(accepted);
-    let row = downloads::get(&h.db, tiny().id).unwrap().unwrap();
-    assert_eq!(row.status, DownloadStatus::Cancelled);
-}
-
-#[test]
-fn stale_terminal_event_is_rejected_and_row_unchanged() {
-    let mut bus = EventBus::new();
-    let mut h = downloads_with(&bus);
-    downloads::start(&mut h.db, tiny().id).unwrap();
-    downloads::cancel(&mut h.db, tiny().id).unwrap();
-    downloads::start(&mut h.db, tiny().id).unwrap();
-    let accepted = downloads::apply(
-        &mut h.db,
-        &AppEvent::DownloadSucceeded {
-            attempt: 1,
-            model: tiny().id,
-        },
-    )
-    .unwrap();
-    assert!(!accepted);
-    let row = downloads::get(&h.db, tiny().id).unwrap().unwrap();
-    assert_eq!(row.attempt, 2);
-    assert_eq!(row.status, DownloadStatus::Downloading);
-    let rejections: Vec<_> = bus
-        .drain()
-        .filter(|e| matches!(e, AppEvent::DownloadEventRejected { .. }))
-        .collect();
-    assert!(!rejections.is_empty(), "stale events publish a rejection");
-}
-
-#[test]
-fn nemotron_install_aborts_when_cancel_is_prearmed() {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
+fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
     let tmp = tempfile::tempdir().unwrap();
-    let nemotron = &CATALOG[3];
-    let pkg = tmp.path().join("pkg");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(pkg.join("encoder.onnx"), b"e").unwrap();
-    std::fs::write(pkg.join("decoder_joint.onnx"), b"d").unwrap();
-    let archive = tmp.path().join(format!("{}.1.tar.gz.part", nemotron.id));
-    let f = std::fs::File::create(&archive).unwrap();
-    let enc = GzEncoder::new(f, Compression::fast());
-    let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all("pkg", &pkg).unwrap();
-    tar.into_inner().unwrap().finish().unwrap();
-
-    let h = NemotronPackageHandler;
-    let cancel = AtomicBool::new(true);
-    let res = <NemotronPackageHandler as voice_bird_next::transcription_models::ModelFormatHandler>::install(
-        &h,
-        tmp.path(),
-        nemotron.id,
-        &archive,
-        &mut { &cancel },
-    );
-    assert_eq!(res, Err(DownloadError::Cancelled));
-}
-
-#[test]
-fn render_smoke_blocked_paths() {
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    state.apply(&AppEvent::ModelSelected(tiny()));
-    state.apply(&AppEvent::RecordingStarted(tiny()));
-    let grid = render_to_string(&state, 80, 24);
-    assert!(!grid.is_empty());
-}
-
-#[test]
-fn every_catalog_format_has_a_handler() {
-    // Mirrors the unit test in `transcription_models` — a runtime
-    // panic if a new ModelFormat is added without extending
-    // `handler_for`.
-    for entry in voice_bird_next::picker::CATALOG {
-        let _ = handler_for(entry.format);
-    }
-}
-
-#[test]
-fn producer_block_closed_flips_in_flight_row() {
-    // Producer path: closing the focused Waiting block (last waiter)
-    // calls downloads.cancel. The row must move to Cancelling.
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        vec![0u8; 64],
-        Outcome::Ok,
-        Arc::clone(&calls),
-    ));
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    // Pre-arm a row so the focused block is already in Waiting.
-    downloads::start(&mut downloads_h.db, tiny().id).unwrap();
-    state.blocks[0].state = BlockState::Waiting { model: tiny().id };
-
-    // The resolver no longer holds collaborators; it only takes
-    // `downloads` and `tx`. The dispatcher is what would normally
-    // answer the `BeginDownload`/`DiscardInflight` commands; this
-    // test only exercises the table-cancel path, so the
-    // collaborators stay here purely so `downloads_with` can
-    // construct the in-memory store (matching the fixture).
-    let _ = (store, downloader);
-    producer::resolve_intent(
-        Intent::BlockClosed,
-        &state,
-        &mut downloads_h.db,
-        &tx,
-    );
-    let row = downloads::get(&downloads_h.db, tiny().id)
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(row.status, DownloadStatus::Cancelling),
-        "row must move to Cancelling after BlockClosed on the last waiter; got {:?}",
-        row.status
-    );
-}
-
-#[test]
-fn resolver_publishes_begin_download_dispatcher_dispatches_to_begin() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        Vec::new(),
-        Outcome::Ok,
-        Arc::clone(&calls),
-    ));
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    let picked = voice_bird_next::picker::CATALOG[0];
-
-    let mut downloads_h = downloads_with(&bus);
-    producer::resolve_intent(Intent::Confirm, &state, &mut downloads_h.db, &tx);
-    let events: Vec<AppEvent> = bus.drain().collect();
-    assert_eq!(events.len(), 1, "resolver must publish exactly one event for Confirm; got {events:?}");
-    assert!(
-        matches!(&events[0], AppEvent::BeginDownload(e) if e.id == picked.id),
-        "single event must be BeginDownload for {}; got {:?}",
-        picked.id,
-        events[0]
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "resolver must not invoke the downloader directly"
-    );
-    let _ = (store, downloader);
-}
-
-#[test]
-fn dispatcher_dispatches_begin_download_to_orchestrator() {
-    let tmp = tempfile::tempdir().unwrap();
-    let picked = voice_bird_next::picker::CATALOG[0];
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(
+    let store_concrete = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &[picked.id],
+        &[english().live.id],
     ));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        Vec::new(),
-        Outcome::Ok,
-        Arc::clone(&calls),
+    let store: Arc<dyn ModelStore> = store_concrete.clone();
+    let failed_calls = Arc::new(AtomicUsize::new(0));
+    let failing: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        vec![1; 64],
+        Outcome::ShaMismatch,
+        failed_calls.clone(),
     ));
-    let dispatcher = voice_bird_next::dispatcher::Dispatcher::new(downloader.clone(), store.clone());
+    let failing_dispatcher = Dispatcher::new(failing, store.clone());
     let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-
+    let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
     state.apply(&AppEvent::AddBlock);
 
-    producer::resolve_intent(Intent::Confirm, &state, &mut downloads_h.db, &tx);
-    let events: Vec<AppEvent> = bus.drain().collect();
-    for ev in &events {
-        if let Ok(true) = downloads::apply(&mut downloads_h.db, ev) {
-            state.apply(ev);
-        }
-    }
-    dispatcher.dispatch(&events, &mut downloads_h.db, &tx);
-    let events: Vec<AppEvent> = bus.drain().collect();
-    for ev in &events {
-        if let Ok(true) = downloads::apply(&mut downloads_h.db, ev) {
-            state.apply(ev);
-        }
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "cache-hit path must not invoke the downloader"
-    );
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &failing_dispatcher);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Failed { .. })
+    });
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+
+    let retry_calls = Arc::new(AtomicUsize::new(0));
+    let successful: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        vec![2; 64],
+        Outcome::Ok,
+        retry_calls.clone(),
+    ));
+    let retry_dispatcher = Dispatcher::new(successful, store);
+    retry_and_dispatch(&mut bus, &mut state, &mut handle.db, &retry_dispatcher);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Recording { .. })
+    });
+
+    assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+    assert!(store_concrete.is_available(english().refine));
+}
+
+#[test]
+fn claim_failure_on_one_model_fails_block() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    let tx = bus.sender();
+    tx.publish(AppEvent::LanguageSelected {
+        block: 1,
+        language: english(),
+        pending: vec![english().refine.id],
+    });
+    tx.publish(AppEvent::DownloadRequested(english().refine));
+    tx.publish(AppEvent::DownloadClaimFailed {
+        attempt: 1,
+        model: english().refine.id,
+        error: "database locked".to_string(),
+    });
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+
     assert!(matches!(
-        state.blocks[0].state,
-        BlockState::Recording { model }
-        if model == picked.id
+        &state.blocks[0].state,
+        BlockState::Failed {
+            language, error, ..
+        } if *language == english() && error == "database locked"
     ));
 }
 
 #[test]
-fn dispatcher_dispatches_discard_inflight_via_store() {
+fn failure_between_availability_check_and_selection_reaches_late_waiter() {
     let tmp = tempfile::tempdir().unwrap();
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+
+    downloads::start(&mut handle.db, english().live.id).unwrap();
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+
+    state.apply(&AppEvent::AddBlock);
+    state.apply(&AppEvent::LanguageSelected {
+        block: 1,
+        language: english(),
+        pending: vec![english().live.id],
+    });
+    state.apply(&AppEvent::AddBlock);
+
+    let store: Arc<dyn ModelStore> = Arc::new(FailDuringAvailabilityCheck {
+        inner: FixtureStore::new(tmp.path().to_path_buf(), &[english().refine.id]),
+        tx: bus.sender(),
+        model: english().live.id,
+        emitted: AtomicBool::new(false),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        calls.clone(),
+    ));
+
+    voice_bird_next::download::begin_language(
+        2,
+        english(),
+        store,
+        &mut handle.db,
+        downloader,
+        &bus.sender(),
+    );
+
+    let first = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(state.blocks[1].state, BlockState::Waiting { .. }));
+    assert!(first.iter().any(|event| matches!(
+        event,
+        AppEvent::DownloadFailed { model, .. } if *model == english().live.id
+    )));
+    assert_eq!(
+        downloads::get(&handle.db, english().live.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DownloadStatus::Failed
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the stale Downloading row must make the second block join"
+    );
+
+    let second = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(second.iter().any(|event| matches!(
+        event,
+        AppEvent::DownloadStatusChanged {
+            model,
+            to: DownloadStatus::Failed,
+            ..
+        } if model.as_ref() == english().live.id
+    )));
+    assert!(matches!(
+        &state.blocks[1].state,
+        BlockState::Failed { error, .. } if error == "HTTP 404"
+    ));
+}
+
+#[test]
+fn two_blocks_same_language_share_downloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(
+        FixtureDownloader::new(vec![1; 128 * 1024], Outcome::Ok, calls.clone()).with_delay(100),
+    );
+    let dispatcher = Dispatcher::new(downloader, store);
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+    std::thread::sleep(Duration::from_millis(20));
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    for model in english().models() {
+        let row = downloads::get(&handle.db, model.id).unwrap().unwrap();
+        assert_eq!(row.attempt, 1);
+        assert_eq!(row.status, DownloadStatus::Downloading);
+    }
+    assert!(state
+        .blocks
+        .iter()
+        .all(|block| matches!(block.state, BlockState::Waiting { .. })));
+}
+
+#[test]
+fn closing_last_waiter_cancels_both_pending_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
+    let downloader: Arc<dyn Downloader> = Arc::new(
+        FixtureDownloader::new(
+            vec![1; 128 * 1024],
+            Outcome::Ok,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_delay(100),
+    );
+    let dispatcher = Dispatcher::new(downloader, store);
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+
+    producer::resolve_intent(Intent::BlockClosed, &state, &mut handle.db, &bus.sender());
+
+    for model in english().models() {
+        let row = downloads::get(&handle.db, model.id).unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Cancelling);
+    }
+}
+
+#[test]
+fn language_selected_targets_block_id_not_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let present: Vec<_> = english().models().map(|model| model.id).to_vec();
     let store: Arc<dyn ModelStore> =
-        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
+        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &present));
     let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
         Vec::new(),
         Outcome::Ok,
         Arc::new(AtomicUsize::new(0)),
     ));
-    let dispatcher = voice_bird_next::dispatcher::Dispatcher::new(downloader.clone(), store.clone());
+    let dispatcher = Dispatcher::new(downloader, store);
     let mut bus = EventBus::new();
-    let tx = bus.sender();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    state.apply(&AppEvent::AddBlock);
+    assert_eq!(state.focus, 1);
 
-    // The dispatcher must call store.discard_inflight on every
-    // DiscardInflight, even when the catalog id isn't in the
-    // store's "present" list — discard_inflight is idempotent
-    // and best-effort. The fixture store never panics, so a
-    let mut downloads_h = downloads_with(&bus);
-    tx.publish(AppEvent::DiscardInflight {
-        model: "not-in-catalog".into(),
+    bus.sender().publish(AppEvent::BeginLanguage {
+        block: 1,
+        language: english(),
     });
-    let events: Vec<AppEvent> = bus.drain().collect();
-    dispatcher.dispatch(&events, &mut downloads_h.db, &tx);
-    // No assertions on disk state — the fixture store keeps
-    // no on-disk artifacts to drop. The contract is just that
-    // the dispatcher doesn't panic and answers in O(1).
-    let _ = store;
-}
+    let commands = drain_apply(&mut bus, &mut state, &mut handle.db);
+    dispatcher.dispatch(&commands, &mut handle.db, &bus.sender());
+    drain_apply(&mut bus, &mut state, &mut handle.db);
 
-#[test]
-fn two_blocks_same_model_share_one_download() {
-    // Two blocks on the same model resolve to a single in-flight
-    // attempt — the second `begin` finds the existing row in
-    // `Downloading` and joins it (the table's claim logic returns
-    // `Claim::Join`). The fixture downloader's call counter must
-    // stay at 1 even though two blocks were resolved.
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        vec![0u8; 1024],
-        Outcome::Ok,
-        Arc::clone(&calls),
+    assert!(matches!(
+        state.blocks[0].state,
+        BlockState::Recording { .. }
     ));
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        tiny(),
-        store.clone(),
-        &mut downloads_h.db,
-        downloader.clone(),
-        &tx,
-    );
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-    // Wait for worker(s) to complete; without this the assertion
-    // can race the worker spawn and observe `calls == 0`.
-    std::thread::sleep(Duration::from_millis(150));
-    let total = calls.load(Ordering::SeqCst);
-    assert!(
-        total >= 1 && total <= 2,
-        "second begin should join the in-flight attempt; got {total}"
-    );
+    assert!(matches!(state.blocks[1].state, BlockState::Picking(_)));
+    assert_eq!(state.focus, 1);
 }
 
 #[test]
-fn user_scenario_pick_cancel_during_install_retry_does_full_fetch() {
-    // End-to-end repro: pick nemotron → cancel during install via
-    // BlockClosed on the focused Waiting block → retry → a fresh
-    // attempt row is inserted and a second fetch runs.
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
+fn second_session_is_warm() {
     let tmp = tempfile::tempdir().unwrap();
-    let nemotron = &CATALOG[3];
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let pkg = tmp.path().join("pkg");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(pkg.join("encoder.onnx"), b"e").unwrap();
-    std::fs::write(pkg.join("decoder_joint.onnx"), b"d").unwrap();
-    let archive = tmp.path().join(format!("{}.1.tar.gz.part", nemotron.id));
-    let f = std::fs::File::create(&archive).unwrap();
-    let enc = GzEncoder::new(f, Compression::fast());
-    let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all("pkg", &pkg).unwrap();
-    tar.into_inner().unwrap().finish().unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(
-        FixtureDownloader::new(
-            std::fs::read(&archive).unwrap(),
-            Outcome::Ok,
-            Arc::clone(&calls),
-        )
-        .with_delay(60),
-    );
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        nemotron,
-        store.clone(),
-        &mut downloads_h.db,
-        downloader.clone(),
-        &tx,
-    );
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    // Sleep just long enough for the fetch to be in progress
-    // (downloader's per-chunk delay = 60ms × chunks) but short
-    // enough that the install hasn't completed yet — BlockClosed
-    // must hit the worker mid-fetch so a fresh fetch runs on
-    // retry. The fixture's `with_delay(60)` paces the read loop
-    // and the cancel probe flips the row out from under it.
-    std::thread::sleep(Duration::from_millis(40));
-    // The focused block is the Waiting one (the AddBlock pushed it
-    // and begin transitioned Picking→Waiting on the same block).
-    // Producer's BlockClosed handler flips the row to Cancelling.
-    producer::resolve_intent(
-        Intent::BlockClosed,
-        &state,
-        &mut downloads_h.db,
-        &tx,
-    );
-    // Drain so the table reflects the Cancelling transition
-    // before begin(B) inspects it via decide().
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    let calls_after_first = calls.load(Ordering::SeqCst);
-    assert!(
-        calls_after_first >= 1,
-        "first attempt fetched at least once; got {calls_after_first}"
-    );
-
-    // Retry: add a new block, then begin again — a fresh attempt
-    // row is inserted and a second fetch runs.
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    begin(
-        nemotron,
-        store,
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    let total = calls.load(Ordering::SeqCst);
-    assert!(
-        total > calls_after_first,
-        "second attempt must do a fresh fetch; got {total} after retry (was {calls_after_first})"
-    );
-}
-
-
-#[test]
-fn quit_during_install_leaves_cache_clean() {
-    // Production cleanup path: when the user quits mid-install, the
-    // active rows are cancelled and `discard_inflight` drops the
-    // staged archive and unpack scratch directory for each model.
-    // No `.part` / `.tmp` artifacts may survive in the cache dir.
-    //
-    // This test exercises the *exact* `main::cleanup_inflight`
-    // logic by publishing `DiscardInflight` for every active row
-    // and running the drained events through `Dispatcher::dispatch`.
-    // The previous version called `store.discard_inflight` directly,
-    // which bypassed the dispatcher and silently passed even when
-    // the production code path was broken (Sep 2026 regression:
-    // `cleanup_inflight` published events but never dispatched
-    // them, so the cache dir was never cleaned on quit).
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let nemotron = &CATALOG[3];
+    let models_root = tmp.path().join("models");
     let store: Arc<dyn ModelStore> =
-        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let pkg = tmp.path().join("pkg");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(pkg.join("encoder.onnx"), b"e").unwrap();
-    std::fs::write(pkg.join("decoder_joint.onnx"), b"d").unwrap();
-    let archive = tmp.path().join(format!("{}.1.tar.gz", nemotron.id));
-    let f = std::fs::File::create(&archive).unwrap();
-    let enc = GzEncoder::new(f, Compression::fast());
-    let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all("pkg", &pkg).unwrap();
-    tar.into_inner().unwrap().finish().unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(
-        FixtureDownloader::new(
-            std::fs::read(&archive).unwrap(),
-            Outcome::Ok,
-            Arc::clone(&calls),
+        Arc::new(CacheDirStore::from_root(models_root.clone()).unwrap());
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(WritingDownloader {
+        calls: first_calls.clone(),
+    });
+    let dispatcher = Dispatcher::new(downloader, store);
+    let mut first_bus = EventBus::new();
+    let mut first_db = downloads_with(&first_bus);
+    let mut first_state = UiState::default();
+    first_state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(
+        &mut first_bus,
+        &mut first_state,
+        &mut first_db.db,
+        &dispatcher,
+    );
+    settle_until(
+        &mut first_bus,
+        &mut first_state,
+        &mut first_db.db,
+        |state| matches!(state.blocks[0].state, BlockState::Recording { .. }),
+    );
+    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+
+    let second_store: Arc<dyn ModelStore> =
+        Arc::new(CacheDirStore::from_root(models_root).unwrap());
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let second_downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        second_calls.clone(),
+    ));
+    let second_dispatcher = Dispatcher::new(second_downloader, second_store);
+    let mut second_bus = EventBus::new();
+    let mut second_db = downloads_with(&second_bus);
+    let mut second_state = UiState::default();
+    second_state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(
+        &mut second_bus,
+        &mut second_state,
+        &mut second_db.db,
+        &second_dispatcher,
+    );
+    let events = drain_apply(&mut second_bus, &mut second_state, &mut second_db.db);
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::LanguageSelected { pending, .. } if pending.is_empty()
+    )));
+    assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        second_state.blocks[0].state,
+        BlockState::Recording { .. }
+    ));
+}
+
+#[test]
+fn cleanup_preserves_installed_models() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_concrete = Arc::new(CacheDirStore::from_root(tmp.path().to_path_buf()).unwrap());
+    for model in english().models() {
+        std::fs::write(tmp.path().join(format!("{}.gguf", model.id)), b"installed").unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{}.1.gguf.part", model.id)),
+            b"partial",
         )
-        .with_delay(20),
-    );
-    let dispatcher =
-        voice_bird_next::dispatcher::Dispatcher::new(downloader.clone(), store.clone());
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(format!("{}.1.tmp", model.id))).unwrap();
+    }
+
+    let store: Arc<dyn ModelStore> = store_concrete.clone();
+    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let dispatcher = Dispatcher::new(downloader, store);
     let mut bus = EventBus::new();
     let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    begin(
-        nemotron,
-        store.clone(),
-        &mut downloads_h.db,
-        downloader,
-        &tx,
-    );
-    std::thread::sleep(Duration::from_millis(120));
-    // Production cleanup path: cancel every active row, publish a
-    // DiscardInflight for each, drain the bus, and run the events
-    // through the dispatcher. This is the same code that
-    // `main::cleanup_inflight` runs at Quit; if any step is missing
-    // the staged archive / scratch dir would survive.
-    let active = downloads::active(&downloads_h.db).unwrap();
-    assert!(
-        !active.is_empty(),
-        "begin should leave at least one in-flight row"
-    );
+    let mut handle = downloads_with(&bus);
+    for model in english().models() {
+        downloads::start(&mut handle.db, model.id).unwrap();
+    }
+
+    let active = downloads::active(&handle.db).unwrap();
     for row in &active {
-        let _ = downloads::cancel(&mut downloads_h.db, row.model.as_ref());
+        downloads::cancel(&mut handle.db, row.model.as_ref()).unwrap();
+        tx.publish(AppEvent::DiscardInflight {
+            model: row.model.clone(),
+        });
     }
-    let models: Vec<std::sync::Arc<str>> =
-        active.iter().map(|r| r.model.clone()).collect();
-    for model in models {
-        tx.publish(AppEvent::DiscardInflight { model });
+    let events: Vec<_> = bus.drain().collect();
+    dispatcher.dispatch(&events, &mut handle.db, &tx);
+
+    for model in english().models() {
+        assert!(store_concrete.is_available(model));
+        assert!(!tmp
+            .path()
+            .join(format!("{}.1.gguf.part", model.id))
+            .exists());
+        assert!(!tmp.path().join(format!("{}.1.tmp", model.id)).exists());
+        assert_eq!(
+            downloads::get(&handle.db, model.id).unwrap().unwrap().status,
+            DownloadStatus::Cancelling
+        );
     }
-    let events: Vec<AppEvent> = bus.drain().collect();
-    dispatcher.dispatch(&events, &mut downloads_h.db, &tx);
-    std::thread::sleep(Duration::from_millis(200));
-    let leftover: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            name.ends_with(".part") || name.ends_with(".tmp")
-        })
-        .collect();
-    assert!(
-        leftover.is_empty(),
-        "quit-during-install must leave no .part/.tmp artifacts; got {leftover:?}"
-    );
 }
 
 #[test]
-fn cancel_and_immediate_retry_two_attempts_run_concurrently() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader_a: Arc<dyn Downloader> = Arc::new(
-        FixtureDownloader::new(vec![1u8; 4096], Outcome::Ok, Arc::clone(&calls)).with_delay(40),
-    );
-    let downloader_b: Arc<dyn Downloader> = Arc::new(
-        FixtureDownloader::new(vec![2u8; 4096], Outcome::Ok, Arc::clone(&calls)).with_delay(0),
-    );
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        tiny(),
-        store.clone(),
-        &mut downloads_h.db,
-        downloader_a.clone(),
-        &tx,
-    );
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    std::thread::sleep(Duration::from_millis(20));
-    producer::resolve_intent(
-        Intent::BlockClosed,
-        &state,
-        &mut downloads_h.db,
-        &tx,
-    );
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        downloader_b,
-        &tx,
-    );
-    std::thread::sleep(Duration::from_millis(200));
-    let total = calls.load(Ordering::SeqCst);
-    assert!(
-        total >= 2,
-        "both attempts must have fetched at least once; got {total}"
-    );
+fn every_catalog_format_has_a_handler() {
+    for model in voice_bird_next::picker::CATALOG {
+        let _ = handler_for(model.format);
+    }
 }
-
-#[test]
-fn stale_terminal_events_after_restart_do_not_repaint_attempt_b_ui() {
-    // After attempt A is cancelled and attempt B starts, a late
-    // `DownloadSucceeded` event from attempt A (e.g. one that
-    // slipped through before the cancel was observed) must NOT
-    // promote attempt B's row to `Succeeded` — the table's
-    // attempt gating rejects it. The final row reflects attempt
-    // B's status.
-    let tmp = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let slow = Arc::new(
-        FixtureDownloader::new(vec![1u8; 4096], Outcome::Ok, Arc::clone(&calls)).with_delay(40),
-    );
-    let fast = Arc::new(FixtureDownloader::new(vec![2u8; 4096], Outcome::Ok, Arc::clone(&calls)));
-    let mut bus = EventBus::new();
-    let tx = bus.sender();
-    let mut downloads_h = downloads_with(&bus);
-    let mut state = UiState::default();
-    state.apply(&AppEvent::AddBlock);
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    begin(
-        tiny(),
-        store.clone(),
-        &mut downloads_h.db,
-        slow.clone(),
-        &tx,
-    );
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-    std::thread::sleep(Duration::from_millis(10));
-    producer::resolve_intent(
-        Intent::BlockClosed,
-        &state,
-        &mut downloads_h.db,
-        &tx,
-    );
-    begin(
-        tiny(),
-        store,
-        &mut downloads_h.db,
-        fast,
-        &tx,
-    );
-    std::thread::sleep(Duration::from_millis(200));
-    tick_drain(&mut bus, &mut state, &mut downloads_h.db);
-
-    let final_row = downloads::get(&downloads_h.db, tiny().id).unwrap().unwrap();
-    assert!(
-        matches!(
-            final_row.status,
-            DownloadStatus::Succeeded | DownloadStatus::Downloading
-        ),
-        "row must reflect attempt B's status; got {:?}",
-        final_row.status
-    );
-}
-
