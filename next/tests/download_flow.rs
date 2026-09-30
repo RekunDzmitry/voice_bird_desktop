@@ -1,11 +1,11 @@
 //! End-to-end language download flow tests. No test touches the network.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus};
+use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus, EventSender};
 use voice_bird_next::db::downloads::CancelCheck;
 use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::dispatcher::Dispatcher;
@@ -41,6 +41,51 @@ impl Downloader for WritingDownloader {
             .map_err(|error| DownloadError::Io(error.to_string()))?;
         progress(13, Some(13));
         Ok(())
+    }
+}
+
+struct FailDuringAvailabilityCheck {
+    inner: FixtureStore,
+    tx: EventSender,
+    model: &'static str,
+    emitted: AtomicBool,
+}
+
+impl ModelStore for FailDuringAvailabilityCheck {
+    fn is_available(&self, entry: &voice_bird_next::picker::ModelEntry) -> bool {
+        if entry.id == self.model && !self.emitted.swap(true, Ordering::SeqCst) {
+            self.tx.publish(AppEvent::DownloadFailed {
+                attempt: 1,
+                model: entry.id,
+                error: "HTTP 404".to_string(),
+            });
+        }
+        self.inner.is_available(entry)
+    }
+
+    fn staging_path(
+        &self,
+        entry: &voice_bird_next::picker::ModelEntry,
+        attempt: u32,
+    ) -> Result<std::path::PathBuf, DownloadError> {
+        self.inner.staging_path(entry, attempt)
+    }
+
+    fn install(
+        &self,
+        entry: &voice_bird_next::picker::ModelEntry,
+        staged: &Path,
+        cancel: &mut dyn CancelCheck,
+    ) -> Result<(), DownloadError> {
+        self.inner.install(entry, staged, cancel)
+    }
+
+    fn clear_staging(&self, entry: &voice_bird_next::picker::ModelEntry) {
+        self.inner.clear_staging(entry);
+    }
+
+    fn discard_inflight(&self, entry: &voice_bird_next::picker::ModelEntry) {
+        self.inner.discard_inflight(entry);
     }
 }
 
@@ -268,6 +313,80 @@ fn claim_failure_on_one_model_fails_block() {
         BlockState::Failed {
             language, error, ..
         } if *language == english() && error == "database locked"
+    ));
+}
+
+#[test]
+fn failure_between_availability_check_and_selection_reaches_late_waiter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+
+    downloads::start(&mut handle.db, english().live.id).unwrap();
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+
+    state.apply(&AppEvent::AddBlock);
+    state.apply(&AppEvent::LanguageSelected {
+        block: 1,
+        language: english(),
+        pending: vec![english().live.id],
+    });
+    state.apply(&AppEvent::AddBlock);
+
+    let store: Arc<dyn ModelStore> = Arc::new(FailDuringAvailabilityCheck {
+        inner: FixtureStore::new(tmp.path().to_path_buf(), &[english().refine.id]),
+        tx: bus.sender(),
+        model: english().live.id,
+        emitted: AtomicBool::new(false),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        calls.clone(),
+    ));
+
+    voice_bird_next::download::begin_language(
+        2,
+        english(),
+        store,
+        &mut handle.db,
+        downloader,
+        &bus.sender(),
+    );
+
+    let first = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(state.blocks[1].state, BlockState::Waiting { .. }));
+    assert!(first.iter().any(|event| matches!(
+        event,
+        AppEvent::DownloadFailed { model, .. } if *model == english().live.id
+    )));
+    assert_eq!(
+        downloads::get(&handle.db, english().live.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DownloadStatus::Failed
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the stale Downloading row must make the second block join"
+    );
+
+    let second = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(second.iter().any(|event| matches!(
+        event,
+        AppEvent::DownloadStatusChanged {
+            model,
+            to: DownloadStatus::Failed,
+            ..
+        } if model.as_ref() == english().live.id
+    )));
+    assert!(matches!(
+        &state.blocks[1].state,
+        BlockState::Failed { error, .. } if error == "HTTP 404"
     ));
 }
 

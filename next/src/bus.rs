@@ -80,8 +80,8 @@ pub enum AppEvent {
     /// Esc on the focused block: remove it.
     BlockClosed,
     /// Model was already installed when the language was selected. The
-    /// reducer records it as ready so a block can reconcile cached and
-    /// completion events regardless of their bus order.
+    /// reducer fans this availability out to any existing waiter; the
+    /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
@@ -128,18 +128,22 @@ pub enum AppEvent {
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
     DownloadCancelled { attempt: u32, model: &'static str },
-    /// Emitted by [`crate::db::downloads::Downloads`] on every
-    /// lifecycle transition (Start, Installing, terminal, …). The
-    /// reducer treats it as observability: it never feeds a state
-    /// change, so the table log is consistent with the event log.
-    /// `model` is an `Arc<str>` (not `&'static str`) because the
-    /// transition publisher may have read it from the database
-    /// instead of the catalog.
+    /// Emitted after the downloads table accepts and persists every lifecycle
+    /// transition. The reducer uses terminal transitions to reconcile worker
+    /// outcomes that raced ahead of `LanguageSelected`; the event log records
+    /// the same lifecycle the SQL table does.
+    ///
+    /// `model` is an `Arc<str>` (not `&'static str`) because the transition
+    /// publisher may have read it from the database instead of the catalog.
+    /// `error` is populated for `Failed` so a late waiter receives the same
+    /// actionable message as blocks that observed the worker event directly.
     DownloadStatusChanged {
         model: std::sync::Arc<str>,
         attempt: u32,
         from: Option<DownloadStatus>,
         to: DownloadStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Emitted when an event arrives whose attempt does not match
     /// the table's current attempt for `model` (the old worker
@@ -347,6 +351,7 @@ mod tests {
             attempt: 2,
             from: Some(DownloadStatus::Cancelling),
             to: DownloadStatus::Cancelled,
+            error: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(

@@ -79,9 +79,12 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
    dispatcher checks both models, publishes `LanguageSelected` before worker
    events, and deduplicates each per-model claim through SQLite. Closing the
    last waiter cancels only that model's in-flight work.
-6. **Two representations of download state** (repository + `UiState::downloads`)
-   are kept honest by a convention: decisions read the repository,
-   renders read `UiState`. Both fold from the same drained events.
+6. **SQLite owns download lifecycle; `UiState::downloads` is its render
+   projection.** Decisions read SQLite. Accepted worker events update the table
+   before the UI, and the table publishes `DownloadStatusChanged` after every
+   persisted transition. Terminal status events reconcile outcomes that raced
+   ahead of `LanguageSelected`, without a second ready/failed cache in
+   `UiState`.
 7. **No test may touch the network.** `HttpDownloader` is constructed
    only in `main.rs`; everything else uses `FixtureDownloader`.
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed

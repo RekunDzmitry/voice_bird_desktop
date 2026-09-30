@@ -259,8 +259,8 @@ impl Throttle {
 /// Start or join the download for one model known to be missing.
 ///
 /// Availability is checked once by [`begin_language`] before it publishes the
-/// selection. Worker events can still overtake that selection on the shared bus;
-/// the reducer reconciles them through `UiState::ready`.
+/// selection. Worker events can still overtake that selection on the shared
+/// bus; the table's subsequent `DownloadStatusChanged` event reconciles them.
 fn ensure_model(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,

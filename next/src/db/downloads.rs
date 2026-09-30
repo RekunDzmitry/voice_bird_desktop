@@ -238,6 +238,7 @@ pub fn start(db: &mut Database, model: &'static str) -> rusqlite::Result<u32> {
         attempt,
         from,
         to: DownloadStatus::Downloading,
+        error: None,
     });
     Ok(attempt)
 }
@@ -271,6 +272,7 @@ pub fn cancel(db: &mut Database, model: &str) -> rusqlite::Result<bool> {
         attempt: row.attempt,
         from: Some(row.status),
         to: DownloadStatus::Cancelling,
+        error: None,
     });
     Ok(true)
 }
@@ -344,7 +346,7 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
         AppEvent::DownloadClaimFailed {
             attempt,
             model,
-            error: _,
+            error,
         } => {
             // Pre-persistence failure: `downloads::start` failed
             // before any row was written, so there is nothing in
@@ -369,6 +371,7 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
                 attempt: *attempt,
                 from: None,
                 to: DownloadStatus::Failed,
+                error: Some(error.clone()),
             });
             Ok(true)
         },
@@ -449,7 +452,13 @@ fn transition(
     let changed = db.conn_mut().execute(
         "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
          WHERE model = ?4 AND attempt = ?5",
-        params![status_to_sql(to), error, now_s, model, attempt],
+        params![
+            status_to_sql(to),
+            error.as_deref(),
+            now_s,
+            model,
+            attempt,
+        ],
     )?;
     if changed == 0 {
         // Row gone or attempt mismatch — log the rejection and
@@ -467,6 +476,7 @@ fn transition(
         attempt,
         from,
         to,
+        error,
     });
     Ok(())
 }
@@ -531,6 +541,7 @@ pub(crate) fn recover_interrupted(db: &mut Database) -> rusqlite::Result<()> {
             attempt: row.attempt,
             from: Some(row.status),
             to: DownloadStatus::Interrupted,
+            error: None,
         });
     }
     Ok(())
@@ -855,7 +866,7 @@ mod tests {
     #[test]
     fn apply_failed_stores_error_in_row() {
         let (_tmp, path) = tmp_db();
-        let (_bus, tx) = bus();
+        let (mut bus, tx) = bus();
         let mut d = Database::open(&path, tx).unwrap();
         start(&mut d, "tiny.en").unwrap();
         apply(&mut d, &AppEvent::DownloadFailed {
@@ -867,6 +878,14 @@ mod tests {
         let row = get(&d, "tiny.en").unwrap().unwrap();
         assert_eq!(row.status, DownloadStatus::Failed);
         assert_eq!(row.error.as_deref(), Some("boom"));
+        assert!(bus.drain().any(|event| matches!(
+            event,
+            AppEvent::DownloadStatusChanged {
+                to: DownloadStatus::Failed,
+                error: Some(error),
+                ..
+            } if error == "boom"
+        )));
     }
 
     #[test]

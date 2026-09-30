@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
@@ -159,10 +159,6 @@ pub struct UiState {
     pub blocks: Vec<Block>,
     pub focus: usize,
     pub downloads: BTreeMap<&'static str, DownloadState>,
-    /// Models confirmed available during this process. This lets selection
-    /// reconcile completion events that were reduced before the block started
-    /// waiting for the same model.
-    pub ready: BTreeSet<&'static str>,
     pub next_block_id: u8,
     /// Left-hand session menu. `None` when closed; `Some(_)`
     /// otherwise. The renderer draws the panel when this is `Some`
@@ -188,7 +184,6 @@ impl Default for UiState {
             blocks: Vec::new(),
             focus: 0,
             downloads: BTreeMap::new(),
-            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -285,7 +280,7 @@ impl UiState {
             self.blocks[idx].visible = true;
         }
     }
-    fn fail_waiters(&mut self, model: &'static str, error: &str) {
+    fn fail_waiters(&mut self, model: &str, error: &str) {
         self.downloads.remove(model);
         for block in &mut self.blocks {
             let failed = match &mut block.state {
@@ -309,8 +304,7 @@ impl UiState {
         }
     }
 
-    fn mark_ready(&mut self, model: &'static str) {
-        self.ready.insert(model);
+    fn mark_ready(&mut self, model: &str) {
         self.downloads.remove(model);
         for block in &mut self.blocks {
             let completed_language = match &mut block.state {
@@ -433,11 +427,6 @@ impl UiState {
                 language,
                 pending,
             } => {
-                let pending: Vec<_> = pending
-                    .iter()
-                    .copied()
-                    .filter(|model| !self.ready.contains(model))
-                    .collect();
                 if let Some(block) = self
                     .blocks
                     .iter_mut()
@@ -450,21 +439,22 @@ impl UiState {
                         block.state = if pending.is_empty() {
                             BlockState::Recording { language }
                         } else {
-                            BlockState::Waiting { language, pending }
+                            BlockState::Waiting {
+                                language,
+                                pending: pending.clone(),
+                            }
                         };
                     }
                 }
             }
             AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::DownloadRequested(entry) => {
-                if !self.ready.contains(entry.id) {
-                    self.downloads.entry(entry.id).or_insert(DownloadState {
-                        phase: DownloadPhase::Fetching,
-                        bytes: 0,
-                        total: None,
-                        bytes_per_sec: 0,
-                    });
-                }
+                self.downloads.entry(entry.id).or_insert(DownloadState {
+                    phase: DownloadPhase::Fetching,
+                    bytes: 0,
+                    total: None,
+                    bytes_per_sec: 0,
+                });
             }
             AppEvent::DownloadProgress {
                 attempt: _,
@@ -509,13 +499,11 @@ impl UiState {
                     self.promote_hidden();
                 }
                 for model in removed_pending {
-                    let still_waiting = self.blocks.iter().any(|block| {
-                        matches!(
-                            &block.state,
-                            BlockState::Waiting { pending, .. } if pending.contains(&model)
-                        )
-                    });
-                    if !still_waiting {
+                    let still_pending = self
+                        .blocks
+                        .iter()
+                        .any(|block| block.pending_models().contains(&model));
+                    if !still_pending {
                         self.downloads.remove(model);
                     }
                 }
@@ -554,11 +542,20 @@ impl UiState {
                 self.show_block(*id);
                 self.menu = None;
             }
-            // Lifecycle observability events: the table is the
-            // source of truth, so the reducer doesn't fold them
-            // into `downloads`. The event log already captures
-            // them via the same drain loop.
-            AppEvent::DownloadStatusChanged { .. } | AppEvent::DownloadEventRejected { .. } => {}
+            // The table publishes these after persisting a lifecycle
+            // transition. Replaying terminal outcomes here reconciles a worker
+            // event that was reduced while a new block was still Picking.
+            AppEvent::DownloadStatusChanged {
+                model, to, error, ..
+            } => match to {
+                crate::bus::DownloadStatus::Succeeded => self.mark_ready(model.as_ref()),
+                crate::bus::DownloadStatus::Failed => self.fail_waiters(
+                    model.as_ref(),
+                    error.as_deref().unwrap_or("download failed"),
+                ),
+                _ => {}
+            },
+            AppEvent::DownloadEventRejected { .. } => {}
             AppEvent::Quit => self.should_quit = true,
             // Bus commands aimed at the loop-thread dispatcher.
             // Reducer ignores them; the dispatcher is the only
@@ -752,7 +749,6 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
-            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -786,7 +782,6 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
-            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -823,7 +818,6 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
-            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -1004,7 +998,6 @@ mod tests {
             blocks: Vec::new(),
             focus: 0,
             downloads: BTreeMap::new(),
-            ready: BTreeSet::new(),
             next_block_id: 42,
             menu: None,
             focus_clock: 0,
@@ -1094,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_ignores_a_model_that_succeeded_before_the_block_started_waiting() {
+    fn table_status_reconciles_success_that_preceded_selection() {
         let mut s = UiState::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadSucceeded {
@@ -1102,10 +1095,46 @@ mod tests {
             model: english().live.id,
         });
         s.apply(&select(1, vec![english().live.id]));
+        assert!(matches!(s.blocks[0].state, BlockState::Waiting { .. }));
+
+        s.apply(&AppEvent::DownloadStatusChanged {
+            model: english().live.id.into(),
+            attempt: 1,
+            from: Some(crate::bus::DownloadStatus::Downloading),
+            to: crate::bus::DownloadStatus::Succeeded,
+            error: None,
+        });
 
         assert!(matches!(
             s.blocks[0].state,
             BlockState::Recording { language } if language == english()
+        ));
+    }
+
+    #[test]
+    fn table_status_reconciles_failure_that_preceded_selection() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "HTTP 404".to_string(),
+        });
+        s.apply(&select(1, vec![english().live.id]));
+        assert!(matches!(s.blocks[0].state, BlockState::Waiting { .. }));
+
+        s.apply(&AppEvent::DownloadStatusChanged {
+            model: english().live.id.into(),
+            attempt: 1,
+            from: Some(crate::bus::DownloadStatus::Downloading),
+            to: crate::bus::DownloadStatus::Failed,
+            error: Some("HTTP 404".to_string()),
+        });
+
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Failed { language, error, .. }
+                if *language == english() && error == "HTTP 404"
         ));
     }
 
@@ -1205,6 +1234,26 @@ mod tests {
         s.apply(&AppEvent::BlockClosed);
         assert!(s.downloads.contains_key(english().live.id));
         assert!(!s.downloads.contains_key(english().refine.id));
+    }
+
+    #[test]
+    fn block_closed_keeps_download_needed_by_a_failed_block() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::DownloadRequested(english().refine));
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "live failed".to_string(),
+        });
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(2, vec![english().refine.id]));
+
+        s.apply(&AppEvent::BlockClosed);
+
+        assert!(matches!(s.blocks[0].state, BlockState::Failed { .. }));
+        assert!(s.downloads.contains_key(english().refine.id));
     }
 
     #[test]
