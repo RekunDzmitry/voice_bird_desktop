@@ -245,6 +245,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn block_closed_cancels_the_sibling_still_running_after_failure() {
+        let bus = EventBus::new();
+        let tx = bus.sender();
+        let mut h = db_with(&bus);
+        crate::db::downloads::start(&mut h.db, english().refine.id).unwrap();
+        let mut state = UiState::default();
+        state.blocks.push(Block::new(
+            1,
+            BlockState::Failed {
+                language: english(),
+                error: "live model failed".to_string(),
+                pending: vec![english().refine.id],
+            },
+        ));
+
+        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
+
+        let row = crate::db::downloads::get(&h.db, english().refine.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, crate::bus::DownloadStatus::Cancelling);
+    }
+
     // -----------------------------------------------------------------
     // Session-menu tests (from a231a62)
     // -----------------------------------------------------------------

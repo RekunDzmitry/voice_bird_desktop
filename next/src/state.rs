@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
@@ -37,6 +37,8 @@ pub enum BlockState {
     Failed {
         language: &'static LanguageProfile,
         error: String,
+        /// Required models that are still running after the failure.
+        pending: Vec<&'static str>,
     },
 }
 
@@ -97,7 +99,7 @@ impl Block {
 
     pub fn pending_models(&self) -> &[&'static str] {
         match &self.state {
-            BlockState::Waiting { pending, .. } => pending,
+            BlockState::Waiting { pending, .. } | BlockState::Failed { pending, .. } => pending,
             _ => &[],
         }
     }
@@ -157,6 +159,10 @@ pub struct UiState {
     pub blocks: Vec<Block>,
     pub focus: usize,
     pub downloads: BTreeMap<&'static str, DownloadState>,
+    /// Models confirmed available during this process. This lets selection
+    /// reconcile completion events that were reduced before the block started
+    /// waiting for the same model.
+    pub ready: BTreeSet<&'static str>,
     pub next_block_id: u8,
     /// Left-hand session menu. `None` when closed; `Some(_)`
     /// otherwise. The renderer draws the panel when this is `Some`
@@ -182,6 +188,7 @@ impl Default for UiState {
             blocks: Vec::new(),
             focus: 0,
             downloads: BTreeMap::new(),
+            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -281,17 +288,44 @@ impl UiState {
     fn fail_waiters(&mut self, model: &'static str, error: &str) {
         self.downloads.remove(model);
         for block in &mut self.blocks {
-            let language = match &block.state {
+            let failed = match &mut block.state {
                 BlockState::Waiting { language, pending } if pending.contains(&model) => {
-                    Some(*language)
+                    pending.retain(|pending_model| *pending_model != model);
+                    Some((*language, pending.clone()))
+                }
+                BlockState::Failed { pending, .. } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    None
                 }
                 _ => None,
             };
-            if let Some(language) = language {
+            if let Some((language, pending)) = failed {
                 block.state = BlockState::Failed {
                     language,
+                    pending,
                     error: error.to_string(),
                 };
+            }
+        }
+    }
+
+    fn mark_ready(&mut self, model: &'static str) {
+        self.ready.insert(model);
+        self.downloads.remove(model);
+        for block in &mut self.blocks {
+            let completed_language = match &mut block.state {
+                BlockState::Waiting { language, pending } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    pending.is_empty().then_some(*language)
+                }
+                BlockState::Failed { pending, .. } => {
+                    pending.retain(|pending_model| *pending_model != model);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(language) = completed_language {
+                block.state = BlockState::Recording { language };
             }
         }
     }
@@ -399,6 +433,11 @@ impl UiState {
                 language,
                 pending,
             } => {
+                let pending: Vec<_> = pending
+                    .iter()
+                    .copied()
+                    .filter(|model| !self.ready.contains(model))
+                    .collect();
                 if let Some(block) = self
                     .blocks
                     .iter_mut()
@@ -411,22 +450,21 @@ impl UiState {
                         block.state = if pending.is_empty() {
                             BlockState::Recording { language }
                         } else {
-                            BlockState::Waiting {
-                                language,
-                                pending: pending.clone(),
-                            }
+                            BlockState::Waiting { language, pending }
                         };
                     }
                 }
             }
-            AppEvent::ModelAlreadyCached(_) => {}
+            AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::DownloadRequested(entry) => {
-                self.downloads.entry(entry.id).or_insert(DownloadState {
-                    phase: DownloadPhase::Fetching,
-                    bytes: 0,
-                    total: None,
-                    bytes_per_sec: 0,
-                });
+                if !self.ready.contains(entry.id) {
+                    self.downloads.entry(entry.id).or_insert(DownloadState {
+                        phase: DownloadPhase::Fetching,
+                        bytes: 0,
+                        total: None,
+                        bytes_per_sec: 0,
+                    });
+                }
             }
             AppEvent::DownloadProgress {
                 attempt: _,
@@ -446,21 +484,7 @@ impl UiState {
                     row.phase = DownloadPhase::Installing;
                 }
             }
-            AppEvent::DownloadSucceeded { attempt: _, model } => {
-                self.downloads.remove(*model);
-                for block in &mut self.blocks {
-                    let completed_language = match &mut block.state {
-                        BlockState::Waiting { language, pending } => {
-                            pending.retain(|pending_model| *pending_model != *model);
-                            pending.is_empty().then_some(*language)
-                        }
-                        _ => None,
-                    };
-                    if let Some(language) = completed_language {
-                        block.state = BlockState::Recording { language };
-                    }
-                }
-            }
+            AppEvent::DownloadSucceeded { attempt: _, model } => self.mark_ready(model),
             AppEvent::DownloadFailed {
                 attempt: _,
                 model,
@@ -728,6 +752,7 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
+            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -761,6 +786,7 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
+            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -797,6 +823,7 @@ mod tests {
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
+            ready: BTreeSet::new(),
             next_block_id: 1,
             menu: None,
             focus_clock: 0,
@@ -977,6 +1004,7 @@ mod tests {
             blocks: Vec::new(),
             focus: 0,
             downloads: BTreeMap::new(),
+            ready: BTreeSet::new(),
             next_block_id: 42,
             menu: None,
             focus_clock: 0,
@@ -1066,6 +1094,22 @@ mod tests {
     }
 
     #[test]
+    fn selection_ignores_a_model_that_succeeded_before_the_block_started_waiting() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&AppEvent::DownloadSucceeded {
+            attempt: 1,
+            model: english().live.id,
+        });
+        s.apply(&select(1, vec![english().live.id]));
+
+        assert!(matches!(
+            s.blocks[0].state,
+            BlockState::Recording { language } if language == english()
+        ));
+    }
+
+    #[test]
     fn model_failure_fails_every_waiter_with_the_message() {
         let mut s = UiState::default();
         for id in 1..=2 {
@@ -1079,13 +1123,34 @@ mod tests {
         });
         for block in &s.blocks {
             match &block.state {
-                BlockState::Failed { language, error } => {
+                BlockState::Failed {
+                    language, error, ..
+                } => {
                     assert_eq!(*language, english());
                     assert_eq!(error, "HTTP 404");
                 }
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn failed_block_retains_only_other_running_models() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, vec![english().live.id, english().refine.id]));
+        s.apply(&AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "HTTP 404".to_string(),
+        });
+
+        assert!(matches!(
+            &s.blocks[0].state,
+            BlockState::Failed { pending, .. }
+                if pending.as_slice() == [english().refine.id]
+        ));
+        assert_eq!(s.blocks[0].pending_models(), &[english().refine.id]);
     }
 
     #[test]
@@ -1100,8 +1165,9 @@ mod tests {
         });
         assert!(matches!(
             &s.blocks[0].state,
-            BlockState::Failed { language, error }
-                if *language == english() && error == "database locked"
+            BlockState::Failed {
+                language, error, ..
+            } if *language == english() && error == "database locked"
         ));
     }
 

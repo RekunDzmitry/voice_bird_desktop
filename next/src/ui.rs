@@ -6,8 +6,6 @@
 //! `Borders::LEFT | Borders::RIGHT` so adjacent columns share a `│`
 //! divider.
 
-use std::collections::BTreeMap;
-
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Stylize,
@@ -26,7 +24,7 @@ use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
 ///
 /// Each column renders its own stage:
 /// - `Picking(p)` → the language list, `▶` on `p.index`.
-/// - `Waiting` → one gauge aggregating all pending model downloads.
+/// - `Waiting` → one gauge per model role.
 /// - `Recording` → `● recording (mocked)`.
 /// - `Failed` → the error wrapped, plus `r retry · Esc close`.
 pub fn render(f: &mut Frame, state: &UiState) {
@@ -112,8 +110,7 @@ fn render_block(
 
     match &block.state {
         BlockState::Waiting { language, pending } => {
-            let aggregate = aggregate_download(&state.downloads, pending);
-            render_gauge(f, language.code, aggregate.as_ref(), inner);
+            render_waiting(f, language, pending, state, inner);
         }
         _ => {
             let lines = block_body_lines(block, state);
@@ -243,64 +240,63 @@ fn block_body_lines(block: &crate::state::Block, _state: &UiState) -> Vec<Line<'
     }
 }
 
-/// Aggregate the progress of every pending model into one language-level row.
-pub fn aggregate_download(
-    downloads: &BTreeMap<&'static str, DownloadState>,
+fn render_waiting(
+    f: &mut Frame,
+    language: &'static LanguageProfile,
     pending: &[&'static str],
-) -> Option<DownloadState> {
-    if pending.is_empty() {
-        return None;
+    state: &UiState,
+    area: Rect,
+) {
+    let rows = Layout::new(
+        Direction::Vertical,
+        vec![Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)],
+    )
+    .split(area);
+    for ((role, model), row) in [("live", language.live), ("refine", language.refine)]
+        .into_iter()
+        .zip(rows.iter())
+    {
+        render_model_gauge(
+            f,
+            role,
+            pending.contains(&model.id),
+            state.downloads.get(model.id),
+            *row,
+        );
     }
-    let mut seen = false;
-    let mut bytes = 0u64;
-    let mut total = 0u64;
-    let mut all_totals_known = true;
-    let mut bytes_per_sec = 0u64;
-    let mut all_installing = true;
-    for model in pending {
-        match downloads.get(model) {
-            Some(state) => {
-                seen = true;
-                bytes = bytes.saturating_add(state.bytes);
-                bytes_per_sec = bytes_per_sec.saturating_add(state.bytes_per_sec);
-                match state.total {
-                    Some(model_total) => total = total.saturating_add(model_total),
-                    None => all_totals_known = false,
-                }
-                all_installing &= state.phase == DownloadPhase::Installing;
-            }
-            None => {
-                all_totals_known = false;
-                all_installing = false;
-            }
-        }
-    }
-    seen.then_some(DownloadState {
-        phase: if all_installing {
-            DownloadPhase::Installing
-        } else {
-            DownloadPhase::Fetching
-        },
-        bytes,
-        total: all_totals_known.then_some(total),
-        bytes_per_sec,
-    })
 }
 
-fn render_gauge(f: &mut Frame, language: &str, state: Option<&DownloadState>, area: Rect) {
+fn render_model_gauge(
+    f: &mut Frame,
+    role: &str,
+    pending: bool,
+    state: Option<&DownloadState>,
+    area: Rect,
+) {
+    if !pending {
+        f.render_widget(
+            Gauge::default()
+                .gauge_style(Style::default().bold())
+                .ratio(1.0)
+                .label(format!("{role} · ready")),
+            area,
+        );
+        return;
+    }
+
     match state {
         Some(s) if s.phase == DownloadPhase::Installing => {
-            f.render_widget(Paragraph::new(format!("Preparing {language}…")), area);
+            f.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().bold())
+                    .ratio(s.ratio().unwrap_or(0.0))
+                    .label(format!("{role} · Preparing…")),
+                area,
+            );
         }
         Some(s) => {
-            // Fetching. Two label shapes:
-            //   - known total  → filled bar + "bytes / total"
-            //   - no total yet → pulsing bar (ratio=0) + MB/s + bytes
-            // The MB/s line is meaningful precisely because `total`
-            // is None — without it, the user sees only a widthless
-            // bar with no end in sight.
             let ratio = s.ratio().unwrap_or(0.0);
-            let label = match s.total {
+            let progress = match s.total {
                 Some(t) => format!("{} / {}", human_bytes(s.bytes), human_bytes(t)),
                 None => format!(
                     "{} · {:.2} MB/s",
@@ -308,14 +304,16 @@ fn render_gauge(f: &mut Frame, language: &str, state: Option<&DownloadState>, ar
                     s.bytes_per_sec as f64 / 1_000_000.0
                 ),
             };
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().bold())
-                .ratio(ratio)
-                .label(label);
-            f.render_widget(gauge, area);
+            f.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().bold())
+                    .ratio(ratio)
+                    .label(format!("{role} · {progress}")),
+                area,
+            );
         }
         None => {
-            f.render_widget(Gauge::default().ratio(0.0).label(" "), area);
+            f.render_widget(Gauge::default().ratio(0.0).label(role.to_string()), area);
         }
     }
 }
@@ -505,74 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_download_sums_progress_and_rates() {
-        let mut downloads = BTreeMap::new();
-        downloads.insert(
-            LANGUAGES[0].live.id,
-            DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 20,
-                total: Some(40),
-                bytes_per_sec: 3,
-            },
-        );
-        downloads.insert(
-            LANGUAGES[0].refine.id,
-            DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 30,
-                total: Some(60),
-                bytes_per_sec: 4,
-            },
-        );
-        assert_eq!(
-            aggregate_download(&downloads, &[LANGUAGES[0].live.id, LANGUAGES[0].refine.id]),
-            Some(DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 50,
-                total: Some(100),
-                bytes_per_sec: 7,
-            })
-        );
-    }
-
-    #[test]
-    fn aggregate_download_requires_every_total_and_installing_phase() {
-        let mut downloads = BTreeMap::new();
-        downloads.insert(
-            LANGUAGES[0].live.id,
-            DownloadState {
-                phase: DownloadPhase::Installing,
-                bytes: 20,
-                total: Some(40),
-                bytes_per_sec: 0,
-            },
-        );
-        downloads.insert(
-            LANGUAGES[0].refine.id,
-            DownloadState {
-                phase: DownloadPhase::Fetching,
-                bytes: 30,
-                total: None,
-                bytes_per_sec: 4,
-            },
-        );
-        let aggregate =
-            aggregate_download(&downloads, &[LANGUAGES[0].live.id, LANGUAGES[0].refine.id])
-                .unwrap();
-        assert_eq!(aggregate.total, None);
-        assert_eq!(aggregate.phase, DownloadPhase::Fetching);
-        downloads.get_mut(LANGUAGES[0].refine.id).unwrap().phase = DownloadPhase::Installing;
-        assert_eq!(
-            aggregate_download(&downloads, &[LANGUAGES[0].live.id, LANGUAGES[0].refine.id])
-                .unwrap()
-                .phase,
-            DownloadPhase::Installing
-        );
-    }
-
-    #[test]
-    fn waiting_block_draws_combined_gauge() {
+    fn waiting_block_draws_separate_role_gauges() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -603,13 +534,15 @@ mod tests {
             "expected filled gauge cells; got:\n{out}"
         );
         assert!(out.contains("1 · en"));
+        assert!(out.contains("live · 50 B / 100 B"), "{out}");
+        assert!(out.contains("refine · 50 B / 100 B"), "{out}");
         for model in LANGUAGES[0].models() {
             assert!(!out.contains(model.id));
         }
     }
 
     #[test]
-    fn waiting_block_without_a_record_does_not_panic() {
+    fn waiting_block_shows_completed_role_as_ready() {
         let state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -621,11 +554,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _ = render_to_string(&state, 40, 5);
+        let out = render_to_string(&state, 40, 8);
+        assert!(out.contains("live"), "{out}");
+        assert!(out.contains("refine · ready"), "{out}");
     }
 
     #[test]
-    fn waiting_block_installing_phase_says_preparing_language() {
+    fn waiting_block_installing_phase_says_preparing_by_role() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -649,12 +584,13 @@ mod tests {
             );
         }
         let out = render_to_string(&state, 100, 10);
-        assert!(out.contains("Preparing en…"), "got:\n{out}");
+        assert!(out.contains("live · Preparing…"), "got:\n{out}");
+        assert!(out.contains("refine · Preparing…"), "got:\n{out}");
         assert!(!out.contains('\u{2588}'));
     }
 
     #[test]
-    fn waiting_block_without_content_length_uses_combined_rate() {
+    fn waiting_block_without_content_length_uses_model_rate() {
         let mut state = UiState {
             blocks: vec![Block {
                 id: 1,
@@ -675,8 +611,10 @@ mod tests {
                 bytes_per_sec: 2 * 1024 * 1024,
             },
         );
-        let out = render_to_string(&state, 40, 5);
+        let out = render_to_string(&state, 40, 8);
         assert!(out.contains("MB/s"), "{out}");
+        assert!(out.contains("live"), "{out}");
+        assert!(out.contains("refine · ready"), "{out}");
         assert!(!out.contains(LANGUAGES[0].live.id));
     }
 
@@ -688,6 +626,7 @@ mod tests {
                 state: BlockState::Failed {
                     language: &LANGUAGES[0],
                     error: "HTTP 404".to_string(),
+                    pending: Vec::new(),
                 },
                 ..Default::default()
             }],

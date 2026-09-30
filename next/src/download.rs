@@ -256,21 +256,18 @@ impl Throttle {
     const NO_TOTAL_TICK_MS: u128 = 250;
 }
 
-/// Ensure one model is installed or has an active download.
+/// Start or join the download for one model known to be missing.
 ///
-/// Returns `true` when the model was already available. All worker events are
-/// published after the caller's `LanguageSelected` event.
-pub fn ensure_model(
+/// Availability is checked once by [`begin_language`] before it publishes the
+/// selection. Worker events can still overtake that selection on the shared bus;
+/// the reducer reconciles them through `UiState::ready`.
+fn ensure_model(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
     db: &mut Database,
     downloader: Arc<dyn Downloader>,
     tx: &EventSender,
-) -> bool {
-    if store.is_available(entry) {
-        tx.publish(AppEvent::ModelAlreadyCached(entry));
-        return true;
-    }
+) {
     tx.publish(AppEvent::DownloadRequested(entry));
     let row = match downloads::get(db, entry.id) {
         Ok(row) => row,
@@ -280,7 +277,7 @@ pub fn ensure_model(
                 model: entry.id,
                 error: truncate_error(&format!("downloads table: {error}")),
             });
-            return false;
+            return;
         }
     };
     match downloads::decide(row.as_ref()) {
@@ -289,10 +286,10 @@ pub fn ensure_model(
         }
         Claim::Join => {}
     }
-    false
 }
 
-/// Select a language, then ensure its live and refinement models.
+/// Select a language after checking each model exactly once, then ensure every
+/// missing model has an active download.
 pub fn begin_language(
     block: u8,
     language: &'static LanguageProfile,
@@ -301,19 +298,24 @@ pub fn begin_language(
     downloader: Arc<dyn Downloader>,
     tx: &EventSender,
 ) {
-    let pending: Vec<&'static str> = language
+    let models = language
         .models()
-        .into_iter()
-        .filter(|model| !store.is_available(model))
-        .map(|model| model.id)
+        .map(|model| (model, store.is_available(model)));
+    let pending = models
+        .iter()
+        .filter_map(|(model, available)| (!available).then_some(model.id))
         .collect();
     tx.publish(AppEvent::LanguageSelected {
         block,
         language,
         pending,
     });
-    for model in language.models() {
-        ensure_model(model, store.clone(), db, downloader.clone(), tx);
+    for (model, available) in models {
+        if available {
+            tx.publish(AppEvent::ModelAlreadyCached(model));
+        } else {
+            ensure_model(model, store.clone(), db, downloader.clone(), tx);
+        }
     }
 }
 
@@ -779,6 +781,7 @@ mod tests {
             crate::state::BlockState::Failed {
                 language: failed_language,
                 error,
+                ..
             } => {
                 assert_eq!(*failed_language, language);
                 assert!(

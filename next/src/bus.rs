@@ -79,8 +79,9 @@ pub enum AppEvent {
     },
     /// Esc on the focused block: remove it.
     BlockClosed,
-    /// Model was already installed when the language was selected. This is
-    /// a per-model diagnostic and does not drive block state.
+    /// Model was already installed when the language was selected. The
+    /// reducer records it as ready so a block can reconcile cached and
+    /// completion events regardless of their bus order.
     ModelAlreadyCached(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.

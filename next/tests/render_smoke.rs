@@ -139,6 +139,7 @@ fn failed_100x30_matches_golden() {
             state: BlockState::Failed {
                 language: &LANGUAGES[0],
                 error: "HTTP 404".to_string(),
+                pending: Vec::new(),
             },
 
             ..Default::default()

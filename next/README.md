@@ -13,8 +13,9 @@ blocks waiting on the same language share each model download.
 
 The registry currently maps `en` to `distil-small.en` for live
 transcription and `large-v3-turbo` for refinement. Model identifiers remain
-an implementation detail: the picker, titles, progress, and errors show the
-language code. Adding a language is one row in `src/language.rs`.
+an implementation detail: the UI shows the language code and labels download
+progress by `live` / `refine` role. Adding a language is one row in
+`src/language.rs`.
 
 ```bash
 cargo run  -p voice-bird-next          # empty bordered window, `q` / Ctrl-C to quit
@@ -50,7 +51,7 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
 | `src/picker.rs` | `LanguagePicker` plus the internal model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + `EventBus` / `EventSender` |
 | `src/state.rs` | `UiState` + `BlockState` + pure reducer |
-| `src/ui.rs` | `render(f, &UiState)` — language rows, aggregate gauges, borders |
+| `src/ui.rs` | `render(f, &UiState)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |

@@ -265,8 +265,9 @@ fn claim_failure_on_one_model_fails_block() {
 
     assert!(matches!(
         &state.blocks[0].state,
-        BlockState::Failed { language, error }
-            if *language == english() && error == "database locked"
+        BlockState::Failed {
+            language, error, ..
+        } if *language == english() && error == "database locked"
     ));
 }
 
