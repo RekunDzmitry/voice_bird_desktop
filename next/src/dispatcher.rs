@@ -12,6 +12,9 @@
 //! - [`AppEvent::BeginLanguage`](crate::bus::AppEvent::BeginLanguage) —
 //!   the resolver saw `Confirm` or `Retry`. The dispatcher calls
 //!   [`download::begin_language`](crate::download::begin_language).
+//! - [`AppEvent::ModelMissing`](crate::bus::AppEvent::ModelMissing) —
+//!   an active block lost an installed model. The dispatcher calls
+//!   [`download::ensure_model`](crate::download::ensure_model) to re-download it.
 //! - [`AppEvent::DiscardInflight`] — Quit-time cleanup asks the
 //!   dispatcher to drop the staged archive and unpack scratch
 //!   directory for one model. No reply (best-effort).
@@ -28,7 +31,7 @@ use std::sync::Arc;
 
 use crate::bus::AppEvent;
 use crate::db::Database;
-use crate::download::begin_language;
+use crate::download::{begin_language, ensure_model};
 use crate::picker::{ModelEntry, CATALOG};
 use crate::transcription_models::ModelStore;
 
@@ -66,6 +69,15 @@ impl Dispatcher {
                     begin_language(
                         *block,
                         language,
+                        self.model_store.clone(),
+                        db,
+                        self.downloader.clone(),
+                        tx,
+                    );
+                }
+                AppEvent::ModelMissing(entry) => {
+                    ensure_model(
+                        entry,
                         self.model_store.clone(),
                         db,
                         self.downloader.clone(),

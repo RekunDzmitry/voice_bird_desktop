@@ -258,10 +258,11 @@ impl Throttle {
 
 /// Start or join the download for one model known to be missing.
 ///
-/// Availability is checked once by [`begin_language`] before it publishes the
-/// selection. Worker events can still overtake that selection on the shared
-/// bus; the table's subsequent `DownloadStatusChanged` event reconciles them.
-fn ensure_model(
+/// Called after availability checks by [`begin_language`] or after the
+/// watcher detects a model lost by an active block. Worker events can still
+/// overtake a language selection on the shared bus; the table's subsequent
+/// `DownloadStatusChanged` event reconciles them.
+pub fn ensure_model(
     entry: &'static ModelEntry,
     store: Arc<dyn ModelStore>,
     db: &mut Database,

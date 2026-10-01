@@ -83,6 +83,9 @@ pub enum AppEvent {
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
+    /// A model a block already counted as installed is no longer on disk.
+    /// Reducer stops recording; dispatcher re-requests the download.
+    ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
     /// Seeds the shared per-model download projection.
@@ -382,5 +385,10 @@ mod tests {
         assert_eq!(command["event"], "BeginLanguage");
         assert_eq!(command["block"], 3);
         assert_eq!(command["language"]["code"], language.code);
+
+        let missing = serde_json::to_value(AppEvent::ModelMissing(language.live))
+            .expect("serialize missing model");
+        assert_eq!(missing["event"], "ModelMissing");
+        assert_eq!(missing["id"], language.live.id);
     }
 }

@@ -17,6 +17,7 @@ use voice_bird_next::dispatcher::Dispatcher;
 use voice_bird_next::download::Downloader;
 #[cfg(feature = "net")]
 use voice_bird_next::download::HttpDownloader;
+use voice_bird_next::model_watch::ModelWatcher;
 use voice_bird_next::state::UiState;
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 use voice_bird_next::{input, producer};
@@ -114,6 +115,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
     let dispatcher = Dispatcher::new(downloader.clone(), store.clone());
+    let watcher = ModelWatcher::new(store.clone());
     let mut dirty = true;
     loop {
         if dirty {
@@ -133,6 +135,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
                 dirty = true;
             }
         }
+        watcher.check(&state, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         if !events.is_empty() {
             for ev in &events {

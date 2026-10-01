@@ -13,6 +13,7 @@ pub mod event_log;
 pub mod input;
 pub mod dispatcher;
 pub mod language;
+pub mod model_watch;
 pub mod picker;
 pub mod state;
 pub mod db;
