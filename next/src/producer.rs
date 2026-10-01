@@ -292,8 +292,10 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
-        state.menu = Some(SessionMenu::open_at(0));
+        let state = UiState {
+            menu: Some(SessionMenu::open_at(0)),
+            ..UiState::default()
+        };
         resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(

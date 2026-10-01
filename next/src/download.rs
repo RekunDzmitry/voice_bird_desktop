@@ -522,7 +522,7 @@ mod tests {
         // Second emit at t=1500 ms, 1 MiB downloaded. 1 MiB - 1 KiB
         // arrived in 500 ms → ~2 MB/s.
         assert!(throttle.should_emit(1024 * 1024, None, 1_500));
-        let expected_2 = ((1024u64 * 1024 - 1024) * 1000 / 500) as u64;
+        let expected_2 = (1024u64 * 1024 - 1024) * 1000 / 500;
         assert_eq!(
             throttle.bytes_per_sec(1_500, 1024 * 1024),
             expected_2,
@@ -533,7 +533,7 @@ mod tests {
 
         // Third emit at t=2000 ms, 2 MiB. 1 MiB / 500 ms → 2 MB/s.
         assert!(throttle.should_emit(2 * 1024 * 1024, None, 2_000));
-        let expected_3 = (1024u64 * 1024 * 1000 / 500) as u64;
+        let expected_3 = 1024u64 * 1024 * 1000 / 500;
         assert_eq!(throttle.bytes_per_sec(2_000, 2 * 1024 * 1024), expected_3);
     }
 
@@ -772,7 +772,7 @@ mod tests {
         // state ignores these observability events so we
         // don't re-apply them.
         let mut post_apply: Vec<AppEvent> = bus.drain().collect();
-        drained.extend(post_apply.drain(..));
+        drained.append(&mut post_apply);
 
         let block = state
             .blocks
