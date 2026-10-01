@@ -51,6 +51,7 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
 | `src/picker.rs` | `LanguagePicker` plus the internal model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + `EventBus` / `EventSender` |
 | `src/state.rs` | `UiState` + `BlockState` + pure reducer |
+| `src/model_watch.rs` | per-tick presence checks for installed models used by active blocks |
 | `src/ui.rs` | `render(f, &UiState)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
@@ -90,6 +91,12 @@ cargo clippy -p voice-bird-next --all-targets -- -D warnings
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed
    live and refine artifacts from `<cache_dir>/voice-bird/models/`.
    SQLite tracks in-flight work; quit cleanup removes staging artifacts only.
+   Active blocks re-verify their installed models every 100 ms tick, including
+   hidden sessions and ready models in Waiting blocks. A missing model sends
+   every affected block back to Waiting and re-claims a shared download; success
+   resumes Recording automatically. Failure enters Failed, where `r` retries.
+   Presence checks do not detect corruption of files that still exist, and
+   Recording remains mocked (no real audio device is stopped yet).
 
 ## Refreshing the golden snapshot
 

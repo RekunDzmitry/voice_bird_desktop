@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
-use crate::picker::{LanguagePicker, PickerEvent, PickerIntent, SessionMenu};
+use crate::picker::{LanguagePicker, ModelEntry, PickerEvent, PickerIntent, SessionMenu};
 
 /// Render-side phase for one download. Lives in `state.rs` (UI
 /// only) because the SQLite `DownloadStatus` enum carries the
@@ -32,6 +32,7 @@ pub enum BlockState {
         pending: Vec<&'static str>,
     },
     /// Mocked in this PR — no audio device; the state only changes rendering.
+    /// Recording stops when either required model goes missing.
     Recording { language: &'static LanguageProfile },
     /// A required model failed. Retry re-checks both models on disk.
     Failed {
@@ -102,6 +103,20 @@ impl Block {
             BlockState::Waiting { pending, .. } | BlockState::Failed { pending, .. } => pending,
             _ => &[],
         }
+    }
+
+    /// Models this active block counts as installed, excluding pending work.
+    pub fn ready_models(&self) -> impl Iterator<Item = &'static ModelEntry> + '_ {
+        let models = match &self.state {
+            BlockState::Recording { language } | BlockState::Waiting { language, .. } => {
+                Some(language.models())
+            }
+            BlockState::Picking(_) | BlockState::Failed { .. } => None,
+        };
+        models
+            .into_iter()
+            .flatten()
+            .filter(|model| !self.pending_models().contains(&model.id))
     }
 }
 
@@ -324,6 +339,28 @@ impl UiState {
         }
     }
 
+    fn mark_missing(&mut self, model: &'static str) {
+        for block in &mut self.blocks {
+            match &mut block.state {
+                BlockState::Recording { language }
+                    if language.models().iter().any(|entry| entry.id == model) =>
+                {
+                    block.state = BlockState::Waiting {
+                        language,
+                        pending: vec![model],
+                    };
+                }
+                BlockState::Waiting { language, pending }
+                    if language.models().iter().any(|entry| entry.id == model)
+                        && !pending.contains(&model) =>
+                {
+                    pending.push(model);
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
             AppEvent::AddBlock => {
@@ -448,6 +485,7 @@ impl UiState {
                 }
             }
             AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
+            AppEvent::ModelMissing(entry) => self.mark_missing(entry.id),
             AppEvent::DownloadRequested(entry) => {
                 self.downloads.entry(entry.id).or_insert(DownloadState {
                     phase: DownloadPhase::Fetching,
@@ -580,6 +618,80 @@ mod tests {
             language: english(),
             pending,
         }
+    }
+
+    #[test]
+    fn missing_model_stops_every_affected_recording_block_and_success_resumes() {
+        let language = english();
+        let mut s = UiState {
+            blocks: vec![
+                Block::new(1, BlockState::Recording { language }),
+                Block::new(2, BlockState::Recording { language }),
+            ],
+            ..UiState::default()
+        };
+        s.blocks[1].visible = false;
+        s.apply(&AppEvent::ModelMissing(language.live));
+        for block in &s.blocks {
+            assert_eq!(block.state, BlockState::Waiting {
+                language,
+                pending: vec![language.live.id],
+            });
+            assert_eq!(block.ready_models().collect::<Vec<_>>(), vec![language.refine]);
+        }
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
+        for block in &s.blocks {
+            assert_eq!(block.state, BlockState::Recording { language });
+            assert_eq!(block.ready_models().collect::<Vec<_>>(), language.models());
+        }
+    }
+
+    #[test]
+    fn missing_model_extends_waiting_once_and_requires_both_models_to_resume() {
+        let language = english();
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&select(1, vec![language.refine.id]));
+        s.apply(&AppEvent::ModelMissing(language.live));
+        s.apply(&AppEvent::ModelMissing(language.live));
+        assert_eq!(s.blocks[0].state, BlockState::Waiting {
+            language,
+            pending: vec![language.refine.id, language.live.id],
+        });
+        assert!(s.blocks[0].ready_models().next().is_none());
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 1, model: language.refine.id });
+        assert_eq!(s.blocks[0].pending_models(), &[language.live.id]);
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
+        assert_eq!(s.blocks[0].state, BlockState::Recording { language });
+    }
+
+    #[test]
+    fn missing_model_leaves_other_languages_picking_and_failed_untouched() {
+        static OTHER: LanguageProfile = LanguageProfile {
+            code: "other",
+            live: &crate::picker::BASE_EN,
+            refine: &crate::picker::TINY_EN,
+        };
+        let language = english();
+        assert!(OTHER.models().iter().all(|model| model.id != language.live.id));
+        let mut s = UiState {
+            blocks: vec![
+                Block::default(),
+                Block::new(1, BlockState::Failed {
+                    language, error: "failure".to_string(), pending: vec![],
+                }),
+                Block::new(2, BlockState::Recording { language: &OTHER }),
+                Block::new(3, BlockState::Waiting {
+                    language: &OTHER, pending: vec![OTHER.refine.id],
+                }),
+            ],
+            ..UiState::default()
+        };
+        let before = s.blocks.clone();
+        assert!(s.blocks[0].ready_models().next().is_none());
+        assert!(s.blocks[1].ready_models().next().is_none());
+        s.apply(&AppEvent::ModelMissing(language.live));
+        assert_eq!(s.blocks, before);
     }
 
     #[test]

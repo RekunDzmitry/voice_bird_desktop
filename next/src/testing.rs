@@ -46,9 +46,9 @@ impl CancelCheck for AtomicBool {
 /// `CancelCheck` impl for `&AtomicBool`. Same semantics as the owned
 /// variant — `Relaxed` ordering is fine because cancellation is a
 /// single-writer / single-reader flag with no compound state.
-impl<'a> CancelCheck for &'a AtomicBool {
+impl CancelCheck for &AtomicBool {
     fn is_cancelled(&mut self) -> bool {
-        AtomicBool::load(*self, Ordering::Relaxed)
+        AtomicBool::load(self, Ordering::Relaxed)
     }
 }
 

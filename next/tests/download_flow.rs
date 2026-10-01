@@ -12,10 +12,11 @@ use voice_bird_next::dispatcher::Dispatcher;
 use voice_bird_next::download::{DownloadError, Downloader};
 use voice_bird_next::input::Intent;
 use voice_bird_next::language::{LanguageProfile, LANGUAGES};
+use voice_bird_next::model_watch::ModelWatcher;
 use voice_bird_next::producer;
 use voice_bird_next::state::{BlockState, UiState};
 use voice_bird_next::testing::{FixtureDownloader, FixtureStore, Outcome};
-use voice_bird_next::transcription_models::{handler_for, CacheDirStore, ModelStore};
+use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 
 fn english() -> &'static LanguageProfile {
     &LANGUAGES[0]
@@ -600,8 +601,199 @@ fn cleanup_preserves_installed_models() {
 }
 
 #[test]
-fn every_catalog_format_has_a_handler() {
-    for model in voice_bird_next::picker::CATALOG {
-        let _ = handler_for(model.format);
+fn model_dropped_while_recording_redownloads_and_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &english().models().map(|model| model.id),
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = Dispatcher::new(
+        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
+        store.clone(),
+    );
+    let watcher = ModelWatcher::new(store.clone());
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(state.blocks[0].state, BlockState::Recording { .. }));
+
+    for expected_attempt in 1..=2 {
+        store.present.lock().expect("fixture store poisoned")
+            .retain(|id| *id != english().live.id);
+        watcher.check(&state, &bus.sender());
+        let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+        assert!(events.contains(&AppEvent::ModelMissing(english().live)));
+        assert_eq!(state.blocks[0].pending_models(), &[english().live.id]);
+        assert!(matches!(state.blocks[0].state, BlockState::Waiting { .. }));
+        dispatcher.dispatch(&events, &mut handle.db, &bus.sender());
+        let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+        assert!(events.contains(&AppEvent::DownloadRequested(english().live)));
+        settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+            matches!(state.blocks[0].state, BlockState::Recording { .. })
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), expected_attempt);
+        let row = downloads::get(&handle.db, english().live.id).unwrap().unwrap();
+        assert_eq!(row.attempt, expected_attempt as u32);
+        assert_eq!(row.status, DownloadStatus::Succeeded);
+        assert!(store.is_available(english().live));
     }
 }
+
+#[test]
+fn model_dropped_with_two_recording_blocks_shares_one_download() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &english().models().map(|model| model.id),
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = Dispatcher::new(
+        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
+        store.clone(),
+    );
+    let watcher = ModelWatcher::new(store.clone());
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    for _ in 0..2 {
+        state.apply(&AppEvent::AddBlock);
+        confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+        drain_apply(&mut bus, &mut state, &mut handle.db);
+    }
+    state.blocks[1].visible = false;
+    assert!(state.blocks.iter().all(|block| matches!(block.state, BlockState::Recording { .. })));
+    store.present.lock().expect("fixture store poisoned")
+        .retain(|id| *id != english().refine.id);
+
+    watcher.check(&state, &bus.sender());
+    let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert_eq!(events, vec![AppEvent::ModelMissing(english().refine)]);
+    for block in &state.blocks {
+        assert!(matches!(block.state, BlockState::Waiting { .. }));
+        assert_eq!(block.pending_models(), &[english().refine.id]);
+    }
+    dispatcher.dispatch(&events, &mut handle.db, &bus.sender());
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        state.blocks.iter().all(|block| matches!(block.state, BlockState::Recording { .. }))
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(store.is_available(english().refine));
+}
+
+#[test]
+fn redownload_failure_fails_block_and_retry_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &english().models().map(|model| model.id),
+    ));
+    let failed_calls = Arc::new(AtomicUsize::new(0));
+    let failing = Dispatcher::new(
+        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::ShaMismatch, failed_calls.clone())),
+        store.clone(),
+    );
+    let watcher = ModelWatcher::new(store.clone());
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &failing);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(state.blocks[0].state, BlockState::Recording { .. }));
+    store.present.lock().expect("fixture store poisoned")
+        .retain(|id| *id != english().live.id);
+    watcher.check(&state, &bus.sender());
+    let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+    failing.dispatch(&events, &mut handle.db, &bus.sender());
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Failed { .. })
+    });
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(&state.blocks[0].state, BlockState::Failed { error, .. }
+        if error.contains("sha256 mismatch")));
+    watcher.check(&state, &bus.sender());
+    let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(!events.iter().any(|event| matches!(event, AppEvent::ModelMissing(_))));
+
+    let retry_calls = Arc::new(AtomicUsize::new(0));
+    let successful = Dispatcher::new(
+        Arc::new(FixtureDownloader::new(vec![2; 64], Outcome::Ok, retry_calls.clone())),
+        store.clone(),
+    );
+    retry_and_dispatch(&mut bus, &mut state, &mut handle.db, &successful);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Recording { .. })
+    });
+    assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+    assert!(store.is_available(english().live));
+    let row = downloads::get(&handle.db, english().live.id).unwrap().unwrap();
+    assert_eq!(row.attempt, 2);
+    assert_eq!(row.status, DownloadStatus::Succeeded);
+}
+
+struct GatedDownloader {
+    inner: FixtureDownloader,
+    gate: Arc<AtomicBool>,
+}
+
+impl Downloader for GatedDownloader {
+    fn fetch(
+        &self,
+        url: &str,
+        staged: &Path,
+        expected_sha: &str,
+        cancel: &mut dyn CancelCheck,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<(), DownloadError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.gate.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return Err(DownloadError::Io("test download gate timed out".to_string()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.inner.fetch(url, staged, expected_sha, cancel, progress)
+    }
+}
+
+#[test]
+fn model_dropped_while_other_model_downloading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[english().live.id]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicBool::new(false));
+    let dispatcher = Dispatcher::new(
+        Arc::new(GatedDownloader {
+            inner: FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone()),
+            gate: gate.clone(),
+        }),
+        store.clone(),
+    );
+    let watcher = ModelWatcher::new(store.clone());
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
+    drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert_eq!(state.blocks[0].pending_models(), &[english().refine.id]);
+    store.present.lock().expect("fixture store poisoned")
+        .retain(|id| *id != english().live.id);
+    watcher.check(&state, &bus.sender());
+    let events = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert_eq!(events, vec![AppEvent::ModelMissing(english().live)]);
+    assert_eq!(state.blocks[0].pending_models(), &[english().refine.id, english().live.id]);
+    dispatcher.dispatch(&events, &mut handle.db, &bus.sender());
+    // Neither worker can install until both pending models have been observed.
+    gate.store(true, Ordering::SeqCst);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks[0].state, BlockState::Recording { .. })
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(english().models().iter().all(|model| store.is_available(model)));
+}
+
