@@ -24,6 +24,39 @@ cargo test -p voice-bird-next --no-default-features  # offline suite, ~12 s
 cargo clippy -p voice-bird-next --all-targets -- -D warnings
 ```
 
+## Next-only linting
+
+Clippy can check this package without checking the legacy `voice-bird-cli`:
+
+```bash
+cargo clippy --locked -p voice-bird-next --all-targets -- -D warnings
+cargo clippy --locked -p voice-bird-next --all-targets --no-default-features -- -D warnings
+```
+
+An optional Git pre-commit hook runs both commands when staged changes touch
+`next/`, the workspace manifest, or the lockfile. Unrelated legacy-only changes
+skip it. Like a normal Cargo invocation, it checks working-tree source, not an
+isolated copy of the staged files.
+
+To enable it from the repository root, first check for existing hooks:
+
+```bash
+git config --show-origin --get core.hooksPath
+git config --local core.hooksPath next/hooks
+```
+
+The second command replaces any configured hooks path and applies to every
+worktree in this repository. If you already have hooks, invoke
+`sh next/hooks/pre-commit` from your existing pre-commit hook instead. Git hooks
+are local and bypassable; a CI job running the same commands is the alternative
+for enforcement on pull requests.
+
+The `cargo-clippy` compatibility declaration in the root `Cargo.toml` belongs
+to the legacy package. It is not inherited by this crate. `next` has no `objc`
+or ScreenCaptureKit dependency and no real audio capture implementation yet;
+recording is mocked. There is currently no Objective-C audio code to migrate
+to `objc2`.
+
 ## Features
 
 - `net` (default) — `reqwest` + `rustls` for the live `HttpDownloader`.
