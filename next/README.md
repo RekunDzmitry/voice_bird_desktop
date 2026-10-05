@@ -13,6 +13,10 @@ app list shows `no running apps`; go back or close the block. An
 serialized background worker when a new block is requested. Slow native queries
 do not block input or Quit. Other platforms, or an unavailable/empty device
 snapshot, open the language picker directly.
+A Rust panic during enumeration disables that catalog for the session; the
+current, queued, and future requests open the language picker instead. The
+caught panic does not restore or print over the live terminal. This handles
+unwinding panics, not process aborts or native crashes.
 
 Arrows move the highlight inside the focused picker; Enter advances a source
 step or resolves the selected language to its live and refine models. Recording

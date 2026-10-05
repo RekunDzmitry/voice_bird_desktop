@@ -50,8 +50,14 @@ fn restore_terminal() {
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if voice_bird_next::dispatcher::source_query_panicking() {
+            return;
+        }
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
+        }
         default_hook(info);
     }));
 }

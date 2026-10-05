@@ -30,9 +30,15 @@
 //! one at a time, and publish replies through the event bus. Dropping the
 //! dispatcher closes the request queue without joining the worker: a stalled
 //! native query must not block Quit. Once queued work finishes, the worker exits.
+//! A panicking source query is contained and disables enumeration for the
+//! session. Its request, queued requests, and later requests get the language
+//! picker fallback. The panic hook recognizes this boundary and leaves the
+//! live terminal untouched.
 //!
 //! [`AppEvent::DiscardInflight`]: crate::bus::AppEvent::DiscardInflight
 
+use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc};
 
 use crate::audio_source::SourceCatalog;
@@ -41,6 +47,16 @@ use crate::db::Database;
 use crate::download::{begin_language, ensure_model};
 use crate::picker::{ModelEntry, CATALOG};
 use crate::transcription_models::ModelStore;
+
+thread_local! {
+    static SOURCE_QUERY_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current panic is inside the worker's recoverable source query.
+/// The binary's panic hook must not restore or print over the live TUI here.
+pub fn source_query_panicking() -> bool {
+    std::thread::panicking() && SOURCE_QUERY_ACTIVE.get()
+}
 
 /// Owns the download, model-store, and source-catalog collaborators and answers
 /// the bus commands that ask them to do work. Constructed once in
@@ -62,8 +78,25 @@ impl Dispatcher {
         // Detach the worker: dropping the dispatcher must not wait for native
         // enumeration. Closing its sender lets the worker exit after its queue.
         let _ = std::thread::spawn(move || {
+            let mut failed = false;
             for tx in requests {
-                let event = match sources.snapshot() {
+                let snapshot = if failed {
+                    None
+                } else {
+                    SOURCE_QUERY_ACTIVE.set(true);
+                    let result = catch_unwind(AssertUnwindSafe(|| sources.snapshot()));
+                    SOURCE_QUERY_ACTIVE.set(false);
+                    match result {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => {
+                            // Native state may have been left inconsistent by
+                            // unwinding; do not reuse this catalog this session.
+                            failed = true;
+                            None
+                        }
+                    }
+                };
+                let event = match snapshot {
                     Some(snapshot) if !snapshot.devices.is_empty() => {
                         AppEvent::AddSourceBlock { snapshot }
                     }
@@ -91,9 +124,9 @@ impl Dispatcher {
         for ev in events {
             match ev {
                 AppEvent::RequestBlock => {
-                    self.source_requests
-                        .send(tx.clone())
-                        .expect("source catalog worker stopped");
+                    if self.source_requests.send(tx.clone()).is_err() {
+                        tx.publish(AppEvent::AddBlock);
+                    }
                 }
                 AppEvent::BeginLanguage {
                     block, language, ..
@@ -214,6 +247,77 @@ mod tests {
             request_block(Some(snapshot.clone())),
             vec![AppEvent::AddSourceBlock { snapshot }]
         );
+    }
+
+    #[test]
+    fn panicking_catalog_answers_current_queued_and_future_requests() {
+        struct PanickingCatalog {
+            entered: mpsc::Sender<()>,
+            release: Arc<Barrier>,
+            calls: AtomicUsize,
+        }
+
+        impl SourceCatalog for PanickingCatalog {
+            fn snapshot(&self) -> Option<AudioSourceSnapshot> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.send(()).unwrap();
+                self.release.wait();
+                panic!("native enumeration failed");
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, replies) = mpsc::channel();
+        let tx = EventSender::from_mpsc(events);
+        let mut db = Database::open(&tmp.path().join("dispatcher.db"), tx.clone()).unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let sources = Arc::new(PanickingCatalog {
+            entered: entered_tx,
+            release: release.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let dispatcher = Dispatcher::new(
+            Arc::new(FixtureDownloader::new(
+                Vec::new(),
+                Outcome::Ok,
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Arc::new(FixtureStore::new(tmp.path().into(), &[])),
+            sources.clone(),
+        );
+        dispatcher.dispatch(&[AppEvent::RequestBlock], &mut db, &tx);
+        entered.recv_timeout(WAIT).unwrap();
+        dispatcher.dispatch(&[AppEvent::RequestBlock], &mut db, &tx);
+        release.wait();
+        assert_eq!(replies.recv_timeout(WAIT).unwrap(), AppEvent::AddBlock);
+        assert_eq!(replies.recv_timeout(WAIT).unwrap(), AppEvent::AddBlock);
+        dispatcher.dispatch(&[AppEvent::RequestBlock], &mut db, &tx);
+        assert_eq!(replies.recv_timeout(WAIT).unwrap(), AppEvent::AddBlock);
+        assert_eq!(sources.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disconnected_source_worker_falls_back_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, replies) = mpsc::channel();
+        let tx = EventSender::from_mpsc(events);
+        let mut db = Database::open(&tmp.path().join("dispatcher.db"), tx.clone()).unwrap();
+        let (source_requests, requests) = mpsc::channel();
+        drop(requests);
+        let dispatcher = Dispatcher {
+            downloader: Arc::new(FixtureDownloader::new(
+                Vec::new(),
+                Outcome::Ok,
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            model_store: Arc::new(FixtureStore::new(tmp.path().into(), &[])),
+            source_requests,
+        };
+        dispatcher.dispatch(&[AppEvent::RequestBlock], &mut db, &tx);
+        assert_eq!(replies.recv_timeout(WAIT).unwrap(), AppEvent::AddBlock);
+        dispatcher.dispatch(&[AppEvent::RequestBlock], &mut db, &tx);
+        assert_eq!(replies.recv_timeout(WAIT).unwrap(), AppEvent::AddBlock);
     }
 
     #[test]
