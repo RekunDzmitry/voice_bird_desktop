@@ -25,6 +25,7 @@
 
 use std::sync::mpsc;
 
+use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
 use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 
@@ -59,8 +60,31 @@ pub enum DownloadStatus {
 pub enum AppEvent {
     /// `+`: push a `Picking` block and focus it. Allowed at any time.
     AddBlock,
+    /// Ask the source catalog which picker a new block should open.
+    RequestBlock,
+    AddSourceBlock {
+        snapshot: AudioSourceSnapshot,
+    },
+    /// Explicit source transition, accepted by the SQLite step/revision gate.
+    SourceStepChanged {
+        block: u8,
+        from: FunnelStep,
+        to: FunnelStep,
+        rev: u32,
+        device: Option<AudioDevice>,
+        app: Option<AppTarget>,
+    },
+    SourceStepRejected {
+        block: u8,
+        from: FunnelStep,
+        to: FunnelStep,
+        rev: u32,
+        actual: Option<(FunnelStep, u32)>,
+    },
     /// `←` / `→`: move focus between blocks.
-    FocusMoved { direction: FocusMove },
+    FocusMoved {
+        direction: FocusMove,
+    },
     /// `↑` / `↓` while the focused block is `Picking`: move the
     /// highlight inside that block's language list. The language
     /// codes are stamped by the resolver for the event log.
@@ -104,9 +128,15 @@ pub enum AppEvent {
         bytes_per_sec: u64,
     },
     /// Bytes verified; the format handler is unpacking.
-    DownloadInstalling { attempt: u32, model: &'static str },
+    DownloadInstalling {
+        attempt: u32,
+        model: &'static str,
+    },
     /// Fans out to EVERY block waiting on `model`.
-    DownloadSucceeded { attempt: u32, model: &'static str },
+    DownloadSucceeded {
+        attempt: u32,
+        model: &'static str,
+    },
     /// `error` carries an actionable message.
     DownloadFailed {
         attempt: u32,
@@ -130,7 +160,10 @@ pub enum AppEvent {
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
-    DownloadCancelled { attempt: u32, model: &'static str },
+    DownloadCancelled {
+        attempt: u32,
+        model: &'static str,
+    },
     /// Emitted after the downloads table accepts and persists every lifecycle
     /// transition. The reducer uses terminal transitions to reconcile worker
     /// outcomes that raced ahead of `LanguageSelected`; the event log records
@@ -166,11 +199,15 @@ pub enum AppEvent {
     MenuClosed,
     /// `↑` / `↓` while the menu is open. Reuses the picker's move
     /// direction so clamp semantics live in one place.
-    MenuMoved { direction: PickerMove },
+    MenuMoved {
+        direction: PickerMove,
+    },
     /// `Enter` on a menu row: reveal the selected session on screen,
     /// FIFO-evicting the oldest-focused visible one. Reducer closes
     /// the menu itself.
-    SessionShown { id: u8 },
+    SessionShown {
+        id: u8,
+    },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 
@@ -187,10 +224,13 @@ pub enum AppEvent {
     BeginLanguage {
         block: u8,
         language: &'static LanguageProfile,
+        source_rev: Option<u32>,
     },
     /// Quit-time cleanup: drop the staged archive and unpack
     /// scratch directory for `model`. The dispatcher answers with a
-    DiscardInflight { model: std::sync::Arc<str> },
+    DiscardInflight {
+        model: std::sync::Arc<str>,
+    },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
@@ -380,8 +420,12 @@ mod tests {
         assert!(selected["language"].get("live").is_none());
         assert!(selected["language"].get("refine").is_none());
 
-        let command = serde_json::to_value(AppEvent::BeginLanguage { block: 3, language })
-            .expect("serialize language command");
+        let command = serde_json::to_value(AppEvent::BeginLanguage {
+            block: 3,
+            language,
+            source_rev: None,
+        })
+        .expect("serialize language command");
         assert_eq!(command["event"], "BeginLanguage");
         assert_eq!(command["block"], 3);
         assert_eq!(command["language"]["code"], language.code);

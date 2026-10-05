@@ -114,7 +114,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-    let dispatcher = Dispatcher::new(downloader.clone(), store.clone());
+    let dispatcher = Dispatcher::new(
+        downloader.clone(),
+        store.clone(),
+        voice_bird_next::audio_source::system_sources(),
+    );
     let watcher = ModelWatcher::new(store.clone());
     let mut dirty = true;
     loop {
@@ -138,17 +142,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         watcher.check(&state, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         if !events.is_empty() {
-            for ev in &events {
+            let mut accepted_events = Vec::with_capacity(events.len());
+            for ev in events {
                 if let Some(l) = log.as_mut() {
-                    l.append(ev);
+                    l.append(&ev);
                 }
-                if let Ok(accepted) = downloads::apply(&mut db, ev) {
-                    if accepted {
-                        state.apply(ev);
-                    }
+                if let Ok(true) = voice_bird_next::db::apply(&mut db, &ev) {
+                    state.apply(&ev);
+                    accepted_events.push(ev);
                 }
             }
-            dispatcher.dispatch(&events, &mut db, &tx);
+            dispatcher.dispatch(&accepted_events, &mut db, &tx);
             dirty = true;
         }
         if state.should_quit {

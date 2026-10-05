@@ -340,4 +340,53 @@ mod tests {
             "size_mb should be a JSON number; got {parsed:?}"
         );
     }
+    #[test]
+    fn source_transitions_log_explicit_steps_revisions_and_selection() {
+        use crate::audio_source::FunnelStep;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("source.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut log = EventLog {
+            file,
+            path: path.clone(),
+        };
+        let snapshot = crate::testing::sample_source_snapshot();
+        log.append(&AppEvent::RequestBlock);
+        log.append(&AppEvent::AddSourceBlock {
+            snapshot: snapshot.clone(),
+        });
+        log.append(&AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::Device,
+            to: FunnelStep::App,
+            rev: 0,
+            device: Some(snapshot.devices[1].clone()),
+            app: None,
+        });
+        log.append(&AppEvent::SourceStepRejected {
+            block: 1,
+            from: FunnelStep::Device,
+            to: FunnelStep::App,
+            rev: 0,
+            actual: Some((FunnelStep::App, 1)),
+        });
+        let body = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows[0]["event"], "RequestBlock");
+        assert_eq!(rows[1]["snapshot"]["devices"][0]["kind"], "Input");
+        assert_eq!(rows[2]["event"], "SourceStepChanged");
+        assert_eq!(rows[2]["from"], "Device");
+        assert_eq!(rows[2]["to"], "App");
+        assert_eq!(rows[2]["rev"], 0);
+        assert_eq!(rows[2]["device"]["name"], "Speakers");
+        assert_eq!(rows[3]["event"], "SourceStepRejected");
+        assert_eq!(rows[3]["actual"], serde_json::json!(["App", 1]));
+    }
 }

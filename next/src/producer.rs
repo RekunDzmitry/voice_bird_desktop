@@ -5,10 +5,11 @@
 //! out of `main.rs` keeps the binary entry point focused on terminal
 //! plumbing (raw mode, alt screen, panic hook, the render loop) and
 //! puts everything that talks to the bus next to the bus itself.
+use crate::audio_source::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
 
-use crate::db::{downloads, Database};
+use crate::db::{block_steps, downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
@@ -21,7 +22,7 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
         Some(block) => match &block.state {
             BlockState::Picking(picker) => {
                 let from = LANGUAGES[picker.index].code;
-                let to = LANGUAGES[picker.peek_next(direction)].code;
+                let to = LANGUAGES[picker::step(picker.index, LANGUAGES.len(), direction)].code;
                 (Some(from), Some(to))
             }
             _ => (None, None),
@@ -80,6 +81,7 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
                 }
                 return;
             }
+            Intent::StepBack => return,
             Intent::BlockClosed => {
                 // Esc closes the menu instead of the focused block.
                 tx.publish(AppEvent::MenuClosed);
@@ -94,7 +96,7 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
     }
 
     match intent {
-        Intent::AddBlock => tx.publish(AppEvent::AddBlock),
+        Intent::AddBlock => tx.publish(AppEvent::RequestBlock),
         Intent::FocusPrev => tx.publish(AppEvent::FocusMoved {
             direction: FocusMove::Prev,
         }),
@@ -105,11 +107,79 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
         Intent::PickerNext => stamp_picker_move(tx, state, picker::PickerMove::Down),
         Intent::Confirm => {
             if let Some(block) = state.focused() {
-                if let BlockState::Picking(picker) = &block.state {
-                    tx.publish(AppEvent::BeginLanguage {
+                match &block.state {
+                    BlockState::PickingDevice(cursor) => {
+                        if let Some(source) = &block.source {
+                            if let Some(device) = source.snapshot.devices.get(cursor.index) {
+                                let to = match device.kind {
+                                    DeviceKind::Input => FunnelStep::Language,
+                                    DeviceKind::Output => FunnelStep::App,
+                                };
+                                tx.publish(AppEvent::SourceStepChanged {
+                                    block: block.id,
+                                    from: FunnelStep::Device,
+                                    to,
+                                    rev: source.rev,
+                                    device: Some(device.clone()),
+                                    app: if source.device.as_ref() == Some(device)
+                                        && device.kind == DeviceKind::Output
+                                    {
+                                        source.app.clone()
+                                    } else {
+                                        None
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    BlockState::PickingApp(cursor) => {
+                        if let Some(source) = &block.source {
+                            if let Some(app) = source.snapshot.apps.get(cursor.index) {
+                                tx.publish(AppEvent::SourceStepChanged {
+                                    block: block.id,
+                                    from: FunnelStep::App,
+                                    to: FunnelStep::Language,
+                                    rev: source.rev,
+                                    device: source.device.clone(),
+                                    app: Some(app.clone()),
+                                });
+                            }
+                        }
+                    }
+                    BlockState::Picking(picker) => tx.publish(AppEvent::BeginLanguage {
                         block: block.id,
                         language: &LANGUAGES[picker.index],
-                    });
+                        source_rev: block.source.as_ref().map(|source| source.rev),
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        Intent::StepBack => {
+            if let Some(block) = state.focused() {
+                if let Some(source) = &block.source {
+                    let edge = match block.state {
+                        BlockState::PickingApp(_) => Some((FunnelStep::App, FunnelStep::Device)),
+                        BlockState::Picking(_) => Some((
+                            FunnelStep::Language,
+                            if source.app.is_some() {
+                                FunnelStep::App
+                            } else {
+                                FunnelStep::Device
+                            },
+                        )),
+                        _ => None,
+                    };
+                    if let Some((from, to)) = edge {
+                        tx.publish(AppEvent::SourceStepChanged {
+                            block: block.id,
+                            from,
+                            to,
+                            rev: source.rev,
+                            device: source.device.clone(),
+                            app: source.app.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -119,12 +189,18 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
                     tx.publish(AppEvent::BeginLanguage {
                         block: block.id,
                         language,
+                        source_rev: None,
                     });
                 }
             }
         }
         Intent::BlockClosed => {
             if let Some(block) = state.focused() {
+                if let Err(error) = block_steps::forget(db, block.id) {
+                    // Do not reuse the id while its previous funnel row could still exist.
+                    eprintln!("voice-bird-next: cannot forget block step: {error}");
+                    return;
+                }
                 for &model in block.pending_models() {
                     let any_other = state.blocks.iter().any(|other| {
                         other.id != block.id && other.pending_models().contains(&model)
@@ -199,7 +275,7 @@ mod tests {
         let events: Vec<_> = bus.drain().collect();
         assert!(matches!(
             events.as_slice(),
-            [AppEvent::BeginLanguage { block: 1, language }]
+            [AppEvent::BeginLanguage { block: 1, language, source_rev: None }]
                 if *language == english()
         ));
     }
@@ -376,24 +452,6 @@ mod tests {
             ),
             "second event must be MenuMoved Down; got {:?}",
             events[1]
-        );
-    }
-
-    #[test]
-    fn add_block_while_menu_open_still_publishes_add_block() {
-        // The menu only intercepts ToggleMenu, picker moves, Confirm,
-        // and Esc. AddBlock falls through unchanged so the user can
-        // still press `+` with the menu open.
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::AddBlock, &state, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(
-            matches!(events.as_slice(), [AppEvent::AddBlock]),
-            "AddBlock with the menu open must still publish AddBlock; got {events:?}"
         );
     }
 

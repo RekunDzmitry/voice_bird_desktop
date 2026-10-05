@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, DeviceKind, SourceCatalog};
 use crate::db::downloads::CancelCheck;
 use crate::download::{DownloadError, Downloader};
 use crate::picker::ModelEntry;
@@ -14,6 +15,43 @@ use crate::state::UiState;
 use crate::transcription_models::{handler_for, ModelStore};
 use crate::ui;
 use ratatui::{backend::TestBackend, Terminal};
+
+/// Fixed source snapshot, including the unavailable (`None`) fallback.
+#[derive(Debug, Clone)]
+pub struct FixtureSources(pub Option<AudioSourceSnapshot>);
+
+impl SourceCatalog for FixtureSources {
+    fn snapshot(&self) -> Option<AudioSourceSnapshot> {
+        self.0.clone()
+    }
+}
+
+pub fn sample_source_snapshot() -> AudioSourceSnapshot {
+    AudioSourceSnapshot {
+        devices: vec![
+            AudioDevice {
+                name: "Mic".into(),
+                kind: DeviceKind::Input,
+            },
+            AudioDevice {
+                name: "Speakers".into(),
+                kind: DeviceKind::Output,
+            },
+        ],
+        apps: vec![
+            AppTarget {
+                id: "com.apple.Safari".into(),
+                name: "Safari".into(),
+                pid: 101,
+            },
+            AppTarget {
+                id: "com.spotify.client".into(),
+                name: "Spotify".into(),
+                pid: 202,
+            },
+        ],
+    }
+}
 
 /// Render `state` into a `w`×`h` in-memory terminal and return the cell
 /// grid as text, one line per row.

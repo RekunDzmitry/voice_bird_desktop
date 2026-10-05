@@ -21,6 +21,7 @@ pub enum Intent {
     PickerPrev,
     PickerNext,
     Confirm,
+    StepBack,
     Retry,
     BlockClosed,
     /// `Tab`: open the session menu (or close it if already open).
@@ -54,6 +55,7 @@ pub fn map_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Up => Some(Intent::PickerPrev),
         KeyCode::Down => Some(Intent::PickerNext),
         KeyCode::Enter => Some(Intent::Confirm),
+        KeyCode::Backspace => Some(Intent::StepBack),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Intent::Retry),
         KeyCode::Tab => Some(Intent::ToggleMenu),
         _ => None,
@@ -80,10 +82,7 @@ mod tests {
 
     #[test]
     fn plus_maps_to_add_block_with_no_modifier() {
-        assert_eq!(
-            map_key(press(KeyCode::Char('+'))),
-            Some(Intent::AddBlock)
-        );
+        assert_eq!(map_key(press(KeyCode::Char('+'))), Some(Intent::AddBlock));
     }
 
     #[test]
@@ -100,6 +99,11 @@ mod tests {
         assert_eq!(map_key(press(KeyCode::Right)), Some(Intent::FocusNext));
         assert_eq!(map_key(press(KeyCode::Up)), Some(Intent::PickerPrev));
         assert_eq!(map_key(press(KeyCode::Down)), Some(Intent::PickerNext));
+    }
+
+    #[test]
+    fn backspace_maps_to_step_back() {
+        assert_eq!(map_key(press(KeyCode::Backspace)), Some(Intent::StepBack));
     }
 
     #[test]

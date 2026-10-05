@@ -8,6 +8,7 @@
 //!   behind traits, never inside the state struct.
 //! - Input maps keys to [`bus::AppEvent`]; the bus transports them; a pure
 //!   reducer on `UiState::apply` folds them in. Input never mutates state.
+pub mod audio_source;
 pub mod bus;
 pub mod event_log;
 pub mod input;
