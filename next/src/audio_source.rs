@@ -184,7 +184,7 @@ mod macos {
     /// NSWorkspace includes minimized and tray apps without Screen Recording
     /// permission, unlike SCShareableContent's shareable-window list.
     fn running_apps() -> Vec<AppTarget> {
-        // The TUI thread has no Cocoa run loop to drain autoreleased objects.
+        // The source worker has no Cocoa run loop to drain autoreleased objects.
         autoreleasepool(|_| {
             let workspace = NSWorkspace::sharedWorkspace();
             let running = workspace.runningApplications();

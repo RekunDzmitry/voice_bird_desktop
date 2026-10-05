@@ -122,7 +122,6 @@ impl Database {
         let conn = open(path)?;
         migrate(&conn, &[downloads::DownloadsTable])?;
         migrate(&conn, &[block_steps::BlockStepsTable])?;
-        block_steps::clear(&conn)?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),

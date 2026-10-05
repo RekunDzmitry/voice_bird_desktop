@@ -36,9 +36,7 @@ pub enum BlockState {
     },
     /// Mocked in this PR — no audio device; the state only changes rendering.
     /// Recording stops when either required model goes missing.
-    Recording {
-        language: &'static LanguageProfile,
-    },
+    Recording { language: &'static LanguageProfile },
     /// A required model failed. Retry re-checks both models on disk.
     Failed {
         language: &'static LanguageProfile,
@@ -570,19 +568,21 @@ impl UiState {
                 model,
                 error,
             } => self.fail_waiters(model, error),
-            AppEvent::BlockClosed => {
-                let removed_pending = self
-                    .blocks
-                    .get(self.focus)
-                    .map(|block| block.pending_models().to_vec())
-                    .unwrap_or_default();
-                if !self.blocks.is_empty() {
-                    self.blocks.remove(self.focus);
-                    if !self.blocks.is_empty() {
-                        self.focus = self.focus.min(self.blocks.len() - 1);
-                    }
-                    self.promote_hidden();
+            AppEvent::BlockClosed { block } => {
+                let Some(index) = self.blocks.iter().position(|candidate| candidate.id == *block)
+                else {
+                    return;
+                };
+                let removed_pending = self.blocks[index].pending_models().to_vec();
+                self.blocks.remove(index);
+                if index < self.focus {
+                    self.focus -= 1;
+                } else if !self.blocks.is_empty() {
+                    self.focus = self.focus.min(self.blocks.len() - 1);
+                } else {
+                    self.focus = 0;
                 }
+                self.promote_hidden();
                 for model in removed_pending {
                     let still_pending = self
                         .blocks
@@ -698,22 +698,13 @@ mod tests {
         s.blocks[1].visible = false;
         s.apply(&AppEvent::ModelMissing(language.live));
         for block in &s.blocks {
-            assert_eq!(
-                block.state,
-                BlockState::Waiting {
-                    language,
-                    pending: vec![language.live.id],
-                }
-            );
-            assert_eq!(
-                block.ready_models().collect::<Vec<_>>(),
-                vec![language.refine]
-            );
+            assert_eq!(block.state, BlockState::Waiting {
+                language,
+                pending: vec![language.live.id],
+            });
+            assert_eq!(block.ready_models().collect::<Vec<_>>(), vec![language.refine]);
         }
-        s.apply(&AppEvent::DownloadSucceeded {
-            attempt: 2,
-            model: language.live.id,
-        });
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
         for block in &s.blocks {
             assert_eq!(block.state, BlockState::Recording { language });
             assert_eq!(block.ready_models().collect::<Vec<_>>(), language.models());
@@ -728,23 +719,14 @@ mod tests {
         s.apply(&select(1, vec![language.refine.id]));
         s.apply(&AppEvent::ModelMissing(language.live));
         s.apply(&AppEvent::ModelMissing(language.live));
-        assert_eq!(
-            s.blocks[0].state,
-            BlockState::Waiting {
-                language,
-                pending: vec![language.refine.id, language.live.id],
-            }
-        );
+        assert_eq!(s.blocks[0].state, BlockState::Waiting {
+            language,
+            pending: vec![language.refine.id, language.live.id],
+        });
         assert!(s.blocks[0].ready_models().next().is_none());
-        s.apply(&AppEvent::DownloadSucceeded {
-            attempt: 1,
-            model: language.refine.id,
-        });
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 1, model: language.refine.id });
         assert_eq!(s.blocks[0].pending_models(), &[language.live.id]);
-        s.apply(&AppEvent::DownloadSucceeded {
-            attempt: 2,
-            model: language.live.id,
-        });
+        s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
         assert_eq!(s.blocks[0].state, BlockState::Recording { language });
     }
 
@@ -756,29 +738,17 @@ mod tests {
             refine: &crate::picker::TINY_EN,
         };
         let language = english();
-        assert!(OTHER
-            .models()
-            .iter()
-            .all(|model| model.id != language.live.id));
+        assert!(OTHER.models().iter().all(|model| model.id != language.live.id));
         let mut s = UiState {
             blocks: vec![
                 Block::default(),
-                Block::new(
-                    1,
-                    BlockState::Failed {
-                        language,
-                        error: "failure".to_string(),
-                        pending: vec![],
-                    },
-                ),
+                Block::new(1, BlockState::Failed {
+                    language, error: "failure".to_string(), pending: vec![],
+                }),
                 Block::new(2, BlockState::Recording { language: &OTHER }),
-                Block::new(
-                    3,
-                    BlockState::Waiting {
-                        language: &OTHER,
-                        pending: vec![OTHER.refine.id],
-                    },
-                ),
+                Block::new(3, BlockState::Waiting {
+                    language: &OTHER, pending: vec![OTHER.refine.id],
+                }),
             ],
             ..UiState::default()
         };
@@ -900,7 +870,7 @@ mod tests {
         let mut s = UiState::default();
         // Create block 1, then close it (frees id 1).
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 0, "block 1 closed");
         // next_block_id is now 2. Force it to the post-wrap
         // value 1; id 1 is free, so the scan picks 1.
@@ -1018,7 +988,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         assert!(s.warning.is_some(), "warning raised on refused AddBlock");
         // Closing the focused block (id 1) frees one id slot.
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(
             s.warning.is_none(),
             "BlockClosed must clear the exhaustion warning once a slot is free"
@@ -1036,7 +1006,7 @@ mod tests {
             ..UiState::default()
         };
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(
             s.warning.as_deref(),
             Some("some other future warning"),
@@ -1127,7 +1097,7 @@ mod tests {
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 1);
     }
@@ -1145,7 +1115,7 @@ mod tests {
             direction: FocusMove::Prev,
         });
         assert_eq!(s.focus, 0);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 0);
     }
@@ -1153,8 +1123,21 @@ mod tests {
     #[test]
     fn block_closed_with_no_blocks_is_a_noop() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(s.blocks.is_empty());
+    }
+
+    #[test]
+    fn queued_close_targets_original_block_after_focus_changes() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        let close = AppEvent::BlockClosed { block: 1 };
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&close);
+        assert_eq!(s.blocks.iter().map(|block| block.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(s.focused().unwrap().id, 2);
+        s.apply(&close);
+        assert_eq!(s.focused().unwrap().id, 2);
     }
 
     #[test]
@@ -1423,7 +1406,7 @@ mod tests {
         s.apply(&AppEvent::FocusMoved {
             direction: FocusMove::Prev,
         });
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(s.downloads.contains_key(english().live.id));
         assert!(!s.downloads.contains_key(english().refine.id));
     }
@@ -1442,7 +1425,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(2, vec![english().refine.id]));
 
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
 
         assert!(matches!(s.blocks[0].state, BlockState::Failed { .. }));
         assert!(s.downloads.contains_key(english().refine.id));
@@ -1615,7 +1598,7 @@ mod tests {
         assert!(!s.blocks[0].visible);
         // Close the focused block (focus=4, block 5). The slot
         // opens; `promote_hidden` brings block 1 back on screen.
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 4);
         let visible_count = s.blocks.iter().filter(|b| b.visible).count();
         assert_eq!(visible_count, 4, "the window stays at the cap");

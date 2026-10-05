@@ -9,8 +9,9 @@ device picker. Input microphones lead directly to language selection; output
 speakers require a running app first (there is no all-apps option). Backspace
 walks back one picker step, restoring the selected device or app row. An empty
 app list shows `no running apps`; go back or close the block. An
-`AudioSourceSnapshot` captures the enumerated devices and running apps when a
-new block is requested. Other platforms, or an unavailable/empty device
+`AudioSourceSnapshot` captures the enumerated devices and running apps on a
+serialized background worker when a new block is requested. Slow native queries
+do not block input or Quit. Other platforms, or an unavailable/empty device
 snapshot, open the language picker directly.
 
 Arrows move the highlight inside the focused picker; Enter advances a source
@@ -18,8 +19,9 @@ step or resolves the selected language to its live and refine models. Recording
 starts only when both models are installed, or immediately when both already
 exist in the persistent cache. Multiple blocks can be at different stages at
 once; blocks waiting on the same language share each model download. Source
-titles retain `id · device · app · language` (app omitted for inputs). Device and
-app selection is real; recording is still mocked.
+titles show only selections before the current picker step; active blocks use
+`id · device · app · language` (app omitted for inputs). Device and app selection
+is real; recording is still mocked.
 
 The registry currently maps `en` to `distil-small.en` for live
 transcription and `large-v3-turbo` for refinement. Model identifiers remain
@@ -124,10 +126,13 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    transitions publish `SourceStepRejected`. Source `BeginLanguage` atomically
    commits Language → Committed before dispatch, so a racing Backspace cannot
    orphan a started download. Only accepted events reach the dispatcher.
-   Closing a block forgets its step row, and startup clears all step rows
-   because blocks are not persisted across sessions. Retry remains ungated.
-   The production block-step API only applies transitions and clears closed or
-   restarted blocks; persisted-row inspection helpers live in tests.
+   Block steps live in a connection-local SQLite TEMP table: another app
+   instance cannot wipe or collide with them, and disconnect discards them.
+   `BlockClosed` carries its target id and deletes the step row through the
+   same event gate, after preceding transitions and before the reducer frees
+   the id. Gate errors are logged and never applied to the UI. Retry remains
+   ungated. Retained selections restore cursors on back steps; titles hide
+   selections at or after the current step. Row inspection stays in unit tests.
 7. **No test may touch the network.** `HttpDownloader` is constructed
    only in `main.rs`; everything else uses `FixtureDownloader`.
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed

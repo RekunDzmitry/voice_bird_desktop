@@ -261,7 +261,7 @@ mod tests {
             language: &LANGUAGES[0],
             pending: vec![LANGUAGES[0].live.id],
         });
-        log.append(&AppEvent::BlockClosed);
+        log.append(&AppEvent::BlockClosed { block: 1 });
         log.append(&AppEvent::Quit);
 
         let body = std::fs::read_to_string(&path).expect("read");

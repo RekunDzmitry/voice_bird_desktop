@@ -57,6 +57,7 @@ Desktop.ini
 test-output/
 recording_*
 transcript_*
+!/next/tests/snapshots/recording_*.txt
 logs/
 
 # Build artifacts

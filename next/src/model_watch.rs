@@ -58,11 +58,7 @@ mod tests {
         watcher.check(&state, &bus.sender());
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
 
-        store
-            .present
-            .lock()
-            .expect("fixture store poisoned")
-            .retain(|id| *id != language.live.id);
+        store.present.lock().expect("fixture store poisoned").retain(|id| *id != language.live.id);
         watcher.check(&state, &bus.sender());
         let events: Vec<_> = bus.drain().collect();
         assert_eq!(events, vec![AppEvent::ModelMissing(language.live)]);
@@ -82,29 +78,20 @@ mod tests {
         let state = UiState {
             blocks: vec![
                 Block::new(1, BlockState::Picking(ListPicker::default())),
-                Block::new(
-                    2,
-                    BlockState::Failed {
-                        language,
-                        error: "failed".to_string(),
-                        pending: vec![],
-                    },
-                ),
-                Block::new(
-                    3,
-                    BlockState::Waiting {
-                        language,
-                        pending: vec![language.refine.id],
-                    },
-                ),
+                Block::new(2, BlockState::Failed {
+                    language,
+                    error: "failed".to_string(),
+                    pending: vec![],
+                }),
+                Block::new(3, BlockState::Waiting {
+                    language,
+                    pending: vec![language.refine.id],
+                }),
             ],
             ..UiState::default()
         };
         let mut bus = EventBus::new();
         watcher.check(&state, &bus.sender());
-        assert_eq!(
-            bus.drain().collect::<Vec<_>>(),
-            vec![AppEvent::ModelMissing(language.live)]
-        );
+        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![AppEvent::ModelMissing(language.live)]);
     }
 }

@@ -651,6 +651,47 @@ fn picking_app_100x30_matches_golden() {
 }
 
 #[test]
+fn device_picker_hides_retained_selections_and_restores_device_cursor() {
+    let state = source_block_state(
+        BlockState::PickingDevice(ListPicker { index: 1 }),
+        Some(1),
+        Some(1),
+    );
+    let out = render_to_string(&state, 100, 30);
+    let title = out
+        .lines()
+        .find(|line| line.contains("pick a device"))
+        .unwrap();
+    assert!(title.contains("1 · pick a device"), "{out}");
+    assert!(!title.contains("Speakers"), "{out}");
+    assert!(!title.contains("Spotify"), "{out}");
+    assert!(out.contains("▶ out Speakers"), "{out}");
+    assert!(out.contains("in  Mic"), "{out}");
+    assert!(!out.contains("Safari"), "{out}");
+    assert!(!out.contains("Spotify"), "{out}");
+}
+
+#[test]
+fn app_picker_hides_retained_app_and_restores_app_cursor() {
+    let state = source_block_state(
+        BlockState::PickingApp(ListPicker { index: 1 }),
+        Some(1),
+        Some(1),
+    );
+    let out = render_to_string(&state, 100, 30);
+    let title = out
+        .lines()
+        .find(|line| line.contains("pick an app"))
+        .unwrap();
+    assert!(title.contains("1 · Speakers · pick an app"), "{out}");
+    assert!(!title.contains("Spotify"), "{out}");
+    assert!(out.contains("▶ Spotify"), "{out}");
+    assert!(out.contains("Safari"), "{out}");
+    assert!(!out.contains("out Speakers"), "{out}");
+    assert!(!out.contains("in  Mic"), "{out}");
+}
+
+#[test]
 fn recording_with_source_100x30_matches_golden() {
     source_golden(
         "recording_with_source",

@@ -9,7 +9,7 @@ use crate::audio_source::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
 
-use crate::db::{block_steps, downloads, Database};
+use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
@@ -196,11 +196,6 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
         }
         Intent::BlockClosed => {
             if let Some(block) = state.focused() {
-                if let Err(error) = block_steps::forget(db, block.id) {
-                    // Do not reuse the id while its previous funnel row could still exist.
-                    eprintln!("voice-bird-next: cannot forget block step: {error}");
-                    return;
-                }
                 for &model in block.pending_models() {
                     let any_other = state.blocks.iter().any(|other| {
                         other.id != block.id && other.pending_models().contains(&model)
@@ -215,8 +210,8 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
                         }
                     }
                 }
+                tx.publish(AppEvent::BlockClosed { block: block.id });
             }
-            tx.publish(AppEvent::BlockClosed);
         }
         Intent::Quit => tx.publish(AppEvent::Quit),
         Intent::ToggleMenu => unreachable!("handled above"),

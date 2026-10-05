@@ -58,7 +58,7 @@ pub enum DownloadStatus {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum AppEvent {
-    /// `+`: push a `Picking` block and focus it. Allowed at any time.
+    /// Language-picker fallback reply to `RequestBlock`.
     AddBlock,
     /// Ask the source catalog which picker a new block should open.
     RequestBlock,
@@ -82,9 +82,7 @@ pub enum AppEvent {
         actual: Option<(FunnelStep, u32)>,
     },
     /// `←` / `→`: move focus between blocks.
-    FocusMoved {
-        direction: FocusMove,
-    },
+    FocusMoved { direction: FocusMove },
     /// `↑` / `↓` while the focused block is `Picking`: move the
     /// highlight inside that block's language list. The language
     /// codes are stamped by the resolver for the event log.
@@ -101,8 +99,8 @@ pub enum AppEvent {
         language: &'static LanguageProfile,
         pending: Vec<&'static str>,
     },
-    /// Esc on the focused block: remove it.
-    BlockClosed,
+    /// Remove the named block after its queued transitions have been gated.
+    BlockClosed { block: u8 },
     /// Model was already installed when the language was selected. The
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
@@ -128,15 +126,9 @@ pub enum AppEvent {
         bytes_per_sec: u64,
     },
     /// Bytes verified; the format handler is unpacking.
-    DownloadInstalling {
-        attempt: u32,
-        model: &'static str,
-    },
+    DownloadInstalling { attempt: u32, model: &'static str },
     /// Fans out to EVERY block waiting on `model`.
-    DownloadSucceeded {
-        attempt: u32,
-        model: &'static str,
-    },
+    DownloadSucceeded { attempt: u32, model: &'static str },
     /// `error` carries an actionable message.
     DownloadFailed {
         attempt: u32,
@@ -160,10 +152,7 @@ pub enum AppEvent {
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiState.downloads entry; the in-flight thread observes the
     /// cancel flag separately and publishes nothing of its own.
-    DownloadCancelled {
-        attempt: u32,
-        model: &'static str,
-    },
+    DownloadCancelled { attempt: u32, model: &'static str },
     /// Emitted after the downloads table accepts and persists every lifecycle
     /// transition. The reducer uses terminal transitions to reconcile worker
     /// outcomes that raced ahead of `LanguageSelected`; the event log records
@@ -199,15 +188,11 @@ pub enum AppEvent {
     MenuClosed,
     /// `↑` / `↓` while the menu is open. Reuses the picker's move
     /// direction so clamp semantics live in one place.
-    MenuMoved {
-        direction: PickerMove,
-    },
+    MenuMoved { direction: PickerMove },
     /// `Enter` on a menu row: reveal the selected session on screen,
     /// FIFO-evicting the oldest-focused visible one. Reducer closes
     /// the menu itself.
-    SessionShown {
-        id: u8,
-    },
+    SessionShown { id: u8 },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 
@@ -228,9 +213,7 @@ pub enum AppEvent {
     },
     /// Quit-time cleanup: drop the staged archive and unpack
     /// scratch directory for `model`. The dispatcher answers with a
-    DiscardInflight {
-        model: std::sync::Arc<str>,
-    },
+    DiscardInflight { model: std::sync::Arc<str> },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the

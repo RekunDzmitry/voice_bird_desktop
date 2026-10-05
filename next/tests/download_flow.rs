@@ -5,8 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
-
 use voice_bird_next::audio_source::{FunnelStep, NoSources};
 use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus, EventSender};
 use voice_bird_next::db::downloads::CancelCheck;
@@ -102,20 +100,6 @@ fn downloads_with(bus: &EventBus) -> DownloadsHandle {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
     DownloadsHandle { db, _tmp: tmp }
-}
-
-fn block_step(handle: &DownloadsHandle, block: u8) -> Option<(FunnelStep, u32)> {
-    let conn = Connection::open(handle._tmp.path().join("downloads.sqlite")).unwrap();
-    conn.query_row(
-        "SELECT step, rev FROM block_steps WHERE block = ?1",
-        [block],
-        |row| {
-            let step: String = row.get(0)?;
-            Ok((FunnelStep::parse(&step).unwrap(), row.get(1)?))
-        },
-    )
-    .optional()
-    .unwrap()
 }
 
 fn drain_apply(bus: &mut EventBus, state: &mut UiState, db: &mut Database) -> Vec<AppEvent> {
@@ -617,10 +601,7 @@ fn cleanup_preserves_installed_models() {
             .exists());
         assert!(!tmp.path().join(format!("{}.1.tmp", model.id)).exists());
         assert_eq!(
-            downloads::get(&handle.db, model.id)
-                .unwrap()
-                .unwrap()
-                .status,
+            downloads::get(&handle.db, model.id).unwrap().unwrap().status,
             DownloadStatus::Cancelling
         );
     }
@@ -650,16 +631,10 @@ fn model_dropped_while_recording_redownloads_and_resumes() {
     state.apply(&AppEvent::AddBlock);
     confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
     drain_apply(&mut bus, &mut state, &mut handle.db);
-    assert!(matches!(
-        state.blocks[0].state,
-        BlockState::Recording { .. }
-    ));
+    assert!(matches!(state.blocks[0].state, BlockState::Recording { .. }));
 
     for expected_attempt in 1..=2 {
-        store
-            .present
-            .lock()
-            .expect("fixture store poisoned")
+        store.present.lock().expect("fixture store poisoned")
             .retain(|id| *id != english().live.id);
         watcher.check(&state, &bus.sender());
         let events = drain_apply(&mut bus, &mut state, &mut handle.db);
@@ -673,9 +648,7 @@ fn model_dropped_while_recording_redownloads_and_resumes() {
             matches!(state.blocks[0].state, BlockState::Recording { .. })
         });
         assert_eq!(calls.load(Ordering::SeqCst), expected_attempt);
-        let row = downloads::get(&handle.db, english().live.id)
-            .unwrap()
-            .unwrap();
+        let row = downloads::get(&handle.db, english().live.id).unwrap().unwrap();
         assert_eq!(row.attempt, expected_attempt as u32);
         assert_eq!(row.status, DownloadStatus::Succeeded);
         assert!(store.is_available(english().live));
@@ -709,14 +682,8 @@ fn model_dropped_with_two_recording_blocks_shares_one_download() {
         drain_apply(&mut bus, &mut state, &mut handle.db);
     }
     state.blocks[1].visible = false;
-    assert!(state
-        .blocks
-        .iter()
-        .all(|block| matches!(block.state, BlockState::Recording { .. })));
-    store
-        .present
-        .lock()
-        .expect("fixture store poisoned")
+    assert!(state.blocks.iter().all(|block| matches!(block.state, BlockState::Recording { .. })));
+    store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().refine.id);
 
     watcher.check(&state, &bus.sender());
@@ -728,10 +695,7 @@ fn model_dropped_with_two_recording_blocks_shares_one_download() {
     }
     dispatcher.dispatch(&events, &mut handle.db, &bus.sender());
     settle_until(&mut bus, &mut state, &mut handle.db, |state| {
-        state
-            .blocks
-            .iter()
-            .all(|block| matches!(block.state, BlockState::Recording { .. }))
+        state.blocks.iter().all(|block| matches!(block.state, BlockState::Recording { .. }))
     });
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(store.is_available(english().refine));
@@ -761,14 +725,8 @@ fn redownload_failure_fails_block_and_retry_recovers() {
     state.apply(&AppEvent::AddBlock);
     confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &failing);
     drain_apply(&mut bus, &mut state, &mut handle.db);
-    assert!(matches!(
-        state.blocks[0].state,
-        BlockState::Recording { .. }
-    ));
-    store
-        .present
-        .lock()
-        .expect("fixture store poisoned")
+    assert!(matches!(state.blocks[0].state, BlockState::Recording { .. }));
+    store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().live.id);
     watcher.check(&state, &bus.sender());
     let events = drain_apply(&mut bus, &mut state, &mut handle.db);
@@ -803,9 +761,7 @@ fn redownload_failure_fails_block_and_retry_recovers() {
     });
     assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
     assert!(store.is_available(english().live));
-    let row = downloads::get(&handle.db, english().live.id)
-        .unwrap()
-        .unwrap();
+    let row = downloads::get(&handle.db, english().live.id).unwrap().unwrap();
     assert_eq!(row.attempt, 2);
     assert_eq!(row.status, DownloadStatus::Succeeded);
 }
@@ -827,24 +783,18 @@ impl Downloader for GatedDownloader {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !self.gate.load(Ordering::SeqCst) {
             if std::time::Instant::now() >= deadline {
-                return Err(DownloadError::Io(
-                    "test download gate timed out".to_string(),
-                ));
+                return Err(DownloadError::Io("test download gate timed out".to_string()));
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        self.inner
-            .fetch(url, staged, expected_sha, cancel, progress)
+        self.inner.fetch(url, staged, expected_sha, cancel, progress)
     }
 }
 
 #[test]
 fn model_dropped_while_other_model_downloading() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(FixtureStore::new(
-        tmp.path().to_path_buf(),
-        &[english().live.id],
-    ));
+    let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[english().live.id]));
     let calls = Arc::new(AtomicUsize::new(0));
     let gate = Arc::new(AtomicBool::new(false));
     let dispatcher = Dispatcher::new(
@@ -863,18 +813,12 @@ fn model_dropped_while_other_model_downloading() {
     confirm_and_dispatch(&mut bus, &mut state, &mut handle.db, &dispatcher);
     drain_apply(&mut bus, &mut state, &mut handle.db);
     assert_eq!(state.blocks[0].pending_models(), &[english().refine.id]);
-    store
-        .present
-        .lock()
-        .expect("fixture store poisoned")
+    store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().live.id);
     watcher.check(&state, &bus.sender());
     let events = drain_apply(&mut bus, &mut state, &mut handle.db);
     assert_eq!(events, vec![AppEvent::ModelMissing(english().live)]);
-    assert_eq!(
-        state.blocks[0].pending_models(),
-        &[english().refine.id, english().live.id]
-    );
+    assert_eq!(state.blocks[0].pending_models(), &[english().refine.id, english().live.id]);
     dispatcher.dispatch(&events, &mut handle.db, &bus.sender());
     // Neither worker can install until both pending models have been observed.
     gate.store(true, Ordering::SeqCst);
@@ -1078,7 +1022,14 @@ fn language_confirm_and_back_race_never_orphans_downloads() {
                 matches!(state.blocks[0].state, BlockState::Recording { .. })
             });
             assert_eq!(calls.load(Ordering::SeqCst), 2);
-            assert_eq!(block_step(&handle, 1), Some((FunnelStep::Committed, 3)));
+            assert!(!voice_bird_next::db::apply(&mut handle.db, &accepted[0]).unwrap());
+            assert!(bus.drain().any(|event| matches!(
+                event,
+                AppEvent::SourceStepRejected {
+                    actual: Some((FunnelStep::Committed, 3)),
+                    ..
+                }
+            )));
         } else {
             assert!(matches!(state.blocks[0].state, BlockState::PickingApp(_)));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1142,13 +1093,37 @@ fn empty_apps_cannot_confirm_and_close_resets_reused_id() {
     producer::resolve_intent(Intent::Confirm, &state, &mut handle.db, &bus.sender());
     assert_eq!(bus.drain().count(), 0);
     source_intent(Intent::BlockClosed, &mut state, &mut handle.db, &mut bus);
-    assert_eq!(block_step(&handle, 1), None);
+    assert!(state.blocks.is_empty());
     state.next_block_id = 1;
     state.apply(&AppEvent::AddSourceBlock {
         snapshot: voice_bird_next::testing::sample_source_snapshot(),
     });
     source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
-    assert_eq!(block_step(&handle, 1), Some((FunnelStep::Language, 1)));
+    assert!(matches!(state.blocks[0].state, BlockState::Picking(_)));
+    assert_eq!(state.blocks[0].source.as_ref().unwrap().rev, 1);
+}
+
+#[test]
+fn queued_confirm_then_close_clears_steps_before_block_id_reuse() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    // Both intents observe Device/0, before either event has been applied.
+    producer::resolve_intent(Intent::Confirm, &state, &mut handle.db, &bus.sender());
+    producer::resolve_intent(Intent::BlockClosed, &state, &mut handle.db, &bus.sender());
+    let accepted = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(
+        accepted.as_slice(),
+        [AppEvent::SourceStepChanged { .. }, AppEvent::BlockClosed { block: 1 }]
+    ));
+    assert!(state.blocks.is_empty());
+    state.next_block_id = 1;
+    state.apply(&AppEvent::AddSourceBlock {
+        snapshot: voice_bird_next::testing::sample_source_snapshot(),
+    });
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    assert!(matches!(state.blocks[0].state, BlockState::Picking(_)));
+    assert_eq!(state.blocks[0].source.as_ref().unwrap().rev, 1);
 }
 
 #[test]
@@ -1173,7 +1148,9 @@ fn add_block_with_menu_open_uses_catalog_and_focuses_new_source_picker() {
     let commands = drain_apply(&mut bus, &mut state, &mut handle.db);
     assert_eq!(commands, vec![AppEvent::RequestBlock]);
     dispatcher.dispatch(&commands, &mut handle.db, &bus.sender());
-    drain_apply(&mut bus, &mut state, &mut handle.db);
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks.first().map(|block| &block.state), Some(BlockState::PickingDevice(_)))
+    });
     assert!(matches!(
         state.focused().unwrap().state,
         BlockState::PickingDevice(_)

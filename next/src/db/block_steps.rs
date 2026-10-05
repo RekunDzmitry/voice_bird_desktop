@@ -3,8 +3,8 @@
 //! A missing block is logically at `Device`, revision zero. Every
 //! accepted transition increments the revision, including back edges,
 //! so returning to the same step never revives an old event. SQL and
-//! the rejection snapshot share an immediate transaction: separate
-//! writer connections cannot race the initial insert or the CAS.
+//! the rejection snapshot share an immediate transaction. The TEMP
+//! table belongs to this connection, never to another app instance.
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -17,7 +17,7 @@ pub struct BlockStepsTable;
 
 impl Table for BlockStepsTable {
     const NAME: &'static str = "block_steps";
-    const DEFINITION: &'static str = "CREATE TABLE IF NOT EXISTS block_steps (
+    const DEFINITION: &'static str = "CREATE TEMP TABLE IF NOT EXISTS block_steps (
         block        INTEGER PRIMARY KEY,
         step         TEXT NOT NULL,
         rev          INTEGER NOT NULL,
@@ -53,14 +53,8 @@ fn actual_on(conn: &Connection, block: u8) -> rusqlite::Result<Option<(FunnelSte
     .optional()
 }
 
-/// Clear session-local state at startup; blocks do not survive a restart.
-pub(super) fn clear(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM block_steps", [])?;
-    Ok(())
-}
-
 /// Release a closed block's id so its next incarnation starts at Device/0.
-pub fn forget(db: &mut Database, block: u8) -> rusqlite::Result<()> {
+fn forget(db: &mut Database, block: u8) -> rusqlite::Result<()> {
     db.conn_mut()
         .execute("DELETE FROM block_steps WHERE block = ?1", params![block])?;
     Ok(())
@@ -71,6 +65,10 @@ pub fn forget(db: &mut Database, block: u8) -> rusqlite::Result<()> {
 /// A gated language command commits the existing selection unchanged.
 pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     let (block, from, to, rev) = match ev {
+        AppEvent::BlockClosed { block } => {
+            forget(db, *block)?;
+            return Ok(true);
+        }
         AppEvent::SourceStepChanged {
             block,
             from,
@@ -163,8 +161,6 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-
     use super::*;
     use crate::audio_source::{AppTarget, AudioDevice};
     use crate::bus::EventBus;
@@ -237,8 +233,8 @@ mod tests {
             from,
             to,
             rev,
-            device: (to != FunnelStep::Device).then(device),
-            app: (to == FunnelStep::Language).then(app),
+            device: Some(device()),
+            app: (rev > 0).then(app),
         }
     }
 
@@ -271,13 +267,14 @@ mod tests {
         let row = get(&db, 1).unwrap().unwrap();
         assert_eq!((row.step, row.rev), (FunnelStep::App, 3));
         assert_eq!(row.device_name.as_deref(), Some("Speakers"));
-        assert_eq!(row.app_id, None);
-        assert_eq!(row.app_name, None);
+        assert_eq!(row.app_id.as_deref(), Some("com.spotify.client"));
+        assert_eq!(row.app_name.as_deref(), Some("Spotify"));
         assert!(apply(&mut db, &change(FunnelStep::App, FunnelStep::Device, 3)).unwrap());
         let row = get(&db, 1).unwrap().unwrap();
         assert_eq!((row.step, row.rev), (FunnelStep::Device, 4));
-        assert_eq!(row.device_name, None);
-        assert_eq!(row.device_kind, None);
+        assert_eq!(row.device_name.as_deref(), Some("Speakers"));
+        assert_eq!(row.device_kind.as_deref(), Some("Output"));
+        assert_eq!(row.app_name.as_deref(), Some("Spotify"));
     }
 
     #[test]
@@ -363,8 +360,8 @@ mod tests {
             app: None,
         };
         assert!(apply(&mut db, &other).unwrap());
-        forget(&mut db, 1).unwrap();
-        forget(&mut db, 1).unwrap();
+        assert!(apply(&mut db, &AppEvent::BlockClosed { block: 1 }).unwrap());
+        assert!(apply(&mut db, &AppEvent::BlockClosed { block: 1 }).unwrap());
         assert_eq!(actual(&db, 1).unwrap(), None);
         assert_eq!(actual(&db, 2).unwrap(), Some((FunnelStep::Language, 1)));
         assert!(apply(&mut db, &change(FunnelStep::Device, FunnelStep::App, 0)).unwrap());
@@ -434,94 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn independent_writers_cannot_accept_both_initial_transitions() {
-        let (dir, db, mut bus) = database();
-        let other = Database::open(&dir.path().join("steps.sqlite"), bus.sender()).unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let workers: Vec<_> = [db, other]
-            .into_iter()
-            .map(|mut db| {
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let accepted =
-                        apply(&mut db, &change(FunnelStep::Device, FunnelStep::App, 0)).unwrap();
-                    (db, accepted)
-                })
-            })
-            .collect();
-        let mut results = workers.into_iter().map(|worker| worker.join().unwrap());
-        let (db, first) = results.next().unwrap();
-        let (_, second) = results.next().unwrap();
-        assert_ne!(first, second);
-        assert_eq!(actual(&db, 1).unwrap(), Some((FunnelStep::App, 1)));
-        assert_eq!(
-            bus.drain().collect::<Vec<_>>(),
-            vec![AppEvent::SourceStepRejected {
-                block: 1,
-                from: FunnelStep::Device,
-                to: FunnelStep::App,
-                rev: 0,
-                actual: Some((FunnelStep::App, 1)),
-            }]
-        );
-    }
-
-    #[test]
-    fn independent_writers_cannot_commit_language_and_step_back() {
-        let (dir, mut db, mut bus) = database();
-        let other = Database::open(&dir.path().join("steps.sqlite"), bus.sender()).unwrap();
-        to_language(&mut db);
-        let barrier = Arc::new(Barrier::new(2));
-        let workers: Vec<_> = [
-            (db, begin(Some(2))),
-            (other, change(FunnelStep::Language, FunnelStep::App, 2)),
-        ]
-        .into_iter()
-        .map(|(mut db, event)| {
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                let accepted = super::super::apply(&mut db, &event).unwrap();
-                (db, accepted)
-            })
-        })
-        .collect();
-        let mut results = workers.into_iter().map(|worker| worker.join().unwrap());
-        let (db, committed) = results.next().unwrap();
-        let (_, backed) = results.next().unwrap();
-        assert_ne!(committed, backed);
-        let expected = if committed {
-            FunnelStep::Committed
-        } else {
-            FunnelStep::App
-        };
-        assert_eq!(actual(&db, 1).unwrap(), Some((expected, 3)));
-        let rejected_to = if committed {
-            FunnelStep::App
-        } else {
-            FunnelStep::Committed
-        };
-        assert_eq!(
-            bus.drain().collect::<Vec<_>>(),
-            vec![AppEvent::SourceStepRejected {
-                block: 1,
-                from: FunnelStep::Language,
-                to: rejected_to,
-                rev: 2,
-                actual: Some((expected, 3)),
-            }]
-        );
-    }
-
-    #[test]
-    fn open_clears_previous_session_rows() {
-        let (dir, mut db, bus) = database();
-        to_language(&mut db);
-        drop(db);
-        let mut db = Database::open(&dir.path().join("steps.sqlite"), bus.sender()).unwrap();
-        assert_eq!(get(&db, 1).unwrap(), None);
-        assert!(apply(&mut db, &change(FunnelStep::Device, FunnelStep::App, 0)).unwrap());
-        assert_eq!(actual(&db, 1).unwrap(), Some((FunnelStep::App, 1)));
+    fn opening_another_instance_does_not_reset_or_share_steps() {
+        let (dir, mut first, bus) = database();
+        to_language(&mut first);
+        let mut second = Database::open(&dir.path().join("steps.sqlite"), bus.sender()).unwrap();
+        assert_eq!(actual(&first, 1).unwrap(), Some((FunnelStep::Language, 2)));
+        assert_eq!(actual(&second, 1).unwrap(), None);
+        assert!(apply(&mut second, &change(FunnelStep::Device, FunnelStep::App, 0)).unwrap());
+        assert!(apply(&mut first, &begin(Some(2))).unwrap());
+        assert_eq!(actual(&first, 1).unwrap(), Some((FunnelStep::Committed, 3)));
+        assert_eq!(actual(&second, 1).unwrap(), Some((FunnelStep::App, 1)));
+        assert!(apply(&mut second, &AppEvent::BlockClosed { block: 1 }).unwrap());
+        assert_eq!(actual(&second, 1).unwrap(), None);
+        assert_eq!(actual(&first, 1).unwrap(), Some((FunnelStep::Committed, 3)));
+        drop(second);
+        let reopened = Database::open(&dir.path().join("steps.sqlite"), bus.sender()).unwrap();
+        assert_eq!(actual(&reopened, 1).unwrap(), None);
+        assert_eq!(actual(&first, 1).unwrap(), Some((FunnelStep::Committed, 3)));
     }
 }

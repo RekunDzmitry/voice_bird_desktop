@@ -143,7 +143,12 @@ fn block_border(focused: bool) -> Block<'static> {
 fn block_title(block: &crate::state::Block) -> String {
     let mut title = block.id.to_string();
     if let Some(source) = &block.source {
-        for label in source.labels() {
+        let visible_labels = match &block.state {
+            BlockState::PickingDevice(_) => 0,
+            BlockState::PickingApp(_) => usize::from(source.device.is_some()),
+            _ => usize::MAX,
+        };
+        for label in source.labels().take(visible_labels) {
             title.push_str(" · ");
             title.push_str(label);
         }

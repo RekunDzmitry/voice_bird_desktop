@@ -147,9 +147,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
                 if let Some(l) = log.as_mut() {
                     l.append(&ev);
                 }
-                if let Ok(true) = voice_bird_next::db::apply(&mut db, &ev) {
-                    state.apply(&ev);
-                    accepted_events.push(ev);
+                match voice_bird_next::db::apply(&mut db, &ev) {
+                    Ok(true) => {
+                        state.apply(&ev);
+                        accepted_events.push(ev);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("voice-bird-next: event gate failed for {ev:?}: {error}");
+                    }
                 }
             }
             dispatcher.dispatch(&accepted_events, &mut db, &tx);
