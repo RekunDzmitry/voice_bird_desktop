@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Workspace manifests and the lockfile can change next's dependency resolution.
+if git diff --cached --quiet -- next Cargo.toml Cargo.lock; then
+    exit 0
+else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+        exit "$status"
+    fi
+fi
+
+cargo clippy --locked -p voice-bird-next --all-targets -- -D warnings
+cargo clippy --locked -p voice-bird-next --all-targets --no-default-features -- -D warnings

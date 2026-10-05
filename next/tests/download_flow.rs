@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use voice_bird_next::audio_source::{FunnelStep, NoSources};
 use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus, EventSender};
 use voice_bird_next::db::downloads::CancelCheck;
 use voice_bird_next::db::{downloads, Database};
@@ -103,12 +104,17 @@ fn downloads_with(bus: &EventBus) -> DownloadsHandle {
 
 fn drain_apply(bus: &mut EventBus, state: &mut UiState, db: &mut Database) -> Vec<AppEvent> {
     let events: Vec<_> = bus.drain().collect();
-    for event in &events {
-        if downloads::apply(db, event).unwrap_or(false) {
-            state.apply(event);
-        }
-    }
     events
+        .into_iter()
+        .filter(|event| {
+            if voice_bird_next::db::apply(db, event).unwrap() {
+                state.apply(event);
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
 fn confirm_and_dispatch(
@@ -164,7 +170,7 @@ fn language_with_both_models_cached_records_immediately() {
         Outcome::Ok,
         calls.clone(),
     ));
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -231,7 +237,7 @@ fn language_with_one_cached_model_downloads_only_the_other() {
         Outcome::Ok,
         calls.clone(),
     ));
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -261,7 +267,7 @@ fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
         Outcome::ShaMismatch,
         failed_calls.clone(),
     ));
-    let failing_dispatcher = Dispatcher::new(failing, store.clone());
+    let failing_dispatcher = Dispatcher::new(failing, store.clone(), Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -279,7 +285,7 @@ fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
         Outcome::Ok,
         retry_calls.clone(),
     ));
-    let retry_dispatcher = Dispatcher::new(successful, store);
+    let retry_dispatcher = Dispatcher::new(successful, store, Arc::new(NoSources));
     retry_and_dispatch(&mut bus, &mut state, &mut handle.db, &retry_dispatcher);
     settle_until(&mut bus, &mut state, &mut handle.db, |state| {
         matches!(state.blocks[0].state, BlockState::Recording { .. })
@@ -399,7 +405,7 @@ fn two_blocks_same_language_share_downloads() {
     let downloader: Arc<dyn Downloader> = Arc::new(
         FixtureDownloader::new(vec![1; 128 * 1024], Outcome::Ok, calls.clone()).with_delay(100),
     );
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -436,7 +442,7 @@ fn closing_last_waiter_cancels_both_pending_rows() {
         )
         .with_delay(100),
     );
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -463,7 +469,7 @@ fn language_selected_targets_block_id_not_focus() {
         Outcome::Ok,
         Arc::new(AtomicUsize::new(0)),
     ));
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     let mut state = UiState::default();
@@ -474,6 +480,7 @@ fn language_selected_targets_block_id_not_focus() {
     bus.sender().publish(AppEvent::BeginLanguage {
         block: 1,
         language: english(),
+        source_rev: None,
     });
     let commands = drain_apply(&mut bus, &mut state, &mut handle.db);
     dispatcher.dispatch(&commands, &mut handle.db, &bus.sender());
@@ -497,7 +504,7 @@ fn second_session_is_warm() {
     let downloader: Arc<dyn Downloader> = Arc::new(WritingDownloader {
         calls: first_calls.clone(),
     });
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut first_bus = EventBus::new();
     let mut first_db = downloads_with(&first_bus);
     let mut first_state = UiState::default();
@@ -524,7 +531,7 @@ fn second_session_is_warm() {
         Outcome::Ok,
         second_calls.clone(),
     ));
-    let second_dispatcher = Dispatcher::new(second_downloader, second_store);
+    let second_dispatcher = Dispatcher::new(second_downloader, second_store, Arc::new(NoSources));
     let mut second_bus = EventBus::new();
     let mut second_db = downloads_with(&second_bus);
     let mut second_state = UiState::default();
@@ -568,7 +575,7 @@ fn cleanup_preserves_installed_models() {
         Outcome::Ok,
         Arc::new(AtomicUsize::new(0)),
     ));
-    let dispatcher = Dispatcher::new(downloader, store);
+    let dispatcher = Dispatcher::new(downloader, store, Arc::new(NoSources));
     let mut bus = EventBus::new();
     let tx = bus.sender();
     let mut handle = downloads_with(&bus);
@@ -609,8 +616,13 @@ fn model_dropped_while_recording_redownloads_and_resumes() {
     ));
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = Dispatcher::new(
-        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
+        Arc::new(FixtureDownloader::new(
+            vec![1; 64],
+            Outcome::Ok,
+            calls.clone(),
+        )),
         store.clone(),
+        Arc::new(NoSources),
     );
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
@@ -652,8 +664,13 @@ fn model_dropped_with_two_recording_blocks_shares_one_download() {
     ));
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = Dispatcher::new(
-        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
+        Arc::new(FixtureDownloader::new(
+            vec![1; 64],
+            Outcome::Ok,
+            calls.clone(),
+        )),
         store.clone(),
+        Arc::new(NoSources),
     );
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
@@ -693,8 +710,13 @@ fn redownload_failure_fails_block_and_retry_recovers() {
     ));
     let failed_calls = Arc::new(AtomicUsize::new(0));
     let failing = Dispatcher::new(
-        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::ShaMismatch, failed_calls.clone())),
+        Arc::new(FixtureDownloader::new(
+            vec![1; 64],
+            Outcome::ShaMismatch,
+            failed_calls.clone(),
+        )),
         store.clone(),
+        Arc::new(NoSources),
     );
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
@@ -713,16 +735,25 @@ fn redownload_failure_fails_block_and_retry_recovers() {
         matches!(state.blocks[0].state, BlockState::Failed { .. })
     });
     assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
-    assert!(matches!(&state.blocks[0].state, BlockState::Failed { error, .. }
-        if error.contains("sha256 mismatch")));
+    assert!(
+        matches!(&state.blocks[0].state, BlockState::Failed { error, .. }
+        if error.contains("sha256 mismatch"))
+    );
     watcher.check(&state, &bus.sender());
     let events = drain_apply(&mut bus, &mut state, &mut handle.db);
-    assert!(!events.iter().any(|event| matches!(event, AppEvent::ModelMissing(_))));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AppEvent::ModelMissing(_))));
 
     let retry_calls = Arc::new(AtomicUsize::new(0));
     let successful = Dispatcher::new(
-        Arc::new(FixtureDownloader::new(vec![2; 64], Outcome::Ok, retry_calls.clone())),
+        Arc::new(FixtureDownloader::new(
+            vec![2; 64],
+            Outcome::Ok,
+            retry_calls.clone(),
+        )),
         store.clone(),
+        Arc::new(NoSources),
     );
     retry_and_dispatch(&mut bus, &mut state, &mut handle.db, &successful);
     settle_until(&mut bus, &mut state, &mut handle.db, |state| {
@@ -772,6 +803,7 @@ fn model_dropped_while_other_model_downloading() {
             gate: gate.clone(),
         }),
         store.clone(),
+        Arc::new(NoSources),
     );
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
@@ -794,6 +826,337 @@ fn model_dropped_while_other_model_downloading() {
         matches!(state.blocks[0].state, BlockState::Recording { .. })
     });
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert!(english().models().iter().all(|model| store.is_available(model)));
+    assert!(english()
+        .models()
+        .iter()
+        .all(|model| store.is_available(model)));
 }
 
+fn source_state() -> UiState {
+    let mut state = UiState::default();
+    state.apply(&AppEvent::AddSourceBlock {
+        snapshot: voice_bird_next::testing::sample_source_snapshot(),
+    });
+    state
+}
+
+fn source_intent(
+    intent: Intent,
+    state: &mut UiState,
+    db: &mut Database,
+    bus: &mut EventBus,
+) -> AppEvent {
+    producer::resolve_intent(intent, state, db, &bus.sender());
+    let events: Vec<_> = bus.drain().collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = events.into_iter().next().unwrap();
+    assert!(voice_bird_next::db::apply(db, &event).unwrap());
+    state.apply(&event);
+    event
+}
+
+#[test]
+fn output_funnel_restores_selected_rows_and_preserves_source_through_model_lifecycle() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    let snapshot = voice_bird_next::testing::sample_source_snapshot();
+    assert!(matches!(
+        state.blocks[0].state,
+        BlockState::PickingDevice(_)
+    ));
+    source_intent(Intent::PickerNext, &mut state, &mut handle.db, &mut bus);
+    assert_eq!(
+        source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus),
+        AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::Device,
+            to: FunnelStep::App,
+            rev: 0,
+            device: Some(snapshot.devices[1].clone()),
+            app: None,
+        }
+    );
+    source_intent(Intent::PickerNext, &mut state, &mut handle.db, &mut bus);
+    assert_eq!(
+        source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus),
+        AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::App,
+            to: FunnelStep::Language,
+            rev: 1,
+            device: Some(snapshot.devices[1].clone()),
+            app: Some(snapshot.apps[1].clone()),
+        }
+    );
+    assert_eq!(
+        source_intent(Intent::StepBack, &mut state, &mut handle.db, &mut bus),
+        AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::Language,
+            to: FunnelStep::App,
+            rev: 2,
+            device: Some(snapshot.devices[1].clone()),
+            app: Some(snapshot.apps[1].clone()),
+        }
+    );
+    assert!(matches!(&state.blocks[0].state, BlockState::PickingApp(cursor) if cursor.index == 1));
+    source_intent(Intent::StepBack, &mut state, &mut handle.db, &mut bus);
+    assert!(
+        matches!(&state.blocks[0].state, BlockState::PickingDevice(cursor) if cursor.index == 1)
+    );
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    assert!(matches!(&state.blocks[0].state, BlockState::PickingApp(cursor) if cursor.index == 1));
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    let selected = state.blocks[0].source.clone();
+    state.apply(&AppEvent::LanguageSelected {
+        block: 1,
+        language: english(),
+        pending: Vec::new(),
+    });
+    assert_eq!(state.blocks[0].source, selected);
+    state.apply(&AppEvent::ModelMissing(english().live));
+    assert_eq!(state.blocks[0].source, selected);
+    state.apply(&AppEvent::DownloadSucceeded {
+        attempt: 1,
+        model: english().live.id,
+    });
+    assert_eq!(state.blocks[0].source, selected);
+    assert!(matches!(
+        state.blocks[0].state,
+        BlockState::Recording { .. }
+    ));
+}
+
+#[test]
+fn input_skips_app_and_back_returns_to_device() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    let snapshot = voice_bird_next::testing::sample_source_snapshot();
+    assert_eq!(
+        source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus),
+        AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::Device,
+            to: FunnelStep::Language,
+            rev: 0,
+            device: Some(snapshot.devices[0].clone()),
+            app: None,
+        }
+    );
+    assert_eq!(
+        source_intent(Intent::StepBack, &mut state, &mut handle.db, &mut bus),
+        AppEvent::SourceStepChanged {
+            block: 1,
+            from: FunnelStep::Language,
+            to: FunnelStep::Device,
+            rev: 1,
+            device: Some(snapshot.devices[0].clone()),
+            app: None,
+        }
+    );
+    assert!(
+        matches!(&state.blocks[0].state, BlockState::PickingDevice(cursor) if cursor.index == 0)
+    );
+}
+
+#[test]
+fn duplicate_confirm_advances_source_once() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    for _ in 0..2 {
+        producer::resolve_intent(Intent::Confirm, &state, &mut handle.db, &bus.sender());
+    }
+    let accepted = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert_eq!(accepted.len(), 1);
+    assert!(matches!(state.blocks[0].state, BlockState::Picking(_)));
+    assert_eq!(state.blocks[0].source.as_ref().unwrap().rev, 1);
+    let rejected: Vec<_> = bus.drain().collect();
+    assert_eq!(
+        rejected,
+        vec![AppEvent::SourceStepRejected {
+            block: 1,
+            from: FunnelStep::Device,
+            to: FunnelStep::Language,
+            rev: 0,
+            actual: Some((FunnelStep::Language, 1)),
+        }]
+    );
+}
+
+#[test]
+fn language_confirm_and_back_race_never_orphans_downloads() {
+    for confirm_first in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher = Dispatcher::new(
+            Arc::new(FixtureDownloader::new(
+                vec![1; 64],
+                Outcome::Ok,
+                calls.clone(),
+            )),
+            Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])),
+            Arc::new(NoSources),
+        );
+        let mut bus = EventBus::new();
+        let mut handle = downloads_with(&bus);
+        let mut state = source_state();
+        source_intent(Intent::PickerNext, &mut state, &mut handle.db, &mut bus);
+        source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+        source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+        let intents = if confirm_first {
+            [Intent::Confirm, Intent::StepBack]
+        } else {
+            [Intent::StepBack, Intent::Confirm]
+        };
+        for intent in intents {
+            producer::resolve_intent(intent, &state, &mut handle.db, &bus.sender());
+        }
+        let accepted = drain_apply(&mut bus, &mut state, &mut handle.db);
+        assert_eq!(accepted.len(), 1);
+        dispatcher.dispatch(&accepted, &mut handle.db, &bus.sender());
+        if confirm_first {
+            settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+                matches!(state.blocks[0].state, BlockState::Recording { .. })
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(!voice_bird_next::db::apply(&mut handle.db, &accepted[0]).unwrap());
+            assert!(bus.drain().any(|event| matches!(
+                event,
+                AppEvent::SourceStepRejected {
+                    actual: Some((FunnelStep::Committed, 3)),
+                    ..
+                }
+            )));
+        } else {
+            assert!(matches!(state.blocks[0].state, BlockState::PickingApp(_)));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            for model in english().models() {
+                assert!(downloads::get(&handle.db, model.id).unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn back_is_ignored_outside_source_pickers_and_menu_intercepts_it() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    let states = [
+        BlockState::PickingDevice(Default::default()),
+        BlockState::Waiting {
+            language: english(),
+            pending: vec![english().live.id],
+        },
+        BlockState::Recording {
+            language: english(),
+        },
+        BlockState::Failed {
+            language: english(),
+            pending: Vec::new(),
+            error: "failure".into(),
+        },
+    ];
+    for phase in states {
+        state.blocks[0].state = phase;
+        producer::resolve_intent(Intent::StepBack, &state, &mut handle.db, &bus.sender());
+        assert_eq!(bus.drain().count(), 0);
+    }
+    state = UiState::default();
+    state.apply(&AppEvent::AddBlock);
+    producer::resolve_intent(Intent::StepBack, &state, &mut handle.db, &bus.sender());
+    assert_eq!(bus.drain().count(), 0);
+    state = source_state();
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    state.apply(&AppEvent::MenuOpened);
+    producer::resolve_intent(Intent::StepBack, &state, &mut handle.db, &bus.sender());
+    assert_eq!(bus.drain().count(), 0);
+}
+
+#[test]
+fn empty_apps_cannot_confirm_and_close_resets_reused_id() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    state.blocks[0]
+        .source
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .apps
+        .clear();
+    source_intent(Intent::PickerNext, &mut state, &mut handle.db, &mut bus);
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    producer::resolve_intent(Intent::Confirm, &state, &mut handle.db, &bus.sender());
+    assert_eq!(bus.drain().count(), 0);
+    source_intent(Intent::BlockClosed, &mut state, &mut handle.db, &mut bus);
+    assert!(state.blocks.is_empty());
+    state.next_block_id = 1;
+    state.apply(&AppEvent::AddSourceBlock {
+        snapshot: voice_bird_next::testing::sample_source_snapshot(),
+    });
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    assert!(matches!(state.blocks[0].state, BlockState::Picking(_)));
+    assert_eq!(state.blocks[0].source.as_ref().unwrap().rev, 1);
+}
+
+#[test]
+fn queued_confirm_then_close_clears_steps_before_block_id_reuse() {
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = source_state();
+    // Both intents observe Device/0, before either event has been applied.
+    producer::resolve_intent(Intent::Confirm, &state, &mut handle.db, &bus.sender());
+    producer::resolve_intent(Intent::BlockClosed, &state, &mut handle.db, &bus.sender());
+    let accepted = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert!(matches!(
+        accepted.as_slice(),
+        [AppEvent::SourceStepChanged { .. }, AppEvent::BlockClosed { block: 1 }]
+    ));
+    assert!(state.blocks.is_empty());
+    state.next_block_id = 1;
+    state.apply(&AppEvent::AddSourceBlock {
+        snapshot: voice_bird_next::testing::sample_source_snapshot(),
+    });
+    source_intent(Intent::Confirm, &mut state, &mut handle.db, &mut bus);
+    assert!(matches!(state.blocks[0].state, BlockState::Picking(_)));
+    assert_eq!(state.blocks[0].source.as_ref().unwrap().rev, 1);
+}
+
+#[test]
+fn add_block_with_menu_open_uses_catalog_and_focuses_new_source_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dispatcher = Dispatcher::new(
+        Arc::new(FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            Arc::new(AtomicUsize::new(0)),
+        )),
+        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])),
+        Arc::new(voice_bird_next::testing::FixtureSources(Some(
+            voice_bird_next::testing::sample_source_snapshot(),
+        ))),
+    );
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    let mut state = UiState::default();
+    state.apply(&AppEvent::MenuOpened);
+    producer::resolve_intent(Intent::AddBlock, &state, &mut handle.db, &bus.sender());
+    let commands = drain_apply(&mut bus, &mut state, &mut handle.db);
+    assert_eq!(commands, vec![AppEvent::RequestBlock]);
+    dispatcher.dispatch(&commands, &mut handle.db, &bus.sender());
+    settle_until(&mut bus, &mut state, &mut handle.db, |state| {
+        matches!(state.blocks.first().map(|block| &block.state), Some(BlockState::PickingDevice(_)))
+    });
+    assert!(matches!(
+        state.focused().unwrap().state,
+        BlockState::PickingDevice(_)
+    ));
+    assert_eq!(
+        state.focused().unwrap().source.as_ref().unwrap().snapshot,
+        voice_bird_next::testing::sample_source_snapshot()
+    );
+}

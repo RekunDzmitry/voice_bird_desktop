@@ -33,7 +33,7 @@ mod tests {
     use super::*;
     use crate::bus::EventBus;
     use crate::language::LANGUAGES;
-    use crate::picker::{LanguagePicker, PickerIntent};
+    use crate::picker::ListPicker;
     use crate::state::BlockState;
     use crate::testing::FixtureStore;
 
@@ -77,7 +77,7 @@ mod tests {
         let watcher = ModelWatcher::new(store);
         let state = UiState {
             blocks: vec![
-                Block::new(1, BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock))),
+                Block::new(1, BlockState::Picking(ListPicker::default())),
                 Block::new(2, BlockState::Failed {
                     language,
                     error: "failed".to_string(),

@@ -15,8 +15,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::language::LanguageProfile;
-use crate::picker::LanguagePicker;
+use crate::audio_source::DeviceKind;
+use crate::language::{LanguageProfile, LANGUAGES};
+use crate::picker::ListPicker;
 use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
 
 /// Draw one frame: outer window with `state.title` in its top border,
@@ -109,6 +110,9 @@ fn render_block(
     f.render_widget(border, area);
 
     match &block.state {
+        BlockState::PickingDevice(cursor) | BlockState::PickingApp(cursor) => {
+            render_source_picker(f, block, cursor.index, inner);
+        }
         BlockState::Waiting { language, pending } => {
             render_waiting(f, language, pending, state, inner);
         }
@@ -137,15 +141,69 @@ fn block_border(focused: bool) -> Block<'static> {
 }
 
 fn block_title(block: &crate::state::Block) -> String {
-    match &block.state {
-        BlockState::Picking(_) => format!("{} · pick a language", block.id),
-        BlockState::Waiting { language, .. } | BlockState::Recording { language } => {
-            format!("{} · {}", block.id, language.code)
-        }
-        BlockState::Failed { language, .. } => {
-            format!("{} · {} · error", block.id, language.code)
+    let mut title = block.id.to_string();
+    if let Some(source) = &block.source {
+        let visible_labels = match &block.state {
+            BlockState::PickingDevice(_) => 0,
+            BlockState::PickingApp(_) => usize::from(source.device.is_some()),
+            _ => usize::MAX,
+        };
+        for label in source.labels().take(visible_labels) {
+            title.push_str(" · ");
+            title.push_str(label);
         }
     }
+    title.push_str(" · ");
+    match &block.state {
+        BlockState::PickingDevice(_) => title.push_str("pick a device"),
+        BlockState::PickingApp(_) => title.push_str("pick an app"),
+        BlockState::Picking(_) => title.push_str("pick a language"),
+        BlockState::Waiting { language, .. } | BlockState::Recording { language } => {
+            title.push_str(language.code);
+        }
+        BlockState::Failed { language, .. } => {
+            title.push_str(language.code);
+            title.push_str(" · error");
+        }
+    }
+    title
+}
+
+fn render_source_picker(f: &mut Frame, block: &crate::state::Block, selected: usize, area: Rect) {
+    let Some(source) = &block.source else { return };
+    let picking_device = matches!(block.state, BlockState::PickingDevice(_));
+    let total = if picking_device {
+        source.snapshot.devices.len()
+    } else {
+        source.snapshot.apps.len()
+    };
+    let height = area.height.saturating_sub(2) as usize;
+    let (start, end) = menu_window(total, selected, height);
+    let mut lines = Vec::with_capacity(end - start + 2);
+    if total == 0 && !picking_device {
+        lines.push(Line::from("no running apps"));
+    }
+    for index in start..end {
+        let marker = if index == selected { "▶" } else { " " };
+        let line = if picking_device {
+            let device = &source.snapshot.devices[index];
+            let kind = match device.kind {
+                DeviceKind::Input => "in ",
+                DeviceKind::Output => "out",
+            };
+            format!("{marker} {kind} {}", device.name)
+        } else {
+            format!("{marker} {}", source.snapshot.apps[index].name)
+        };
+        lines.push(Line::from(line));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(if picking_device {
+        "Enter select · Esc close"
+    } else {
+        "⌫ back · Esc close"
+    }));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Compute the half-open `[start, end)` window of session indices
@@ -230,7 +288,15 @@ fn render_menu(f: &mut Frame, state: &UiState, menu: &crate::picker::SessionMenu
 
 fn block_body_lines(block: &crate::state::Block, _state: &UiState) -> Vec<Line<'static>> {
     match &block.state {
-        BlockState::Picking(picker) => picker_lines(picker),
+        BlockState::Picking(picker) => {
+            let mut lines = picker_lines(picker);
+            if block.source.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("⌫ back · Esc close"));
+            }
+            lines
+        }
+        BlockState::PickingDevice(_) | BlockState::PickingApp(_) => Vec::new(),
         // Waiting is rendered directly by render_block (Gauge widget).
         BlockState::Waiting { .. } => Vec::new(),
         BlockState::Recording { .. } => vec![Line::from("● recording (mocked)")],
@@ -318,9 +384,8 @@ fn render_model_gauge(
     }
 }
 
-fn picker_lines(picker: &LanguagePicker) -> Vec<Line<'static>> {
-    picker
-        .languages()
+fn picker_lines(picker: &ListPicker) -> Vec<Line<'static>> {
+    LANGUAGES
         .iter()
         .enumerate()
         .map(|(i, language)| picker_row(i, picker.index, language))
@@ -393,9 +458,7 @@ mod tests {
         let state = UiState {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Picking(LanguagePicker::open(
-                    crate::picker::PickerIntent::AddBlock,
-                )),
+                state: BlockState::Picking(ListPicker::default()),
                 ..Default::default()
             }],
             focus: 0,

@@ -2,7 +2,7 @@ use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 use voice_bird_next::{
     language::LANGUAGES,
-    picker::{LanguagePicker, PickerIntent, SessionMenu, CATALOG},
+    picker::{ListPicker, SessionMenu, CATALOG},
     state::{Block, BlockState, DownloadPhase, DownloadState, UiState},
     testing::render_to_string,
 };
@@ -79,7 +79,7 @@ fn picking_100x30_matches_golden() {
     let state = UiState {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+            state: BlockState::Picking(ListPicker::default()),
 
             ..Default::default()
         }],
@@ -161,7 +161,7 @@ fn picker_renders_languages_without_model_ids() {
     let state = UiState {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
+            state: BlockState::Picking(ListPicker::default()),
             ..Default::default()
         }],
         focus: 0,
@@ -601,5 +601,158 @@ proptest! {
             },
         );
         let _ = render_to_string(&state, w, h);
+    }
+}
+
+fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiState {
+    let snapshot = voice_bird_next::testing::sample_source_snapshot();
+    let source = voice_bird_next::audio_source::SourceSelection {
+        device: device.map(|index| snapshot.devices[index].clone()),
+        app: app.map(|index| snapshot.apps[index].clone()),
+        snapshot,
+        rev: 0,
+    };
+    UiState {
+        blocks: vec![Block {
+            id: 1,
+            state,
+            source: Some(source),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn source_golden(name: &str, state: UiState) {
+    let out = render_to_string(&state, 100, 30);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/snapshots")
+        .join(format!("{name}_100x30.txt"));
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(&path, &out).expect("write golden");
+    }
+    assert_eq!(out, std::fs::read_to_string(path).expect("read golden"));
+}
+
+#[test]
+fn picking_device_100x30_matches_golden() {
+    source_golden(
+        "picking_device",
+        source_block_state(BlockState::PickingDevice(Default::default()), None, None),
+    );
+}
+
+#[test]
+fn picking_app_100x30_matches_golden() {
+    source_golden(
+        "picking_app",
+        source_block_state(BlockState::PickingApp(Default::default()), Some(1), None),
+    );
+}
+
+#[test]
+fn device_picker_hides_retained_selections_and_restores_device_cursor() {
+    let state = source_block_state(
+        BlockState::PickingDevice(ListPicker { index: 1 }),
+        Some(1),
+        Some(1),
+    );
+    let out = render_to_string(&state, 100, 30);
+    let title = out
+        .lines()
+        .find(|line| line.contains("pick a device"))
+        .unwrap();
+    assert!(title.contains("1 · pick a device"), "{out}");
+    assert!(!title.contains("Speakers"), "{out}");
+    assert!(!title.contains("Spotify"), "{out}");
+    assert!(out.contains("▶ out Speakers"), "{out}");
+    assert!(out.contains("in  Mic"), "{out}");
+    assert!(!out.contains("Safari"), "{out}");
+    assert!(!out.contains("Spotify"), "{out}");
+}
+
+#[test]
+fn app_picker_hides_retained_app_and_restores_app_cursor() {
+    let state = source_block_state(
+        BlockState::PickingApp(ListPicker { index: 1 }),
+        Some(1),
+        Some(1),
+    );
+    let out = render_to_string(&state, 100, 30);
+    let title = out
+        .lines()
+        .find(|line| line.contains("pick an app"))
+        .unwrap();
+    assert!(title.contains("1 · Speakers · pick an app"), "{out}");
+    assert!(!title.contains("Spotify"), "{out}");
+    assert!(out.contains("▶ Spotify"), "{out}");
+    assert!(out.contains("Safari"), "{out}");
+    assert!(!out.contains("out Speakers"), "{out}");
+    assert!(!out.contains("in  Mic"), "{out}");
+}
+
+#[test]
+fn recording_with_source_100x30_matches_golden() {
+    source_golden(
+        "recording_with_source",
+        source_block_state(
+            BlockState::Recording {
+                language: &LANGUAGES[0],
+            },
+            Some(1),
+            Some(1),
+        ),
+    );
+}
+
+#[test]
+fn input_source_title_omits_app() {
+    let state = source_block_state(
+        BlockState::Recording {
+            language: &LANGUAGES[0],
+        },
+        Some(0),
+        None,
+    );
+    let out = render_to_string(&state, 100, 30);
+    assert!(out.contains("1 · Mic · en"), "{out}");
+    assert!(!out.contains("Spotify"), "{out}");
+}
+
+#[test]
+fn empty_app_picker_explains_required_app_and_back_navigation() {
+    let mut state = source_block_state(BlockState::PickingApp(Default::default()), Some(1), None);
+    state.blocks[0]
+        .source
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .apps
+        .clear();
+    let out = render_to_string(&state, 100, 30);
+    assert!(out.contains("no running apps"), "{out}");
+    assert!(out.contains("⌫ back · Esc close"), "{out}");
+}
+
+#[test]
+fn long_source_lists_keep_selection_and_back_visible_on_resize() {
+    let mut state = source_block_state(
+        BlockState::PickingApp(voice_bird_next::picker::ListPicker { index: 30 }),
+        Some(1),
+        None,
+    );
+    let source = state.blocks[0].source.as_mut().unwrap();
+    source.snapshot.apps = (0..40)
+        .map(|index| voice_bird_next::audio_source::AppTarget {
+            id: format!("app.{index}"),
+            name: format!("App {index}"),
+            pid: index,
+        })
+        .collect();
+    for height in [8, 12, 30] {
+        let out = render_to_string(&state, 100, height);
+        assert!(out.contains("▶ App 30"), "{out}");
+        assert!(out.contains("⌫ back · Esc close"), "{out}");
+        assert!(!out.contains("App 0 "), "{out}");
     }
 }

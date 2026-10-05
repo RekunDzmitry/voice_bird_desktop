@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::audio_source::{AudioSourceSnapshot, FunnelStep, SourceSelection};
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
-use crate::picker::{LanguagePicker, ModelEntry, PickerEvent, PickerIntent, SessionMenu};
+use crate::picker::{ListPicker, ModelEntry, PickerEvent, SessionMenu};
 
 /// Render-side phase for one download. Lives in `state.rs` (UI
 /// only) because the SQLite `DownloadStatus` enum carries the
@@ -23,8 +24,10 @@ pub const MAX_VISIBLE_BLOCKS: usize = 4;
 /// language, waits for both of its models, then records with that language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockState {
+    PickingDevice(ListPicker),
+    PickingApp(ListPicker),
     /// Choosing a language. Carries its own picker — no shared overlay.
-    Picking(LanguagePicker),
+    Picking(ListPicker),
     /// Waiting until every model id in `pending` is present on disk.
     /// Progress stays in [`UiState::downloads`] so blocks share per-model state.
     Waiting {
@@ -48,6 +51,7 @@ pub enum BlockState {
 pub struct Block {
     pub id: u8,
     pub state: BlockState,
+    pub source: Option<SourceSelection>,
     /// Whether the block occupies a column on screen. `false` once the
     /// cap has pushed the block off the visible strip; it stays alive
     /// and the renderer simply skips it.
@@ -68,6 +72,7 @@ impl Block {
         Self {
             id,
             state,
+            source: None,
             visible: true,
             last_focused: 0,
         }
@@ -84,6 +89,7 @@ impl Block {
         Self {
             id,
             state,
+            source: None,
             visible: false,
             last_focused: 0,
         }
@@ -91,7 +97,9 @@ impl Block {
 
     pub fn language(&self) -> Option<&'static LanguageProfile> {
         match &self.state {
-            BlockState::Picking(_) => None,
+            BlockState::Picking(_) | BlockState::PickingDevice(_) | BlockState::PickingApp(_) => {
+                None
+            }
             BlockState::Waiting { language, .. }
             | BlockState::Recording { language }
             | BlockState::Failed { language, .. } => Some(language),
@@ -111,7 +119,10 @@ impl Block {
             BlockState::Recording { language } | BlockState::Waiting { language, .. } => {
                 Some(language.models())
             }
-            BlockState::Picking(_) | BlockState::Failed { .. } => None,
+            BlockState::Picking(_)
+            | BlockState::PickingDevice(_)
+            | BlockState::PickingApp(_)
+            | BlockState::Failed { .. } => None,
         };
         models
             .into_iter()
@@ -125,10 +136,7 @@ impl Default for Block {
     /// ..Default::default() }`. Not used by production code; the
     /// reducer constructs blocks via [`Block::new`].
     fn default() -> Self {
-        Self::new(
-            0,
-            BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
-        )
+        Self::new(0, BlockState::Picking(ListPicker::default()))
     }
 }
 
@@ -361,65 +369,89 @@ impl UiState {
         }
     }
 
+    fn push_block(&mut self, snapshot: Option<AudioSourceSnapshot>) {
+        // Scan the nonzero id space, including wraparound, without replacing a live session.
+        let candidate = self.next_block_id;
+        let id = (candidate..=u8::MAX)
+            .chain(1..candidate)
+            .find(|&id| !self.blocks.iter().any(|block| block.id == id));
+        let Some(id) = id else {
+            self.warning = Some("session limit reached; close a session to make room".to_string());
+            return;
+        };
+        self.next_block_id = if id == u8::MAX { 1 } else { id + 1 };
+        let state = if snapshot.is_some() {
+            BlockState::PickingDevice(ListPicker::default())
+        } else {
+            BlockState::Picking(ListPicker::default())
+        };
+        let mut block = Block::new_hidden(id, state);
+        block.source = snapshot.map(|snapshot| SourceSelection {
+            snapshot,
+            device: None,
+            app: None,
+            rev: 0,
+        });
+        self.blocks.push(block);
+        self.show_block(id);
+    }
+
     pub fn apply(&mut self, event: &AppEvent) {
         match event {
-            AppEvent::AddBlock => {
-                // Pick an id that is not in use. A naive `u8` wrap
-                // collides: after 256 additions, `next_block_id`
-                // rolls back to 1 while block 1 is still alive.
-                // `show_block(1)` then finds the *old* session and
-                // the new one stays hidden with the wrong focus.
-                //
-                // Scan from the candidate forward, then wrap and
-                // continue from 1, skipping any id already taken
-                // by a live block. The first free id wins. If
-                // every id in `1..=u8::MAX` is taken, we are at
-                // the realistic ceiling (~256 live sessions) and
-                // refuse the AddBlock with a visible warning; the
-                // user can close one to make room. 0 is reserved
-                // (never issued) so an unset block has a
-                // distinguishable id.
-                let candidate = self.next_block_id;
-                let id = (candidate..=u8::MAX)
-                    .chain(1..candidate)
-                    .find(|&id| !self.blocks.iter().any(|b| b.id == id));
-                let Some(id) = id else {
-                    // Exhaustion: every id in 1..=255 is in use.
-                    // Refuse the AddBlock. We *don't* drop a live
-                    // session on the user's behalf — the user
-                    // might be watching its download gauge. Set a
-                    // user-visible warning instead; the renderer
-                    // shows `state.warning` in the title bar, and
-                    // BlockClosed clears it once a slot is free.
-                    self.warning =
-                        Some("session limit reached; close a session to make room".to_string());
+            AppEvent::AddBlock => self.push_block(None),
+            AppEvent::AddSourceBlock { snapshot } => self.push_block(Some(snapshot.clone())),
+            AppEvent::SourceStepChanged {
+                block,
+                from,
+                to,
+                rev,
+                device,
+                app,
+            } => {
+                let Some(block) = self
+                    .blocks
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *block)
+                else {
                     return;
                 };
-                // Advance `next_block_id` past the issued id, so
-                // the *next* AddBlock starts scanning one higher.
-                // If `id == u8::MAX`, wrap back to 1; the scan
-                // above still finds a free slot.
-                self.next_block_id = if id == u8::MAX { 1 } else { id + 1 };
-                // Push hidden. `show_block` is the single seam
-                // that decides whether the new block fits in the
-                // visible strip: if it does, it gets flipped
-                // visible (and stamped); if not, an oldest-focused
-                // peer is evicted first. Pushing with
-                // `visible: false` keeps the cap math in one
-                // place - without it the new block would always be
-                // visible before `show_block` runs, the eviction
-                // branch would never fire, and the cap would
-                // silently grow.
-                self.blocks.push(Block::new_hidden(
-                    id,
-                    BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
-                ));
-                // `+` is the canonical "auto-show and focus, evict
-                // if full" path. Goes through `show_block` so the
-                // cap is enforced here too, not only on the
-                // menu's `Enter`.
-                self.show_block(id);
+                let step = match block.state {
+                    BlockState::PickingDevice(_) => FunnelStep::Device,
+                    BlockState::PickingApp(_) => FunnelStep::App,
+                    BlockState::Picking(_) => FunnelStep::Language,
+                    _ => FunnelStep::Committed,
+                };
+                let Some(source) = block.source.as_mut() else {
+                    return;
+                };
+                if step != *from || source.rev != *rev || *to == FunnelStep::Committed {
+                    return;
+                }
+                source.device = device.clone();
+                source.app = app.clone();
+                source.rev += 1;
+                block.state = match to {
+                    FunnelStep::Device => BlockState::PickingDevice(ListPicker {
+                        index: source
+                            .snapshot
+                            .devices
+                            .iter()
+                            .position(|row| Some(row) == source.device.as_ref())
+                            .unwrap_or(0),
+                    }),
+                    FunnelStep::App => BlockState::PickingApp(ListPicker {
+                        index: source
+                            .snapshot
+                            .apps
+                            .iter()
+                            .position(|row| Some(row) == source.app.as_ref())
+                            .unwrap_or(0),
+                    }),
+                    FunnelStep::Language => BlockState::Picking(ListPicker::default()),
+                    FunnelStep::Committed => unreachable!(),
+                };
             }
+            AppEvent::SourceStepRejected { .. } => {}
             AppEvent::FocusMoved { direction } => {
                 if self.blocks.is_empty() {
                     return;
@@ -454,8 +486,21 @@ impl UiState {
             }
             AppEvent::PickerMoved { direction, .. } => {
                 if let Some(block) = self.focused_mut() {
-                    if let BlockState::Picking(picker) = &mut block.state {
-                        picker.apply(crate::picker::PickerEvent::Moved(*direction));
+                    match &mut block.state {
+                        BlockState::Picking(picker) => {
+                            picker.apply(*direction, crate::language::LANGUAGES.len());
+                        }
+                        BlockState::PickingDevice(cursor) => {
+                            if let Some(source) = &block.source {
+                                cursor.apply(*direction, source.snapshot.devices.len());
+                            }
+                        }
+                        BlockState::PickingApp(cursor) => {
+                            if let Some(source) = &block.source {
+                                cursor.apply(*direction, source.snapshot.apps.len());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -523,19 +568,21 @@ impl UiState {
                 model,
                 error,
             } => self.fail_waiters(model, error),
-            AppEvent::BlockClosed => {
-                let removed_pending = self
-                    .blocks
-                    .get(self.focus)
-                    .map(|block| block.pending_models().to_vec())
-                    .unwrap_or_default();
-                if !self.blocks.is_empty() {
-                    self.blocks.remove(self.focus);
-                    if !self.blocks.is_empty() {
-                        self.focus = self.focus.min(self.blocks.len() - 1);
-                    }
-                    self.promote_hidden();
+            AppEvent::BlockClosed { block } => {
+                let Some(index) = self.blocks.iter().position(|candidate| candidate.id == *block)
+                else {
+                    return;
+                };
+                let removed_pending = self.blocks[index].pending_models().to_vec();
+                self.blocks.remove(index);
+                if index < self.focus {
+                    self.focus -= 1;
+                } else if !self.blocks.is_empty() {
+                    self.focus = self.focus.min(self.blocks.len() - 1);
+                } else {
+                    self.focus = 0;
                 }
+                self.promote_hidden();
                 for model in removed_pending {
                     let still_pending = self
                         .blocks
@@ -598,7 +645,25 @@ impl UiState {
             // Bus commands aimed at the loop-thread dispatcher.
             // Reducer ignores them; the dispatcher is the only
             // consumer.
-            AppEvent::BeginLanguage { .. } | AppEvent::DiscardInflight { .. } => {}
+            AppEvent::BeginLanguage {
+                block,
+                source_rev: Some(rev),
+                ..
+            } => {
+                if let Some(source) = self
+                    .blocks
+                    .iter_mut()
+                    .find(|candidate| candidate.id == *block)
+                    .and_then(|block| block.source.as_mut())
+                {
+                    if source.rev == *rev {
+                        source.rev += 1;
+                    }
+                }
+            }
+            AppEvent::RequestBlock
+            | AppEvent::BeginLanguage { .. }
+            | AppEvent::DiscardInflight { .. } => {}
         }
     }
 }
@@ -805,7 +870,7 @@ mod tests {
         let mut s = UiState::default();
         // Create block 1, then close it (frees id 1).
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 0, "block 1 closed");
         // next_block_id is now 2. Force it to the post-wrap
         // value 1; id 1 is free, so the scan picks 1.
@@ -852,12 +917,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| {
-                    Block::new(
-                        id,
-                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
-                    )
-                })
+                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -885,12 +945,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| {
-                    Block::new(
-                        id,
-                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
-                    )
-                })
+                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -921,12 +976,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| {
-                    Block::new(
-                        id,
-                        BlockState::Picking(LanguagePicker::open(PickerIntent::AddBlock)),
-                    )
-                })
+                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -938,7 +988,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         assert!(s.warning.is_some(), "warning raised on refused AddBlock");
         // Closing the focused block (id 1) frees one id slot.
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(
             s.warning.is_none(),
             "BlockClosed must clear the exhaustion warning once a slot is free"
@@ -956,7 +1006,7 @@ mod tests {
             ..UiState::default()
         };
         s.apply(&AppEvent::AddBlock);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(
             s.warning.as_deref(),
             Some("some other future warning"),
@@ -1047,7 +1097,7 @@ mod tests {
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 1);
     }
@@ -1065,7 +1115,7 @@ mod tests {
             direction: FocusMove::Prev,
         });
         assert_eq!(s.focus, 0);
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(s.focus, 0);
     }
@@ -1073,8 +1123,21 @@ mod tests {
     #[test]
     fn block_closed_with_no_blocks_is_a_noop() {
         let mut s = UiState::default();
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(s.blocks.is_empty());
+    }
+
+    #[test]
+    fn queued_close_targets_original_block_after_focus_changes() {
+        let mut s = UiState::default();
+        s.apply(&AppEvent::AddBlock);
+        let close = AppEvent::BlockClosed { block: 1 };
+        s.apply(&AppEvent::AddBlock);
+        s.apply(&close);
+        assert_eq!(s.blocks.iter().map(|block| block.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(s.focused().unwrap().id, 2);
+        s.apply(&close);
+        assert_eq!(s.focused().unwrap().id, 2);
     }
 
     #[test]
@@ -1343,7 +1406,7 @@ mod tests {
         s.apply(&AppEvent::FocusMoved {
             direction: FocusMove::Prev,
         });
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(s.downloads.contains_key(english().live.id));
         assert!(!s.downloads.contains_key(english().refine.id));
     }
@@ -1362,7 +1425,7 @@ mod tests {
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(2, vec![english().refine.id]));
 
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
 
         assert!(matches!(s.blocks[0].state, BlockState::Failed { .. }));
         assert!(s.downloads.contains_key(english().refine.id));
@@ -1535,7 +1598,7 @@ mod tests {
         assert!(!s.blocks[0].visible);
         // Close the focused block (focus=4, block 5). The slot
         // opens; `promote_hidden` brings block 1 back on screen.
-        s.apply(&AppEvent::BlockClosed);
+        s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert_eq!(s.blocks.len(), 4);
         let visible_count = s.blocks.iter().filter(|b| b.visible).count();
         assert_eq!(visible_count, 4, "the window stays at the cap");

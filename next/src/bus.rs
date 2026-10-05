@@ -25,6 +25,7 @@
 
 use std::sync::mpsc;
 
+use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
 use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 
@@ -57,8 +58,29 @@ pub enum DownloadStatus {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum AppEvent {
-    /// `+`: push a `Picking` block and focus it. Allowed at any time.
+    /// Language-picker fallback reply to `RequestBlock`.
     AddBlock,
+    /// Ask the source catalog which picker a new block should open.
+    RequestBlock,
+    AddSourceBlock {
+        snapshot: AudioSourceSnapshot,
+    },
+    /// Explicit source transition, accepted by the SQLite step/revision gate.
+    SourceStepChanged {
+        block: u8,
+        from: FunnelStep,
+        to: FunnelStep,
+        rev: u32,
+        device: Option<AudioDevice>,
+        app: Option<AppTarget>,
+    },
+    SourceStepRejected {
+        block: u8,
+        from: FunnelStep,
+        to: FunnelStep,
+        rev: u32,
+        actual: Option<(FunnelStep, u32)>,
+    },
     /// `←` / `→`: move focus between blocks.
     FocusMoved { direction: FocusMove },
     /// `↑` / `↓` while the focused block is `Picking`: move the
@@ -77,8 +99,8 @@ pub enum AppEvent {
         language: &'static LanguageProfile,
         pending: Vec<&'static str>,
     },
-    /// Esc on the focused block: remove it.
-    BlockClosed,
+    /// Remove the named block after its queued transitions have been gated.
+    BlockClosed { block: u8 },
     /// Model was already installed when the language was selected. The
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
@@ -187,6 +209,7 @@ pub enum AppEvent {
     BeginLanguage {
         block: u8,
         language: &'static LanguageProfile,
+        source_rev: Option<u32>,
     },
     /// Quit-time cleanup: drop the staged archive and unpack
     /// scratch directory for `model`. The dispatcher answers with a
@@ -380,8 +403,12 @@ mod tests {
         assert!(selected["language"].get("live").is_none());
         assert!(selected["language"].get("refine").is_none());
 
-        let command = serde_json::to_value(AppEvent::BeginLanguage { block: 3, language })
-            .expect("serialize language command");
+        let command = serde_json::to_value(AppEvent::BeginLanguage {
+            block: 3,
+            language,
+            source_rev: None,
+        })
+        .expect("serialize language command");
         assert_eq!(command["event"], "BeginLanguage");
         assert_eq!(command["block"], 3);
         assert_eq!(command["language"]["code"], language.code);

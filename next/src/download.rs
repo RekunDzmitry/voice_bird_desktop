@@ -732,7 +732,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                AppEvent::BeginLanguage { block: 1, language: selected }
+                AppEvent::BeginLanguage { block: 1, language: selected, source_rev: None }
                     if *selected == language
             )),
             "Confirm must publish BeginLanguage; got {events:?}"

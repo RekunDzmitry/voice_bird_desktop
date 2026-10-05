@@ -102,17 +102,31 @@ pub const CATALOG: &[ModelEntry] = &[
     TINY_EN,
 ];
 
-/// Why the picker was opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PickerIntent {
-    AddBlock,
-}
-
 /// Direction the picker moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PickerMove {
     Up,
     Down,
+}
+
+pub(crate) fn step(index: usize, len: usize, direction: PickerMove) -> usize {
+    let last = len.saturating_sub(1);
+    match direction {
+        PickerMove::Up => index.saturating_sub(1).min(last),
+        PickerMove::Down => index.saturating_add(1).min(last),
+    }
+}
+
+/// Selection state for a caller-owned list, with saturating movement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPicker {
+    pub index: usize,
+}
+
+impl ListPicker {
+    pub fn apply(&mut self, direction: PickerMove, len: usize) {
+        self.index = step(self.index, len, direction);
+    }
 }
 
 /// Events the picker's own reducer folds.
@@ -122,66 +136,8 @@ pub enum PickerEvent {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanguagePicker {
-    pub index: usize,
-    intent: PickerIntent,
-}
-
-impl LanguagePicker {
-    pub fn open(intent: PickerIntent) -> Self {
-        Self { index: 0, intent }
-    }
-
-    pub fn apply(
-        &mut self,
-        event: PickerEvent,
-    ) -> Option<&'static crate::language::LanguageProfile> {
-        match event {
-            PickerEvent::Moved(PickerMove::Up) => {
-                if self.index > 0 {
-                    self.index -= 1;
-                }
-                None
-            }
-            PickerEvent::Moved(PickerMove::Down) => {
-                if self.index + 1 < crate::language::LANGUAGES.len() {
-                    self.index += 1;
-                }
-                None
-            }
-            PickerEvent::Picked => crate::language::LANGUAGES.get(self.index),
-            PickerEvent::Cancelled => None,
-        }
-    }
-
-    /// Index the picker WOULD land on after applying `direction`,
-    /// without mutating. Saturation matches `apply`'s clamping.
-    pub fn peek_next(&self, direction: PickerMove) -> usize {
-        match direction {
-            PickerMove::Up => self.index.saturating_sub(1),
-            PickerMove::Down => {
-                if self.index + 1 < crate::language::LANGUAGES.len() {
-                    self.index + 1
-                } else {
-                    self.index
-                }
-            }
-        }
-    }
-
-    pub fn languages(&self) -> &'static [crate::language::LanguageProfile] {
-        crate::language::LANGUAGES
-    }
-
-    pub fn intent(&self) -> PickerIntent {
-        self.intent
-    }
-}
-
-/// Left-hand session menu. Mirrors [`LanguagePicker`]'s reducer shape
-/// (saturating at both ends, never wraps) and reuses [`PickerMove`]
-/// for its direction events so the clamp semantics live in one place.
+/// Left-hand session menu. Shares [`ListPicker`]'s saturating movement
+/// (never wraps) and uses [`PickerMove`] for direction events.
 ///
 /// `index` is a position into [`crate::state::UiState::blocks`] — the
 /// menu lists *all* sessions in creation order, not just the visible
@@ -207,29 +163,11 @@ impl SessionMenu {
     /// visible subset), so the clamp lives at the menu layer rather
     /// than at the resolver.
     pub fn apply(&mut self, event: PickerEvent, len: usize) {
-        if len == 0 {
-            // No rows: keep `index` at zero so the next opening of
-            // the menu starts there. Nothing renders anyway.
-            self.index = 0;
-            return;
+        if let PickerEvent::Moved(direction) = event {
+            self.index = step(self.index, len, direction);
+        } else {
+            self.index = self.index.min(len.saturating_sub(1));
         }
-        let last = len - 1;
-        match event {
-            PickerEvent::Moved(PickerMove::Up) => {
-                self.index = self.index.saturating_sub(1);
-            }
-            PickerEvent::Moved(PickerMove::Down) => {
-                if self.index < last {
-                    self.index += 1;
-                }
-            }
-            // Picked / Cancelled do not move the highlight.
-            PickerEvent::Picked | PickerEvent::Cancelled => {}
-        }
-        // Belt-and-braces: if the caller fed a `len` smaller than
-        // `index` (e.g. the focused block was removed while the menu
-        // was open), clamp back inside.
-        self.index = self.index.min(last);
     }
 }
 
@@ -249,57 +187,40 @@ mod tests {
     }
 
     #[test]
-    fn open_starts_at_zero() {
-        let p = LanguagePicker::open(PickerIntent::AddBlock);
-        assert_eq!(p.index, 0);
-        assert_eq!(p.intent(), PickerIntent::AddBlock);
-    }
-
-    #[test]
-    fn apply_moved_up_at_zero_stays_at_zero() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        assert!(p.apply(PickerEvent::Moved(PickerMove::Up)).is_none());
-        assert_eq!(p.index, 0);
-    }
-
-    #[test]
-    fn apply_moved_down_at_last_clamps() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        for _ in 0..(crate::language::LANGUAGES.len() + 5) {
-            assert!(p.apply(PickerEvent::Moved(PickerMove::Down)).is_none());
+    fn list_picker_saturates_at_both_ends() {
+        let mut picker = ListPicker { index: 0 };
+        picker.apply(PickerMove::Up, 3);
+        assert_eq!(picker.index, 0);
+        for _ in 0..5 {
+            picker.apply(PickerMove::Down, 3);
         }
-        assert_eq!(p.index, crate::language::LANGUAGES.len() - 1);
+        assert_eq!(picker.index, 2);
+        for _ in 0..5 {
+            picker.apply(PickerMove::Up, 3);
+        }
+        assert_eq!(picker.index, 0);
     }
 
     #[test]
-    fn apply_moved_down_then_up_returns_to_previous() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        p.apply(PickerEvent::Moved(PickerMove::Down));
-        assert_eq!(p.index, 0);
-        p.apply(PickerEvent::Moved(PickerMove::Up));
-        assert_eq!(p.index, 0);
+    fn list_picker_moves_down_then_up() {
+        let mut picker = ListPicker { index: 1 };
+        picker.apply(PickerMove::Down, 3);
+        assert_eq!(picker.index, 2);
+        picker.apply(PickerMove::Up, 3);
+        assert_eq!(picker.index, 1);
     }
 
     #[test]
-    fn apply_picked_returns_language_profile() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        let profile = p.apply(PickerEvent::Picked).expect("picked");
-        assert_eq!(profile.code, crate::language::LANGUAGES[0].code);
-    }
+    fn list_picker_clamps_empty_and_shrinking_lists() {
+        for direction in [PickerMove::Up, PickerMove::Down] {
+            let mut picker = ListPicker { index: usize::MAX };
+            picker.apply(direction, 0);
+            assert_eq!(picker.index, 0);
 
-    #[test]
-    fn apply_cancelled_returns_none() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        assert!(p.apply(PickerEvent::Cancelled).is_none());
-    }
-
-    #[test]
-    fn apply_picked_after_close_is_safe() {
-        let mut p = LanguagePicker::open(PickerIntent::AddBlock);
-        let first = p.apply(PickerEvent::Picked).unwrap();
-        let second = p.apply(PickerEvent::Picked).unwrap();
-        assert_eq!(first.code, second.code);
-        assert_eq!(first.code, crate::language::LANGUAGES[0].code);
+            picker.index = 4;
+            picker.apply(direction, 3);
+            assert_eq!(picker.index, 2);
+        }
     }
 
     #[test]

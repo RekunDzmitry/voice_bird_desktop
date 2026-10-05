@@ -50,8 +50,14 @@ fn restore_terminal() {
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if voice_bird_next::dispatcher::source_query_panicking() {
+            return;
+        }
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
+        }
         default_hook(info);
     }));
 }
@@ -114,7 +120,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-    let dispatcher = Dispatcher::new(downloader.clone(), store.clone());
+    let dispatcher = Dispatcher::new(
+        downloader.clone(),
+        store.clone(),
+        voice_bird_next::audio_source::system_sources(),
+    );
     let watcher = ModelWatcher::new(store.clone());
     let mut dirty = true;
     loop {
@@ -138,17 +148,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         watcher.check(&state, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         if !events.is_empty() {
-            for ev in &events {
+            let mut accepted_events = Vec::with_capacity(events.len());
+            for ev in events {
                 if let Some(l) = log.as_mut() {
-                    l.append(ev);
+                    l.append(&ev);
                 }
-                if let Ok(accepted) = downloads::apply(&mut db, ev) {
-                    if accepted {
-                        state.apply(ev);
+                match voice_bird_next::db::apply(&mut db, &ev) {
+                    Ok(true) => {
+                        state.apply(&ev);
+                        accepted_events.push(ev);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("voice-bird-next: event gate failed for {ev:?}: {error}");
                     }
                 }
             }
-            dispatcher.dispatch(&events, &mut db, &tx);
+            dispatcher.dispatch(&accepted_events, &mut db, &tx);
             dirty = true;
         }
         if state.should_quit {

@@ -3,17 +3,16 @@
 //! One file per machine, opened at the OS data directory (the same
 //! resolution [`crate::event_log`] uses). The module is kept small
 //! on purpose: every table is an implementation of [`Table`], and
-//! [`Database::open`] / [`migrate`] / [`db_path`] are the only entry
-//! points. Adding a new table is one impl of the trait, one line in
-//! `Database::open`'s `migrate` call, and one module of free
-//! functions that take `&mut Database`.
+//! [`Database::open`] runs each table's migration and session recovery.
+//! Table operations take `&mut Database`; [`apply`] composes their
+//! event gates before the reducer or dispatcher can observe an event.
 
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use rusqlite::Connection;
 
-use crate::bus::EventSender;
+use crate::bus::{AppEvent, EventSender};
 
 /// A table in the local SQLite file. Implementing this trait is the
 /// only obligation: name + definition. New tables plug into
@@ -73,7 +72,11 @@ pub fn db_path() -> Option<PathBuf> {
     if let Some(proj) = ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next") {
         return Some(proj.data_dir().join("downloads.sqlite"));
     }
-    Some(std::env::temp_dir().join("voice-bird-next").join("downloads.sqlite"))
+    Some(
+        std::env::temp_dir()
+            .join("voice-bird-next")
+            .join("downloads.sqlite"),
+    )
 }
 
 /// Extension trait so each `Table` impl can hand its `DEFINITION` /
@@ -118,6 +121,7 @@ impl Database {
     pub fn open(path: &Path, tx: EventSender) -> rusqlite::Result<Self> {
         let conn = open(path)?;
         migrate(&conn, &[downloads::DownloadsTable])?;
+        migrate(&conn, &[block_steps::BlockStepsTable])?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
@@ -166,13 +170,20 @@ impl Database {
     /// Used by `download::tests::*` to drive `downloads::start`
     /// failure paths (e.g. a read-only connection whose writes
     /// return `SQLITE_READONLY`).
-    pub fn from_connection_for_test(
-        conn: Connection,
-        path: PathBuf,
-        tx: EventSender,
-    ) -> Self {
+    pub fn from_connection_for_test(conn: Connection, path: PathBuf, tx: EventSender) -> Self {
         Self { conn, path, tx }
     }
 }
 
+pub mod block_steps;
 pub mod downloads;
+
+/// Apply every table's event gate. Only a `true` result may reach
+/// the reducer or dispatcher: a rejected source-language command
+/// must never start model downloads.
+pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
+    if !block_steps::apply(db, ev)? {
+        return Ok(false);
+    }
+    downloads::apply(db, ev)
+}
