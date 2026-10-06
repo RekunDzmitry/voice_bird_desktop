@@ -3,7 +3,7 @@ use proptest::prelude::*;
 use voice_bird_next::{
     language::LANGUAGES,
     picker::{ListPicker, SessionMenu, CATALOG},
-    state::{Block, BlockState, DownloadPhase, DownloadState, UiState},
+    consumer::ui_state::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     testing::render_to_string,
 };
 
@@ -42,7 +42,7 @@ const MENU_OPEN_MANY: &str = concat!(
 
 #[test]
 fn idle_100x30_matches_golden() {
-    let out = render_to_string(&UiState::default(), 100, 30);
+    let out = render_to_string(&UiView::default(), 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(IDLE, &out).expect("write golden");
     }
@@ -52,7 +52,7 @@ fn idle_100x30_matches_golden() {
 
 #[test]
 fn three_blocks_100x30_matches_golden() {
-    let state = UiState {
+    let state = UiView {
         blocks: (1..=3)
             .map(|id| Block {
                 id,
@@ -76,7 +76,7 @@ fn three_blocks_100x30_matches_golden() {
 
 #[test]
 fn picking_100x30_matches_golden() {
-    let state = UiState {
+    let state = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::Picking(ListPicker::default()),
@@ -97,7 +97,7 @@ fn picking_100x30_matches_golden() {
 
 #[test]
 fn downloading_two_blocks_100x30_matches_golden() {
-    let mut state = UiState {
+    let mut state = UiView {
         blocks: (1..=2)
             .map(|id| Block {
                 id,
@@ -133,7 +133,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
 
 #[test]
 fn failed_100x30_matches_golden() {
-    let state = UiState {
+    let state = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::Failed {
@@ -158,7 +158,7 @@ fn failed_100x30_matches_golden() {
 
 #[test]
 fn picker_renders_languages_without_model_ids() {
-    let state = UiState {
+    let state = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::Picking(ListPicker::default()),
@@ -181,7 +181,7 @@ fn five_blocks_capped_100x30_matches_golden() {
     // Five sessions, menu closed. The cap keeps the window at 4
     // columns; block 1 is hidden (evicted as the oldest-focused
     // visible peer when block 5 was added).
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..5 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -212,7 +212,7 @@ fn menu_open_100x30_matches_golden() {
     // 18 columns; the remaining 4 visible blocks fill the rest.
     // Highlight is on the 5th row (block 5), which is the most-
     // recently-focused one and still visible.
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..5 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -231,7 +231,7 @@ fn menu_open_many_100x30_matches_golden() {
     // them all, so it scrolls. Selection is on session 27 (the
     // user-reported bug case) — the carousel window must contain
     // row 27 with `▶`, even though session 1 is no longer visible.
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..31 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -275,7 +275,7 @@ fn warning_renders_in_title_bar_when_set() {
     // Set a transient warning and assert the title bar carries it.
     // The base title "Voice Bird" is replaced/augmented by the
     // warning text; the renderer joins them with " — ! ".
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     s.warning = Some("session limit reached; close a session to make room".to_string());
     let out = render_to_string(&s, 100, 30);
@@ -294,7 +294,7 @@ fn warning_renders_in_title_bar_when_set() {
 #[test]
 fn title_bar_is_clean_when_no_warning() {
     // Steady state: title is just "Voice Bird", no warning suffix.
-    let s = UiState::default();
+    let s = UiView::default();
     let out = render_to_string(&s, 100, 30);
     let first_line = out.lines().next().unwrap_or("");
     assert!(
@@ -319,7 +319,7 @@ fn title_bar_is_clean_when_no_warning() {
 /// on a block the user cannot see.
 #[test]
 fn focus_left_into_hidden_block_reveals_it() {
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..5 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -408,7 +408,7 @@ fn focus_right_into_hidden_block_reveals_it() {
     // `focus_right_at_right_edge_clamps_without_panic`. This
     // test stays as a placeholder documenting why we don't
     // exercise the reveal-on-Next path.
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     assert_eq!(s.focus, 1);
@@ -432,7 +432,7 @@ fn focus_right_into_hidden_block_reveals_it() {
 
 #[test]
 fn focus_left_at_left_edge_saturates_without_panic() {
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     assert_eq!(s.focus, 0);
     s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
@@ -444,7 +444,7 @@ fn focus_left_at_left_edge_saturates_without_panic() {
 
 #[test]
 fn focus_right_at_right_edge_clamps_without_panic() {
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     assert_eq!(s.focus, 0);
     s.apply(&voice_bird_next::bus::AppEvent::FocusMoved {
@@ -459,7 +459,7 @@ fn focus_left_across_visible_blocks_does_not_evict_a_peer() {
     // The reveal-on-hidden fix must NOT churn the visible strip
     // when the destination is already visible. Walking across
     // visible blocks must only restamp; no eviction.
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..3 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -494,7 +494,7 @@ fn focus_reveal_evicts_the_lru_visible_peer() {
     // should be evicted. Walking Left four times into a 5-block
     // state reveals block 1; block 5 (the most-recently-focused,
     // now LRU) should be evicted.
-    let mut s = UiState::default();
+    let mut s = UiView::default();
     for _ in 0..5 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
@@ -536,7 +536,7 @@ fn focus_reveal_evicts_the_lru_visible_peer() {
 proptest! {
     #[test]
     fn render_never_panics_for_any_size(w in 1u16..200, h in 1u16..80) {
-        let _ = render_to_string(&UiState::default(), w, h);
+        let _ = render_to_string(&UiView::default(), w, h);
     }
 
     #[test]
@@ -545,7 +545,7 @@ proptest! {
         h in 1u16..80,
         blocks in 0usize..20,
     ) {
-        let state = UiState {
+        let state = UiView {
             blocks: (1..=blocks as u8)
                 .map(|i| Block {
                     id: i,
@@ -577,7 +577,7 @@ proptest! {
         } else {
             Some(0)
         };
-        let mut state = UiState {
+        let mut state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -604,15 +604,15 @@ proptest! {
     }
 }
 
-fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiState {
+fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiView {
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
-    let source = voice_bird_next::audio_source::SourceSelection {
+    let source = voice_bird_next::producer::sources::SourceSelection {
         device: device.map(|index| snapshot.devices[index].clone()),
         app: app.map(|index| snapshot.apps[index].clone()),
         snapshot,
         rev: 0,
     };
-    UiState {
+    UiView {
         blocks: vec![Block {
             id: 1,
             state,
@@ -623,7 +623,7 @@ fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usiz
     }
 }
 
-fn source_golden(name: &str, state: UiState) {
+fn source_golden(name: &str, state: UiView) {
     let out = render_to_string(&state, 100, 30);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/snapshots")
@@ -743,7 +743,7 @@ fn long_source_lists_keep_selection_and_back_visible_on_resize() {
     );
     let source = state.blocks[0].source.as_mut().unwrap();
     source.snapshot.apps = (0..40)
-        .map(|index| voice_bird_next::audio_source::AppTarget {
+        .map(|index| voice_bird_next::producer::sources::AppTarget {
             id: format!("app.{index}"),
             name: format!("App {index}"),
             pid: index,

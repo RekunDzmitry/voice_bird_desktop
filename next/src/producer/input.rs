@@ -5,7 +5,7 @@
 //! out of `main.rs` keeps the binary entry point focused on terminal
 //! plumbing (raw mode, alt screen, panic hook, the render loop) and
 //! puts everything that talks to the bus next to the bus itself.
-use crate::audio_source::{DeviceKind, FunnelStep};
+use crate::producer::sources::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
 
@@ -13,11 +13,11 @@ use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
-use crate::state::{BlockState, UiState};
+use crate::consumer::ui_state::{BlockState, UiView};
 /// Stamp the `from_language`/`to_language` codes onto `PickerMoved`.
 /// The input layer has no registry context, so the resolver reads the
 /// focused block's picker without mutating it.
-pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::PickerMove) {
+pub fn stamp_picker_move(tx: &EventSender, state: &UiView, direction: picker::PickerMove) {
     let (from_language, to_language) = match state.focused() {
         Some(block) => match &block.state {
             BlockState::Picking(picker) => {
@@ -38,11 +38,11 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
 /// - `Confirm` and `Retry` publish [`AppEvent::BeginLanguage`] with the
-///   target block id. The dispatcher owns the downloader and model store.
+///   target block id. The consumer routes it to the download producer.
 /// - All other intents are direct mappings.
 ///
 /// [`AppEvent::BeginLanguage`]: crate::bus::AppEvent::BeginLanguage
-pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &EventSender) {
+pub fn resolve_intent(intent: Intent, state: &UiView, db: &mut Database, tx: &EventSender) {
     // intents are hijacked to drive the menu instead of falling
     // through to their default reducer. Branch on `state.menu.is_some()`
     // FIRST so the menu's behaviour is local and obvious; everything
@@ -225,7 +225,7 @@ mod tests {
     use crate::db::Database;
     use crate::language::{LanguageProfile, LANGUAGES};
     use crate::picker::SessionMenu;
-    use crate::state::Block;
+    use crate::consumer::ui_state::Block;
 
     fn english() -> &'static LanguageProfile {
         &LANGUAGES[0]
@@ -247,8 +247,8 @@ mod tests {
     /// The state with five Picking blocks (one focused). Mirrors the
     /// original `state_with_five_blocks` helper but walks the bus so
     /// the reducer's AddBlock path — including `show_block` — runs.
-    fn state_with_five_blocks() -> UiState {
-        let mut s = UiState::default();
+    fn state_with_five_blocks() -> UiView {
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -264,7 +264,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
+        let mut state = UiView::default();
         state.apply(&AppEvent::AddBlock);
         resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
@@ -280,7 +280,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
+        let state = UiView::default();
         resolve_intent(Intent::Quit, &state, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
         assert!(
@@ -294,7 +294,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
+        let mut state = UiView::default();
         for model in english().models() {
             crate::db::downloads::start(&mut h.db, model.id).unwrap();
         }
@@ -322,7 +322,7 @@ mod tests {
         let tx = bus.sender();
         let mut h = db_with(&bus);
         crate::db::downloads::start(&mut h.db, english().refine.id).unwrap();
-        let mut state = UiState::default();
+        let mut state = UiView::default();
         state.blocks.push(Block::new(
             1,
             BlockState::Failed {
@@ -349,7 +349,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
+        let state = UiView::default();
         resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
@@ -363,9 +363,9 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState {
+        let state = UiView {
             menu: Some(SessionMenu::open_at(0)),
-            ..UiState::default()
+            ..UiView::default()
         };
         resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
@@ -474,7 +474,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
+        let state = UiView::default();
         resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
@@ -491,7 +491,7 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
+        let mut state = UiView::default();
         for _ in 0..3 {
             state.apply(&AppEvent::AddBlock);
         }

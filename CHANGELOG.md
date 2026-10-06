@@ -1,5 +1,15 @@
 # Changelog
 
+## Next (unreleased)
+
+- Refactor `voice-bird-next` into producers, an event bus, the SQLite gate,
+  and a consumer-owned `UiView`; remove the dispatcher and old state modules.
+- Schedule input, source enumeration, downloads, and model-watch ticks with
+  Tokio. Stream HTTP downloads asynchronously; run native enumeration and
+  model installation on the blocking pool.
+- Preserve serialized source requests, session panic fallback, download
+  cancellation, render snapshots, and immediate Quit without joining stalled work.
+
 ## 0.5.0 (2026-08-05)
 
 Breaking: the local agent / Kafka funnel path is retired. Agents are

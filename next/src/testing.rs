@@ -1,20 +1,20 @@
 //! Test helpers. Compiled unconditionally (not `#[cfg(test)]`) so the
 //! `tests/` integration crate can use them too.
 
-use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, DeviceKind, SourceCatalog};
+use crate::consumer::UiView;
 use crate::db::downloads::CancelCheck;
-use crate::download::{DownloadError, Downloader};
+use crate::producer::download::{DownloadError, Downloader};
+use crate::producer::sources::{AppTarget, AudioDevice, AudioSourceSnapshot, DeviceKind, SourceCatalog};
 use crate::picker::ModelEntry;
-use crate::state::UiState;
 use crate::transcription_models::{handler_for, ModelStore};
 use crate::ui;
 use ratatui::{backend::TestBackend, Terminal};
+use tokio::io::AsyncWriteExt;
 
 /// Fixed source snapshot, including the unavailable (`None`) fallback.
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ pub fn sample_source_snapshot() -> AudioSourceSnapshot {
 
 /// Render `state` into a `w`×`h` in-memory terminal and return the cell
 /// grid as text, one line per row.
-pub fn render_to_string(state: &UiState, w: u16, h: u16) -> String {
+pub fn render_to_string(state: &UiView, w: u16, h: u16) -> String {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal.draw(|f| ui::render(f, state)).expect("draw");
@@ -127,7 +127,7 @@ impl ModelStore for FixtureStore {
     fn install(
         &self,
         entry: &ModelEntry,
-        _staged: &Path,
+        staged: &Path,
         cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
         // The fixture install is a Vec push — no filesystem work to
@@ -140,10 +140,9 @@ impl ModelStore for FixtureStore {
         // Mark the model present so subsequent is_available checks
         // observe the post-install state. The integration test wants
         // to assert the resolver reached `install`.
-        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
         self.present.lock().unwrap().push(entry.id);
         // Drop any staged file we created during the test.
-        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
+        let _ = std::fs::remove_file(staged);
         Ok(())
     }
 
@@ -178,12 +177,11 @@ pub struct FixtureDownloader {
     pub bytes: Vec<u8>,
     pub outcome: Outcome,
     pub calls: Arc<AtomicUsize>,
-    /// When , the fetched bytes don't need to match
-    /// . Tests for the success path need this because
-    /// synthetic bytes never hash to the real catalog sha.
+    /// When true, the fetched bytes don't need to match the catalog SHA.
+    /// Success tests use this because their synthetic bytes aren't model files.
     pub skip_sha_verify: bool,
     /// Per-chunk delay. Lets a test interleave cancellation before
-    /// the thread completes. `0` for the fast path.
+    /// the task completes. `0` for the fast path.
     pub delay_ms: u64,
 }
 
@@ -198,7 +196,7 @@ impl FixtureDownloader {
         }
     }
 
-    /// Construct a downloader that verifies the sha against .
+    /// Construct a downloader that verifies the SHA against `expected_sha`.
     pub fn with_sha_verify(bytes: Vec<u8>, outcome: Outcome, calls: Arc<AtomicUsize>) -> Self {
         Self {
             bytes,
@@ -223,50 +221,56 @@ pub enum Outcome {
     ShaMismatch,
 }
 
+#[async_trait::async_trait]
 impl Downloader for FixtureDownloader {
-    fn fetch(
+    async fn fetch(
         &self,
         _url: &str,
         staged: &Path,
         expected_sha: &str,
-        cancel: &mut dyn CancelCheck,
-        progress: &mut dyn FnMut(u64, Option<u64>),
+        cancel: &mut (dyn CancelCheck + Send),
+        progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<(), DownloadError> {
         use sha2::{Digest, Sha256};
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.outcome == Outcome::Cancelled {
-            // Set the flag the test is observing: for `&AtomicBool`
-            // (the test fixture) this is a no-op for already-set
-            // flags; for `CancelProbe` it would be similarly
-            // idempotent. Production wiring never goes through this
-            // branch — `Outcome::Cancelled` is a test-only signal.
+        if self.outcome == Outcome::Cancelled || cancel.is_cancelled() {
+            let _ = tokio::fs::remove_file(staged).await;
+            return Err(DownloadError::Cancelled);
         }
-        let mut cursor = Cursor::new(&self.bytes);
+        let mut out = tokio::fs::File::create(staged)
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
         let total = Some(self.bytes.len() as u64);
         let mut hasher = Sha256::new();
-        let mut buf = [0u8; 1 << 16];
         let mut total_read: u64 = 0;
-        loop {
+        for chunk in self.bytes.chunks(1 << 16) {
+            if self.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            }
             if cancel.is_cancelled() {
-                let _ = std::fs::remove_file(staged);
+                drop(out);
+                let _ = tokio::fs::remove_file(staged).await;
                 return Err(DownloadError::Cancelled);
             }
-            if self.delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(self.delay_ms));
-            }
-            let n = cursor
-                .read(&mut buf)
+            out.write_all(chunk)
+                .await
                 .map_err(|e| DownloadError::Io(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            total_read += n as u64;
+            hasher.update(chunk);
+            total_read += chunk.len() as u64;
             progress(total_read, total);
         }
+        if cancel.is_cancelled() {
+            drop(out);
+            let _ = tokio::fs::remove_file(staged).await;
+            return Err(DownloadError::Cancelled);
+        }
+        out.flush()
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
+        drop(out);
         let got = hex::encode(hasher.finalize());
         if self.outcome == Outcome::ShaMismatch || (!self.skip_sha_verify && got != expected_sha) {
-            let _ = std::fs::remove_file(staged);
+            let _ = tokio::fs::remove_file(staged).await;
             return Err(DownloadError::Sha256Mismatch {
                 got,
                 expected: expected_sha.to_string(),

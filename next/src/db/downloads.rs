@@ -181,7 +181,7 @@ fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
 /// Callers pass the whole database, then pick the table they need.
 /// Adding a second table later is one new module of free functions
 /// and one more `&Database` borrow — no signature churn in
-/// `producer::resolve_intent`, `download::begin_language`,
+/// `producer::input::resolve_intent`, `producer::download::begin_language`,
 /// `main::handle_key`, etc.
 pub fn get(db: &Database, model: &str) -> rusqlite::Result<Option<DownloadRow>> {
     db.conn_ref()

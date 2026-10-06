@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::state::{Block, UiState};
+use crate::consumer::ui_state::{Block, UiView};
 use crate::transcription_models::ModelStore;
 
 pub struct ModelWatcher {
@@ -18,7 +18,7 @@ impl ModelWatcher {
 
     /// Publish once per distinct model counted as installed but missing on disk.
     /// Reducing the event adds it to pending, excluding it from the next check.
-    pub fn check(&self, state: &UiState, tx: &EventSender) {
+    pub fn check(&self, state: &UiView, tx: &EventSender) {
         let mut checked = BTreeSet::new();
         for model in state.blocks.iter().flat_map(Block::ready_models) {
             if checked.insert(model.id) && !self.store.is_available(model) {
@@ -34,7 +34,7 @@ mod tests {
     use crate::bus::EventBus;
     use crate::language::LANGUAGES;
     use crate::picker::ListPicker;
-    use crate::state::BlockState;
+    use crate::consumer::ui_state::BlockState;
     use crate::testing::FixtureStore;
 
     #[test]
@@ -46,12 +46,12 @@ mod tests {
             &language.models().map(|model| model.id),
         ));
         let watcher = ModelWatcher::new(store.clone());
-        let mut state = UiState {
+        let mut state = UiView {
             blocks: vec![
                 Block::new(1, BlockState::Recording { language }),
                 Block::new(2, BlockState::Recording { language }),
             ],
-            ..UiState::default()
+            ..UiView::default()
         };
         state.blocks[1].visible = false;
         let mut bus = EventBus::new();
@@ -75,7 +75,7 @@ mod tests {
         let language = &LANGUAGES[0];
         let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
         let watcher = ModelWatcher::new(store);
-        let state = UiState {
+        let state = UiView {
             blocks: vec![
                 Block::new(1, BlockState::Picking(ListPicker::default())),
                 Block::new(2, BlockState::Failed {
@@ -88,7 +88,7 @@ mod tests {
                     pending: vec![language.refine.id],
                 }),
             ],
-            ..UiState::default()
+            ..UiView::default()
         };
         let mut bus = EventBus::new();
         watcher.check(&state, &bus.sender());

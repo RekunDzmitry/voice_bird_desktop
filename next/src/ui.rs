@@ -1,6 +1,6 @@
 //! Block-level rendering.
 //!
-//! `render` is a pure function of `&UiState`. N concurrent blocks at
+//! `render` is a pure function of `&UiView`. N concurrent blocks at
 //! N stages each render inside their own column; arrows move focus, the
 //! focused block draws `Borders::ALL` while the rest draw
 //! `Borders::LEFT | Borders::RIGHT` so adjacent columns share a `│`
@@ -15,10 +15,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::audio_source::DeviceKind;
+use crate::producer::sources::DeviceKind;
 use crate::language::{LanguageProfile, LANGUAGES};
 use crate::picker::ListPicker;
-use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
+use crate::consumer::ui_state::{BlockState, DownloadPhase, DownloadState, UiView};
 
 /// Draw one frame: outer window with `state.title` in its top border,
 /// then `state.blocks` evenly-distributed columns inside.
@@ -28,7 +28,7 @@ use crate::state::{BlockState, DownloadPhase, DownloadState, UiState};
 /// - `Waiting` → one gauge per model role.
 /// - `Recording` → `● recording (mocked)`.
 /// - `Failed` → the error wrapped, plus `r retry · Esc close`.
-pub fn render(f: &mut Frame, state: &UiState) {
+pub fn render(f: &mut Frame, state: &UiView) {
     // When the reducer sets a transient warning (e.g. "session
     // limit reached; close a session to make room"), append it to
     // the title bar so the user actually sees it. The title bar
@@ -71,7 +71,7 @@ pub fn render(f: &mut Frame, state: &UiState) {
     // enforced in the reducer's `show_block`, so the renderer never
     // has to clamp. If no block is visible (e.g. nothing has been
     // created yet), skip the layout entirely.
-    let visible: Vec<&crate::state::Block> = state.blocks.iter().filter(|b| b.visible).collect();
+    let visible: Vec<&crate::consumer::ui_state::Block> = state.blocks.iter().filter(|b| b.visible).collect();
     if !visible.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
@@ -98,10 +98,10 @@ pub fn render(f: &mut Frame, state: &UiState) {
 
 fn render_block(
     f: &mut Frame,
-    block: &crate::state::Block,
+    block: &crate::consumer::ui_state::Block,
     focused: bool,
     area: Rect,
-    state: &UiState,
+    state: &UiView,
 ) {
     let border = block_border(focused);
     let title = block_title(block);
@@ -140,7 +140,7 @@ fn block_border(focused: bool) -> Block<'static> {
     }
 }
 
-fn block_title(block: &crate::state::Block) -> String {
+fn block_title(block: &crate::consumer::ui_state::Block) -> String {
     let mut title = block.id.to_string();
     if let Some(source) = &block.source {
         let visible_labels = match &block.state {
@@ -169,7 +169,7 @@ fn block_title(block: &crate::state::Block) -> String {
     title
 }
 
-fn render_source_picker(f: &mut Frame, block: &crate::state::Block, selected: usize, area: Rect) {
+fn render_source_picker(f: &mut Frame, block: &crate::consumer::ui_state::Block, selected: usize, area: Rect) {
     let Some(source) = &block.source else { return };
     let picking_device = matches!(block.state, BlockState::PickingDevice(_));
     let total = if picking_device {
@@ -252,7 +252,7 @@ fn menu_window(total: usize, selected: usize, height: usize) -> (usize, usize) {
 /// every keystroke. This makes the menu responsive to terminal
 /// resizes (the window follows `inner.height`) without needing
 /// a separate scroll state on the menu itself.
-fn render_menu(f: &mut Frame, state: &UiState, menu: &crate::picker::SessionMenu, area: Rect) {
+fn render_menu(f: &mut Frame, state: &UiView, menu: &crate::picker::SessionMenu, area: Rect) {
     let border = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().bold());
@@ -286,7 +286,7 @@ fn render_menu(f: &mut Frame, state: &UiState, menu: &crate::picker::SessionMenu
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn block_body_lines(block: &crate::state::Block, _state: &UiState) -> Vec<Line<'static>> {
+fn block_body_lines(block: &crate::consumer::ui_state::Block, _state: &UiView) -> Vec<Line<'static>> {
     match &block.state {
         BlockState::Picking(picker) => {
             let mut lines = picker_lines(picker);
@@ -310,7 +310,7 @@ fn render_waiting(
     f: &mut Frame,
     language: &'static LanguageProfile,
     pending: &[&'static str],
-    state: &UiState,
+    state: &UiView,
     area: Rect,
 ) {
     let rows = Layout::new(
@@ -421,12 +421,12 @@ pub fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::language::LANGUAGES;
-    use crate::state::Block;
+    use crate::consumer::ui_state::Block;
     use crate::testing::render_to_string;
 
     #[test]
     fn window_is_an_empty_bordered_box_with_title() {
-        let out = render_to_string(&UiState::default(), 40, 5);
+        let out = render_to_string(&UiView::default(), 40, 5);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 5);
         assert_eq!(lines[0], format!("┌ Voice Bird {}┐", "─".repeat(26)));
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn title_comes_from_state() {
-        let state = UiState {
+        let state = UiView {
             title: "Hello".to_string(),
             ..Default::default()
         };
@@ -449,13 +449,13 @@ mod tests {
     #[test]
     fn tiny_sizes_do_not_panic() {
         for (w, h) in [(1, 1), (2, 2), (3, 3), (10, 2), (5, 40), (200, 1)] {
-            let _ = render_to_string(&UiState::default(), w, h);
+            let _ = render_to_string(&UiView::default(), w, h);
         }
     }
 
     #[test]
     fn one_block_picking_lists_languages_with_marker() {
-        let state = UiState {
+        let state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Picking(ListPicker::default()),
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn recording_title_uses_language_code() {
-        let state = UiState {
+        let state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Recording {
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn focused_block_border_differs_from_unfocused() {
-        let state = UiState {
+        let state = UiView {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn three_blocks_split_into_language_titled_columns() {
-        let state = UiState {
+        let state = UiView {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn many_blocks_in_a_tiny_terminal_do_not_panic() {
-        let state = UiState {
+        let state = UiView {
             blocks: (1..=5)
                 .map(|id| Block {
                     id,
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn waiting_block_draws_separate_role_gauges() {
-        let mut state = UiState {
+        let mut state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn waiting_block_shows_completed_role_as_ready() {
-        let state = UiState {
+        let state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn waiting_block_installing_phase_says_preparing_by_role() {
-        let mut state = UiState {
+        let mut state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn waiting_block_without_content_length_uses_model_rate() {
-        let mut state = UiState {
+        let mut state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn failed_block_shows_language_error_and_retry_hint() {
-        let state = UiState {
+        let state = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Failed {
@@ -717,7 +717,7 @@ mod tests {
         // After 5 AddBlocks the cap is reached: 4 columns visible,
         // 1 hidden. The hidden block does not contribute a column
         // title. The menu is closed so no panel steals width.
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&crate::bus::AppEvent::AddBlock);
         }
@@ -751,7 +751,7 @@ mod tests {
         // session as a plain "session N" row — model names and
         // picker state are deliberately absent (the column strip
         // on the right owns those).
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&crate::bus::AppEvent::AddBlock);
         }

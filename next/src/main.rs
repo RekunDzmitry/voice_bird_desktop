@@ -2,23 +2,23 @@
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyEvent},
+    event::{Event, EventStream, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use futures::StreamExt;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
 use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
 use voice_bird_next::db::{downloads, Database};
-use voice_bird_next::dispatcher::Dispatcher;
-use voice_bird_next::download::Downloader;
+use voice_bird_next::consumer::{Consumer, UiView};
+use voice_bird_next::producer::download::Downloader;
 #[cfg(feature = "net")]
-use voice_bird_next::download::HttpDownloader;
-use voice_bird_next::model_watch::ModelWatcher;
-use voice_bird_next::state::UiState;
+use voice_bird_next::producer::download::HttpDownloader;
+use voice_bird_next::producer::model_watch::ModelWatcher;
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 use voice_bird_next::{input, producer};
 /// Runs `restore` on drop.
@@ -52,7 +52,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        if voice_bird_next::dispatcher::source_query_panicking() {
+        if voice_bird_next::producer::sources::source_query_panicking() {
             return;
         }
         if std::thread::current().id() == ui_thread {
@@ -70,31 +70,29 @@ fn main() -> io::Result<()> {
         restore_terminal,
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run(&mut terminal)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run(&mut terminal));
+    // A stalled native query or transfer must never delay restoring the TUI.
+    rt.shutdown_background();
+    result
 }
 
-/// Map one key press to bus events via the [`producer`] module.
-/// [`producer::resolve_intent`] is the single seam where user
-/// intent becomes [`AppEvent`]s; the reducer does the rest.
-///
-/// The resolver does NOT hold `Downloader` or `ModelStore` — it
-/// only publishes `BeginLanguage` on Enter/Retry. The dispatcher
-/// that owns the collaborators answers it.
-fn handle_key(key: KeyEvent, state: &UiState, db: &mut Database, tx: &EventSender) {
+/// Resolve keys into events without mutating the UI projection.
+fn handle_key(key: KeyEvent, view: &UiView, db: &mut Database, tx: &EventSender) {
     if let Some(intent) = input::map_key(key) {
-        producer::resolve_intent(intent, state, db, tx);
+        producer::input::resolve_intent(intent, view, db, tx);
     }
 }
-/// Drive one tick: draw if dirty, drain events, fold into state. The
-/// 100 ms poll bounds bar latency at 10 fps while the dirty flag keeps
-/// an idle app from spamming the terminal.
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+
+/// Keep SQLite on this task while Tokio schedules input and producer work.
+async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     const TICK: Duration = Duration::from_millis(100);
 
     let mut bus = EventBus::new();
     let tx = bus.sender();
     let mut log = voice_bird_next::event_log::EventLog::open();
-    let mut state = UiState::default();
 
     let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
         Ok(s) => {
@@ -120,59 +118,69 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         }
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-    let dispatcher = Dispatcher::new(
-        downloader.clone(),
+    let mut consumer = Consumer::new(
+        downloader,
         store.clone(),
-        voice_bird_next::audio_source::system_sources(),
+        voice_bird_next::producer::sources::system_sources(),
     );
-    let watcher = ModelWatcher::new(store.clone());
+    let watcher = ModelWatcher::new(store);
+    let mut input = EventStream::new();
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     loop {
         if dirty {
-            terminal.draw(|f| voice_bird_next::ui::render(f, &state))?;
+            terminal.draw(|f| voice_bird_next::ui::render(f, &consumer.view))?;
+            dirty = false;
         }
-        // Drain once, fold UI events, then dispatch the same
-        // events to the dispatcher. The dispatcher answers
-        // `BeginLanguage` by calling `download::begin_language` and
-        // `DiscardInflight` by calling
-        // `ModelStore::discard_inflight`. Command variants
-        // published during dispatch (language selection, cache-hit
-        // diagnostics, `DownloadRequested`) appear in `events` on the
-        // next tick.
-        if event::poll(TICK)? {
-            if let Event::Key(k) = event::read()? {
-                handle_key(k, &state, &mut db, &tx);
+        tokio::select! {
+            event = input.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => handle_key(key, &consumer.view, &mut db, &tx),
+                    Some(Ok(Event::Resize(_, _))) => dirty = true,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => break,
+                }
+            }
+            event = bus.recv() => {
+                let Some(event) = event else { break };
+                let events = std::iter::once(event).chain(bus.drain()).collect();
+                consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
                 dirty = true;
             }
+            _ = tick.tick() => watcher.check(&consumer.view, &tx),
         }
-        watcher.check(&state, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        if !events.is_empty() {
-            let mut accepted_events = Vec::with_capacity(events.len());
-            for ev in events {
-                if let Some(l) = log.as_mut() {
-                    l.append(&ev);
-                }
-                match voice_bird_next::db::apply(&mut db, &ev) {
-                    Ok(true) => {
-                        state.apply(&ev);
-                        accepted_events.push(ev);
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        eprintln!("voice-bird-next: event gate failed for {ev:?}: {error}");
-                    }
-                }
-            }
-            dispatcher.dispatch(&accepted_events, &mut db, &tx);
-            dirty = true;
-        }
-        if state.should_quit {
-            cleanup_inflight(&mut db, &mut bus, &dispatcher);
+        if consumer.view.should_quit {
+            cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);
             break;
         }
     }
     Ok(())
+}
+
+/// Log before the database gate; only accepted events reach the consumer.
+fn consume_logged(
+    events: Vec<AppEvent>,
+    log: &mut Option<voice_bird_next::event_log::EventLog>,
+    consumer: &mut Consumer,
+    db: &mut Database,
+    tx: &EventSender,
+) {
+    let mut accepted = Vec::with_capacity(events.len());
+    for event in events {
+        if let Some(log) = log.as_mut() {
+            log.append(&event);
+        }
+        match voice_bird_next::db::apply(db, &event) {
+            Ok(true) => accepted.push(event),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("voice-bird-next: event gate failed for {event:?}: {error}");
+            }
+        }
+    }
+    consumer.consume(&accepted, db, tx);
 }
 /// Drop staged archives and unpack scratch directories for every
 /// model with an active claim. Called at Quit so the cache dir is
@@ -188,8 +196,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 ///
 /// `DiscardInflight { model }` is published for each active
 /// claim instead of reaching into the model store directly. The
-/// dispatcher that owns the store answers it on the next drain.
-fn cleanup_inflight(db: &mut Database, bus: &mut EventBus, dispatcher: &Dispatcher) {
+/// consumer that owns the store answers it on the next drain.
+fn cleanup_inflight(
+    db: &mut Database,
+    bus: &mut EventBus,
+    consumer: &mut Consumer,
+    log: &mut Option<voice_bird_next::event_log::EventLog>,
+) {
     let active = match downloads::active(db) {
         Ok(a) => a,
         Err(_) => return,
@@ -201,21 +214,15 @@ fn cleanup_inflight(db: &mut Database, bus: &mut EventBus, dispatcher: &Dispatch
     for model in models {
         bus.sender().publish(AppEvent::DiscardInflight { model });
     }
-    // Drain the DiscardInflight events we just published and run
-    // them through the dispatcher so `ModelStore::discard_inflight`
-    // is actually called. Without this dispatch step, the staged
-    // archive and unpack scratch directory for every in-flight
-    // attempt would survive process exit, and the next session's
-    // first pick on the same model would attempt to unpack from
-    // a half-written `.tmp/` (the user-observed 2026-09-16
-    // `install: unpack: failed to unpack ...tmp/...` error).
-    let events: Vec<AppEvent> = bus.drain().collect();
-    for ev in &events {
-        if let Some(l) = voice_bird_next::event_log::EventLog::open().as_mut() {
-            l.append(ev);
+    // Flush cleanup and lifecycle events through the same log/database gate.
+    let tx = bus.sender();
+    loop {
+        let events: Vec<_> = bus.drain().collect();
+        if events.is_empty() {
+            break;
         }
+        consume_logged(events, log, consumer, db, &tx);
     }
-    dispatcher.dispatch(&events, db, &bus.sender());
 }
 
 #[cfg(feature = "net")]

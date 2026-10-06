@@ -5,7 +5,7 @@
 //! on purpose: every table is an implementation of [`Table`], and
 //! [`Database::open`] runs each table's migration and session recovery.
 //! Table operations take `&mut Database`; [`apply`] composes their
-//! event gates before the reducer or dispatcher can observe an event.
+//! event gates before the consumer can observe an event.
 
 use std::path::{Path, PathBuf};
 
@@ -167,7 +167,7 @@ impl Database {
 #[cfg(test)]
 impl Database {
     /// Build a `Database` from a caller-supplied connection.
-    /// Used by `download::tests::*` to drive `downloads::start`
+    /// Used by `producer::download::tests::*` to drive `downloads::start`
     /// failure paths (e.g. a read-only connection whose writes
     /// return `SQLITE_READONLY`).
     pub fn from_connection_for_test(conn: Connection, path: PathBuf, tx: EventSender) -> Self {
@@ -179,7 +179,7 @@ pub mod block_steps;
 pub mod downloads;
 
 /// Apply every table's event gate. Only a `true` result may reach
-/// the reducer or dispatcher: a rejected source-language command
+/// the consumer: a rejected source-language command
 /// must never start model downloads.
 pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     if !block_steps::apply(db, ev)? {

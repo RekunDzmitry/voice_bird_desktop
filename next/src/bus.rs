@@ -1,17 +1,8 @@
 //! Application event bus.
 //!
-//! Transport for everything that can happen in the app. Producers (today: the
-//! input path; tomorrow: background adapters — audio devices, engines, timers)
-//! call [`EventSender::publish`]. The loop drains queued events at the bottom
-//! of each tick and feeds them to a reducer that folds them into `UiState`.
-//!
-//! ## Why a typed enum + std `mpsc`
-//!
-//! One producer, many consumers is the only pattern the loop needs today;
-//! many producers, one consumer is the only one that needs a queue. Both
-//! are covered by `std::sync::mpsc` — `EventSender` is `Clone`, so producers
-//! only ever touch [`EventSender::publish`], and `drain` yields in publish
-//! order on the loop thread.
+//! Producers publish typed events through a Tokio unbounded channel. The loop
+//! logs every event, gates it through SQLite, and passes accepted events to the
+//! consumer. Publishing stays synchronous; receiving wakes the event loop.
 //!
 //! ## Why not `Copy`?
 //!
@@ -23,9 +14,9 @@
 //! tests stops compiling, which is why progress is `bytes`/`total` and
 //! never a pre-computed ratio.
 
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
-use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
+use crate::producer::sources::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
 use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 
@@ -91,7 +82,7 @@ pub enum AppEvent {
         from_language: Option<&'static str>,
         to_language: Option<&'static str>,
     },
-    /// The dispatcher resolved both model-presence checks for a language.
+    /// The language producer resolved both model-presence checks for a language.
     /// The block id is explicit because focus may move before this reply is
     /// reduced.
     LanguageSelected {
@@ -106,7 +97,7 @@ pub enum AppEvent {
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
     /// A model a block already counted as installed is no longer on disk.
-    /// Reducer stops recording; dispatcher re-requests the download.
+    /// The consumer stops recording and starts a producer to re-request it.
     ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
@@ -136,7 +127,7 @@ pub enum AppEvent {
         error: String,
     },
     /// Same shape as [`AppEvent::DownloadFailed`] but published by
-    /// [`crate::download::begin_language`] when the orchestrator failed
+    /// [`crate::producer::download::begin_language`] when the orchestrator failed
     /// to claim a row in the downloads table *before* a worker could
     /// spawn (disk full, lock timeout, write error). The table
     /// reducer accepts this variant even when no row exists for
@@ -150,8 +141,8 @@ pub enum AppEvent {
         error: String,
     },
     /// Last waiter for `model` closed. Removes the repo row and the
-    /// UiState.downloads entry; the in-flight thread observes the
-    /// cancel flag separately and publishes nothing of its own.
+    /// UiView.downloads entry; the in-flight task observes the
+    /// cancellation row separately.
     DownloadCancelled { attempt: u32, model: &'static str },
     /// Emitted after the downloads table accepts and persists every lifecycle
     /// transition. The reducer uses terminal transitions to reconcile worker
@@ -197,41 +188,27 @@ pub enum AppEvent {
     Quit,
 
     // -----------------------------------------------------------------
-    // Bus commands: aimed at the loop-thread dispatcher that owns the
-    // long-lived `Downloader` / `ModelStore` collaborators. The
-    // reducer treats them as observability (the `Downloads::apply`
-    // catch-all returns `Ok(true)` and `UiState::apply` ignores
-    // them); only the dispatcher's `dispatch` consumes them. Reply
-    // channels are `mpsc::sync_channel(1)` oneshots.
+    // Bus commands are routed by the consumer only after SQLite accepts them.
+    // Producers answer by publishing new events, never by mutating the UI.
     // -----------------------------------------------------------------
-    /// Resolver saw Enter/Retry on a block. The dispatcher ensures both
-    /// models for the language and targets the reply by block id.
+    /// Resolver saw Enter/Retry on a block. The consumer starts producers to
+    /// ensure both models for the language and target the reply by block id.
     BeginLanguage {
         block: u8,
         language: &'static LanguageProfile,
         source_rev: Option<u32>,
     },
     /// Quit-time cleanup: drop the staged archive and unpack
-    /// scratch directory for `model`. The dispatcher answers with a
+    /// scratch directory for `model`. The consumer asks the store to discard it.
     DiscardInflight { model: std::sync::Arc<str> },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
 /// whole API they see, and cloning is the only way to get one.
 #[derive(Debug, Clone)]
-pub struct EventSender(mpsc::Sender<AppEvent>);
+pub struct EventSender(mpsc::UnboundedSender<AppEvent>);
 
 impl EventSender {
-    /// Wrap an `mpsc::Sender`. Sole constructor — the field is
-    /// private so producers have to come through [`EventBus`],
-    /// which is what guarantees the bus and its senders are
-    /// constructed together. Tests that used to inline the tuple
-    /// (`EventSender(mpsc::channel().0)`) now go through
-    /// `EventBus::new().sender()` to keep the same coupling.
-    pub fn from_mpsc(sender: mpsc::Sender<AppEvent>) -> Self {
-        Self(sender)
-    }
-
     /// Best-effort: send only fails when the bus is gone, i.e. the loop is
     /// shutting down — dropping the event is correct then.
     pub fn publish(&self, event: AppEvent) {
@@ -239,24 +216,28 @@ impl EventSender {
     }
 }
 
-/// Single-consumer pub/sub over `std::sync::mpsc`.
+/// Single-consumer pub/sub over Tokio's unbounded channel.
 pub struct EventBus {
-    sender: mpsc::Sender<AppEvent>,
-    receiver: mpsc::Receiver<AppEvent>,
+    sender: mpsc::UnboundedSender<AppEvent>,
+    receiver: mpsc::UnboundedReceiver<AppEvent>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     pub fn sender(&self) -> EventSender {
-        EventSender::from_mpsc(self.sender.clone())
+        EventSender(self.sender.clone())
     }
 
     pub fn drain(&mut self) -> impl Iterator<Item = AppEvent> + '_ {
-        self.receiver.try_iter()
+        std::iter::from_fn(|| self.receiver.try_recv().ok())
+    }
+
+    pub async fn recv(&mut self) -> Option<AppEvent> {
+        self.receiver.recv().await
     }
 }
 

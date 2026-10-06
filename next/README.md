@@ -10,12 +10,13 @@ speakers require a running app first (there is no all-apps option). Backspace
 walks back one picker step, restoring the selected device or app row. An empty
 app list shows `no running apps`; go back or close the block. An
 `AudioSourceSnapshot` captures the enumerated devices and running apps on a
-serialized background worker when a new block is requested. Slow native queries
-do not block input or Quit. Other platforms, or an unavailable/empty device
-snapshot, open the language picker directly.
+serialized Tokio task using `spawn_blocking` for native queries. Slow queries
+do not block input or Quit; runtime shutdown never waits for stalled work.
+Other platforms, or an unavailable/empty device snapshot, open the language
+picker directly.
 A Rust panic during enumeration disables that catalog for the session; the
 current, queued, and future requests open the language picker instead. The
-caught panic does not restore or print over the live terminal. This handles
+contained panic does not restore or print over the live terminal. This handles
 unwinding panics, not process aborts or native crashes.
 
 Arrows move the highlight inside the focused picker; Enter advances a source
@@ -84,52 +85,55 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | path | role |
 |---|---|
 | `src/language.rs` | language registry mapping each code to live + refine models |
-| `src/audio_source.rs` | point-in-time audio source snapshots and macOS device/running-app enumeration |
+| `src/producer/sources.rs` | source snapshots, macOS enumeration, serialized async requests and session panic containment |
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
-| `src/bus.rs` | `AppEvent` commands/UI events + `EventBus` / `EventSender` |
-| `src/state.rs` | `UiState` + `BlockState` + pure reducer |
-| `src/model_watch.rs` | per-tick presence checks for installed models used by active blocks |
-| `src/ui.rs` | `render(f, &UiState)` — language rows, per-role gauges, borders |
+| `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
+| `src/consumer/ui_state.rs` | `UiView` + `BlockState` + pure reducer |
+| `src/producer/model_watch.rs` | tick-driven presence checks for installed models used by active blocks |
+| `src/ui.rs` | `render(f, &UiView)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
-| `src/download.rs` | `Downloader`, `HttpDownloader`, per-model workers, language orchestration |
-| `src/producer.rs` | intent-to-command resolution and last-waiter cancellation |
-| `src/dispatcher.rs` | source-catalog block creation and command-side model preparation |
+| `src/producer/download.rs` | async `Downloader` / HTTP streaming, per-model tasks, loop-side SQLite claims and language orchestration |
+| `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
+| `src/producer/mod.rs` | `Producers` handles for sources, downloads, and model store |
+| `src/consumer/mod.rs` | accepted-event projection and command routing to producers |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
-| `src/main.rs` | terminal guard and event loop (the only file touching a real terminal) |
+| `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
 | `tests/` | render goldens/properties and end-to-end language download flows |
 
 ## Growth rules
 
-1. **State is plain data.** No `Instant`, runtime handles, channels or
-   `JoinHandle`s in `UiState`. The loop (or later, adapters) writes into it.
+1. **The UI view is plain data.** No `Instant`, runtime handles, channels or
+   `JoinHandle`s in `UiView`. The consumer projects accepted events into it.
 2. **Every render fn gets a `render_to_string` test** next to it.
 3. **Side effects live behind traits** (audio, engines, cloud), never in
-   `UiState`; tests use fixture implementations.
+   `UiView`; tests use fixture implementations.
 4. **Input flows through the bus.** `input::map_key` returns
-   `Option<Intent>`; the resolver in `main.rs` translates to bus events
-   and `UiState::apply` folds them in. There is no direct input→state
-   mutation.
-5. **The producer resolves user intent; the dispatcher owns side effects.**
+   `Option<Intent>`; `producer/input.rs` reads focus/cursors from the view and
+   domain facts from SQLite, then publishes events. There is no direct
+   input→view mutation.
+5. **Producers publish; the consumer reacts to accepted events.**
    `BeginLanguage` carries the target block id and registry profile. The
-   dispatcher checks both models, publishes `LanguageSelected` before worker
-   events, and deduplicates each per-model claim through SQLite. Closing the
-   last waiter cancels only that model's in-flight work.
-6. **SQLite owns download lifecycle; `UiState::downloads` is its render
-   projection.** Decisions read SQLite. Accepted worker events update the table
-   before the UI, and the table publishes `DownloadStatusChanged` after every
-   persisted transition. Terminal status events reconcile outcomes that raced
-   ahead of `LanguageSelected`, without a second ready/failed cache in
-   `UiState`.
+   consumer starts producers, which check both models, publish
+   `LanguageSelected` before worker events, and deduplicate claims through
+   SQLite. Closing the last waiter cancels only that model's in-flight work.
+   No service calls `std::thread::spawn`: Tokio schedules asynchronous work;
+   native enumeration and installation use `spawn_blocking`.
+6. **SQLite is the source of truth; `UiView::downloads` is its render
+   projection.** Every event enters the JSONL log before the database gate.
+   Accepted worker events update the table before the view, and the table
+   publishes `DownloadStatusChanged` after every persisted transition.
+   Terminal status events reconcile outcomes that raced ahead of
+   `LanguageSelected`, without a second ready/failed cache in `UiView`.
    Source transitions are CAS-gated the same way: `SourceStepChanged` names the
    block, from/to steps, expected revision, and resulting selections. SQLite
    increments the revision on every forward/back edge; duplicate and stale
    transitions publish `SourceStepRejected`. Source `BeginLanguage` atomically
-   commits Language → Committed before dispatch, so a racing Backspace cannot
-   orphan a started download. Only accepted events reach the dispatcher.
+   commits Language → Committed before consumption, so a racing Backspace cannot
+   orphan a started download. Only accepted events reach the consumer.
    Block steps live in a connection-local SQLite TEMP table: another app
    instance cannot wipe or collide with them, and disconnect discards them.
    `BlockClosed` carries its target id and deletes the step row through the
@@ -142,12 +146,16 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed
    live and refine artifacts from `<cache_dir>/voice-bird/models/`.
    SQLite tracks in-flight work; quit cleanup removes staging artifacts only.
-   Active blocks re-verify their installed models every 100 ms tick, including
+   The loop's 100 ms Tokio interval calls the model-watch producer, including
    hidden sessions and ready models in Waiting blocks. A missing model sends
    every affected block back to Waiting and re-claims a shared download; success
    resumes Recording automatically. Failure enters Failed, where `r` retries.
    Presence checks do not detect corruption of files that still exist, and
    Recording remains mocked (no real audio device is stopped yet).
+   Async downloads use a separate SQLite `CancelProbe` connection; it polls
+   the current attempt's row every 50 ms between streamed chunks. Quit marks
+   active rows Cancelling, consumes staging-cleanup commands through the same
+   log/database gate, and calls `shutdown_background` without joining workers.
 
 ## Refreshing the golden snapshot
 
