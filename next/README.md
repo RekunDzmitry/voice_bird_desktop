@@ -89,10 +89,11 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
 | `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
-| `src/producer/model_watch.rs` | tick-driven presence checks for installed models used by active blocks |
+| `src/producer/model_watch.rs` | startup/tick disk checks for the entire catalog, persisted in SQLite |
 | `src/ui.rs` | `render(f, &UiView)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
+| `src/db/models.rs` | observed model availability, independent of download lifecycle |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
 | `src/producer/download.rs` | async `Downloader`, HTTP streaming, and progress throttling |
@@ -100,7 +101,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/producer/mod.rs` | external input and transport modules; no consumer-owned producer aggregate |
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
 | `src/consumer/audio_sources.rs` | serialized audio-source requests and session panic containment |
-| `src/consumer/language.rs` | language availability checks and follow-up model requests |
+| `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
 | `src/consumer/downloads.rs` | attempt-aware SQLite claims, download workers, and staging cleanup |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
@@ -159,11 +160,17 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    only in `main.rs`; everything else uses `FixtureDownloader`.
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed
    live and refine artifacts from `<cache_dir>/voice-bird/models/`.
-   SQLite tracks in-flight work; quit cleanup removes staging artifacts only.
-   The loop's 100 ms Tokio interval calls the model-watch producer, including
-   hidden sessions and ready models in Waiting blocks. A missing model sends
-   every affected block back to Waiting and re-claims a shared download; success
-   resumes Recording automatically. Failure enters Failed, where `r` retries.
+   SQLite tracks availability separately from in-flight work; quit cleanup
+   removes staging artifacts only. Before accepting input, the model watcher
+   refreshes every catalog model from disk, correcting stale persisted rows.
+   The loop repeats that scan every 100 ms, including unused models.
+   `LanguageConsumer` has no model-store dependency: it queries the availability
+   table, then download history only for missing models. Accepted installation
+   successes update availability before consumption; rejected stale successes
+   cannot change it. A missing ready model sends every affected block, including
+   hidden sessions and Waiting blocks, back to Waiting and re-claims a shared
+   download; success resumes Recording automatically. Failure enters Failed,
+   where `r` retries.
    Presence checks do not detect corruption of files that still exist, and
    Recording remains mocked (no real audio device is stopped yet).
    Async downloads use a separate SQLite `CancelProbe` connection; it polls

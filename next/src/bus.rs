@@ -82,7 +82,7 @@ pub enum AppEvent {
         from_language: Option<&'static str>,
         to_language: Option<&'static str>,
     },
-    /// The language producer resolved both model-presence checks for a language.
+    /// The language consumer resolved model availability from SQLite.
     /// The block id is explicit because focus may move before this reply is
     /// reduced.
     LanguageSelected {
@@ -92,12 +92,13 @@ pub enum AppEvent {
     },
     /// Remove the named block after its queued transitions have been gated.
     BlockClosed { block: u8 },
-    /// Model was already installed when the language was selected. The
+    /// Model was available in SQLite when the language was selected. The
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
-    /// A model a block already counted as installed is no longer on disk.
-    /// The view stops recording; the language consumer publishes a model request.
+    /// The model watcher observed that a ready model is no longer on disk.
+    /// SQLite availability is updated first; the language consumer queries it
+    /// to publish a model request and the view stops recording.
     ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.

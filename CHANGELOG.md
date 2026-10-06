@@ -15,6 +15,10 @@
   Preserve attempt lineage across delayed requests and terminal replays.
 - Rename the audio catalog to `AudioSourcesCatalog`, its dependency to
   `audio_sources`, and the language-picker state to `PickingLanguage`.
+- Move model-presence checks into `ModelWatcher` and a separate SQLite
+  availability table. Refresh the full catalog at startup and on ticks;
+  `LanguageConsumer` is stateless and queries availability and download attempts.
+  Accepted installation successes update availability; stale successes do not.
 
 ## 0.5.0 (2026-08-05)
 

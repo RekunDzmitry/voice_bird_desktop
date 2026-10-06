@@ -122,6 +122,7 @@ impl Database {
         let conn = open(path)?;
         migrate(&conn, &[downloads::DownloadsTable])?;
         migrate(&conn, &[block_steps::BlockStepsTable])?;
+        migrate(&conn, &[models::ModelsTable])?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
@@ -177,6 +178,7 @@ impl Database {
 
 pub mod block_steps;
 pub mod downloads;
+pub mod models;
 
 /// Apply every table's event gate. Only a `true` result may reach
 /// the consumer: a rejected source-language command
@@ -185,5 +187,11 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     if !block_steps::apply(db, ev)? {
         return Ok(false);
     }
-    downloads::apply(db, ev)
+    if !downloads::apply(db, ev)? {
+        return Ok(false);
+    }
+    if let AppEvent::DownloadSucceeded { model, .. } = ev {
+        models::set_available(db, model, true)?;
+    }
+    Ok(true)
 }

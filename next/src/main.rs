@@ -124,6 +124,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
         voice_bird_next::producer::sources::system_sources(),
     ));
     let watcher = ModelWatcher::new(store);
+    watcher.check(&consumer.consumers.ui_view, &mut db, &tx).map_err(io::Error::other)?;
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -149,7 +150,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
                 consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
                 dirty = true;
             }
-            _ = tick.tick() => watcher.check(&consumer.consumers.ui_view, &tx),
+            _ = tick.tick() => {
+                watcher.check(&consumer.consumers.ui_view, &mut db, &tx).map_err(io::Error::other)?;
+            }
         }
         if consumer.consumers.ui_view.should_quit {
             cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);

@@ -39,7 +39,7 @@ impl Consumers {
         Self {
             ui_view: UiView::default(),
             audio_sources: AudioSourcesConsumer::new(audio_sources),
-            language: LanguageConsumer::new(model_store.clone()),
+            language: LanguageConsumer,
             downloads: DownloadsConsumer::new(downloader, model_store),
         }
     }

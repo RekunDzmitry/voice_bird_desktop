@@ -1,24 +1,15 @@
-//! Checks language models and publishes requests for the next bus pass.
-
-use std::sync::Arc;
+//! Queries persisted model availability and publishes requests for the next bus pass.
 
 use crate::bus::{AppEvent, EventSender};
 use crate::db::downloads::Claim;
-use crate::db::{downloads, Database};
+use crate::db::{downloads, models, Database};
 use crate::language::LanguageProfile;
 use crate::picker::ModelEntry;
 use super::downloads::truncate_error;
-use crate::transcription_models::ModelStore;
 
-pub struct LanguageConsumer {
-    pub model_store: Arc<dyn ModelStore>,
-}
+pub struct LanguageConsumer;
 
 impl LanguageConsumer {
-    pub fn new(model_store: Arc<dyn ModelStore>) -> Self {
-        Self { model_store }
-    }
-
     /// Publish the selection before any per-model reply. Download claims and
     /// workers start only when the requests return through the bus gate.
     pub fn begin(
@@ -28,24 +19,22 @@ impl LanguageConsumer {
         db: &Database,
         tx: &EventSender,
     ) {
-        let models = language
+        let events = language
             .models()
-            .map(|model| (model, self.model_store.is_available(model)));
-        let pending = models
+            .map(|model| (model.id, Self::request_event(model, db)));
+        let pending = events
             .iter()
-            .filter_map(|(model, available)| (!available).then_some(model.id))
+            .filter_map(|(model, event)| {
+                (!matches!(event, AppEvent::ModelAlreadyCached(_))).then_some(*model)
+            })
             .collect();
         tx.publish(AppEvent::LanguageSelected {
             block,
             language,
             pending,
         });
-        for (model, available) in models {
-            tx.publish(if available {
-                AppEvent::ModelAlreadyCached(model)
-            } else {
-                Self::request_event(model, db)
-            });
+        for (_, event) in events {
+            tx.publish(event);
         }
     }
 
@@ -57,6 +46,17 @@ impl LanguageConsumer {
     /// finishes before this request returns through the bus must not turn a
     /// join into an implicit retry.
     fn request_event(entry: &'static ModelEntry, db: &Database) -> AppEvent {
+        match models::is_available(db, entry.id) {
+            Ok(true) => return AppEvent::ModelAlreadyCached(entry),
+            Ok(false) => {}
+            Err(error) => {
+                return AppEvent::DownloadClaimFailed {
+                    attempt: 0,
+                    model: entry.id,
+                    error: truncate_error(&format!("models table: {error}")),
+                };
+            }
+        }
         match downloads::get(db, entry.id) {
             Ok(row) => {
                 let attempt = match downloads::decide(row.as_ref()) {
@@ -73,6 +73,84 @@ impl LanguageConsumer {
                 model: entry.id,
                 error: truncate_error(&format!("downloads table: {error}")),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::EventBus;
+    use crate::consumer::{ui_view::BlockState, UiView};
+    use crate::language::LANGUAGES;
+
+    #[test]
+    fn persisted_availability_records_even_when_download_history_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+        let language = &LANGUAGES[0];
+        for model in language.models() {
+            models::set_available(&mut db, model.id, true).unwrap();
+        }
+        db.conn_mut().execute_batch("DROP TABLE downloads").unwrap();
+        let mut view = UiView::default();
+        view.apply(&AppEvent::AddBlock);
+
+        LanguageConsumer.begin(1, language, &db, &bus.sender());
+        let events: Vec<_> = bus.drain().collect();
+        assert_eq!(
+            events,
+            vec![
+                AppEvent::LanguageSelected { block: 1, language, pending: vec![] },
+                AppEvent::ModelAlreadyCached(language.live),
+                AppEvent::ModelAlreadyCached(language.refine),
+            ]
+        );
+        for event in events {
+            assert!(crate::db::apply(&mut db, &event).unwrap());
+            view.apply(&event);
+        }
+        assert!(matches!(view.blocks[0].state, BlockState::Recording { language: selected }
+            if selected == language));
+    }
+
+    #[test]
+    fn availability_and_download_lookup_errors_fail_both_pending_models() {
+        for table in ["models", "downloads"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bus = EventBus::new();
+            let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+            db.conn_mut().execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            let language = &LANGUAGES[0];
+            let mut view = UiView::default();
+            view.apply(&AppEvent::AddBlock);
+
+            LanguageConsumer.begin(1, language, &db, &bus.sender());
+            let events: Vec<_> = bus.drain().collect();
+            assert_eq!(
+                events[0],
+                AppEvent::LanguageSelected {
+                    block: 1,
+                    language,
+                    pending: vec![language.live.id, language.refine.id],
+                }
+            );
+            for (event, model) in events[1..].iter().zip(language.models()) {
+                assert!(matches!(event, AppEvent::DownloadClaimFailed {
+                    attempt: 0, model: failed, error,
+                } if *failed == model.id && error.starts_with(&format!("{table} table:"))));
+            }
+            assert_eq!(events.len(), 3);
+            for event in events {
+                assert!(crate::db::apply(&mut db, &event).unwrap());
+                view.apply(&event);
+            }
+            assert!(matches!(&view.blocks[0].state, BlockState::Failed {
+                language: selected, pending, error,
+            } if *selected == language
+                && pending.is_empty()
+                && error.starts_with(&format!("{table} table:"))));
         }
     }
 }

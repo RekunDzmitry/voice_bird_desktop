@@ -1,10 +1,11 @@
-//! Re-check installed models used by active blocks on each loop tick.
+//! Refresh model availability from disk at startup and on each loop tick.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::consumer::ui_view::{Block, UiView};
+use crate::consumer::ui_view::UiView;
+use crate::db::{models, Database};
+use crate::picker::CATALOG;
 use crate::transcription_models::ModelStore;
 
 pub struct ModelWatcher {
@@ -16,15 +17,20 @@ impl ModelWatcher {
         Self { store }
     }
 
-    /// Publish once per distinct model counted as installed but missing on disk.
-    /// Reducing the event adds it to pending, excluding it from the next check.
-    pub fn check(&self, state: &UiView, tx: &EventSender) {
-        let mut checked = BTreeSet::new();
-        for model in state.blocks.iter().flat_map(Block::ready_models) {
-            if checked.insert(model.id) && !self.store.is_available(model) {
+    /// Refresh the entire catalog, including models no block currently uses.
+    /// Publish missing models once each only when a block counts them as ready.
+    /// Reducing the event adds them to pending, suppressing later notifications.
+    pub fn check(&self, state: &UiView, db: &mut Database, tx: &EventSender) -> rusqlite::Result<()> {
+        for model in CATALOG {
+            let available = self.store.is_available(model);
+            models::set_available(db, model.id, available)?;
+            if !available && state.blocks.iter().any(|block| {
+                block.ready_models().any(|ready| ready.id == model.id)
+            }) {
                 tx.publish(AppEvent::ModelMissing(model));
             }
         }
+        Ok(())
     }
 }
 
@@ -34,17 +40,72 @@ mod tests {
     use crate::bus::EventBus;
     use crate::language::LANGUAGES;
     use crate::picker::ListPicker;
-    use crate::consumer::ui_view::BlockState;
+    use crate::consumer::ui_view::{Block, BlockState};
     use crate::testing::FixtureStore;
+    use crate::db::downloads;
+    use crate::transcription_models::CacheDirStore;
+
+    #[test]
+    fn startup_and_ticks_discover_cached_models_without_active_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CacheDirStore::from_root(tmp.path().join("cache")).unwrap());
+        let cached = &CATALOG[0];
+        let installed_later = &CATALOG[1];
+        std::fs::write(store.root().join(format!("{}.gguf", cached.id)), b"installed").unwrap();
+        let watcher = ModelWatcher::new(store.clone());
+        let mut bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+
+        watcher.check(&UiView::default(), &mut db, &bus.sender()).unwrap();
+        assert!(models::is_available(&db, cached.id).unwrap());
+        assert!(!models::is_available(&db, installed_later.id).unwrap());
+        assert!(downloads::get(&db, cached.id).unwrap().is_none());
+        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
+
+        std::fs::write(store.root().join(format!("{}.gguf", installed_later.id)), b"installed").unwrap();
+        watcher.check(&UiView::default(), &mut db, &bus.sender()).unwrap();
+        assert!(models::is_available(&db, installed_later.id).unwrap());
+        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
+    }
+
+    #[test]
+    fn restart_reconciles_stale_availability_independently_of_download_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("models.sqlite");
+        let store = Arc::new(CacheDirStore::from_root(tmp.path().join("cache")).unwrap());
+        let removed = &CATALOG[0];
+        let installed = &CATALOG[1];
+        let watcher = ModelWatcher::new(store.clone());
+        let mut bus = EventBus::new();
+        let mut db = Database::open(&path, bus.sender()).unwrap();
+        let attempt = downloads::start(&mut db, removed.id).unwrap();
+        crate::db::apply(&mut db, &AppEvent::DownloadSucceeded {
+            attempt,
+            model: removed.id,
+        }).unwrap();
+        models::set_available(&mut db, installed.id, false).unwrap();
+        drop(db);
+        std::fs::write(store.root().join(format!("{}.gguf", installed.id)), b"installed").unwrap();
+        let mut db = Database::open(&path, bus.sender()).unwrap();
+        assert!(models::is_available(&db, removed.id).unwrap());
+        assert!(!models::is_available(&db, installed.id).unwrap());
+        bus.drain().for_each(drop);
+
+        watcher.check(&UiView::default(), &mut db, &bus.sender()).unwrap();
+        assert!(!models::is_available(&db, removed.id).unwrap());
+        assert!(models::is_available(&db, installed.id).unwrap());
+        assert_eq!(downloads::get(&db, removed.id).unwrap().unwrap().status, crate::bus::DownloadStatus::Succeeded);
+        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
+    }
 
     #[test]
     fn missing_model_is_shared_and_not_republished_after_reduction() {
         let tmp = tempfile::tempdir().unwrap();
         let language = &LANGUAGES[0];
-        let store = Arc::new(FixtureStore::new(
-            tmp.path().to_path_buf(),
-            &language.models().map(|model| model.id),
-        ));
+        let store = Arc::new(CacheDirStore::from_root(tmp.path().join("cache")).unwrap());
+        for model in language.models() {
+            std::fs::write(store.root().join(format!("{}.gguf", model.id)), b"installed").unwrap();
+        }
         let watcher = ModelWatcher::new(store.clone());
         let mut state = UiView {
             blocks: vec![
@@ -55,22 +116,32 @@ mod tests {
         };
         state.blocks[1].visible = false;
         let mut bus = EventBus::new();
-        watcher.check(&state, &bus.sender());
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
+        assert!(models::is_available(&db, language.live.id).unwrap());
 
-        store.present.lock().expect("fixture store poisoned").retain(|id| *id != language.live.id);
-        watcher.check(&state, &bus.sender());
+        std::fs::remove_file(store.root().join(format!("{}.gguf", language.live.id))).unwrap();
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
         let events: Vec<_> = bus.drain().collect();
         assert_eq!(events, vec![AppEvent::ModelMissing(language.live)]);
+        assert!(!models::is_available(&db, language.live.id).unwrap());
+        assert!(models::is_available(&db, language.refine.id).unwrap());
         for event in events {
             state.apply(&event);
         }
-        watcher.check(&state, &bus.sender());
+        for block in &state.blocks {
+            assert_eq!(block.state, BlockState::Waiting {
+                language,
+                pending: vec![language.live.id],
+            });
+        }
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
     }
 
     #[test]
-    fn pending_and_inactive_models_are_not_checked() {
+    fn pending_and_inactive_models_do_not_publish_missing_events() {
         let tmp = tempfile::tempdir().unwrap();
         let language = &LANGUAGES[0];
         let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
@@ -91,7 +162,10 @@ mod tests {
             ..UiView::default()
         };
         let mut bus = EventBus::new();
-        watcher.check(&state, &bus.sender());
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![AppEvent::ModelMissing(language.live)]);
+        assert!(!models::is_available(&db, language.live.id).unwrap());
+        assert!(!models::is_available(&db, language.refine.id).unwrap());
     }
 }

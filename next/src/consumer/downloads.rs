@@ -306,6 +306,19 @@ mod tests {
                 )
                 .unwrap();
             bootstrap
+                .execute_batch(
+                    <crate::db::models::ModelsTable as crate::db::Table>::DEFINITION,
+                )
+                .unwrap();
+            for model in LANGUAGES[0].models() {
+                bootstrap
+                    .execute(
+                        "INSERT INTO models (model, available) VALUES (?1, 0)",
+                        [model.id],
+                    )
+                    .unwrap();
+            }
+            bootstrap
                 .execute(
                     "INSERT INTO downloads (model, attempt, status, error, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, NULL, ?4, ?4)",
@@ -349,7 +362,7 @@ mod tests {
             Outcome::Ok,
             Arc::clone(&calls),
         ));
-        let language_consumer = crate::consumer::language::LanguageConsumer::new(store.clone());
+        let language_consumer = crate::consumer::language::LanguageConsumer;
         let downloads_consumer = DownloadsConsumer::new(downloader, store);
         for event in &events {
             if downloads::apply(&mut db, event).unwrap() {

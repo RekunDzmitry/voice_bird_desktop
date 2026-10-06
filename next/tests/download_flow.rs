@@ -1,7 +1,7 @@
 //! End-to-end language download flow tests. No test touches the network.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,51 +48,6 @@ impl Downloader for WritingDownloader {
             .map_err(|error| DownloadError::Io(error.to_string()))?;
         progress(13, Some(13));
         Ok(())
-    }
-}
-
-struct FailDuringAvailabilityCheck {
-    inner: FixtureStore,
-    tx: EventSender,
-    model: &'static str,
-    emitted: AtomicBool,
-}
-
-impl ModelStore for FailDuringAvailabilityCheck {
-    fn is_available(&self, entry: &voice_bird_next::picker::ModelEntry) -> bool {
-        if entry.id == self.model && !self.emitted.swap(true, Ordering::SeqCst) {
-            self.tx.publish(AppEvent::DownloadFailed {
-                attempt: 1,
-                model: entry.id,
-                error: "HTTP 404".to_string(),
-            });
-        }
-        self.inner.is_available(entry)
-    }
-
-    fn staging_path(
-        &self,
-        entry: &voice_bird_next::picker::ModelEntry,
-        attempt: u32,
-    ) -> Result<std::path::PathBuf, DownloadError> {
-        self.inner.staging_path(entry, attempt)
-    }
-
-    fn install(
-        &self,
-        entry: &voice_bird_next::picker::ModelEntry,
-        staged: &Path,
-        cancel: &mut dyn CancelCheck,
-    ) -> Result<(), DownloadError> {
-        self.inner.install(entry, staged, cancel)
-    }
-
-    fn clear_staging(&self, entry: &voice_bird_next::picker::ModelEntry) {
-        self.inner.clear_staging(entry);
-    }
-
-    fn discard_inflight(&self, entry: &voice_bird_next::picker::ModelEntry) {
-        self.inner.discard_inflight(entry);
     }
 }
 
@@ -188,6 +143,9 @@ async fn language_downloads_start_only_after_followups_cross_the_gate() {
     ));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     let tx = bus.sender();
 
@@ -256,6 +214,9 @@ async fn closing_or_quitting_before_language_followups_never_starts_orphan_downl
         ));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
+        ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+            .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+            .unwrap();
         let tx = bus.sender();
         consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
         consume_batch(
@@ -313,6 +274,9 @@ async fn language_with_both_models_cached_records_immediately() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
 
     let events = confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -375,6 +339,9 @@ async fn language_with_one_cached_model_downloads_only_the_other() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store_concrete.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
 
     let events = confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -414,6 +381,9 @@ async fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
     let mut consumer = Consumer::new(Consumers::new(failing, store.clone(), Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
 
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -501,7 +471,7 @@ async fn claim_failure_on_one_model_fails_block() {
 }
 
 #[tokio::test]
-async fn failure_between_availability_check_and_selection_reaches_late_waiter() {
+async fn failure_between_language_begin_and_selection_reaches_late_waiter() {
     let tmp = tempfile::tempdir().unwrap();
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
@@ -518,12 +488,10 @@ async fn failure_between_availability_check_and_selection_reaches_late_waiter() 
     });
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
 
-    let store: Arc<dyn ModelStore> = Arc::new(FailDuringAvailabilityCheck {
-        inner: FixtureStore::new(tmp.path().to_path_buf(), &[english().refine.id]),
-        tx: bus.sender(),
-        model: english().live.id,
-        emitted: AtomicBool::new(false),
-    });
+    let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(
+        tmp.path().to_path_buf(),
+        &[english().refine.id],
+    ));
     let calls = Arc::new(AtomicUsize::new(0));
     let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
         Vec::new(),
@@ -531,16 +499,37 @@ async fn failure_between_availability_check_and_selection_reaches_late_waiter() 
         calls.clone(),
     ));
 
-    consumer.consumers.language.model_store = store.clone();
     consumer.consumers.downloads.model_store = store;
     consumer.consumers.downloads.downloader = downloader;
-    bus.sender().publish(AppEvent::BeginLanguage {
-        block: 2,
-        language: english(),
-        source_rev: None,
-    });
-
-    let first = drain_consume(&mut bus, &mut consumer, &mut handle.db);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
+    let tx = bus.sender();
+    consume_batch(
+        vec![AppEvent::BeginLanguage {
+            block: 2,
+            language: english(),
+            source_rev: None,
+        }],
+        &mut consumer,
+        &mut handle.db,
+        &tx,
+    );
+    let followups: Vec<_> = bus.drain().collect();
+    let mut first = consume_batch(
+        vec![AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "HTTP 404".to_string(),
+        }],
+        &mut consumer,
+        &mut handle.db,
+        &tx,
+    );
+    // The worker fails before the second block's selection crosses the gate.
+    first.extend(drain_consume(&mut bus, &mut consumer, &mut handle.db));
+    first.extend(consume_batch(followups, &mut consumer, &mut handle.db, &tx));
+    first.extend(drain_consume(&mut bus, &mut consumer, &mut handle.db));
     assert!(first.iter().any(|event| matches!(
         event,
         AppEvent::DownloadFailed { model, .. } if *model == english().live.id
@@ -590,6 +579,9 @@ async fn cancelled_attempt_before_late_request_fails_waiter_and_explicit_retry_r
     ));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     let tx = bus.sender();
     downloads::start(&mut handle.db, english().refine.id).unwrap();
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -656,6 +648,9 @@ async fn two_blocks_same_language_share_downloads() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
 
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -698,6 +693,9 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -736,6 +734,9 @@ async fn language_selected_targets_block_id_not_focus() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     assert_eq!(consumer.consumers.ui_view.focus, 1);
@@ -769,6 +770,9 @@ async fn second_session_is_warm() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut first_bus = EventBus::new();
     let mut first_db = downloads_with(&first_bus);
+    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        .check(&consumer.consumers.ui_view, &mut first_db.db, &first_bus.sender())
+        .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(
         &mut first_bus,
@@ -794,6 +798,9 @@ async fn second_session_is_warm() {
     let mut second_consumer = Consumer::new(Consumers::new(second_downloader, second_store, Arc::new(NoSources)));
     let mut second_bus = EventBus::new();
     let mut second_db = downloads_with(&second_bus);
+    ModelWatcher::new(second_consumer.consumers.downloads.model_store.clone())
+        .check(&second_consumer.consumers.ui_view, &mut second_db.db, &second_bus.sender())
+        .unwrap();
     second_consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     let events = confirm_and_consume(
         &mut second_bus,
@@ -884,6 +891,7 @@ async fn model_dropped_while_recording_redownloads_and_resumes() {
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -892,7 +900,7 @@ async fn model_dropped_while_recording_redownloads_and_resumes() {
     for expected_attempt in 1..=2 {
         store.present.lock().expect("fixture store poisoned")
             .retain(|id| *id != english().live.id);
-        watcher.check(&consumer.consumers.ui_view, &bus.sender());
+        watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
         let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
         assert!(events.contains(&AppEvent::ModelMissing(english().live)));
         assert_eq!(consumer.consumers.ui_view.blocks[0].pending_models(), &[english().live.id]);
@@ -933,6 +941,7 @@ async fn model_dropped_with_two_recording_blocks_shares_one_download() {
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     for _ in 0..2 {
         consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
         confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
@@ -943,7 +952,7 @@ async fn model_dropped_with_two_recording_blocks_shares_one_download() {
     store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().refine.id);
 
-    watcher.check(&consumer.consumers.ui_view, &bus.sender());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert_eq!(events.iter().filter(|event| matches!(event,
         AppEvent::ModelMissing(model) if model.id == english().refine.id
@@ -984,13 +993,14 @@ async fn redownload_failure_fails_block_and_retry_recovers() {
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Recording { .. }));
     store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().live.id);
-    watcher.check(&consumer.consumers.ui_view, &bus.sender());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert!(events.contains(&AppEvent::ModelMissing(english().live)));
     assert!(events.contains(&AppEvent::DownloadRequested {
@@ -1005,7 +1015,7 @@ async fn redownload_failure_fails_block_and_retry_recovers() {
         matches!(&consumer.consumers.ui_view.blocks[0].state, BlockState::Failed { error, .. }
         if error.contains("sha256 mismatch"))
     );
-    watcher.check(&consumer.consumers.ui_view, &bus.sender());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert!(!events
         .iter()
@@ -1069,13 +1079,14 @@ async fn model_dropped_while_other_model_downloading() {
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
     confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert_eq!(consumer.consumers.ui_view.blocks[0].pending_models(), &[english().refine.id]);
     store.present.lock().expect("fixture store poisoned")
         .retain(|id| *id != english().live.id);
-    watcher.check(&consumer.consumers.ui_view, &bus.sender());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert_eq!(events.iter().filter(|event| matches!(event,
         AppEvent::ModelMissing(model) if model.id == english().live.id
@@ -1145,9 +1156,9 @@ async fn output_funnel_restores_selected_rows_and_preserves_source_through_model
         handle._tmp.path().to_path_buf(),
         &english().models().map(|model| model.id),
     ));
-    consumer.consumers.language.model_store = store.clone();
     consumer.consumers.downloads.model_store = store.clone();
     let watcher = ModelWatcher::new(store.clone());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
     assert!(matches!(
         consumer.consumers.ui_view.blocks[0].state,
@@ -1203,7 +1214,7 @@ async fn output_funnel_restores_selected_rows_and_preserves_source_through_model
     assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Recording { .. }));
 
     store.present.lock().expect("fixture store poisoned").retain(|model| *model != english().live.id);
-    watcher.check(&consumer.consumers.ui_view, &bus.sender());
+    watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert!(events.contains(&AppEvent::ModelMissing(english().live)));
     assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting { .. }));
@@ -1289,6 +1300,9 @@ async fn language_confirm_and_back_race_never_orphans_downloads() {
         ));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
+        ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+            .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+            .unwrap();
         consumer.consumers.ui_view = source_view();
         source_intent(Intent::PickerNext, &mut consumer, &mut handle.db, &mut bus);
         source_intent(Intent::Confirm, &mut consumer, &mut handle.db, &mut bus);
