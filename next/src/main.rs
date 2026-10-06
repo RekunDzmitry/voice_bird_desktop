@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
 use voice_bird_next::db::{downloads, Database};
-use voice_bird_next::consumer::{Consumer, UiView};
+use voice_bird_next::consumer::{Consumer, Consumers, UiView};
 use voice_bird_next::producer::download::Downloader;
 #[cfg(feature = "net")]
 use voice_bird_next::producer::download::HttpDownloader;
@@ -118,11 +118,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
         }
     };
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
-    let mut consumer = Consumer::new(
+    let mut consumer = Consumer::new(Consumers::new(
         downloader,
         store.clone(),
         voice_bird_next::producer::sources::system_sources(),
-    );
+    ));
     let watcher = ModelWatcher::new(store);
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
@@ -130,13 +130,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     let mut dirty = true;
     loop {
         if dirty {
-            terminal.draw(|f| voice_bird_next::ui::render(f, &consumer.view))?;
+            terminal.draw(|f| voice_bird_next::ui::render(f, &consumer.consumers.ui_view))?;
             dirty = false;
         }
         tokio::select! {
             event = input.next() => {
                 match event {
-                    Some(Ok(Event::Key(key))) => handle_key(key, &consumer.view, &mut db, &tx),
+                    Some(Ok(Event::Key(key))) => handle_key(key, &consumer.consumers.ui_view, &mut db, &tx),
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error),
@@ -149,9 +149,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
                 consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
                 dirty = true;
             }
-            _ = tick.tick() => watcher.check(&consumer.view, &tx),
+            _ = tick.tick() => watcher.check(&consumer.consumers.ui_view, &tx),
         }
-        if consumer.view.should_quit {
+        if consumer.consumers.ui_view.should_quit {
             cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);
             break;
         }
@@ -196,7 +196,7 @@ fn consume_logged(
 ///
 /// `DiscardInflight { model }` is published for each active
 /// claim instead of reaching into the model store directly. The
-/// consumer that owns the store answers it on the next drain.
+/// downloads consumer that owns the model store answers it on the next drain.
 fn cleanup_inflight(
     db: &mut Database,
     bus: &mut EventBus,

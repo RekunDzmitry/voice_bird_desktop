@@ -85,7 +85,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | path | role |
 |---|---|
 | `src/language.rs` | language registry mapping each code to live + refine models |
-| `src/producer/sources.rs` | source snapshots, macOS enumeration, serialized async requests and session panic containment |
+| `src/producer/sources.rs` | audio source snapshots, `AudioSourcesCatalog`, and macOS enumeration |
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
 | `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
@@ -95,10 +95,13 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
-| `src/producer/download.rs` | async `Downloader` / HTTP streaming, per-model tasks, loop-side SQLite claims and language orchestration |
+| `src/producer/download.rs` | async `Downloader`, HTTP streaming, and progress throttling |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
-| `src/producer/mod.rs` | `Producers` handles: `sources`, `downloads`, and `model_store` |
-| `src/consumer/mod.rs` | accepted-event projection and command routing to producers |
+| `src/producer/mod.rs` | external input and transport modules; no consumer-owned producer aggregate |
+| `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
+| `src/consumer/audio_sources.rs` | serialized audio-source requests and session panic containment |
+| `src/consumer/language.rs` | language availability checks and follow-up model requests |
+| `src/consumer/downloads.rs` | attempt-aware SQLite claims, download workers, and staging cleanup |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
@@ -115,11 +118,22 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    `Option<Intent>`; `producer/input.rs` reads focus/cursors from the view and
    domain facts from SQLite, then publishes events. There is no direct
    input→view mutation.
-5. **Producers publish; the consumer reacts to accepted events.**
-   `BeginLanguage` carries the target block id and registry profile. The
-   consumer starts producers, which check both models, publish
-   `LanguageSelected` before worker events, and deduplicate claims through
-   SQLite. Closing the last waiter cancels only that model's in-flight work.
+5. **Consumers can produce the next stage of a flow.** `Consumer` owns
+   `Consumers`, not producer handles. It routes events to the UI projection,
+   audio-source, language, and download consumers. Each handler owns its
+   collaborators; it never calls another consumer to advance the flow.
+   While a block is `PickingLanguage`, input produces `BeginLanguage`.
+   The language consumer publishes `LanguageSelected` and model requests.
+   Those requests must cross the bus/log/SQLite gate before the download
+   consumer claims work. Cached models lead straight to Recording; otherwise
+   download success events move Waiting blocks to Recording.
+   `DownloadRequested` carries the intended attempt: a terminal result that
+   overtakes a join is reconciled, not silently retried. Superseded requests
+   and stale terminal replays are rejected. An explicit retry requests the
+   next attempt. A cancelled/interrupted late join enters Failed rather than
+   waiting forever. Requests without waiters or after Quit launch no work.
+   Duplicate valid requests share one SQLite claim. Closing the last waiter
+   cancels only that model's in-flight work.
    No service calls `std::thread::spawn`: Tokio schedules asynchronous work;
    native enumeration and installation use `spawn_blocking`.
 6. **SQLite is the source of truth; `UiView::downloads` is its render

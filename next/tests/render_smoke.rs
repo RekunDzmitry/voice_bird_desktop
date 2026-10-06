@@ -79,7 +79,7 @@ fn picking_100x30_matches_golden() {
     let state = UiView {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(ListPicker::default()),
+            state: BlockState::PickingLanguage(ListPicker::default()),
 
             ..Default::default()
         }],
@@ -161,7 +161,7 @@ fn picker_renders_languages_without_model_ids() {
     let state = UiView {
         blocks: vec![Block {
             id: 1,
-            state: BlockState::Picking(ListPicker::default()),
+            state: BlockState::PickingLanguage(ListPicker::default()),
             ..Default::default()
         }],
         focus: 0,

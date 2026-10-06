@@ -9,6 +9,12 @@
   model installation on the blocking pool.
 - Preserve serialized source requests, session panic fallback, download
   cancellation, render snapshots, and immediate Quit without joining stalled work.
+- Decouple event consumers from the producer aggregate. Route audio-source,
+  language, model-request, and UI stages through independent `Consumers`;
+  follow-up events cross the bus and SQLite gate before the next stage runs.
+  Preserve attempt lineage across delayed requests and terminal replays.
+- Rename the audio catalog to `AudioSourcesCatalog`, its dependency to
+  `audio_sources`, and the language-picker state to `PickingLanguage`.
 
 ## 0.5.0 (2026-08-05)
 

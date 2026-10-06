@@ -77,7 +77,7 @@ mod tests {
         let watcher = ModelWatcher::new(store);
         let state = UiView {
             blocks: vec![
-                Block::new(1, BlockState::Picking(ListPicker::default())),
+                Block::new(1, BlockState::PickingLanguage(ListPicker::default())),
                 Block::new(2, BlockState::Failed {
                     language,
                     error: "failed".to_string(),

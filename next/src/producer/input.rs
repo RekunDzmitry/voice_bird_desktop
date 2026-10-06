@@ -20,7 +20,7 @@ use crate::consumer::ui_view::{BlockState, UiView};
 pub fn stamp_picker_move(tx: &EventSender, state: &UiView, direction: picker::PickerMove) {
     let (from_language, to_language) = match state.focused() {
         Some(block) => match &block.state {
-            BlockState::Picking(picker) => {
+            BlockState::PickingLanguage(picker) => {
                 let from = LANGUAGES[picker.index].code;
                 let to = LANGUAGES[picker::step(picker.index, LANGUAGES.len(), direction)].code;
                 (Some(from), Some(to))
@@ -38,7 +38,7 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiView, direction: picker::Pi
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
 /// - `Confirm` and `Retry` publish [`AppEvent::BeginLanguage`] with the
-///   target block id. The consumer routes it to the download producer.
+///   target block id. The consumer routes it to the language consumer.
 /// - All other intents are direct mappings.
 ///
 /// [`AppEvent::BeginLanguage`]: crate::bus::AppEvent::BeginLanguage
@@ -146,7 +146,7 @@ pub fn resolve_intent(intent: Intent, state: &UiView, db: &mut Database, tx: &Ev
                             }
                         }
                     }
-                    BlockState::Picking(picker) => tx.publish(AppEvent::BeginLanguage {
+                    BlockState::PickingLanguage(picker) => tx.publish(AppEvent::BeginLanguage {
                         block: block.id,
                         language: &LANGUAGES[picker.index],
                         source_rev: block.source.as_ref().map(|source| source.rev),
@@ -160,7 +160,7 @@ pub fn resolve_intent(intent: Intent, state: &UiView, db: &mut Database, tx: &Ev
                 if let Some(source) = &block.source {
                     let edge = match block.state {
                         BlockState::PickingApp(_) => Some((FunnelStep::App, FunnelStep::Device)),
-                        BlockState::Picking(_) => Some((
+                        BlockState::PickingLanguage(_) => Some((
                             FunnelStep::Language,
                             if source.app.is_some() {
                                 FunnelStep::App
@@ -244,7 +244,7 @@ mod tests {
         DbHandle { db, _tmp: tmp }
     }
 
-    /// The state with five Picking blocks (one focused). Mirrors the
+    /// The state with five PickingLanguage blocks (one focused). Mirrors the
     /// original `state_with_five_blocks` helper but walks the bus so
     /// the reducer's AddBlock path — including `show_block` — runs.
     fn state_with_five_blocks() -> UiView {

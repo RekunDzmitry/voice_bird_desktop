@@ -181,7 +181,7 @@ fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
 /// Callers pass the whole database, then pick the table they need.
 /// Adding a second table later is one new module of free functions
 /// and one more `&Database` borrow — no signature churn in
-/// `producer::input::resolve_intent`, `producer::download::begin_language`,
+/// `producer::input::resolve_intent`, `consumer::downloads::DownloadsConsumer::request`,
 /// `main::handle_key`, etc.
 pub fn get(db: &Database, model: &str) -> rusqlite::Result<Option<DownloadRow>> {
     db.conn_ref()
@@ -287,11 +287,9 @@ pub fn cancel(db: &mut Database, model: &str) -> rusqlite::Result<bool> {
 /// drop instead of silently filtering it.
 pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     match ev {
-        AppEvent::DownloadRequested(_) => {
-            // `DownloadRequested` is published by the resolver
-            // *after* a successful claim — `start` already
-            // inserted the row. The event itself carries no
-            // attempt, so it's not a transition.
+        AppEvent::DownloadRequested { .. } => {
+            // A request precedes its claim. The requested attempt is a
+            // consumer precondition, not a persisted lifecycle transition.
             Ok(true)
         }
         AppEvent::DownloadProgress {
@@ -411,6 +409,23 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
             )?;
             Ok(true)
         }
+        AppEvent::DownloadStatusChanged {
+            model,
+            attempt,
+            from: Some(from),
+            to,
+            ..
+        } if from == to => {
+            // A replay describes the current row, not a historical transition.
+            // It must not fail a newer retry that started before this bus pass.
+            let current = get(db, model)?;
+            if current.is_some_and(|row| row.attempt == *attempt && row.status == *to) {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
+        }
         _ => Ok(true),
     }
 }
@@ -501,6 +516,7 @@ fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
         AppEvent::DownloadSucceeded { model, .. } => (*model, "DownloadSucceeded"),
         AppEvent::DownloadFailed { model, .. } => (*model, "DownloadFailed"),
         AppEvent::DownloadCancelled { model, .. } => (*model, "DownloadCancelled"),
+        AppEvent::DownloadStatusChanged { model, .. } => (model.as_ref(), "DownloadStatusChanged"),
         _ => ("", "Unknown"),
     };
     // Best-effort: re-read the row to capture the live attempt

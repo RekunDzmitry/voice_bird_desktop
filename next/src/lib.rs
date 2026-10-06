@@ -3,7 +3,7 @@
 //! Ground rules (see README.md):
 //! - [`consumer::UiView`] is plain data: no runtime handles or channels.
 //! - [`ui::render`] is a pure function of the UI view.
-//! - Producers publish events; the consumer reacts only to accepted events.
+//! - Consumers handle accepted events and publish follow-up stages through the bus.
 //! - Every event is logged before SQLite gates domain transitions.
 //! - Tokio schedules services; blocking native/file work uses `spawn_blocking`.
 pub mod bus;

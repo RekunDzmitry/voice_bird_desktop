@@ -24,7 +24,7 @@ use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView}
 /// then `state.blocks` evenly-distributed columns inside.
 ///
 /// Each column renders its own stage:
-/// - `Picking(p)` → the language list, `▶` on `p.index`.
+/// - `PickingLanguage(p)` → the language list, `▶` on `p.index`.
 /// - `Waiting` → one gauge per model role.
 /// - `Recording` → `● recording (mocked)`.
 /// - `Failed` → the error wrapped, plus `r retry · Esc close`.
@@ -157,7 +157,7 @@ fn block_title(block: &crate::consumer::ui_view::Block) -> String {
     match &block.state {
         BlockState::PickingDevice(_) => title.push_str("pick a device"),
         BlockState::PickingApp(_) => title.push_str("pick an app"),
-        BlockState::Picking(_) => title.push_str("pick a language"),
+        BlockState::PickingLanguage(_) => title.push_str("pick a language"),
         BlockState::Waiting { language, .. } | BlockState::Recording { language } => {
             title.push_str(language.code);
         }
@@ -288,7 +288,7 @@ fn render_menu(f: &mut Frame, state: &UiView, menu: &crate::picker::SessionMenu,
 
 fn block_body_lines(block: &crate::consumer::ui_view::Block, _state: &UiView) -> Vec<Line<'static>> {
     match &block.state {
-        BlockState::Picking(picker) => {
+        BlockState::PickingLanguage(picker) => {
             let mut lines = picker_lines(picker);
             if block.source.is_some() {
                 lines.push(Line::from(""));
@@ -458,7 +458,7 @@ mod tests {
         let state = UiView {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Picking(ListPicker::default()),
+                state: BlockState::PickingLanguage(ListPicker::default()),
                 ..Default::default()
             }],
             focus: 0,

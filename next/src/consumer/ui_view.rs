@@ -27,7 +27,7 @@ pub enum BlockState {
     PickingDevice(ListPicker),
     PickingApp(ListPicker),
     /// Choosing a language. Carries its own picker — no shared overlay.
-    Picking(ListPicker),
+    PickingLanguage(ListPicker),
     /// Waiting until every model id in `pending` is present on disk.
     /// Progress stays in [`UiView::downloads`] so blocks share per-model state.
     Waiting {
@@ -97,7 +97,7 @@ impl Block {
 
     pub fn language(&self) -> Option<&'static LanguageProfile> {
         match &self.state {
-            BlockState::Picking(_) | BlockState::PickingDevice(_) | BlockState::PickingApp(_) => {
+            BlockState::PickingLanguage(_) | BlockState::PickingDevice(_) | BlockState::PickingApp(_) => {
                 None
             }
             BlockState::Waiting { language, .. }
@@ -119,7 +119,7 @@ impl Block {
             BlockState::Recording { language } | BlockState::Waiting { language, .. } => {
                 Some(language.models())
             }
-            BlockState::Picking(_)
+            BlockState::PickingLanguage(_)
             | BlockState::PickingDevice(_)
             | BlockState::PickingApp(_)
             | BlockState::Failed { .. } => None,
@@ -136,7 +136,7 @@ impl Default for Block {
     /// ..Default::default() }`. Not used by production code; the
     /// reducer constructs blocks via [`Block::new`].
     fn default() -> Self {
-        Self::new(0, BlockState::Picking(ListPicker::default()))
+        Self::new(0, BlockState::PickingLanguage(ListPicker::default()))
     }
 }
 
@@ -383,7 +383,7 @@ impl UiView {
         let state = if snapshot.is_some() {
             BlockState::PickingDevice(ListPicker::default())
         } else {
-            BlockState::Picking(ListPicker::default())
+            BlockState::PickingLanguage(ListPicker::default())
         };
         let mut block = Block::new_hidden(id, state);
         block.source = snapshot.map(|snapshot| SourceSelection {
@@ -418,7 +418,7 @@ impl UiView {
                 let step = match block.state {
                     BlockState::PickingDevice(_) => FunnelStep::Device,
                     BlockState::PickingApp(_) => FunnelStep::App,
-                    BlockState::Picking(_) => FunnelStep::Language,
+                    BlockState::PickingLanguage(_) => FunnelStep::Language,
                     _ => FunnelStep::Committed,
                 };
                 let Some(source) = block.source.as_mut() else {
@@ -447,7 +447,7 @@ impl UiView {
                             .position(|row| Some(row) == source.app.as_ref())
                             .unwrap_or(0),
                     }),
-                    FunnelStep::Language => BlockState::Picking(ListPicker::default()),
+                    FunnelStep::Language => BlockState::PickingLanguage(ListPicker::default()),
                     FunnelStep::Committed => unreachable!(),
                 };
             }
@@ -487,7 +487,7 @@ impl UiView {
             AppEvent::PickerMoved { direction, .. } => {
                 if let Some(block) = self.focused_mut() {
                     match &mut block.state {
-                        BlockState::Picking(picker) => {
+                        BlockState::PickingLanguage(picker) => {
                             picker.apply(*direction, crate::language::LANGUAGES.len());
                         }
                         BlockState::PickingDevice(cursor) => {
@@ -516,7 +516,7 @@ impl UiView {
                 {
                     if matches!(
                         block.state,
-                        BlockState::Picking(_) | BlockState::Failed { .. }
+                        BlockState::PickingLanguage(_) | BlockState::Failed { .. }
                     ) {
                         block.state = if pending.is_empty() {
                             BlockState::Recording { language }
@@ -531,7 +531,7 @@ impl UiView {
             }
             AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::ModelMissing(entry) => self.mark_missing(entry.id),
-            AppEvent::DownloadRequested(entry) => {
+            AppEvent::DownloadRequested { model: entry, .. } => {
                 self.downloads.entry(entry.id).or_insert(DownloadState {
                     phase: DownloadPhase::Fetching,
                     bytes: 0,
@@ -629,7 +629,7 @@ impl UiView {
             }
             // The table publishes these after persisting a lifecycle
             // transition. Replaying terminal outcomes here reconciles a worker
-            // event that was reduced while a new block was still Picking.
+            // event that was reduced while a new block was still PickingLanguage.
             AppEvent::DownloadStatusChanged {
                 model, to, error, ..
             } => match to {
@@ -638,6 +638,12 @@ impl UiView {
                     model.as_ref(),
                     error.as_deref().unwrap_or("download failed"),
                 ),
+                crate::bus::DownloadStatus::Cancelled => {
+                    self.fail_waiters(model.as_ref(), "download cancelled");
+                }
+                crate::bus::DownloadStatus::Interrupted => {
+                    self.fail_waiters(model.as_ref(), "download interrupted");
+                }
                 _ => {}
             },
             AppEvent::DownloadEventRejected { .. } => {}
@@ -772,7 +778,7 @@ mod tests {
         assert_eq!(s.blocks.len(), 1);
         assert_eq!(s.focus, 0);
         assert_eq!(s.blocks[0].id, 1);
-        assert!(matches!(s.blocks[0].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[0].state, BlockState::PickingLanguage(_)));
         assert_eq!(s.next_block_id, 2);
         assert!(s.blocks[0].visible, "a fresh block starts visible");
     }
@@ -789,7 +795,7 @@ mod tests {
             s.blocks[0].state,
             BlockState::Recording { language } if language == english()
         ));
-        assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
 
     /// Regression: after 256 `AddBlock` events the candidate id
@@ -916,7 +922,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -944,7 +950,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -975,7 +981,7 @@ mod tests {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -1055,7 +1061,7 @@ mod tests {
             to_language: None,
         });
         let picker_index = match &s.blocks[1].state {
-            BlockState::Picking(picker) => picker.index,
+            BlockState::PickingLanguage(picker) => picker.index,
             _ => panic!("block 2 should still be picking"),
         };
         assert_eq!(picker_index, 0);
@@ -1075,7 +1081,7 @@ mod tests {
             s.blocks[0].state,
             BlockState::Recording { language } if language == english()
         ));
-        assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
 
     #[test]
@@ -1181,7 +1187,7 @@ mod tests {
         assert_eq!(s.title, "Hello");
         assert!(s.should_quit);
         assert_eq!(s.next_block_id, 43);
-        assert!(matches!(s.blocks[0].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[0].state, BlockState::PickingLanguage(_)));
         assert!(s.menu.is_none());
         assert_eq!(s.focus_clock, 1, "AddBlock bumps the focus clock");
     }
@@ -1189,7 +1195,7 @@ mod tests {
     #[test]
     fn download_requested_creates_one_shared_record() {
         let mut s = UiView::default();
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         s.apply(&AppEvent::DownloadProgress {
             attempt: 1,
             model: english().live.id,
@@ -1197,7 +1203,7 @@ mod tests {
             total: Some(200),
             bytes_per_sec: 12,
         });
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         let row = s.downloads.get(english().live.id).unwrap();
         assert_eq!(row.bytes, 100);
         assert_eq!(row.total, Some(200));
@@ -1207,7 +1213,7 @@ mod tests {
     #[test]
     fn download_progress_after_success_is_ignored() {
         let mut s = UiView::default();
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         s.apply(&AppEvent::DownloadSucceeded {
             attempt: 1,
             model: english().live.id,
@@ -1225,7 +1231,7 @@ mod tests {
     #[test]
     fn download_installing_sets_phase() {
         let mut s = UiView::default();
-        s.apply(&AppEvent::DownloadRequested(english().refine));
+        s.apply(&AppEvent::DownloadRequested { model: english().refine, attempt: 1 });
         s.apply(&AppEvent::DownloadInstalling {
             attempt: 1,
             model: english().refine.id,
@@ -1396,7 +1402,7 @@ mod tests {
     fn block_closed_drops_only_unshared_pending_downloads() {
         let mut s = UiView::default();
         for model in english().models() {
-            s.apply(&AppEvent::DownloadRequested(model));
+            s.apply(&AppEvent::DownloadRequested { model, attempt: 1 });
         }
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
@@ -1413,7 +1419,7 @@ mod tests {
     #[test]
     fn block_closed_keeps_download_needed_by_a_failed_block() {
         let mut s = UiView::default();
-        s.apply(&AppEvent::DownloadRequested(english().refine));
+        s.apply(&AppEvent::DownloadRequested { model: english().refine, attempt: 1 });
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadFailed {

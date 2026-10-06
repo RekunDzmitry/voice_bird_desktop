@@ -1,8 +1,8 @@
 //! Application event bus.
 //!
-//! Producers publish typed events through a Tokio unbounded channel. The loop
-//! logs every event, gates it through SQLite, and passes accepted events to the
-//! consumer. Publishing stays synchronous; receiving wakes the event loop.
+//! Producers and consumers publish typed events through a Tokio unbounded
+//! channel. The loop logs every event, gates it through SQLite, and routes
+//! accepted events to consumers. Publishing is synchronous; receiving wakes the loop.
 //!
 //! ## Why not `Copy`?
 //!
@@ -74,7 +74,7 @@ pub enum AppEvent {
     },
     /// `←` / `→`: move focus between blocks.
     FocusMoved { direction: FocusMove },
-    /// `↑` / `↓` while the focused block is `Picking`: move the
+    /// `↑` / `↓` while the focused block is `PickingLanguage`: move the
     /// highlight inside that block's language list. The language
     /// codes are stamped by the resolver for the event log.
     PickerMoved {
@@ -97,12 +97,17 @@ pub enum AppEvent {
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
     /// A model a block already counted as installed is no longer on disk.
-    /// The consumer stops recording and starts a producer to re-request it.
+    /// The view stops recording; the language consumer publishes a model request.
     ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
-    /// Seeds the shared per-model download projection.
-    DownloadRequested(&'static ModelEntry),
+    /// Seeds the shared projection; the download consumer claims or joins work.
+    DownloadRequested {
+        model: &'static ModelEntry,
+        /// Intended attempt, captured before the request's next bus pass.
+        /// A terminal outcome for this attempt must not trigger an implicit retry.
+        attempt: u32,
+    },
     /// Progress on a download. `bytes_per_sec` is a per-tick average
     /// over the throttle window — used by the renderer to label the
     /// gauge when `total` is `None`. `attempt` disambiguates events
@@ -127,7 +132,7 @@ pub enum AppEvent {
         error: String,
     },
     /// Same shape as [`AppEvent::DownloadFailed`] but published by
-    /// [`crate::producer::download::begin_language`] when the orchestrator failed
+    /// [`crate::consumer::downloads::DownloadsConsumer::request`] when it failed
     /// to claim a row in the downloads table *before* a worker could
     /// spawn (disk full, lock timeout, write error). The table
     /// reducer accepts this variant even when no row exists for
@@ -144,10 +149,10 @@ pub enum AppEvent {
     /// UiView.downloads entry; the in-flight task observes the
     /// cancellation row separately.
     DownloadCancelled { attempt: u32, model: &'static str },
-    /// Emitted after the downloads table accepts and persists every lifecycle
-    /// transition. The reducer uses terminal transitions to reconcile worker
-    /// outcomes that raced ahead of `LanguageSelected`; the event log records
-    /// the same lifecycle the SQL table does.
+    /// Emitted after the downloads table persists a lifecycle transition, or
+    /// to replay its current outcome for a request overtaken by that transition.
+    /// The reducer reconciles outcomes that raced ahead of `LanguageSelected`;
+    /// the event log records the same lifecycle the SQL table does.
     ///
     /// `model` is an `Arc<str>` (not `&'static str`) because the transition
     /// publisher may have read it from the database instead of the catalog.
@@ -188,11 +193,11 @@ pub enum AppEvent {
     Quit,
 
     // -----------------------------------------------------------------
-    // Bus commands are routed by the consumer only after SQLite accepts them.
-    // Producers answer by publishing new events, never by mutating the UI.
+    // Events are routed to consumers only after SQLite accepts them.
+    // Follow-up stages publish new events instead of calling another consumer.
     // -----------------------------------------------------------------
-    /// Resolver saw Enter/Retry on a block. The consumer starts producers to
-    /// ensure both models for the language and target the reply by block id.
+    /// Resolve model availability for a language and publish `LanguageSelected`
+    /// plus model requests. Downloads begin when those requests are consumed.
     BeginLanguage {
         block: u8,
         language: &'static LanguageProfile,

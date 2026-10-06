@@ -9,7 +9,9 @@ use std::time::Duration;
 use crate::consumer::UiView;
 use crate::db::downloads::CancelCheck;
 use crate::producer::download::{DownloadError, Downloader};
-use crate::producer::sources::{AppTarget, AudioDevice, AudioSourceSnapshot, DeviceKind, SourceCatalog};
+use crate::producer::sources::{
+    AppTarget, AudioDevice, AudioSourceSnapshot, AudioSourcesCatalog, DeviceKind,
+};
 use crate::picker::ModelEntry;
 use crate::transcription_models::{handler_for, ModelStore};
 use crate::ui;
@@ -20,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Clone)]
 pub struct FixtureSources(pub Option<AudioSourceSnapshot>);
 
-impl SourceCatalog for FixtureSources {
+impl AudioSourcesCatalog for FixtureSources {
     fn snapshot(&self) -> Option<AudioSourceSnapshot> {
         self.0.clone()
     }
