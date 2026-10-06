@@ -26,12 +26,12 @@ pub struct Consumer {
 impl Consumer {
     pub fn new(
         downloader: Arc<dyn Downloader>,
-        store: Arc<dyn ModelStore>,
+        model_store: Arc<dyn ModelStore>,
         sources: Arc<dyn SourceCatalog>,
     ) -> Self {
         Self {
             view: UiView::default(),
-            producers: Producers::new(downloader, store, sources),
+            producers: Producers::new(downloader, model_store, sources),
         }
     }
 
@@ -47,14 +47,14 @@ impl Consumer {
                 } => begin_language(
                     *block,
                     language,
-                    self.producers.store.clone(),
+                    self.producers.model_store.clone(),
                     db,
                     self.producers.downloads.clone(),
                     tx,
                 ),
                 AppEvent::ModelMissing(entry) => ensure_model(
                     entry,
-                    self.producers.store.clone(),
+                    self.producers.model_store.clone(),
                     db,
                     self.producers.downloads.clone(),
                     tx,
@@ -62,7 +62,7 @@ impl Consumer {
                 AppEvent::DiscardInflight { model } => {
                     // Unknown model ids have no inflight artifacts to discard.
                     if let Some(entry) = CATALOG.iter().find(|entry| entry.id == model.as_ref()) {
-                        self.producers.store.discard_inflight(entry);
+                        self.producers.model_store.discard_inflight(entry);
                     }
                 }
                 _ => {}

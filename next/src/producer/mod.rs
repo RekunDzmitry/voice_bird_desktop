@@ -16,19 +16,19 @@ pub mod sources;
 pub struct Producers {
     pub sources: SourceManager,
     pub downloads: Arc<dyn Downloader>,
-    pub store: Arc<dyn ModelStore>,
+    pub model_store: Arc<dyn ModelStore>,
 }
 
 impl Producers {
     pub fn new(
         downloads: Arc<dyn Downloader>,
-        store: Arc<dyn ModelStore>,
+        model_store: Arc<dyn ModelStore>,
         sources: Arc<dyn SourceCatalog>,
     ) -> Self {
         Self {
             sources: SourceManager::new(sources),
             downloads,
-            store,
+            model_store,
         }
     }
 }

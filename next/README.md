@@ -97,7 +97,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
 | `src/producer/download.rs` | async `Downloader` / HTTP streaming, per-model tasks, loop-side SQLite claims and language orchestration |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
-| `src/producer/mod.rs` | `Producers` handles for sources, downloads, and model store |
+| `src/producer/mod.rs` | `Producers` handles: `sources`, `downloads`, and `model_store` |
 | `src/consumer/mod.rs` | accepted-event projection and command routing to producers |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |

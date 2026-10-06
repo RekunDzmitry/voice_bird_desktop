@@ -381,7 +381,7 @@ async fn failure_between_availability_check_and_selection_reaches_late_waiter() 
         calls.clone(),
     ));
 
-    consumer.producers.store = store;
+    consumer.producers.model_store = store;
     consumer.producers.downloads = downloader;
     bus.sender().publish(AppEvent::BeginLanguage {
         block: 2,
@@ -506,7 +506,7 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
         })
     }).await;
     for model in english().models() {
-        assert!(!consumer.producers.store.is_available(model));
+        assert!(!consumer.producers.model_store.is_available(model));
         assert!(!tmp.path().join(format!("{}.1.part", model.id)).exists());
     }
 }
@@ -922,7 +922,7 @@ async fn output_funnel_restores_selected_rows_and_preserves_source_through_model
         handle._tmp.path().to_path_buf(),
         &english().models().map(|model| model.id),
     ));
-    consumer.producers.store = store.clone();
+    consumer.producers.model_store = store.clone();
     let watcher = ModelWatcher::new(store.clone());
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
     assert!(matches!(
