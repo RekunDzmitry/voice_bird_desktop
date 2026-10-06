@@ -88,7 +88,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/producer/sources.rs` | source snapshots, macOS enumeration, serialized async requests and session panic containment |
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
-| `src/consumer/ui_state.rs` | `UiView` + `BlockState` + pure reducer |
+| `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
 | `src/producer/model_watch.rs` | tick-driven presence checks for installed models used by active blocks |
 | `src/ui.rs` | `render(f, &UiView)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |

@@ -13,7 +13,7 @@ use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
-use crate::consumer::ui_state::{BlockState, UiView};
+use crate::consumer::ui_view::{BlockState, UiView};
 /// Stamp the `from_language`/`to_language` codes onto `PickerMoved`.
 /// The input layer has no registry context, so the resolver reads the
 /// focused block's picker without mutating it.
@@ -225,7 +225,7 @@ mod tests {
     use crate::db::Database;
     use crate::language::{LanguageProfile, LANGUAGES};
     use crate::picker::SessionMenu;
-    use crate::consumer::ui_state::Block;
+    use crate::consumer::ui_view::Block;
 
     fn english() -> &'static LanguageProfile {
         &LANGUAGES[0]

@@ -3,7 +3,7 @@ use proptest::prelude::*;
 use voice_bird_next::{
     language::LANGUAGES,
     picker::{ListPicker, SessionMenu, CATALOG},
-    consumer::ui_state::{Block, BlockState, DownloadPhase, DownloadState, UiView},
+    consumer::ui_view::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     testing::render_to_string,
 };
 

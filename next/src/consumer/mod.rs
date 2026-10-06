@@ -14,8 +14,8 @@ use crate::producer::sources::SourceCatalog;
 use crate::producer::Producers;
 use crate::transcription_models::ModelStore;
 
-pub mod ui_state;
-pub use ui_state::UiView;
+pub mod ui_view;
+pub use ui_view::UiView;
 
 /// The loop's accepted-event consumer and render-side projection.
 pub struct Consumer {

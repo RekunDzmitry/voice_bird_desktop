@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender};
-use crate::consumer::ui_state::{Block, UiView};
+use crate::consumer::ui_view::{Block, UiView};
 use crate::transcription_models::ModelStore;
 
 pub struct ModelWatcher {
@@ -34,7 +34,7 @@ mod tests {
     use crate::bus::EventBus;
     use crate::language::LANGUAGES;
     use crate::picker::ListPicker;
-    use crate::consumer::ui_state::BlockState;
+    use crate::consumer::ui_view::BlockState;
     use crate::testing::FixtureStore;
 
     #[test]

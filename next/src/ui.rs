@@ -18,7 +18,7 @@ use ratatui::{
 use crate::producer::sources::DeviceKind;
 use crate::language::{LanguageProfile, LANGUAGES};
 use crate::picker::ListPicker;
-use crate::consumer::ui_state::{BlockState, DownloadPhase, DownloadState, UiView};
+use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView};
 
 /// Draw one frame: outer window with `state.title` in its top border,
 /// then `state.blocks` evenly-distributed columns inside.
@@ -71,7 +71,7 @@ pub fn render(f: &mut Frame, state: &UiView) {
     // enforced in the reducer's `show_block`, so the renderer never
     // has to clamp. If no block is visible (e.g. nothing has been
     // created yet), skip the layout entirely.
-    let visible: Vec<&crate::consumer::ui_state::Block> = state.blocks.iter().filter(|b| b.visible).collect();
+    let visible: Vec<&crate::consumer::ui_view::Block> = state.blocks.iter().filter(|b| b.visible).collect();
     if !visible.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
@@ -98,7 +98,7 @@ pub fn render(f: &mut Frame, state: &UiView) {
 
 fn render_block(
     f: &mut Frame,
-    block: &crate::consumer::ui_state::Block,
+    block: &crate::consumer::ui_view::Block,
     focused: bool,
     area: Rect,
     state: &UiView,
@@ -140,7 +140,7 @@ fn block_border(focused: bool) -> Block<'static> {
     }
 }
 
-fn block_title(block: &crate::consumer::ui_state::Block) -> String {
+fn block_title(block: &crate::consumer::ui_view::Block) -> String {
     let mut title = block.id.to_string();
     if let Some(source) = &block.source {
         let visible_labels = match &block.state {
@@ -169,7 +169,7 @@ fn block_title(block: &crate::consumer::ui_state::Block) -> String {
     title
 }
 
-fn render_source_picker(f: &mut Frame, block: &crate::consumer::ui_state::Block, selected: usize, area: Rect) {
+fn render_source_picker(f: &mut Frame, block: &crate::consumer::ui_view::Block, selected: usize, area: Rect) {
     let Some(source) = &block.source else { return };
     let picking_device = matches!(block.state, BlockState::PickingDevice(_));
     let total = if picking_device {
@@ -286,7 +286,7 @@ fn render_menu(f: &mut Frame, state: &UiView, menu: &crate::picker::SessionMenu,
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn block_body_lines(block: &crate::consumer::ui_state::Block, _state: &UiView) -> Vec<Line<'static>> {
+fn block_body_lines(block: &crate::consumer::ui_view::Block, _state: &UiView) -> Vec<Line<'static>> {
     match &block.state {
         BlockState::Picking(picker) => {
             let mut lines = picker_lines(picker);
@@ -421,7 +421,7 @@ pub fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::language::LANGUAGES;
-    use crate::consumer::ui_state::Block;
+    use crate::consumer::ui_view::Block;
     use crate::testing::render_to_string;
 
     #[test]

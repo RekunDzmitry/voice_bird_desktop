@@ -5,7 +5,7 @@ use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
 use crate::picker::{ListPicker, ModelEntry, PickerEvent, SessionMenu};
 
-/// Render-side phase for one download. Lives in `consumer/ui_state.rs` (UI
+/// Render-side phase for one download. Lives in `consumer/ui_view.rs` (UI
 /// only) because the SQLite `DownloadStatus` enum carries the
 /// matching lifecycle for the table — the renderer doesn't need
 /// the full enum, only the two phases it renders distinctly.

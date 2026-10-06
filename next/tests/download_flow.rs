@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use voice_bird_next::bus::{AppEvent, DownloadStatus, EventBus, EventSender};
-use voice_bird_next::consumer::ui_state::BlockState;
+use voice_bird_next::consumer::ui_view::BlockState;
 use voice_bird_next::consumer::{Consumer, UiView};
 use voice_bird_next::db::downloads::CancelCheck;
 use voice_bird_next::db::{downloads, Database};

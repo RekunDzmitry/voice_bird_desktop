@@ -897,7 +897,7 @@ mod tests {
             .first()
             .expect("block must still exist after the failure");
         match &block.state {
-            crate::consumer::ui_state::BlockState::Failed {
+            crate::consumer::ui_view::BlockState::Failed {
                 language: failed_language,
                 error,
                 ..
