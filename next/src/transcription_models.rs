@@ -301,16 +301,14 @@ fn locate_nemotron_dir(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Public surface used by the resolver. `CacheDirStore` is a thin
-/// pass-through over [`ModelFormatHandler`]; future stores (memory,
-/// http, ...) live behind the same trait.
+/// Model-store surface used by the watcher and model-store consumer.
+/// `CacheDirStore` delegates format-specific work to [`ModelFormatHandler`].
 pub trait ModelStore: Send + Sync + 'static {
     fn is_available(&self, entry: &ModelEntry) -> bool;
-    /// Resolve the staging path for the supplied attempt id. The
-    /// caller is the worker that just received a `Claim` from the
-    /// table; it threads the attempt through to the handler so two
-    /// concurrent attempts of the same model never share a
-    /// `.part` file.
+    /// Resolve the staging path for the supplied attempt id.
+    /// The watcher and model-store consumer persist it in SQLite before fetch;
+    /// they thread the claimed attempt through to the handler so concurrent
+    /// attempts of the same model never share a `.part` file.
     fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError>;
     fn install(
         &self,
@@ -421,13 +419,9 @@ impl ModelStore for CacheDirStore {
     }
 
     fn discard_inflight(&self, _entry: &ModelEntry) {
-        // The startup sweep below is the canonical handler for any
-        // straggler `.part` files and `.tmp` directories from any
-        // attempt, so this per-call cleanup only needs to cover the
-        // canonical attempt=1 path. In practice a previous session's
-        // `cleanup_inflight` ran before exit; this defensive call
-        // exists so the contract still holds if the process is
-        // killed before the Quit handler.
+        // Both startup and quit cleanup sweep every attempt's staging artifacts,
+        // including archives and unpack scratch directories, but never installed
+        // model files.
         let _ = self.sweep_staging();
     }
 }

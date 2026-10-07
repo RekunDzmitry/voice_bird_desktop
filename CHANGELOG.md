@@ -19,6 +19,11 @@
   availability table. Refresh the full catalog at startup and on ticks;
   `LanguageConsumer` is stateless and queries availability and download attempts.
   Accepted installation successes update availability; stale successes do not.
+- Remove the model store from `DownloadsConsumer`. Persist attempt-scoped
+  staging paths via the watcher; downloads only claim and fetch. Route verified
+  fetches through a gated model-store consumer for installation, and send
+  `DiscardInflight` there for staging sweeps. Reject duplicate/stale handoffs and
+  old-attempt status notifications so immediate cancellation retries stay independent.
 
 ## 0.5.0 (2026-08-05)
 

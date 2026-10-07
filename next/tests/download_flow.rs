@@ -203,6 +203,114 @@ async fn language_downloads_start_only_after_followups_cross_the_gate() {
 }
 
 #[tokio::test]
+async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut consumer = Consumer::new(Consumers::new(
+        Arc::new(WritingDownloader { calls: calls.clone() }),
+        store.clone(),
+        Arc::new(NoSources),
+    ));
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
+    consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
+    confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
+
+    // Leave fetch completion on the bus: verified bytes are not installed yet.
+    let mut fetched = Vec::new();
+    while fetched.len() < 2 {
+        let event = timeout(Duration::from_secs(5), bus.recv()).await.unwrap().unwrap();
+        if matches!(event, AppEvent::DownloadFetched { .. }) {
+            fetched.push(event);
+        } else {
+            consume_batch(vec![event], &mut consumer, &mut handle.db, &bus.sender());
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting { .. }));
+    for model in english().models() {
+        assert!(!store.is_available(model));
+        assert_eq!(
+            std::fs::read(store.staging_path(model, 1).unwrap()).unwrap(),
+            b"fixture model"
+        );
+        assert_eq!(
+            downloads::get(&handle.db, model.id).unwrap().unwrap().status,
+            DownloadStatus::Downloading
+        );
+    }
+
+    consume_batch(fetched, &mut consumer, &mut handle.db, &bus.sender());
+    settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
+        matches!(view.blocks[0].state, BlockState::Recording { .. })
+    }).await;
+    for model in english().models() {
+        assert_eq!(
+            std::fs::read(store.root().join(format!("{}.gguf", model.id))).unwrap(),
+            b"fixture model"
+        );
+        assert!(!store.staging_path(model, 1).unwrap().exists());
+        assert!(voice_bird_next::db::models::is_available(&handle.db, model.id).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn cancelled_fetch_handoff_cannot_fail_an_immediate_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
+    std::fs::write(
+        store.root().join(format!("{}.gguf", english().refine.id)),
+        b"cached refine",
+    ).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut consumer = Consumer::new(Consumers::new(
+        Arc::new(WritingDownloader { calls: calls.clone() }),
+        store.clone(),
+        Arc::new(NoSources),
+    ));
+    let mut bus = EventBus::new();
+    let mut handle = downloads_with(&bus);
+    ModelWatcher::new(store.clone())
+        .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
+        .unwrap();
+    consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
+    confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
+    let fetched = loop {
+        let event = timeout(Duration::from_secs(5), bus.recv()).await.unwrap().unwrap();
+        if matches!(event, AppEvent::DownloadFetched { .. }) {
+            break event;
+        }
+        consume_batch(vec![event], &mut consumer, &mut handle.db, &bus.sender());
+    };
+    downloads::cancel(&mut handle.db, english().live.id).unwrap();
+    assert!(!voice_bird_next::db::apply(&mut handle.db, &fetched).unwrap());
+    assert!(!store.is_available(english().live));
+
+    // The cancelled fetch's acknowledgement and status are still queued.
+    // Request attempt 2 before processing them, with no intervening watcher tick.
+    consume_batch(
+        vec![AppEvent::BeginLanguage { block: 1, language: english(), source_rev: None }],
+        &mut consumer,
+        &mut handle.db,
+        &bus.sender(),
+    );
+    drain_consume(&mut bus, &mut consumer, &mut handle.db);
+    assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting { .. }));
+    settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
+        matches!(view.blocks[0].state, BlockState::Recording { .. })
+    }).await;
+    let row = downloads::get(&handle.db, english().live.id).unwrap().unwrap();
+    assert_eq!(row.attempt, 2);
+    assert_eq!(row.status, DownloadStatus::Succeeded);
+    assert!(store.is_available(english().live));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn closing_or_quitting_before_language_followups_never_starts_orphan_downloads() {
     for stop in [AppEvent::BlockClosed { block: 1 }, AppEvent::Quit] {
         let tmp = tempfile::tempdir().unwrap();
@@ -214,7 +322,7 @@ async fn closing_or_quitting_before_language_followups_never_starts_orphan_downl
         ));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
-        ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
             .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
             .unwrap();
         let tx = bus.sender();
@@ -274,7 +382,7 @@ async fn language_with_both_models_cached_records_immediately() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
         .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
@@ -499,9 +607,9 @@ async fn failure_between_language_begin_and_selection_reaches_late_waiter() {
         calls.clone(),
     ));
 
-    consumer.consumers.downloads.model_store = store;
+    consumer.consumers.model_store.model_store = store;
     consumer.consumers.downloads.downloader = downloader;
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
         .unwrap();
     let tx = bus.sender();
@@ -648,7 +756,7 @@ async fn two_blocks_same_language_share_downloads() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
         .unwrap();
 
@@ -693,7 +801,7 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
         .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
@@ -715,7 +823,7 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
         })
     }).await;
     for model in english().models() {
-        assert!(!consumer.consumers.downloads.model_store.is_available(model));
+        assert!(!consumer.consumers.model_store.model_store.is_available(model));
         assert!(!tmp.path().join(format!("{}.1.part", model.id)).exists());
     }
 }
@@ -734,7 +842,7 @@ async fn language_selected_targets_block_id_not_focus() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
         .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
@@ -770,7 +878,7 @@ async fn second_session_is_warm() {
     let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
     let mut first_bus = EventBus::new();
     let mut first_db = downloads_with(&first_bus);
-    ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
         .check(&consumer.consumers.ui_view, &mut first_db.db, &first_bus.sender())
         .unwrap();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
@@ -798,7 +906,7 @@ async fn second_session_is_warm() {
     let mut second_consumer = Consumer::new(Consumers::new(second_downloader, second_store, Arc::new(NoSources)));
     let mut second_bus = EventBus::new();
     let mut second_db = downloads_with(&second_bus);
-    ModelWatcher::new(second_consumer.consumers.downloads.model_store.clone())
+    ModelWatcher::new(second_consumer.consumers.model_store.model_store.clone())
         .check(&second_consumer.consumers.ui_view, &mut second_db.db, &second_bus.sender())
         .unwrap();
     second_consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
@@ -820,17 +928,20 @@ async fn second_session_is_warm() {
 }
 
 #[tokio::test]
-async fn cleanup_preserves_installed_models() {
+async fn quit_store_consumer_sweeps_every_attempt_and_preserves_installed_models() {
     let tmp = tempfile::tempdir().unwrap();
     let store_concrete = Arc::new(CacheDirStore::from_root(tmp.path().to_path_buf()).unwrap());
     for model in english().models() {
         std::fs::write(tmp.path().join(format!("{}.gguf", model.id)), b"installed").unwrap();
-        std::fs::write(
-            tmp.path().join(format!("{}.1.gguf.part", model.id)),
-            b"partial",
-        )
-        .unwrap();
-        std::fs::create_dir(tmp.path().join(format!("{}.1.tmp", model.id))).unwrap();
+        for attempt in [1, 7] {
+            std::fs::write(
+                tmp.path().join(format!("{}.{attempt}.gguf.part", model.id)),
+                b"partial",
+            ).unwrap();
+            let scratch = tmp.path().join(format!("{}.{attempt}.tar.gz.tmp", model.id));
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::write(scratch.join("unfinished"), b"partial unpack").unwrap();
+        }
     }
 
     let store: Arc<dyn ModelStore> = store_concrete.clone();
@@ -848,6 +959,7 @@ async fn cleanup_preserves_installed_models() {
     }
 
     let active = downloads::active(&handle.db).unwrap();
+    tx.publish(AppEvent::Quit);
     for row in &active {
         downloads::cancel(&mut handle.db, row.model.as_ref()).unwrap();
         tx.publish(AppEvent::DiscardInflight {
@@ -855,15 +967,15 @@ async fn cleanup_preserves_installed_models() {
         });
     }
     drain_consume(&mut bus, &mut consumer, &mut handle.db);
+    assert!(consumer.consumers.ui_view.should_quit);
 
 
     for model in english().models() {
         assert!(store_concrete.is_available(model));
-        assert!(!tmp
-            .path()
-            .join(format!("{}.1.gguf.part", model.id))
-            .exists());
-        assert!(!tmp.path().join(format!("{}.1.tmp", model.id)).exists());
+        for attempt in [1, 7] {
+            assert!(!tmp.path().join(format!("{}.{attempt}.gguf.part", model.id)).exists());
+            assert!(!tmp.path().join(format!("{}.{attempt}.tar.gz.tmp", model.id)).exists());
+        }
         assert_eq!(
             downloads::get(&handle.db, model.id).unwrap().unwrap().status,
             DownloadStatus::Cancelling
@@ -1156,7 +1268,7 @@ async fn output_funnel_restores_selected_rows_and_preserves_source_through_model
         handle._tmp.path().to_path_buf(),
         &english().models().map(|model| model.id),
     ));
-    consumer.consumers.downloads.model_store = store.clone();
+    consumer.consumers.model_store.model_store = store.clone();
     let watcher = ModelWatcher::new(store.clone());
     watcher.check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender()).unwrap();
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
@@ -1300,7 +1412,7 @@ async fn language_confirm_and_back_race_never_orphans_downloads() {
         ));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
-        ModelWatcher::new(consumer.consumers.downloads.model_store.clone())
+        ModelWatcher::new(consumer.consumers.model_store.model_store.clone())
             .check(&consumer.consumers.ui_view, &mut handle.db, &bus.sender())
             .unwrap();
         consumer.consumers.ui_view = source_view();

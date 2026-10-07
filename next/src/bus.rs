@@ -122,6 +122,9 @@ pub enum AppEvent {
         total: Option<u64>,
         bytes_per_sec: u64,
     },
+    /// The downloader verified the staged bytes. SQLite claims Installing once
+    /// for the current Downloading attempt before the store consumer installs.
+    DownloadFetched { attempt: u32, model: &'static str },
     /// Bytes verified; the format handler is unpacking.
     DownloadInstalling { attempt: u32, model: &'static str },
     /// Fans out to EVERY block waiting on `model`.
@@ -132,12 +135,10 @@ pub enum AppEvent {
         model: &'static str,
         error: String,
     },
-    /// Same shape as [`AppEvent::DownloadFailed`] but published by
-    /// [`crate::consumer::downloads::DownloadsConsumer::request`] when it failed
-    /// to claim a row in the downloads table *before* a worker could
-    /// spawn (disk full, lock timeout, write error). The table
-    /// reducer accepts this variant even when no row exists for
-    /// `model`, so the UI receives the failure instead of seeing
+    /// A request failed before a worker could spawn, while preparing staging
+    /// metadata or claiming a row in the downloads table (disk full, lock
+    /// timeout, write error). The table reducer accepts this variant even when
+    /// no row exists for `model`, so the UI receives the failure instead of seeing
     /// the event rejected by the attempt gate. The reducer treats
     /// it identically to [`AppEvent::DownloadFailed`]: any waiting
     /// block flips to `Failed`, the downloads entry is removed.
@@ -167,9 +168,9 @@ pub enum AppEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// Emitted when an event arrives whose attempt does not match
-    /// the table's current attempt for `model` (the old worker
-    /// hasn't been acked yet, but a Restart already superseded it).
+    /// Emitted when an event's attempt or lifecycle stage no longer matches
+    /// the table's current row (a Restart superseded the old worker, or a
+    /// duplicate/cancelled handoff can no longer begin installation).
     /// Visibility — the event log now records stale-event drops
     /// instead of silently filtering them. `rejected` is the
     /// variant name of the dropped event (e.g. `"DownloadProgress"`).

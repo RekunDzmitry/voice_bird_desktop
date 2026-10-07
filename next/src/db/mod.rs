@@ -123,6 +123,7 @@ impl Database {
         migrate(&conn, &[downloads::DownloadsTable])?;
         migrate(&conn, &[block_steps::BlockStepsTable])?;
         migrate(&conn, &[models::ModelsTable])?;
+        migrate(&conn, &[model_staging::ModelStagingTable])?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
@@ -178,6 +179,7 @@ impl Database {
 
 pub mod block_steps;
 pub mod downloads;
+pub mod model_staging;
 pub mod models;
 
 /// Apply every table's event gate. Only a `true` result may reach

@@ -1,15 +1,15 @@
-//! Claims accepted download requests and owns their asynchronous workers.
+//! Claims accepted download requests and owns their asynchronous fetch workers.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
 use crate::bus::{AppEvent, DownloadStatus, EventSender};
 use crate::db::downloads::{CancelProbe, Claim};
-use crate::db::{downloads, Database};
-use crate::picker::{ModelEntry, CATALOG};
+use crate::db::{downloads, model_staging, Database};
+use crate::picker::ModelEntry;
 use crate::producer::download::{DownloadError, Downloader, Throttle};
-use crate::transcription_models::ModelStore;
 
 pub(super) fn truncate_error(s: &str) -> String {
     const MAX: usize = 160;
@@ -22,16 +22,12 @@ pub(super) fn truncate_error(s: &str) -> String {
 }
 
 pub struct DownloadsConsumer {
-    pub model_store: Arc<dyn ModelStore>,
     pub downloader: Arc<dyn Downloader>,
 }
 
 impl DownloadsConsumer {
-    pub fn new(downloader: Arc<dyn Downloader>, model_store: Arc<dyn ModelStore>) -> Self {
-        Self {
-            model_store,
-            downloader,
-        }
+    pub fn new(downloader: Arc<dyn Downloader>) -> Self {
+        Self { downloader }
     }
 
     /// Start or join a model download after its request passes the bus gate.
@@ -75,10 +71,30 @@ impl DownloadsConsumer {
                         return;
                     }
                 };
+                let staged = match model_staging::get(db, entry.id, attempt) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => Err(format!(
+                        "model staging path missing for {} attempt {attempt}",
+                        entry.id
+                    )),
+                    Err(error) => Err(format!("model staging table: {error}")),
+                };
+                let staged = match staged {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tx.publish(AppEvent::DownloadFailed {
+                            attempt,
+                            model: entry.id,
+                            error: truncate_error(&error),
+                        });
+                        return;
+                    }
+                };
                 self.spawn(
                     entry,
                     downloads::probe(db, entry.id, attempt),
                     attempt,
+                    staged,
                     tx.clone(),
                 );
             }
@@ -128,37 +144,19 @@ impl DownloadsConsumer {
         }
     }
 
-    pub fn discard_inflight(&self, model: &str) {
-        if let Some(entry) = CATALOG.iter().find(|entry| entry.id == model) {
-            self.model_store.discard_inflight(entry);
-        }
-    }
-
     fn spawn(
         &self,
         entry: &'static ModelEntry,
         probe: CancelProbe,
         attempt: u32,
+        staged: PathBuf,
         tx: EventSender,
     ) -> JoinHandle<()> {
-        let store = self.model_store.clone();
         let downloader = self.downloader.clone();
         tokio::spawn(async move {
             let url = entry.download_url;
             let sha = entry.download_sha256;
             let model = entry.id;
-            let staged = match store.staging_path(entry, attempt) {
-                Ok(p) => p,
-                Err(e) => {
-                    tx.publish(AppEvent::DownloadFailed {
-                        attempt,
-                        model,
-                        error: truncate_error(&e.to_string()),
-                    });
-                    return;
-                }
-            };
-            let format = entry.format;
             let mut throttle = Throttle::new();
             let mut probe = probe;
             let result = {
@@ -174,27 +172,7 @@ impl DownloadsConsumer {
                     if let Some(total) = throttle.last_total() {
                         throttle.finalize(attempt, total, Some(total), &tx, model);
                     }
-                    if crate::transcription_models::handler_for(format).install_is_slow() {
-                        tx.publish(AppEvent::DownloadInstalling { attempt, model });
-                    }
-                    let install_result = tokio::task::spawn_blocking(move || {
-                        store.install(entry, &staged, &mut probe)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(DownloadError::Install(e.to_string())));
-                    match install_result {
-                        Ok(()) => {
-                            tx.publish(AppEvent::DownloadSucceeded { attempt, model });
-                        }
-                        Err(DownloadError::Cancelled) => {
-                            tx.publish(AppEvent::DownloadCancelled { attempt, model });
-                        }
-                        Err(e) => tx.publish(AppEvent::DownloadFailed {
-                            attempt,
-                            model,
-                            error: truncate_error(&e.to_string()),
-                        }),
-                    }
+                    tx.publish(AppEvent::DownloadFetched { attempt, model });
                 }
                 Err(DownloadError::Cancelled) => {
                     tx.publish(AppEvent::DownloadCancelled { attempt, model });
@@ -252,9 +230,6 @@ mod tests {
         .expect("open read-only");
         let mut bus = EventBus::new();
         let tiny: &'static ModelEntry = &CATALOG[5];
-        let store: Arc<dyn crate::transcription_models::ModelStore> = Arc::new(
-            crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]),
-        );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
         let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
@@ -263,7 +238,7 @@ mod tests {
             Arc::clone(&calls),
         ));
 
-        DownloadsConsumer::new(downloader, store).request(tiny, 1, &mut db, &bus.sender());
+        DownloadsConsumer::new(downloader).request(tiny, 1, &mut db, &bus.sender());
 
         // The fetcher must not have been touched — the failure
         // happens at the row-write step, before `spawn` runs.
@@ -353,9 +328,6 @@ mod tests {
         let events: Vec<AppEvent> = bus.drain().collect();
 
         // Language replies and accepted download requests run in separate passes.
-        let store: Arc<dyn crate::transcription_models::ModelStore> = Arc::new(
-            crate::testing::FixtureStore::new(tmp.path().to_path_buf(), &[]),
-        );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let downloader: Arc<dyn Downloader> = Arc::new(crate::testing::FixtureDownloader::new(
             Vec::new(),
@@ -363,7 +335,7 @@ mod tests {
             Arc::clone(&calls),
         ));
         let language_consumer = crate::consumer::language::LanguageConsumer;
-        let downloads_consumer = DownloadsConsumer::new(downloader, store);
+        let downloads_consumer = DownloadsConsumer::new(downloader);
         for event in &events {
             if downloads::apply(&mut db, event).unwrap() {
                 state.apply(event);
@@ -446,9 +418,7 @@ mod tests {
         );
     }
 
-    fn fixture_consumer(
-        root: &std::path::Path,
-    ) -> (DownloadsConsumer, Arc<std::sync::atomic::AtomicUsize>) {
+    fn fixture_consumer() -> (DownloadsConsumer, Arc<std::sync::atomic::AtomicUsize>) {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let consumer = DownloadsConsumer::new(
             Arc::new(crate::testing::FixtureDownloader::new(
@@ -456,7 +426,6 @@ mod tests {
                 Outcome::Ok,
                 calls.clone(),
             )),
-            Arc::new(crate::testing::FixtureStore::new(root.to_path_buf(), &[])),
         );
         (consumer, calls)
     }
@@ -481,7 +450,7 @@ mod tests {
             tmp.path().join("missing-schema.sqlite"),
             bus.sender(),
         );
-        let (consumer, calls) = fixture_consumer(tmp.path());
+        let (consumer, calls) = fixture_consumer();
         let model = crate::language::LANGUAGES[0].live;
         let mut view = waiting_view();
         view.apply(&AppEvent::DownloadRequested { model, attempt: 1 });
@@ -511,7 +480,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = crate::bus::EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
-        let (consumer, calls) = fixture_consumer(tmp.path());
+        let (consumer, calls) = fixture_consumer();
         let model = crate::language::LANGUAGES[0].live;
         let mut view = waiting_view();
         view.apply(&AppEvent::DownloadRequested { model, attempt: 2 });
@@ -536,7 +505,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = crate::bus::EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
-        let (consumer, calls) = fixture_consumer(tmp.path());
+        let (consumer, calls) = fixture_consumer();
         let model = crate::language::LANGUAGES[0].live;
         downloads::start(&mut db, model.id).unwrap();
         let attempt = downloads::start(&mut db, model.id).unwrap();
@@ -580,5 +549,56 @@ mod tests {
         assert_eq!(row.attempt, attempt);
         assert_eq!(row.status, DownloadStatus::Failed);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn staging_metadata_failures_stop_fetch_and_fail_the_claimed_attempt() {
+        for failure in ["missing", "preparation", "query"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bus = crate::bus::EventBus::new();
+            let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+            let model = crate::language::LANGUAGES[0].live;
+            match failure {
+                "preparation" => {
+                    db.conn_mut().execute(
+                        "INSERT INTO model_staging (model, attempt, error) VALUES (?1, 1, ?2)",
+                        rusqlite::params![model.id, "cache directory is read-only"],
+                    ).unwrap();
+                }
+                "query" => {
+                    db.conn_mut().execute_batch("DROP TABLE model_staging").unwrap();
+                }
+                _ => {}
+            }
+            let (consumer, calls) = fixture_consumer();
+            let mut view = waiting_view();
+            view.apply(&AppEvent::DownloadRequested { model, attempt: 1 });
+
+            consumer.request(model, 1, &mut db, &bus.sender());
+            let events: Vec<_> = bus.drain().collect();
+            let error = events.iter().find_map(|event| match event {
+                AppEvent::DownloadFailed { attempt: 1, model: failed_model, error }
+                    if *failed_model == model.id => Some(error),
+                _ => None,
+            }).expect("metadata failure must belong to the persisted claim");
+            match failure {
+                "preparation" => assert!(error.contains("read-only")),
+                "query" => assert!(error.contains("model staging") && error.contains("no such table")),
+                _ => assert!(error.contains(model.id) && error.contains("attempt 1")),
+            }
+            for event in &events {
+                if downloads::apply(&mut db, event).unwrap() {
+                    view.apply(event);
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let row = downloads::get(&db, model.id).unwrap().unwrap();
+            assert_eq!(row.attempt, 1);
+            assert_eq!(row.status, DownloadStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some(error.as_str()));
+            assert!(matches!(&view.blocks[0].state,
+                crate::consumer::ui_view::BlockState::Failed { error: ui_error, .. } if ui_error == error
+            ));
+            assert!(!view.downloads.contains_key(model.id));
+        }
     }
 }

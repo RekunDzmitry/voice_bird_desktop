@@ -667,6 +667,7 @@ impl UiView {
                 }
             }
             AppEvent::RequestBlock
+            | AppEvent::DownloadFetched { .. }
             | AppEvent::BeginLanguage { .. }
             | AppEvent::DiscardInflight { .. } => {}
         }

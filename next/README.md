@@ -94,6 +94,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
 | `src/db/models.rs` | observed model availability, independent of download lifecycle |
+| `src/db/model_staging.rs` | exact attempt-scoped staging paths and preparation errors observed by the store |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
 | `src/producer/download.rs` | async `Downloader`, HTTP streaming, and progress throttling |
@@ -102,7 +103,8 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
 | `src/consumer/audio_sources.rs` | serialized audio-source requests and session panic containment |
 | `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
-| `src/consumer/downloads.rs` | attempt-aware SQLite claims, download workers, and staging cleanup |
+| `src/consumer/downloads.rs` | attempt-aware SQLite claims and async fetch workers; no model-store dependency |
+| `src/consumer/model_store.rs` | staging preparation, gated installation, and quit-time staging sweep |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
@@ -121,7 +123,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    input→view mutation.
 5. **Consumers can produce the next stage of a flow.** `Consumer` owns
    `Consumers`, not producer handles. It routes events to the UI projection,
-   audio-source, language, and download consumers. Each handler owns its
+   audio-source, language, download, and model-store consumers. Each handler owns its
    collaborators; it never calls another consumer to advance the flow.
    While a block is `PickingLanguage`, input produces `BeginLanguage`.
    The language consumer publishes `LanguageSelected` and model requests.
@@ -130,11 +132,19 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    download success events move Waiting blocks to Recording.
    `DownloadRequested` carries the intended attempt: a terminal result that
    overtakes a join is reconciled, not silently retried. Superseded requests
-   and stale terminal replays are rejected. An explicit retry requests the
+   and old-attempt terminal notifications/replays are rejected. An explicit retry requests the
    next attempt. A cancelled/interrupted late join enters Failed rather than
    waiting forever. Requests without waiters or after Quit launch no work.
    Duplicate valid requests share one SQLite claim. Closing the last waiter
    cancels only that model's in-flight work.
+   Downloads read their exact attempt's staging path from SQLite. The watcher
+   prepares paths at startup/ticks; the store consumer also prepares new requests
+   before claiming, so immediate retries need no intervening tick. Preparation
+   failures fail waiters without fetching. Verified fetches publish
+   `DownloadFetched`; its gate atomically claims Installing and rejects duplicate,
+   stale, cancelled, or terminal handoffs. Only then does the store consumer
+   install on the blocking pool and publish the outcome. Fast GGUF installation
+   keeps the download gauge; slow package installation shows its own phase.
    No service calls `std::thread::spawn`: Tokio schedules asynchronous work;
    native enumeration and installation use `spawn_blocking`.
 6. **SQLite is the source of truth; `UiView::downloads` is its render
@@ -175,8 +185,10 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    Recording remains mocked (no real audio device is stopped yet).
    Async downloads use a separate SQLite `CancelProbe` connection; it polls
    the current attempt's row every 50 ms between streamed chunks. Quit marks
-   active rows Cancelling, consumes staging-cleanup commands through the same
-   log/database gate, and calls `shutdown_background` without joining workers.
+   active rows Cancelling, consumes `DiscardInflight` through the same log/database
+   gate, and calls `shutdown_background` without joining workers. The model-store
+   consumer handles that command even after Quit and sweeps `.part` files and
+   `.tmp` directories, preserving installed models.
 
 ## Refreshing the golden snapshot
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender};
 use crate::consumer::ui_view::UiView;
-use crate::db::{models, Database};
+use crate::db::{downloads, model_staging, models, Database};
 use crate::picker::CATALOG;
 use crate::transcription_models::ModelStore;
 
@@ -24,6 +24,12 @@ impl ModelWatcher {
         for model in CATALOG {
             let available = self.store.is_available(model);
             models::set_available(db, model.id, available)?;
+            let row = downloads::get(db, model.id)?;
+            let attempt = match downloads::decide(row.as_ref()) {
+                downloads::Claim::Start { attempt } | downloads::Claim::Restart { attempt } => attempt,
+                downloads::Claim::Join => row.as_ref().expect("Join requires a download row").attempt,
+            };
+            model_staging::observe(db, self.store.as_ref(), model, attempt)?;
             if !available && state.blocks.iter().any(|block| {
                 block.ready_models().any(|ready| ready.id == model.id)
             }) {
@@ -42,7 +48,7 @@ mod tests {
     use crate::picker::ListPicker;
     use crate::consumer::ui_view::{Block, BlockState};
     use crate::testing::FixtureStore;
-    use crate::db::downloads;
+    use crate::bus::DownloadStatus;
     use crate::transcription_models::CacheDirStore;
 
     #[test]
@@ -167,5 +173,81 @@ mod tests {
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![AppEvent::ModelMissing(language.live)]);
         assert!(!models::is_available(&db, language.live.id).unwrap());
         assert!(!models::is_available(&db, language.refine.id).unwrap());
+    }
+
+    #[test]
+    fn startup_prepares_first_active_and_interrupted_retry_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("models.sqlite");
+        let bus = EventBus::new();
+        let mut db = Database::open(&path, bus.sender()).unwrap();
+        let model = &CATALOG[0];
+        let store = Arc::new(FixtureStore::new(tmp.path().join("custom-cache"), &[]));
+        let watcher = ModelWatcher::new(store.clone());
+        let state = UiView::default();
+
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        let first_path = store.root.join(format!("{}.1.part", model.id));
+        assert_eq!(model_staging::get(&db, model.id, 1).unwrap(), Some(Ok(first_path.clone())));
+        assert!(downloads::get(&db, model.id).unwrap().is_none());
+
+        let attempt = downloads::start(&mut db, model.id).unwrap();
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        assert_eq!(model_staging::get(&db, model.id, attempt).unwrap(), Some(Ok(first_path.clone())));
+        assert_eq!(model_staging::get(&db, model.id, attempt + 1).unwrap(), None);
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Downloading);
+        drop(db);
+
+        let mut db = Database::open(&path, bus.sender()).unwrap();
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Interrupted);
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        assert_eq!(model_staging::get(&db, model.id, attempt).unwrap(), Some(Ok(first_path)));
+        assert_eq!(model_staging::get(&db, model.id, attempt + 1).unwrap(),
+            Some(Ok(store.root.join(format!("{}.{}.part", model.id, attempt + 1)))));
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().attempt, attempt);
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Interrupted);
+    }
+
+    #[test]
+    fn cancellation_and_terminal_ticks_prepare_next_attempt_without_overwriting_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+        let model = &CATALOG[0];
+        let old_store = Arc::new(FixtureStore::new(tmp.path().join("old-cache"), &[]));
+        let old_watcher = ModelWatcher::new(old_store.clone());
+        let state = UiView::default();
+        let attempt = downloads::start(&mut db, model.id).unwrap();
+        old_watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        let first = model_staging::get(&db, model.id, attempt).unwrap();
+        downloads::cancel(&mut db, model.id).unwrap();
+        let new_store = Arc::new(FixtureStore::new(tmp.path().join("new-cache"), &[]));
+        let watcher = ModelWatcher::new(new_store.clone());
+
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        let second_path = new_store.root.join(format!("{}.{}.part", model.id, attempt + 1));
+        assert_eq!(model_staging::get(&db, model.id, attempt + 1).unwrap(), Some(Ok(second_path.clone())));
+        assert_eq!(model_staging::get(&db, model.id, attempt).unwrap(), first);
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Cancelling);
+        crate::db::apply(&mut db, &AppEvent::DownloadCancelled { attempt, model: model.id }).unwrap();
+
+        watcher.check(&state, &mut db, &bus.sender()).unwrap();
+        assert_eq!(model_staging::get(&db, model.id, attempt + 1).unwrap(), Some(Ok(second_path)));
+        assert_eq!(model_staging::get(&db, model.id, attempt).unwrap(), first);
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Cancelled);
+        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().attempt, attempt);
+    }
+
+    #[test]
+    fn staging_sql_errors_propagate_without_starting_a_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
+        db.conn_mut().execute("DROP TABLE model_staging", []).unwrap();
+        let watcher = ModelWatcher::new(Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])));
+        let error = watcher.check(&UiView::default(), &mut db, &bus.sender()).unwrap_err();
+        assert!(error.to_string().contains("model_staging"));
+        assert!(downloads::get(&db, CATALOG[0].id).unwrap().is_none());
+        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
     }
 }

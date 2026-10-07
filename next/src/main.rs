@@ -199,7 +199,7 @@ fn consume_logged(
 ///
 /// `DiscardInflight { model }` is published for each active
 /// claim instead of reaching into the model store directly. The
-/// downloads consumer that owns the model store answers it on the next drain.
+/// model-store consumer answers it by sweeping staging on the next drain.
 fn cleanup_inflight(
     db: &mut Database,
     bus: &mut EventBus,

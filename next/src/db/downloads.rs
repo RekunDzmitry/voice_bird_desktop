@@ -311,20 +311,45 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
                 Ok(false)
             }
         }
-        AppEvent::DownloadInstalling { attempt, model } => {
-            if !matches_attempt(db, model, *attempt)? {
+        AppEvent::DownloadFetched { attempt, model } => {
+            let current = get(db, model)?;
+            if current.as_ref().is_some_and(|row| {
+                row.attempt == *attempt && row.status == DownloadStatus::Downloading
+            }) {
+                transition(
+                    db,
+                    model,
+                    *attempt,
+                    Some(DownloadStatus::Downloading),
+                    DownloadStatus::Installing,
+                    None,
+                )?;
+                Ok(true)
+            } else {
                 reject(db, ev, *attempt);
-                return Ok(false);
+                if current.is_some_and(|row| {
+                    row.attempt == *attempt && row.status == DownloadStatus::Cancelling
+                }) {
+                    // Fetch finished, and the rejected handoff cannot create
+                    // an install worker to acknowledge cancellation.
+                    db.tx().publish(AppEvent::DownloadCancelled {
+                        attempt: *attempt,
+                        model,
+                    });
+                }
+                Ok(false)
             }
-            transition(
-                db,
-                model,
-                *attempt,
-                Some(DownloadStatus::Downloading),
-                DownloadStatus::Installing,
-                None,
-            )?;
-            Ok(true)
+        }
+        AppEvent::DownloadInstalling { attempt, model } => {
+            let current = get(db, model)?;
+            if current.is_some_and(|row| {
+                row.attempt == *attempt && row.status == DownloadStatus::Installing
+            }) {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
         }
         AppEvent::DownloadSucceeded { attempt, model } => {
             if !matches_attempt(db, model, *attempt)? {
@@ -426,6 +451,17 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
                 Ok(false)
             }
         }
+        AppEvent::DownloadStatusChanged { model, attempt, from: Some(_), .. } => {
+            // Persisted transitions can be queued behind a new claim. Keep
+            // them in the audit log, but never project an old attempt onto
+            // the current attempt's waiters.
+            if matches_attempt(db, model, *attempt)? {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
+        }
         _ => Ok(true),
     }
 }
@@ -512,6 +548,7 @@ fn matches_attempt(db: &Database, model: &str, attempt: u32) -> rusqlite::Result
 fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
     let (model, name): (&str, &'static str) = match ev {
         AppEvent::DownloadProgress { model, .. } => (*model, "DownloadProgress"),
+        AppEvent::DownloadFetched { model, .. } => (*model, "DownloadFetched"),
         AppEvent::DownloadInstalling { model, .. } => (*model, "DownloadInstalling"),
         AppEvent::DownloadSucceeded { model, .. } => (*model, "DownloadSucceeded"),
         AppEvent::DownloadFailed { model, .. } => (*model, "DownloadFailed"),
@@ -977,5 +1014,96 @@ mod tests {
         let active = active(&d, ).unwrap();
         assert_eq!(active.len(), 1, "only tiny.en is active");
         assert_eq!(active[0].model.as_ref(), "tiny.en");
+    }
+    #[test]
+    fn fetched_handoff_claims_installing_once_and_rejects_duplicates() {
+        let (_tmp, path) = tmp_db();
+        let (mut bus, tx) = bus();
+        let mut db = Database::open(&path, tx).unwrap();
+        let attempt = start(&mut db, "tiny.en").unwrap();
+        bus.drain().for_each(drop);
+        let fetched = AppEvent::DownloadFetched { model: "tiny.en", attempt };
+
+        assert!(apply(&mut db, &fetched).unwrap());
+        assert!(!apply(&mut db, &fetched).unwrap());
+        let row = get(&db, "tiny.en").unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Installing);
+        let events: Vec<_> = bus.drain().collect();
+        assert_eq!(events, vec![
+            AppEvent::DownloadStatusChanged {
+                model: Arc::from("tiny.en"),
+                attempt,
+                from: Some(DownloadStatus::Downloading),
+                to: DownloadStatus::Installing,
+                error: None,
+            },
+            AppEvent::DownloadEventRejected {
+                model: Arc::from("tiny.en"),
+                rejected: "DownloadFetched",
+                event_attempt: attempt,
+                row_attempt: Some(attempt),
+            },
+        ]);
+    }
+
+    #[test]
+    fn fetched_handoff_rejects_cancelled_and_terminal_rows() {
+        for status in [
+            DownloadStatus::Installing,
+            DownloadStatus::Cancelling,
+            DownloadStatus::Cancelled,
+            DownloadStatus::Succeeded,
+            DownloadStatus::Failed,
+            DownloadStatus::Interrupted,
+        ] {
+            let (_tmp, path) = tmp_db();
+            let (mut bus, tx) = bus();
+            let mut db = Database::open(&path, tx).unwrap();
+            let attempt = start(&mut db, "tiny.en").unwrap();
+            transition(&mut db, "tiny.en", attempt, Some(DownloadStatus::Downloading), status, None).unwrap();
+            bus.drain().for_each(drop);
+
+            assert!(!apply(&mut db, &AppEvent::DownloadFetched { model: "tiny.en", attempt }).unwrap());
+            assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, status);
+            let events: Vec<_> = bus.drain().collect();
+            assert!(matches!(events.first(), Some(AppEvent::DownloadEventRejected {
+                rejected: "DownloadFetched", event_attempt, row_attempt: Some(row_attempt), ..
+            }) if *event_attempt == attempt && *row_attempt == attempt));
+            if status == DownloadStatus::Cancelling {
+                let ack = events.iter().find(|event| matches!(event, AppEvent::DownloadCancelled { .. }))
+                    .expect("finished fetch must acknowledge cancellation");
+                assert!(apply(&mut db, ack).unwrap());
+                assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, DownloadStatus::Cancelled);
+            } else {
+                assert!(!events.iter().any(|event| matches!(event, AppEvent::DownloadCancelled { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn installing_projection_event_cannot_regress_cancellation_or_terminal_rows() {
+        let (_tmp, path) = tmp_db();
+        let (mut bus, tx) = bus();
+        let mut db = Database::open(&path, tx).unwrap();
+        let attempt = start(&mut db, "tiny.en").unwrap();
+        let installing = AppEvent::DownloadInstalling { model: "tiny.en", attempt };
+        assert!(!apply(&mut db, &installing).unwrap());
+        assert!(apply(&mut db, &AppEvent::DownloadFetched { model: "tiny.en", attempt }).unwrap());
+        assert!(apply(&mut db, &installing).unwrap());
+        for status in [
+            DownloadStatus::Cancelling,
+            DownloadStatus::Cancelled,
+            DownloadStatus::Succeeded,
+            DownloadStatus::Failed,
+            DownloadStatus::Interrupted,
+        ] {
+            transition(&mut db, "tiny.en", attempt, None, status, None).unwrap();
+            bus.drain().for_each(drop);
+            assert!(!apply(&mut db, &installing).unwrap());
+            assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, status);
+            assert!(bus.drain().any(|event| matches!(event, AppEvent::DownloadEventRejected {
+                rejected: "DownloadInstalling", ..
+            })));
+        }
     }
 }
