@@ -26,7 +26,7 @@ pub enum Intent {
     BlockClosed,
     /// `Tab`: open the session menu (or close it if already open).
     /// The resolver decides which side of the toggle to land on
-    /// based on `state.menu`.
+    /// based on `ui_view.menu`.
     ToggleMenu,
     Quit,
 }

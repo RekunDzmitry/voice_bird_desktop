@@ -31,15 +31,15 @@ pub fn is_available(db: &Database, model: &str) -> rusqlite::Result<bool> {
         .map(|available| available.unwrap_or(false))
 }
 
-/// Repeated observations leave unchanged rows alone.
-pub fn set_available(db: &mut Database, model: &str, available: bool) -> rusqlite::Result<()> {
-    db.conn_mut().execute(
+/// Return whether an observation inserted or changed a row, without a read.
+pub fn set_available(db: &mut Database, model: &str, available: bool) -> rusqlite::Result<bool> {
+    let changed = db.conn_mut().execute(
         "INSERT INTO models (model, available) VALUES (?1, ?2)
          ON CONFLICT(model) DO UPDATE SET available = excluded.available
          WHERE models.available != excluded.available",
         rusqlite::params![model, available],
     )?;
-    Ok(())
+    Ok(changed != 0)
 }
 
 #[cfg(test)]
@@ -56,18 +56,18 @@ mod tests {
         let bus = EventBus::new();
         let mut db = Database::open(&path, bus.sender()).unwrap();
         assert!(!is_available(&db, "tiny.en").unwrap());
-        set_available(&mut db, "tiny.en", true).unwrap();
+        assert!(set_available(&mut db, "tiny.en", false).unwrap());
+        assert!(!set_available(&mut db, "tiny.en", false).unwrap());
+        assert!(set_available(&mut db, "tiny.en", true).unwrap());
         assert!(is_available(&db, "tiny.en").unwrap());
-        set_available(&mut db, "tiny.en", true).unwrap();
-        assert_eq!(db.conn_ref().changes(), 0);
+        assert!(!set_available(&mut db, "tiny.en", true).unwrap());
         drop(db);
 
         let mut db = Database::open(&path, bus.sender()).unwrap();
         assert!(is_available(&db, "tiny.en").unwrap());
-        set_available(&mut db, "tiny.en", false).unwrap();
+        assert!(set_available(&mut db, "tiny.en", false).unwrap());
         assert!(!is_available(&db, "tiny.en").unwrap());
-        set_available(&mut db, "tiny.en", false).unwrap();
-        assert_eq!(db.conn_ref().changes(), 0);
+        assert!(!set_available(&mut db, "tiny.en", false).unwrap());
     }
 
     #[test]
@@ -89,6 +89,10 @@ mod tests {
             model: model.id,
         }).unwrap());
         assert!(is_available(&db, model.id).unwrap());
+        assert!(!db::apply(&mut db, &AppEvent::ModelAvailabilityChanged {
+            model, available: false,
+        }).unwrap());
+        assert!(is_available(&db, model.id).unwrap());
 
         // A queued cached reply is an observation, not an installation.
         set_available(&mut db, model.id, false).unwrap();
@@ -99,5 +103,17 @@ mod tests {
             model: model.id,
         }).unwrap());
         assert!(!is_available(&db, model.id).unwrap());
+    }
+
+    #[test]
+    fn availability_gate_propagates_sql_errors_instead_of_accepting_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut db = Database::open(&dir.path().join("models.sqlite"), bus.sender()).unwrap();
+        db.conn_mut().execute("DROP TABLE models", []).unwrap();
+        let error = db::apply(&mut db, &AppEvent::ModelAvailabilityChanged {
+            model: LANGUAGES[0].live, available: false,
+        }).unwrap_err();
+        assert!(error.to_string().contains("models"));
     }
 }

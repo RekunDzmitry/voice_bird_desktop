@@ -174,12 +174,19 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    removes staging artifacts only. Before accepting input, the model watcher
    refreshes every catalog model from disk, correcting stale persisted rows.
    The loop repeats that scan every 100 ms, including unused models.
+   The watcher has no `UiView` dependency: inserted or changed availability rows
+   publish `ModelAvailabilityChanged`; unchanged ticks publish nothing.
+   SQLite rejects observations that no longer match persisted availability.
+   Consumers select interested sessions and publish `ModelMissing` through the
+   bus before the view changes or a language consumer requests shared work.
    `LanguageConsumer` has no model-store dependency: it queries the availability
    table, then download history only for missing models. Accepted installation
    successes update availability before consumption; rejected stale successes
    cannot change it. A missing ready model sends every affected block, including
-   hidden sessions and Waiting blocks, back to Waiting and re-claims a shared
-   download; success resumes Recording automatically. Failure enters Failed,
+   hidden sessions and the ready subset of Waiting blocks, back to Waiting and
+   re-claims a shared download; pending, picker, and Failed sessions launch no
+   automatic work. Duplicate notifications and observations after Quit do not
+   launch work. Success resumes Recording automatically; failure enters Failed,
    where `r` retries.
    Presence checks do not detect corruption of files that still exist, and
    Recording remains mocked (no real audio device is stopped yet).

@@ -186,6 +186,9 @@ pub mod models;
 /// the consumer: a rejected source-language command
 /// must never start model downloads.
 pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
+    if let AppEvent::ModelAvailabilityChanged { model, available } = ev {
+        return Ok(models::is_available(db, model.id)? == *available);
+    }
     if !block_steps::apply(db, ev)? {
         return Ok(false);
     }

@@ -20,28 +20,28 @@ use crate::language::{LanguageProfile, LANGUAGES};
 use crate::picker::ListPicker;
 use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView};
 
-/// Draw one frame: outer window with `state.title` in its top border,
-/// then `state.blocks` evenly-distributed columns inside.
+/// Draw one frame: outer window with `ui_view.title` in its top border,
+/// then `ui_view.blocks` evenly-distributed columns inside.
 ///
 /// Each column renders its own stage:
 /// - `PickingLanguage(p)` → the language list, `▶` on `p.index`.
 /// - `Waiting` → one gauge per model role.
 /// - `Recording` → `● recording (mocked)`.
 /// - `Failed` → the error wrapped, plus `r retry · Esc close`.
-pub fn render(f: &mut Frame, state: &UiView) {
+pub fn render(f: &mut Frame, ui_view: &UiView) {
     // When the reducer sets a transient warning (e.g. "session
     // limit reached; close a session to make room"), append it to
     // the title bar so the user actually sees it. The title bar
     // is the one place we *know* is on screen, regardless of cap,
     // menu state, or focused block.
-    let title = match state.warning.as_deref() {
-        Some(w) => format!("{} — ! {w}", state.title),
-        None => state.title.clone(),
+    let title = match ui_view.warning.as_deref() {
+        Some(w) => format!("{} — ! {w}", ui_view.title),
+        None => ui_view.title.clone(),
     };
     let window = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {title} "))
-        .border_style(if state.warning.is_some() {
+        .border_style(if ui_view.warning.is_some() {
             Style::default().bold().red()
         } else {
             Style::default()
@@ -55,7 +55,7 @@ pub fn render(f: &mut Frame, state: &UiView) {
     // blocks take the full width — no empty reserved space. The
     // split lives inside the outer window border, so the menu never
     // overlaps the title.
-    let (menu_area, blocks_area) = match state.menu.as_ref() {
+    let (menu_area, blocks_area) = match ui_view.menu.as_ref() {
         Some(_) => {
             let chunks = Layout::new(
                 Direction::Horizontal,
@@ -71,7 +71,7 @@ pub fn render(f: &mut Frame, state: &UiView) {
     // enforced in the reducer's `show_block`, so the renderer never
     // has to clamp. If no block is visible (e.g. nothing has been
     // created yet), skip the layout entirely.
-    let visible: Vec<&crate::consumer::ui_view::Block> = state.blocks.iter().filter(|b| b.visible).collect();
+    let visible: Vec<&crate::consumer::ui_view::Block> = ui_view.blocks.iter().filter(|b| b.visible).collect();
     if !visible.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
@@ -79,19 +79,19 @@ pub fn render(f: &mut Frame, state: &UiView) {
         )
         .split(blocks_area);
         for (block, column) in visible.iter().zip(columns.iter()) {
-            // `state.focus` is an index into `blocks`, not the visible
+            // `ui_view.focus` is an index into `blocks`, not the visible
             // list, so the focused check is "is this block's id the
             // focused one?". Comparing the index directly would mark
             // the wrong column focused once the cap has reordered
             // anything.
-            let focused = Some(block.id) == state.focused().map(|b| b.id);
-            render_block(f, block, focused, *column, state);
+            let focused = Some(block.id) == ui_view.focused().map(|b| b.id);
+            render_block(f, block, focused, *column, ui_view);
         }
     }
 
-    if let Some(menu) = state.menu.as_ref() {
+    if let Some(menu) = ui_view.menu.as_ref() {
         if let Some(area) = menu_area {
-            render_menu(f, state, menu, area);
+            render_menu(f, ui_view, menu, area);
         }
     }
 }
@@ -101,7 +101,7 @@ fn render_block(
     block: &crate::consumer::ui_view::Block,
     focused: bool,
     area: Rect,
-    state: &UiView,
+    ui_view: &UiView,
 ) {
     let border = block_border(focused);
     let title = block_title(block);
@@ -114,10 +114,10 @@ fn render_block(
             render_source_picker(f, block, cursor.index, inner);
         }
         BlockState::Waiting { language, pending } => {
-            render_waiting(f, language, pending, state, inner);
+            render_waiting(f, language, pending, ui_view, inner);
         }
         _ => {
-            let lines = block_body_lines(block, state);
+            let lines = block_body_lines(block);
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
@@ -213,7 +213,7 @@ fn render_source_picker(f: &mut Frame, block: &crate::consumer::ui_view::Block, 
 /// The window never extends past `total` rows, and `start` clamps
 /// to `0` so a terminal resize cannot make the menu "scroll past
 /// the top". This is the carousel's pure data shape — the
-/// renderer just iterates `state.blocks[start..end]` and draws
+/// renderer just iterates `ui_view.blocks[start..end]` and draws
 /// one line per row.
 fn menu_window(total: usize, selected: usize, height: usize) -> (usize, usize) {
     if total == 0 || height == 0 {
@@ -252,21 +252,21 @@ fn menu_window(total: usize, selected: usize, height: usize) -> (usize, usize) {
 /// every keystroke. This makes the menu responsive to terminal
 /// resizes (the window follows `inner.height`) without needing
 /// a separate scroll state on the menu itself.
-fn render_menu(f: &mut Frame, state: &UiView, menu: &crate::picker::SessionMenu, area: Rect) {
+fn render_menu(f: &mut Frame, ui_view: &UiView, menu: &crate::picker::SessionMenu, area: Rect) {
     let border = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().bold());
     let inner = border.inner(area);
     f.render_widget(border, area);
 
-    let total = state.blocks.len();
+    let total = ui_view.blocks.len();
     let (start, end) = menu_window(total, menu.index, inner.height as usize);
     if start >= end {
         // Nothing to render (e.g. zero blocks, zero-height panel).
         return;
     }
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
-    for (idx, block) in state.blocks[start..end].iter().enumerate() {
+    for (idx, block) in ui_view.blocks[start..end].iter().enumerate() {
         let absolute = start + idx;
         let marker = if absolute == menu.index {
             "\u{25b6}"
@@ -286,7 +286,7 @@ fn render_menu(f: &mut Frame, state: &UiView, menu: &crate::picker::SessionMenu,
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn block_body_lines(block: &crate::consumer::ui_view::Block, _state: &UiView) -> Vec<Line<'static>> {
+fn block_body_lines(block: &crate::consumer::ui_view::Block) -> Vec<Line<'static>> {
     match &block.state {
         BlockState::PickingLanguage(picker) => {
             let mut lines = picker_lines(picker);
@@ -310,7 +310,7 @@ fn render_waiting(
     f: &mut Frame,
     language: &'static LanguageProfile,
     pending: &[&'static str],
-    state: &UiView,
+    ui_view: &UiView,
     area: Rect,
 ) {
     let rows = Layout::new(
@@ -326,7 +326,7 @@ fn render_waiting(
             f,
             role,
             pending.contains(&model.id),
-            state.downloads.get(model.id),
+            ui_view.downloads.get(model.id),
             *row,
         );
     }
@@ -437,12 +437,12 @@ mod tests {
     }
 
     #[test]
-    fn title_comes_from_state() {
-        let state = UiView {
+    fn title_comes_from_ui_view() {
+        let ui_view = UiView {
             title: "Hello".to_string(),
             ..Default::default()
         };
-        let out = render_to_string(&state, 20, 3);
+        let out = render_to_string(&ui_view, 20, 3);
         assert!(out.starts_with("┌ Hello ─"), "{out}");
     }
 
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn one_block_picking_lists_languages_with_marker() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::PickingLanguage(ListPicker::default()),
@@ -465,7 +465,7 @@ mod tests {
             next_block_id: 2,
             ..Default::default()
         };
-        let out = render_to_string(&state, 100, 30);
+        let out = render_to_string(&ui_view, 100, 30);
         assert!(out.contains("\u{25b6} en"));
         assert!(out.contains("pick a language"));
         for model in LANGUAGES[0].models() {
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn recording_title_uses_language_code() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Recording {
@@ -490,14 +490,14 @@ mod tests {
             next_block_id: 2,
             ..Default::default()
         };
-        let out = render_to_string(&state, 80, 10);
+        let out = render_to_string(&ui_view, 80, 10);
         assert!(out.contains("recording"), "{out}");
         assert!(out.contains("1 · en"), "{out}");
     }
 
     #[test]
     fn focused_block_border_differs_from_unfocused() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
@@ -511,13 +511,13 @@ mod tests {
             next_block_id: 4,
             ..Default::default()
         };
-        let out = render_to_string(&state, 100, 10);
+        let out = render_to_string(&ui_view, 100, 10);
         assert!(out.matches('─').count() >= 3);
     }
 
     #[test]
     fn three_blocks_split_into_language_titled_columns() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
@@ -531,7 +531,7 @@ mod tests {
             next_block_id: 4,
             ..Default::default()
         };
-        let out = render_to_string(&state, 100, 30);
+        let out = render_to_string(&ui_view, 100, 30);
         for label in ["1 · en", "2 · en", "3 · en"] {
             assert!(out.contains(label), "missing {label} in:\n{out}");
         }
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn many_blocks_in_a_tiny_terminal_do_not_panic() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: (1..=5)
                 .map(|id| Block {
                     id,
@@ -553,7 +553,7 @@ mod tests {
             next_block_id: 6,
             ..Default::default()
         };
-        let _ = render_to_string(&state, 3, 5);
+        let _ = render_to_string(&ui_view, 3, 5);
     }
 
     #[test]
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn waiting_block_draws_separate_role_gauges() {
-        let mut state = UiView {
+        let mut ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -581,7 +581,7 @@ mod tests {
             ..Default::default()
         };
         for model in LANGUAGES[0].models() {
-            state.downloads.insert(
+            ui_view.downloads.insert(
                 model.id,
                 DownloadState {
                     phase: DownloadPhase::Fetching,
@@ -591,7 +591,7 @@ mod tests {
                 },
             );
         }
-        let out = render_to_string(&state, 100, 10);
+        let out = render_to_string(&ui_view, 100, 10);
         assert!(
             out.contains('█'),
             "expected filled gauge cells; got:\n{out}"
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn waiting_block_shows_completed_role_as_ready() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -617,14 +617,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = render_to_string(&state, 40, 8);
+        let out = render_to_string(&ui_view, 40, 8);
         assert!(out.contains("live"), "{out}");
         assert!(out.contains("refine · ready"), "{out}");
     }
 
     #[test]
     fn waiting_block_installing_phase_says_preparing_by_role() {
-        let mut state = UiView {
+        let mut ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -636,7 +636,7 @@ mod tests {
             ..Default::default()
         };
         for model in LANGUAGES[0].models() {
-            state.downloads.insert(
+            ui_view.downloads.insert(
                 model.id,
                 DownloadState {
                     phase: DownloadPhase::Installing,
@@ -646,7 +646,7 @@ mod tests {
                 },
             );
         }
-        let out = render_to_string(&state, 100, 10);
+        let out = render_to_string(&ui_view, 100, 10);
         assert!(out.contains("live · Preparing…"), "got:\n{out}");
         assert!(out.contains("refine · Preparing…"), "got:\n{out}");
         assert!(!out.contains('\u{2588}'));
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn waiting_block_without_content_length_uses_model_rate() {
-        let mut state = UiView {
+        let mut ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -665,7 +665,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.downloads.insert(
+        ui_view.downloads.insert(
             LANGUAGES[0].live.id,
             DownloadState {
                 phase: DownloadPhase::Fetching,
@@ -674,7 +674,7 @@ mod tests {
                 bytes_per_sec: 2 * 1024 * 1024,
             },
         );
-        let out = render_to_string(&state, 40, 8);
+        let out = render_to_string(&ui_view, 40, 8);
         assert!(out.contains("MB/s"), "{out}");
         assert!(out.contains("live"), "{out}");
         assert!(out.contains("refine · ready"), "{out}");
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn failed_block_shows_language_error_and_retry_hint() {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Failed {
@@ -695,7 +695,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = render_to_string(&state, 100, 10);
+        let out = render_to_string(&ui_view, 100, 10);
         assert!(out.contains("1 · en · error"), "{out}");
         assert!(out.contains("HTTP 404"), "{out}");
         assert!(out.contains("retry"), "{out}");
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn five_blocks_state_renders_exactly_four_column_titles() {
+    fn five_blocks_ui_view_renders_exactly_four_column_titles() {
         // After 5 AddBlocks the cap is reached: 4 columns visible,
         // 1 hidden. The hidden block does not contribute a column
         // title. The menu is closed so no panel steals width.

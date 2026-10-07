@@ -261,7 +261,7 @@ mod tests {
     }
 
     // End-to-end regression: a failed downloads-table claim must pass through
-    // the bus/table/state pipeline and fail the waiting language block.
+    // the bus/table/UI-view pipeline and fail the waiting language block.
     #[test]
     fn db_write_failure_surfaces_to_ui_via_full_drain_apply_flow() {
         use crate::bus::EventBus;
@@ -314,14 +314,14 @@ mod tests {
         .expect("open read-only");
         let mut bus = EventBus::new();
         let mut db = Database::from_connection_for_test(readonly, path.clone(), bus.sender());
-        let mut state = crate::consumer::UiView::default();
-        state.apply(&AppEvent::AddBlock);
+        let mut ui_view = crate::consumer::UiView::default();
+        ui_view.apply(&AppEvent::AddBlock);
         let _ = crate::db::downloads::apply(&mut db, &AppEvent::AddBlock);
 
         let language = &LANGUAGES[0];
         crate::producer::input::resolve_intent(
             crate::input::Intent::Confirm,
-            &state,
+            &ui_view,
             &mut db,
             &bus.sender(),
         );
@@ -338,7 +338,7 @@ mod tests {
         let downloads_consumer = DownloadsConsumer::new(downloader);
         for event in &events {
             if downloads::apply(&mut db, event).unwrap() {
-                state.apply(event);
+                ui_view.apply(event);
                 if let AppEvent::BeginLanguage { block, language, .. } = event {
                     language_consumer.begin(*block, language, &db, &bus.sender());
                 }
@@ -352,7 +352,7 @@ mod tests {
             }
             for event in &events {
                 if downloads::apply(&mut db, event).unwrap() {
-                    state.apply(event);
+                    ui_view.apply(event);
                     if let AppEvent::DownloadRequested { model, attempt } = event {
                         downloads_consumer.request(model, *attempt, &mut db, &bus.sender());
                     }
@@ -377,7 +377,7 @@ mod tests {
                 _ => None,
             })
             .expect("live model claim must fail");
-        let block = state
+        let block = ui_view
             .blocks
             .first()
             .expect("block must still exist after the failure");

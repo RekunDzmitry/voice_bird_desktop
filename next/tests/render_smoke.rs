@@ -52,7 +52,7 @@ fn idle_100x30_matches_golden() {
 
 #[test]
 fn three_blocks_100x30_matches_golden() {
-    let state = UiView {
+    let ui_view = UiView {
         blocks: (1..=3)
             .map(|id| Block {
                 id,
@@ -66,7 +66,7 @@ fn three_blocks_100x30_matches_golden() {
         next_block_id: 4,
         ..Default::default()
     };
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(THREE_BLOCKS, &out).expect("write golden");
     }
@@ -76,18 +76,18 @@ fn three_blocks_100x30_matches_golden() {
 
 #[test]
 fn picking_100x30_matches_golden() {
-    let state = UiView {
+    let ui_view = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::PickingLanguage(ListPicker::default()),
-
+    
             ..Default::default()
         }],
         focus: 0,
         next_block_id: 2,
         ..Default::default()
     };
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(PICKING, &out).expect("write golden");
     }
@@ -97,7 +97,7 @@ fn picking_100x30_matches_golden() {
 
 #[test]
 fn downloading_two_blocks_100x30_matches_golden() {
-    let mut state = UiView {
+    let mut ui_view = UiView {
         blocks: (1..=2)
             .map(|id| Block {
                 id,
@@ -113,7 +113,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
         ..Default::default()
     };
     for model in LANGUAGES[0].models() {
-        state.downloads.insert(
+        ui_view.downloads.insert(
             model.id,
             DownloadState {
                 phase: DownloadPhase::Fetching,
@@ -123,7 +123,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
             },
         );
     }
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(DOWNLOADING_TWO_BLOCKS, &out).expect("write golden");
     }
@@ -133,7 +133,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
 
 #[test]
 fn failed_100x30_matches_golden() {
-    let state = UiView {
+    let ui_view = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::Failed {
@@ -141,14 +141,14 @@ fn failed_100x30_matches_golden() {
                 error: "HTTP 404".to_string(),
                 pending: Vec::new(),
             },
-
+    
             ..Default::default()
         }],
         focus: 0,
         next_block_id: 2,
         ..Default::default()
     };
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         std::fs::write(FAILED, &out).expect("write golden");
     }
@@ -158,7 +158,7 @@ fn failed_100x30_matches_golden() {
 
 #[test]
 fn picker_renders_languages_without_model_ids() {
-    let state = UiView {
+    let ui_view = UiView {
         blocks: vec![Block {
             id: 1,
             state: BlockState::PickingLanguage(ListPicker::default()),
@@ -168,7 +168,7 @@ fn picker_renders_languages_without_model_ids() {
         next_block_id: 2,
         ..Default::default()
     };
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     assert!(out.contains(&format!("\u{25b6} {}", LANGUAGES[0].code)));
     assert!(out.contains("pick a language"));
     for model in CATALOG {
@@ -385,7 +385,7 @@ fn focus_right_into_hidden_block_reveals_it() {
     //
     // To exercise reveal-on-Next: start with focus NOT at the
     // right edge, then walk Right *across* a hidden index.
-    // Build a state where index 0 is hidden and indices 1..=4
+    // Build a UI view where index 0 is hidden and indices 1..=4
     // are visible, with focus at index 1 — Next from index 1
     // walks 2, 3, 4, 5, all visible; nothing reveals. So we
     // need focus to be somewhere that Next lands on index 0
@@ -492,13 +492,13 @@ fn focus_left_across_visible_blocks_does_not_evict_a_peer() {
 fn focus_reveal_evicts_the_lru_visible_peer() {
     // When a hidden block is revealed, the LRU visible peer
     // should be evicted. Walking Left four times into a 5-block
-    // state reveals block 1; block 5 (the most-recently-focused,
+    // UI view reveals block 1; block 5 (the most-recently-focused,
     // now LRU) should be evicted.
     let mut s = UiView::default();
     for _ in 0..5 {
         s.apply(&voice_bird_next::bus::AppEvent::AddBlock);
     }
-    // Initial state: blocks 2..=5 visible, block 1 hidden.
+    // Initial UI view: blocks 2..=5 visible, block 1 hidden.
     let visible: std::collections::HashSet<u8> = s
         .blocks
         .iter()
@@ -545,7 +545,7 @@ proptest! {
         h in 1u16..80,
         blocks in 0usize..20,
     ) {
-        let state = UiView {
+        let ui_view = UiView {
             blocks: (1..=blocks as u8)
                 .map(|i| Block {
                     id: i,
@@ -560,7 +560,7 @@ proptest! {
             next_block_id: blocks as u8 + 1,
             ..Default::default()
         };
-        let _ = render_to_string(&state, w, h);
+        let _ = render_to_string(&ui_view, w, h);
     }
 
     #[test]
@@ -577,7 +577,7 @@ proptest! {
         } else {
             Some(0)
         };
-        let mut state = UiView {
+        let mut ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
                 state: BlockState::Waiting {
@@ -591,7 +591,7 @@ proptest! {
             next_block_id: 2,
             ..Default::default()
         };
-        state.downloads.insert(
+        ui_view.downloads.insert(
             LANGUAGES[0].live.id,
             DownloadState {
                 phase: DownloadPhase::Fetching,
@@ -600,11 +600,11 @@ proptest! {
                 bytes_per_sec: 0,
             },
         );
-        let _ = render_to_string(&state, w, h);
+        let _ = render_to_string(&ui_view, w, h);
     }
 }
 
-fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiView {
+fn source_block_view(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiView {
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
     let source = voice_bird_next::producer::sources::SourceSelection {
         device: device.map(|index| snapshot.devices[index].clone()),
@@ -623,8 +623,8 @@ fn source_block_state(state: BlockState, device: Option<usize>, app: Option<usiz
     }
 }
 
-fn source_golden(name: &str, state: UiView) {
-    let out = render_to_string(&state, 100, 30);
+fn source_golden(name: &str, ui_view: UiView) {
+    let out = render_to_string(&ui_view, 100, 30);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/snapshots")
         .join(format!("{name}_100x30.txt"));
@@ -638,7 +638,7 @@ fn source_golden(name: &str, state: UiView) {
 fn picking_device_100x30_matches_golden() {
     source_golden(
         "picking_device",
-        source_block_state(BlockState::PickingDevice(Default::default()), None, None),
+        source_block_view(BlockState::PickingDevice(Default::default()), None, None),
     );
 }
 
@@ -646,18 +646,18 @@ fn picking_device_100x30_matches_golden() {
 fn picking_app_100x30_matches_golden() {
     source_golden(
         "picking_app",
-        source_block_state(BlockState::PickingApp(Default::default()), Some(1), None),
+        source_block_view(BlockState::PickingApp(Default::default()), Some(1), None),
     );
 }
 
 #[test]
 fn device_picker_hides_retained_selections_and_restores_device_cursor() {
-    let state = source_block_state(
+    let ui_view = source_block_view(
         BlockState::PickingDevice(ListPicker { index: 1 }),
         Some(1),
         Some(1),
     );
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     let title = out
         .lines()
         .find(|line| line.contains("pick a device"))
@@ -673,12 +673,12 @@ fn device_picker_hides_retained_selections_and_restores_device_cursor() {
 
 #[test]
 fn app_picker_hides_retained_app_and_restores_app_cursor() {
-    let state = source_block_state(
+    let ui_view = source_block_view(
         BlockState::PickingApp(ListPicker { index: 1 }),
         Some(1),
         Some(1),
     );
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     let title = out
         .lines()
         .find(|line| line.contains("pick an app"))
@@ -695,7 +695,7 @@ fn app_picker_hides_retained_app_and_restores_app_cursor() {
 fn recording_with_source_100x30_matches_golden() {
     source_golden(
         "recording_with_source",
-        source_block_state(
+        source_block_view(
             BlockState::Recording {
                 language: &LANGUAGES[0],
             },
@@ -707,41 +707,41 @@ fn recording_with_source_100x30_matches_golden() {
 
 #[test]
 fn input_source_title_omits_app() {
-    let state = source_block_state(
+    let ui_view = source_block_view(
         BlockState::Recording {
             language: &LANGUAGES[0],
         },
         Some(0),
         None,
     );
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     assert!(out.contains("1 · Mic · en"), "{out}");
     assert!(!out.contains("Spotify"), "{out}");
 }
 
 #[test]
 fn empty_app_picker_explains_required_app_and_back_navigation() {
-    let mut state = source_block_state(BlockState::PickingApp(Default::default()), Some(1), None);
-    state.blocks[0]
+    let mut ui_view = source_block_view(BlockState::PickingApp(Default::default()), Some(1), None);
+    ui_view.blocks[0]
         .source
         .as_mut()
         .unwrap()
         .snapshot
         .apps
         .clear();
-    let out = render_to_string(&state, 100, 30);
+    let out = render_to_string(&ui_view, 100, 30);
     assert!(out.contains("no running apps"), "{out}");
     assert!(out.contains("⌫ back · Esc close"), "{out}");
 }
 
 #[test]
 fn long_source_lists_keep_selection_and_back_visible_on_resize() {
-    let mut state = source_block_state(
+    let mut ui_view = source_block_view(
         BlockState::PickingApp(voice_bird_next::picker::ListPicker { index: 30 }),
         Some(1),
         None,
     );
-    let source = state.blocks[0].source.as_mut().unwrap();
+    let source = ui_view.blocks[0].source.as_mut().unwrap();
     source.snapshot.apps = (0..40)
         .map(|index| voice_bird_next::producer::sources::AppTarget {
             id: format!("app.{index}"),
@@ -750,7 +750,7 @@ fn long_source_lists_keep_selection_and_back_visible_on_resize() {
         })
         .collect();
     for height in [8, 12, 30] {
-        let out = render_to_string(&state, 100, height);
+        let out = render_to_string(&ui_view, 100, height);
         assert!(out.contains("▶ App 30"), "{out}");
         assert!(out.contains("⌫ back · Esc close"), "{out}");
         assert!(!out.contains("App 0 "), "{out}");

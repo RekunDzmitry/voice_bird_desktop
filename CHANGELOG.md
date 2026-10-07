@@ -19,6 +19,11 @@
   availability table. Refresh the full catalog at startup and on ticks;
   `LanguageConsumer` is stateless and queries availability and download attempts.
   Accepted installation successes update availability; stale successes do not.
+- Decouple `ModelWatcher` from the UI projection. Publish persisted availability
+  changes through the bus; consumers select affected sessions and publish
+  `ModelMissing` for the next pass. Reject stale observations and duplicate work,
+  including after Quit. Use `ui_view` for projection bindings across input,
+  rendering, and tests instead of misleading whole-view `state` names.
 - Remove the model store from `DownloadsConsumer`. Persist attempt-scoped
   staging paths via the watcher; downloads only claim and fetch. Route verified
   fetches through a gated model-store consumer for installation, and send

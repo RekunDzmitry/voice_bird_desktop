@@ -55,12 +55,12 @@ pub fn sample_source_snapshot() -> AudioSourceSnapshot {
     }
 }
 
-/// Render `state` into a `w`×`h` in-memory terminal and return the cell
+/// Render `ui_view` into a `w`×`h` in-memory terminal and return the cell
 /// grid as text, one line per row.
-pub fn render_to_string(state: &UiView, w: u16, h: u16) -> String {
+pub fn render_to_string(ui_view: &UiView, w: u16, h: u16) -> String {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal.draw(|f| ui::render(f, state)).expect("draw");
+    terminal.draw(|f| ui::render(f, ui_view)).expect("draw");
     let buf = terminal.backend().buffer().clone();
     let mut out = String::new();
     for y in 0..h {

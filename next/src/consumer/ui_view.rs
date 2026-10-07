@@ -647,6 +647,8 @@ impl UiView {
                 _ => {}
             },
             AppEvent::DownloadEventRejected { .. } => {}
+            // Disk observations inform consumers, not session readiness.
+            AppEvent::ModelAvailabilityChanged { .. } => {}
             AppEvent::Quit => self.should_quit = true,
             // Bus commands routed by the consumer after the UI projection.
             // The reducer only mirrors their UI effects.

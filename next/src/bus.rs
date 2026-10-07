@@ -96,9 +96,15 @@ pub enum AppEvent {
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
-    /// The model watcher observed that a ready model is no longer on disk.
-    /// SQLite availability is updated first; the language consumer queries it
-    /// to publish a model request and the view stops recording.
+    /// A changed disk observation, persisted before publication. SQLite rejects
+    /// observations superseded by a newer scan or accepted installation.
+    ModelAvailabilityChanged {
+        model: &'static ModelEntry,
+        available: bool,
+    },
+    /// An accepted absent observation concerns a model a session counts ready.
+    /// Returns through the bus before the projection stops recording and the
+    /// language consumer publishes a model request.
     ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
@@ -405,5 +411,18 @@ mod tests {
             .expect("serialize missing model");
         assert_eq!(missing["event"], "ModelMissing");
         assert_eq!(missing["id"], language.live.id);
+    }
+
+    #[test]
+    fn availability_observations_serialize_model_metadata_and_boolean() {
+        let model = &crate::picker::CATALOG[0];
+        let observation = serde_json::to_value(AppEvent::ModelAvailabilityChanged {
+            model,
+            available: false,
+        }).expect("serialize model observation");
+        assert_eq!(observation["event"], "ModelAvailabilityChanged");
+        assert_eq!(observation["model"]["id"], model.id);
+        assert_eq!(observation["model"]["size_mb"], model.size_mb);
+        assert_eq!(observation["available"], false);
     }
 }
