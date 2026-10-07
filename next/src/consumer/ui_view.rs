@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use crate::audio_source::{AudioSourceSnapshot, FunnelStep, SourceSelection};
+use crate::audio_sources::{AudioSourceSnapshot, FunnelStep, SourceSelection};
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
 use crate::picker::{ListPicker, ModelEntry, PickerEvent, SessionMenu};
 
-/// Render-side phase for one download. Lives in `state.rs` (UI
+/// Render-side phase for one download. Lives in `consumer/ui_view.rs` (UI
 /// only) because the SQLite `DownloadStatus` enum carries the
 /// matching lifecycle for the table — the renderer doesn't need
 /// the full enum, only the two phases it renders distinctly.
@@ -27,9 +27,9 @@ pub enum BlockState {
     PickingDevice(ListPicker),
     PickingApp(ListPicker),
     /// Choosing a language. Carries its own picker — no shared overlay.
-    Picking(ListPicker),
+    PickingLanguage(ListPicker),
     /// Waiting until every model id in `pending` is present on disk.
-    /// Progress stays in [`UiState::downloads`] so blocks share per-model state.
+    /// Progress stays in [`UiView::downloads`] so blocks share per-model state.
     Waiting {
         language: &'static LanguageProfile,
         pending: Vec<&'static str>,
@@ -78,7 +78,7 @@ impl Block {
         }
     }
 
-    /// Build a hidden block. Used by [`UiState::apply`] for
+    /// Build a hidden block. Used by [`UiView::apply`] for
     /// `AddBlock`: the reducer pushes the block into `blocks` with
     /// `visible: false` and then calls `show_block`, which decides
     /// whether to flip it visible (and which peer to evict if not).
@@ -97,7 +97,7 @@ impl Block {
 
     pub fn language(&self) -> Option<&'static LanguageProfile> {
         match &self.state {
-            BlockState::Picking(_) | BlockState::PickingDevice(_) | BlockState::PickingApp(_) => {
+            BlockState::PickingLanguage(_) | BlockState::PickingDevice(_) | BlockState::PickingApp(_) => {
                 None
             }
             BlockState::Waiting { language, .. }
@@ -119,7 +119,7 @@ impl Block {
             BlockState::Recording { language } | BlockState::Waiting { language, .. } => {
                 Some(language.models())
             }
-            BlockState::Picking(_)
+            BlockState::PickingLanguage(_)
             | BlockState::PickingDevice(_)
             | BlockState::PickingApp(_)
             | BlockState::Failed { .. } => None,
@@ -136,15 +136,17 @@ impl Default for Block {
     /// ..Default::default() }`. Not used by production code; the
     /// reducer constructs blocks via [`Block::new`].
     fn default() -> Self {
-        Self::new(0, BlockState::Picking(ListPicker::default()))
+        Self::new(0, BlockState::PickingLanguage(ListPicker::default()))
     }
 }
 
 /// Render-side projection of one download. The SQLite downloads table and
 /// this map fold the same accepted bus events: decisions read SQLite while
-/// rendering remains a pure function of `UiState`.
+/// rendering remains a pure function of `UiView`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadState {
+    /// Worker lineage for this gauge, independent of batch-time SQLite checks.
+    pub attempt: u32,
     pub phase: DownloadPhase,
     pub bytes: u64,
     pub total: Option<u64>,
@@ -171,7 +173,7 @@ impl DownloadState {
 
 /// Everything the UI needs to draw one frame. Plain data only.
 #[derive(Debug, Clone)]
-pub struct UiState {
+pub struct UiView {
     pub title: String,
     pub should_quit: bool,
     /// Every session, in creation order. `focus` is an index into this
@@ -199,7 +201,7 @@ pub struct UiState {
     pub warning: Option<String>,
 }
 
-impl Default for UiState {
+impl Default for UiView {
     fn default() -> Self {
         Self {
             title: "Voice Bird".to_string(),
@@ -215,7 +217,7 @@ impl Default for UiState {
     }
 }
 
-impl UiState {
+impl UiView {
     pub fn focused(&self) -> Option<&Block> {
         self.blocks.get(self.focus)
     }
@@ -383,7 +385,7 @@ impl UiState {
         let state = if snapshot.is_some() {
             BlockState::PickingDevice(ListPicker::default())
         } else {
-            BlockState::Picking(ListPicker::default())
+            BlockState::PickingLanguage(ListPicker::default())
         };
         let mut block = Block::new_hidden(id, state);
         block.source = snapshot.map(|snapshot| SourceSelection {
@@ -397,6 +399,27 @@ impl UiState {
     }
 
     pub fn apply(&mut self, event: &AppEvent) {
+        let download_attempt = match event {
+            AppEvent::DownloadSucceeded { attempt, model }
+            | AppEvent::DownloadFailed { attempt, model, .. }
+            | AppEvent::DownloadCancelled { attempt, model } => Some((*model, *attempt)),
+            AppEvent::DownloadClaimFailed { attempt, model, .. } if *attempt != 0 => {
+                Some((*model, *attempt))
+            }
+            AppEvent::DownloadStatusChanged { attempt, model, .. } => {
+                Some((model.as_ref(), *attempt))
+            }
+            _ => None,
+        };
+        // SQLite gates the whole batch before consumers can claim a newer
+        // attempt. Do not let an already-accepted old result change its gauge
+        // or waiters. No gauge still permits terminal replay for late joiners;
+        // attempt-zero claim errors have no worker lineage and remain actionable.
+        if let Some((model, attempt)) = download_attempt {
+            if self.downloads.get(model).is_some_and(|row| row.attempt != attempt) {
+                return;
+            }
+        }
         match event {
             AppEvent::AddBlock => self.push_block(None),
             AppEvent::AddSourceBlock { snapshot } => self.push_block(Some(snapshot.clone())),
@@ -418,7 +441,7 @@ impl UiState {
                 let step = match block.state {
                     BlockState::PickingDevice(_) => FunnelStep::Device,
                     BlockState::PickingApp(_) => FunnelStep::App,
-                    BlockState::Picking(_) => FunnelStep::Language,
+                    BlockState::PickingLanguage(_) => FunnelStep::Language,
                     _ => FunnelStep::Committed,
                 };
                 let Some(source) = block.source.as_mut() else {
@@ -447,7 +470,7 @@ impl UiState {
                             .position(|row| Some(row) == source.app.as_ref())
                             .unwrap_or(0),
                     }),
-                    FunnelStep::Language => BlockState::Picking(ListPicker::default()),
+                    FunnelStep::Language => BlockState::PickingLanguage(ListPicker::default()),
                     FunnelStep::Committed => unreachable!(),
                 };
             }
@@ -487,7 +510,7 @@ impl UiState {
             AppEvent::PickerMoved { direction, .. } => {
                 if let Some(block) = self.focused_mut() {
                     match &mut block.state {
-                        BlockState::Picking(picker) => {
+                        BlockState::PickingLanguage(picker) => {
                             picker.apply(*direction, crate::language::LANGUAGES.len());
                         }
                         BlockState::PickingDevice(cursor) => {
@@ -516,7 +539,7 @@ impl UiState {
                 {
                     if matches!(
                         block.state,
-                        BlockState::Picking(_) | BlockState::Failed { .. }
+                        BlockState::PickingLanguage(_) | BlockState::Failed { .. }
                     ) {
                         block.state = if pending.is_empty() {
                             BlockState::Recording { language }
@@ -531,8 +554,12 @@ impl UiState {
             }
             AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::ModelMissing(entry) => self.mark_missing(entry.id),
-            AppEvent::DownloadRequested(entry) => {
-                self.downloads.entry(entry.id).or_insert(DownloadState {
+            AppEvent::DownloadRequested { model: entry, attempt } => {
+                if self.downloads.get(entry.id).is_some_and(|row| row.attempt >= *attempt) {
+                    return;
+                }
+                self.downloads.insert(entry.id, DownloadState {
+                    attempt: *attempt,
                     phase: DownloadPhase::Fetching,
                     bytes: 0,
                     total: None,
@@ -540,20 +567,20 @@ impl UiState {
                 });
             }
             AppEvent::DownloadProgress {
-                attempt: _,
+                attempt,
                 model,
                 bytes,
                 total,
                 bytes_per_sec,
             } => {
-                if let Some(row) = self.downloads.get_mut(*model) {
+                if let Some(row) = self.downloads.get_mut(*model).filter(|row| row.attempt == *attempt) {
                     row.bytes = *bytes;
                     row.total = *total;
                     row.bytes_per_sec = *bytes_per_sec;
                 }
             }
-            AppEvent::DownloadInstalling { attempt: _, model } => {
-                if let Some(row) = self.downloads.get_mut(*model) {
+            AppEvent::DownloadInstalling { attempt, model } => {
+                if let Some(row) = self.downloads.get_mut(*model).filter(|row| row.attempt == *attempt) {
                     row.phase = DownloadPhase::Installing;
                 }
             }
@@ -629,7 +656,7 @@ impl UiState {
             }
             // The table publishes these after persisting a lifecycle
             // transition. Replaying terminal outcomes here reconciles a worker
-            // event that was reduced while a new block was still Picking.
+            // event that was reduced while a new block was still PickingLanguage.
             AppEvent::DownloadStatusChanged {
                 model, to, error, ..
             } => match to {
@@ -638,13 +665,20 @@ impl UiState {
                     model.as_ref(),
                     error.as_deref().unwrap_or("download failed"),
                 ),
+                crate::bus::DownloadStatus::Cancelled => {
+                    self.fail_waiters(model.as_ref(), "download cancelled");
+                }
+                crate::bus::DownloadStatus::Interrupted => {
+                    self.fail_waiters(model.as_ref(), "download interrupted");
+                }
                 _ => {}
             },
             AppEvent::DownloadEventRejected { .. } => {}
+            // Disk observations inform consumers, not session readiness.
+            AppEvent::ModelAvailabilityChanged { .. } => {}
             AppEvent::Quit => self.should_quit = true,
-            // Bus commands aimed at the loop-thread dispatcher.
-            // Reducer ignores them; the dispatcher is the only
-            // consumer.
+            // Bus commands routed by the consumer after the UI projection.
+            // The reducer only mirrors their UI effects.
             AppEvent::BeginLanguage {
                 block,
                 source_rev: Some(rev),
@@ -662,6 +696,7 @@ impl UiState {
                 }
             }
             AppEvent::RequestBlock
+            | AppEvent::DownloadFetched { .. }
             | AppEvent::BeginLanguage { .. }
             | AppEvent::DiscardInflight { .. } => {}
         }
@@ -688,12 +723,12 @@ mod tests {
     #[test]
     fn missing_model_stops_every_affected_recording_block_and_success_resumes() {
         let language = english();
-        let mut s = UiState {
+        let mut s = UiView {
             blocks: vec![
                 Block::new(1, BlockState::Recording { language }),
                 Block::new(2, BlockState::Recording { language }),
             ],
-            ..UiState::default()
+            ..UiView::default()
         };
         s.blocks[1].visible = false;
         s.apply(&AppEvent::ModelMissing(language.live));
@@ -714,7 +749,7 @@ mod tests {
     #[test]
     fn missing_model_extends_waiting_once_and_requires_both_models_to_resume() {
         let language = english();
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![language.refine.id]));
         s.apply(&AppEvent::ModelMissing(language.live));
@@ -739,7 +774,7 @@ mod tests {
         };
         let language = english();
         assert!(OTHER.models().iter().all(|model| model.id != language.live.id));
-        let mut s = UiState {
+        let mut s = UiView {
             blocks: vec![
                 Block::default(),
                 Block::new(1, BlockState::Failed {
@@ -750,7 +785,7 @@ mod tests {
                     language: &OTHER, pending: vec![OTHER.refine.id],
                 }),
             ],
-            ..UiState::default()
+            ..UiView::default()
         };
         let before = s.blocks.clone();
         assert!(s.blocks[0].ready_models().next().is_none());
@@ -761,26 +796,26 @@ mod tests {
 
     #[test]
     fn apply_quit_sets_should_quit() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::Quit);
         assert!(s.should_quit);
     }
 
     #[test]
     fn apply_add_block_pushes_picking_block_and_focuses_it() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         assert_eq!(s.blocks.len(), 1);
         assert_eq!(s.focus, 0);
         assert_eq!(s.blocks[0].id, 1);
-        assert!(matches!(s.blocks[0].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[0].state, BlockState::PickingLanguage(_)));
         assert_eq!(s.next_block_id, 2);
         assert!(s.blocks[0].visible, "a fresh block starts visible");
     }
 
     #[test]
     fn apply_add_block_works_while_a_download_is_in_flight() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, Vec::new()));
         s.apply(&AppEvent::AddBlock);
@@ -790,7 +825,7 @@ mod tests {
             s.blocks[0].state,
             BlockState::Recording { language } if language == english()
         ));
-        assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
 
     /// Regression: after 256 `AddBlock` events the candidate id
@@ -800,7 +835,7 @@ mod tests {
     /// focusing the wrong block.
     #[test]
     fn add_block_avoids_colliding_id_when_wrap_would_hit_a_live_block() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         // Add 256 blocks. The 256th would naively reuse id 1
         // (since next_block_id wraps from 255 -> 1), but block 1
         // is still alive.
@@ -838,7 +873,7 @@ mod tests {
     /// scan must skip id 1 and land on the first free slot.
     #[test]
     fn add_block_after_wrap_picks_the_next_free_id() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         // Block 1 is alive. Force the next candidate back to 1
         // (the post-wrap value).
@@ -867,7 +902,7 @@ mod tests {
     /// closed by then, the scan picks id 1 (the wrapped value).
     #[test]
     fn add_block_picks_wrapped_id_when_it_is_free() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         // Create block 1, then close it (frees id 1).
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
@@ -884,7 +919,7 @@ mod tests {
     /// finds the gap.
     #[test]
     fn add_block_skips_a_range_of_taken_ids() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         // Create blocks 1, 2, 3.
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
@@ -913,11 +948,11 @@ mod tests {
     /// makes the scan find nothing.
     #[test]
     fn add_block_is_a_noop_when_all_ids_are_exhausted() {
-        let mut s = UiState {
+        let mut s = UiView {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -941,11 +976,11 @@ mod tests {
     /// bar by the renderer.
     #[test]
     fn add_block_sets_a_warning_when_ids_are_exhausted() {
-        let mut s = UiState {
+        let mut s = UiView {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -972,11 +1007,11 @@ mod tests {
     /// will succeed.
     #[test]
     fn block_closed_clears_the_exhaustion_warning() {
-        let mut s = UiState {
+        let mut s = UiView {
             title: "Voice Bird".to_string(),
             should_quit: false,
             blocks: (1..=u8::MAX)
-                .map(|id| Block::new(id, BlockState::Picking(ListPicker::default())))
+                .map(|id| Block::new(id, BlockState::PickingLanguage(ListPicker::default())))
                 .collect(),
             focus: 0,
             downloads: BTreeMap::new(),
@@ -1001,9 +1036,9 @@ mod tests {
     /// warning; this test guards the equality check.
     #[test]
     fn block_closed_only_clears_the_exhaustion_warning() {
-        let mut s = UiState {
+        let mut s = UiView {
             warning: Some("some other future warning".to_string()),
-            ..UiState::default()
+            ..UiView::default()
         };
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
@@ -1016,7 +1051,7 @@ mod tests {
 
     #[test]
     fn focus_moves_and_saturates_at_both_ends() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1037,7 +1072,7 @@ mod tests {
 
     #[test]
     fn focus_moved_is_noop_when_no_blocks() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::FocusMoved {
             direction: FocusMove::Next,
         });
@@ -1046,7 +1081,7 @@ mod tests {
 
     #[test]
     fn picker_moved_targets_only_the_focused_block() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, Vec::new()));
         s.apply(&AppEvent::AddBlock);
@@ -1056,7 +1091,7 @@ mod tests {
             to_language: None,
         });
         let picker_index = match &s.blocks[1].state {
-            BlockState::Picking(picker) => picker.index,
+            BlockState::PickingLanguage(picker) => picker.index,
             _ => panic!("block 2 should still be picking"),
         };
         assert_eq!(picker_index, 0);
@@ -1068,7 +1103,7 @@ mod tests {
 
     #[test]
     fn language_selected_targets_block_id_and_records_when_ready() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, Vec::new()));
@@ -1076,12 +1111,12 @@ mod tests {
             s.blocks[0].state,
             BlockState::Recording { language } if language == english()
         ));
-        assert!(matches!(s.blocks[1].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
 
     #[test]
     fn language_selected_is_noop_when_target_block_is_recording() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, Vec::new()));
         s.apply(&select(1, vec![english().live.id]));
@@ -1093,7 +1128,7 @@ mod tests {
 
     #[test]
     fn block_closed_removes_and_clamps_focus() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1104,7 +1139,7 @@ mod tests {
 
     #[test]
     fn block_closed_on_first_clamps_focus_to_zero() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1122,14 +1157,14 @@ mod tests {
 
     #[test]
     fn block_closed_with_no_blocks_is_a_noop() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::BlockClosed { block: s.focused().map_or(1, |block| block.id) });
         assert!(s.blocks.is_empty());
     }
 
     #[test]
     fn queued_close_targets_original_block_after_focus_changes() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         let close = AppEvent::BlockClosed { block: 1 };
         s.apply(&AppEvent::AddBlock);
@@ -1142,7 +1177,7 @@ mod tests {
 
     #[test]
     fn next_block_id_monotonic_across_multiple_adds() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for expected in 1u8..=3 {
             s.apply(&AppEvent::AddBlock);
             s.apply(&select(expected, Vec::new()));
@@ -1156,7 +1191,7 @@ mod tests {
         // Drive the reducer to the cap and confirm the next add
         // restarts from 1 — ids are unique among alive sessions,
         // not unique forever, and a closed block frees its id.
-        let mut s = UiState {
+        let mut s = UiView {
             next_block_id: u8::MAX,
             ..Default::default()
         };
@@ -1167,7 +1202,7 @@ mod tests {
 
     #[test]
     fn apply_leaves_other_fields_untouched() {
-        let mut s = UiState {
+        let mut s = UiView {
             title: "Hello".to_string(),
             should_quit: true,
             blocks: Vec::new(),
@@ -1182,15 +1217,15 @@ mod tests {
         assert_eq!(s.title, "Hello");
         assert!(s.should_quit);
         assert_eq!(s.next_block_id, 43);
-        assert!(matches!(s.blocks[0].state, BlockState::Picking(_)));
+        assert!(matches!(s.blocks[0].state, BlockState::PickingLanguage(_)));
         assert!(s.menu.is_none());
         assert_eq!(s.focus_clock, 1, "AddBlock bumps the focus clock");
     }
 
     #[test]
     fn download_requested_creates_one_shared_record() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        let mut s = UiView::default();
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         s.apply(&AppEvent::DownloadProgress {
             attempt: 1,
             model: english().live.id,
@@ -1198,7 +1233,7 @@ mod tests {
             total: Some(200),
             bytes_per_sec: 12,
         });
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         let row = s.downloads.get(english().live.id).unwrap();
         assert_eq!(row.bytes, 100);
         assert_eq!(row.total, Some(200));
@@ -1207,8 +1242,8 @@ mod tests {
 
     #[test]
     fn download_progress_after_success_is_ignored() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::DownloadRequested(english().live));
+        let mut s = UiView::default();
+        s.apply(&AppEvent::DownloadRequested { model: english().live, attempt: 1 });
         s.apply(&AppEvent::DownloadSucceeded {
             attempt: 1,
             model: english().live.id,
@@ -1225,8 +1260,8 @@ mod tests {
 
     #[test]
     fn download_installing_sets_phase() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::DownloadRequested(english().refine));
+        let mut s = UiView::default();
+        s.apply(&AppEvent::DownloadRequested { model: english().refine, attempt: 1 });
         s.apply(&AppEvent::DownloadInstalling {
             attempt: 1,
             model: english().refine.id,
@@ -1239,7 +1274,7 @@ mod tests {
 
     #[test]
     fn block_records_only_after_both_models_succeed() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadSucceeded {
@@ -1263,7 +1298,7 @@ mod tests {
 
     #[test]
     fn table_status_reconciles_success_that_preceded_selection() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadSucceeded {
             attempt: 1,
@@ -1288,7 +1323,7 @@ mod tests {
 
     #[test]
     fn table_status_reconciles_failure_that_preceded_selection() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::DownloadFailed {
             attempt: 1,
@@ -1315,7 +1350,7 @@ mod tests {
 
     #[test]
     fn model_failure_fails_every_waiter_with_the_message() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for id in 1..=2 {
             s.apply(&AppEvent::AddBlock);
             s.apply(&select(id, vec![english().refine.id]));
@@ -1340,7 +1375,7 @@ mod tests {
 
     #[test]
     fn failed_block_retains_only_other_running_models() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadFailed {
@@ -1359,7 +1394,7 @@ mod tests {
 
     #[test]
     fn claim_failure_has_the_same_ui_semantics() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id]));
         s.apply(&AppEvent::DownloadClaimFailed {
@@ -1377,7 +1412,7 @@ mod tests {
 
     #[test]
     fn retry_selection_replaces_failed_state_with_current_pending_models() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id]));
         s.apply(&AppEvent::DownloadFailed {
@@ -1395,9 +1430,9 @@ mod tests {
 
     #[test]
     fn block_closed_drops_only_unshared_pending_downloads() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for model in english().models() {
-            s.apply(&AppEvent::DownloadRequested(model));
+            s.apply(&AppEvent::DownloadRequested { model, attempt: 1 });
         }
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
@@ -1413,8 +1448,8 @@ mod tests {
 
     #[test]
     fn block_closed_keeps_download_needed_by_a_failed_block() {
-        let mut s = UiState::default();
-        s.apply(&AppEvent::DownloadRequested(english().refine));
+        let mut s = UiView::default();
+        s.apply(&AppEvent::DownloadRequested { model: english().refine, attempt: 1 });
         s.apply(&AppEvent::AddBlock);
         s.apply(&select(1, vec![english().live.id, english().refine.id]));
         s.apply(&AppEvent::DownloadFailed {
@@ -1434,6 +1469,7 @@ mod tests {
     #[test]
     fn ratio_clamps_when_bytes_exceed_total() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 200,
             total: Some(100),
@@ -1445,6 +1481,7 @@ mod tests {
     #[test]
     fn ratio_is_none_without_total() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 100,
             total: None,
@@ -1456,6 +1493,7 @@ mod tests {
     #[test]
     fn ratio_with_zero_total_is_one() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 0,
             total: Some(0),
@@ -1464,11 +1502,67 @@ mod tests {
         assert_eq!(state.ratio(), Some(1.0));
     }
 
+    #[test]
+    fn download_attempts_isolate_gauges_and_waiters() {
+        use crate::bus::DownloadStatus;
+        let mut view = UiView::default();
+        let model = english().live;
+        view.apply(&AppEvent::AddBlock);
+        view.apply(&select(1, vec![model.id]));
+        let first = AppEvent::DownloadRequested { model, attempt: 1 };
+        view.apply(&first);
+        view.apply(&AppEvent::DownloadProgress {
+            attempt: 1, model: model.id, bytes: 64, total: Some(128), bytes_per_sec: 32,
+        });
+        view.apply(&AppEvent::DownloadInstalling { attempt: 1, model: model.id });
+        let joining = view.downloads[model.id].clone();
+        view.apply(&first);
+        assert_eq!(view.downloads[model.id], joining);
+
+        view.apply(&AppEvent::DownloadRequested { model, attempt: 2 });
+        assert_eq!(view.downloads[model.id], DownloadState {
+            attempt: 2, phase: DownloadPhase::Fetching, bytes: 0, total: None, bytes_per_sec: 0,
+        });
+        view.apply(&AppEvent::DownloadProgress {
+            attempt: 2, model: model.id, bytes: 7, total: Some(20), bytes_per_sec: 5,
+        });
+        let current = view.downloads[model.id].clone();
+        let mut stale = vec![
+            first,
+            AppEvent::DownloadProgress {
+                attempt: 1, model: model.id, bytes: 999, total: Some(999), bytes_per_sec: 999,
+            },
+            AppEvent::DownloadInstalling { attempt: 1, model: model.id },
+            AppEvent::DownloadSucceeded { attempt: 1, model: model.id },
+            AppEvent::DownloadFailed { attempt: 1, model: model.id, error: "old failure".into() },
+            AppEvent::DownloadCancelled { attempt: 1, model: model.id },
+            AppEvent::DownloadClaimFailed { attempt: 1, model: model.id, error: "old claim".into() },
+        ];
+        stale.extend([
+            DownloadStatus::Succeeded, DownloadStatus::Failed,
+            DownloadStatus::Cancelled, DownloadStatus::Interrupted,
+        ].into_iter().map(|to| AppEvent::DownloadStatusChanged {
+            model: model.id.into(), attempt: 1, from: Some(DownloadStatus::Downloading),
+            to, error: Some("old status".into()),
+        }));
+        for event in stale {
+            view.apply(&event);
+            assert_eq!(view.downloads[model.id], current, "{event:?}");
+            assert!(matches!(&view.blocks[0].state, BlockState::Waiting { pending, .. }
+                if pending.as_slice() == [model.id]), "{event:?}");
+        }
+        view.apply(&AppEvent::DownloadInstalling { attempt: 2, model: model.id });
+        assert_eq!(view.downloads[model.id].phase, DownloadPhase::Installing);
+        view.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: model.id });
+        assert!(!view.downloads.contains_key(model.id));
+        assert!(matches!(view.blocks[0].state, BlockState::Recording { .. }));
+    }
+
     // ----- visible-cap and menu reducer arms -----
 
     #[test]
     fn five_add_blocks_leave_four_visible_and_one_hidden() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1501,7 +1595,7 @@ mod tests {
         // visible). The result is independent of column order — the
         // leftmost-column block is id=1, and it IS evicted, but the
         // *rule* under test is "smallest stamp", not "leftmost".
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..6 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1525,7 +1619,7 @@ mod tests {
 
     #[test]
     fn session_shown_brings_a_hidden_block_back_and_evicts_oldest_focused() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1545,7 +1639,7 @@ mod tests {
 
     #[test]
     fn session_shown_on_an_already_visible_id_does_not_evict() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1571,7 +1665,7 @@ mod tests {
         // focus is an index into `blocks`, not the visible subset,
         // so the user can navigate to a hidden block by walking
         // ←/→ past the visible ones.
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1590,7 +1684,7 @@ mod tests {
 
     #[test]
     fn block_closed_promotes_the_most_recently_focused_hidden_block() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1611,7 +1705,7 @@ mod tests {
 
     #[test]
     fn menu_opened_sets_index_to_focused_block() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..3 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1628,7 +1722,7 @@ mod tests {
 
     #[test]
     fn menu_moved_clamps_at_row_zero_and_at_last_row() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -1651,7 +1745,7 @@ mod tests {
 
     #[test]
     fn menu_closed_clears_the_menu() {
-        let mut s = UiState::default();
+        let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
         s.apply(&AppEvent::MenuOpened);
         assert!(s.menu.is_some());

@@ -1,8 +1,10 @@
-//! Capturable devices and running apps, independent of the picker and UI.
+//! Capturable devices, running apps, and native audio source catalogs.
 //!
-//! Snapshots are refreshed when a block is requested. Only macOS currently
-//! supplies one; other platforms keep the language-first block flow.
+//! Catalog queries are synchronous; the audio-sources producer runs them on
+//! Tokio's blocking pool and owns serialization and session panic fallback.
+//! Only macOS currently supplies source snapshots.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -80,21 +82,47 @@ impl SourceSelection {
     }
 }
 
-pub trait SourceCatalog: Send + Sync {
+/// Synchronous enumeration of capturable devices and running apps.
+/// Callers must run native queries off the event-loop thread.
+pub trait AudioSourcesCatalog: Send + Sync {
     /// `None` means source enumeration is unavailable on this host.
     fn snapshot(&self) -> Option<AudioSourceSnapshot>;
+}
+
+thread_local! {
+    static SOURCE_QUERY_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current panic is inside a recoverable native source query.
+/// The binary's panic hook must leave the live terminal untouched here.
+pub fn source_query_panicking() -> bool {
+    std::thread::panicking() && SOURCE_QUERY_ACTIVE.get()
+}
+
+pub(crate) struct SourceQueryActive(bool);
+
+impl SourceQueryActive {
+    pub(crate) fn enter() -> Self {
+        Self(SOURCE_QUERY_ACTIVE.replace(true))
+    }
+}
+
+impl Drop for SourceQueryActive {
+    fn drop(&mut self) {
+        SOURCE_QUERY_ACTIVE.set(self.0);
+    }
 }
 
 /// Language-first fallback, also useful for deterministic tests on macOS.
 pub struct NoSources;
 
-impl SourceCatalog for NoSources {
+impl AudioSourcesCatalog for NoSources {
     fn snapshot(&self) -> Option<AudioSourceSnapshot> {
         None
     }
 }
 
-pub fn system_sources() -> Arc<dyn SourceCatalog> {
+pub fn system_sources() -> Arc<dyn AudioSourcesCatalog> {
     #[cfg(target_os = "macos")]
     {
         Arc::new(MacSources)
@@ -109,7 +137,7 @@ pub fn system_sources() -> Arc<dyn SourceCatalog> {
 pub struct MacSources;
 
 #[cfg(target_os = "macos")]
-impl SourceCatalog for MacSources {
+impl AudioSourcesCatalog for MacSources {
     fn snapshot(&self) -> Option<AudioSourceSnapshot> {
         macos::snapshot()
     }
@@ -184,7 +212,7 @@ mod macos {
     /// NSWorkspace includes minimized and tray apps without Screen Recording
     /// permission, unlike SCShareableContent's shareable-window list.
     fn running_apps() -> Vec<AppTarget> {
-        // The source worker has no Cocoa run loop to drain autoreleased objects.
+        // Tokio's blocking workers have no Cocoa run loop to drain these objects.
         autoreleasepool(|_| {
             let workspace = NSWorkspace::sharedWorkspace();
             let running = workspace.runningApplications();
@@ -221,5 +249,21 @@ mod macos {
             apps.sort_by_cached_key(|app| app.name.to_lowercase());
             apps
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_activity_resets_when_a_query_unwinds() {
+        let result = std::panic::catch_unwind(|| {
+            let _query = SourceQueryActive::enter();
+            assert!(SOURCE_QUERY_ACTIVE.get());
+            panic!("native enumeration failed");
+        });
+        assert!(result.is_err());
+        assert!(!SOURCE_QUERY_ACTIVE.get());
     }
 }

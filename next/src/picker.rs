@@ -139,12 +139,12 @@ pub enum PickerEvent {
 /// Left-hand session menu. Shares [`ListPicker`]'s saturating movement
 /// (never wraps) and uses [`PickerMove`] for direction events.
 ///
-/// `index` is a position into [`crate::state::UiState::blocks`] — the
+/// `index` is a position into [`crate::consumer::UiView::blocks`] — the
 /// menu lists *all* sessions in creation order, not just the visible
 /// ones, so the user can reach a hidden block through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMenu {
-    /// Position inside `UiState.blocks`. The reducer's `show_block`
+    /// Position inside `UiView.blocks`. The reducer's `show_block`
     /// helper looks the id up by index, so a stale position simply
     /// misses and the resolver no-ops — no panics on a race.
     pub index: usize,

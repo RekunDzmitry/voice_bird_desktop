@@ -1,17 +1,8 @@
 //! Application event bus.
 //!
-//! Transport for everything that can happen in the app. Producers (today: the
-//! input path; tomorrow: background adapters — audio devices, engines, timers)
-//! call [`EventSender::publish`]. The loop drains queued events at the bottom
-//! of each tick and feeds them to a reducer that folds them into `UiState`.
-//!
-//! ## Why a typed enum + std `mpsc`
-//!
-//! One producer, many consumers is the only pattern the loop needs today;
-//! many producers, one consumer is the only one that needs a queue. Both
-//! are covered by `std::sync::mpsc` — `EventSender` is `Clone`, so producers
-//! only ever touch [`EventSender::publish`], and `drain` yields in publish
-//! order on the loop thread.
+//! Producers and consumers publish typed events through a Tokio unbounded
+//! channel. The loop logs every event, gates it through SQLite, and routes
+//! accepted events to consumers. Publishing is synchronous; receiving wakes the loop.
 //!
 //! ## Why not `Copy`?
 //!
@@ -23,9 +14,9 @@
 //! tests stops compiling, which is why progress is `bytes`/`total` and
 //! never a pre-computed ratio.
 
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
-use crate::audio_source::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
+use crate::audio_sources::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
 use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 
@@ -83,7 +74,7 @@ pub enum AppEvent {
     },
     /// `←` / `→`: move focus between blocks.
     FocusMoved { direction: FocusMove },
-    /// `↑` / `↓` while the focused block is `Picking`: move the
+    /// `↑` / `↓` while the focused block is `PickingLanguage`: move the
     /// highlight inside that block's language list. The language
     /// codes are stamped by the resolver for the event log.
     PickerMoved {
@@ -91,7 +82,7 @@ pub enum AppEvent {
         from_language: Option<&'static str>,
         to_language: Option<&'static str>,
     },
-    /// The dispatcher resolved both model-presence checks for a language.
+    /// The language consumer resolved model availability from SQLite.
     /// The block id is explicit because focus may move before this reply is
     /// reduced.
     LanguageSelected {
@@ -101,17 +92,29 @@ pub enum AppEvent {
     },
     /// Remove the named block after its queued transitions have been gated.
     BlockClosed { block: u8 },
-    /// Model was already installed when the language was selected. The
+    /// Model was available in SQLite when the language was selected. The
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
     ModelAlreadyCached(&'static ModelEntry),
-    /// A model a block already counted as installed is no longer on disk.
-    /// Reducer stops recording; dispatcher re-requests the download.
+    /// A changed disk observation, persisted before publication. SQLite rejects
+    /// observations superseded by a newer scan or accepted installation.
+    ModelAvailabilityChanged {
+        model: &'static ModelEntry,
+        available: bool,
+    },
+    /// An accepted absent observation concerns a model a session counts ready.
+    /// Returns through the bus before the projection stops recording and the
+    /// language consumer publishes a model request.
     ModelMissing(&'static ModelEntry),
 
     /// One model needed by the selected language is not on disk yet.
-    /// Seeds the shared per-model download projection.
-    DownloadRequested(&'static ModelEntry),
+    /// Seeds the shared projection; the download consumer claims or joins work.
+    DownloadRequested {
+        model: &'static ModelEntry,
+        /// Intended attempt, captured before the request's next bus pass.
+        /// A terminal outcome for this attempt must not trigger an implicit retry.
+        attempt: u32,
+    },
     /// Progress on a download. `bytes_per_sec` is a per-tick average
     /// over the throttle window — used by the renderer to label the
     /// gauge when `total` is `None`. `attempt` disambiguates events
@@ -125,6 +128,9 @@ pub enum AppEvent {
         total: Option<u64>,
         bytes_per_sec: u64,
     },
+    /// The downloader verified the staged bytes. SQLite claims Installing once
+    /// for the current Downloading attempt before the store consumer installs.
+    DownloadFetched { attempt: u32, model: &'static str },
     /// Bytes verified; the format handler is unpacking.
     DownloadInstalling { attempt: u32, model: &'static str },
     /// Fans out to EVERY block waiting on `model`.
@@ -135,12 +141,10 @@ pub enum AppEvent {
         model: &'static str,
         error: String,
     },
-    /// Same shape as [`AppEvent::DownloadFailed`] but published by
-    /// [`crate::download::begin_language`] when the orchestrator failed
-    /// to claim a row in the downloads table *before* a worker could
-    /// spawn (disk full, lock timeout, write error). The table
-    /// reducer accepts this variant even when no row exists for
-    /// `model`, so the UI receives the failure instead of seeing
+    /// A request failed before a worker could spawn, while preparing staging
+    /// metadata or claiming a row in the downloads table (disk full, lock
+    /// timeout, write error). The table reducer accepts this variant even when
+    /// no row exists for `model`, so the UI receives the failure instead of seeing
     /// the event rejected by the attempt gate. The reducer treats
     /// it identically to [`AppEvent::DownloadFailed`]: any waiting
     /// block flips to `Failed`, the downloads entry is removed.
@@ -150,13 +154,13 @@ pub enum AppEvent {
         error: String,
     },
     /// Last waiter for `model` closed. Removes the repo row and the
-    /// UiState.downloads entry; the in-flight thread observes the
-    /// cancel flag separately and publishes nothing of its own.
+    /// UiView.downloads entry; the in-flight task observes the
+    /// cancellation row separately.
     DownloadCancelled { attempt: u32, model: &'static str },
-    /// Emitted after the downloads table accepts and persists every lifecycle
-    /// transition. The reducer uses terminal transitions to reconcile worker
-    /// outcomes that raced ahead of `LanguageSelected`; the event log records
-    /// the same lifecycle the SQL table does.
+    /// Emitted after the downloads table persists a lifecycle transition, or
+    /// to replay its current outcome for a request overtaken by that transition.
+    /// The reducer reconciles outcomes that raced ahead of `LanguageSelected`;
+    /// the event log records the same lifecycle the SQL table does.
     ///
     /// `model` is an `Arc<str>` (not `&'static str`) because the transition
     /// publisher may have read it from the database instead of the catalog.
@@ -170,9 +174,9 @@ pub enum AppEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// Emitted when an event arrives whose attempt does not match
-    /// the table's current attempt for `model` (the old worker
-    /// hasn't been acked yet, but a Restart already superseded it).
+    /// Emitted when an event's attempt or lifecycle stage no longer matches
+    /// the table's current row (a Restart superseded the old worker, or a
+    /// duplicate/cancelled handoff can no longer begin installation).
     /// Visibility — the event log now records stale-event drops
     /// instead of silently filtering them. `rejected` is the
     /// variant name of the dropped event (e.g. `"DownloadProgress"`).
@@ -197,41 +201,27 @@ pub enum AppEvent {
     Quit,
 
     // -----------------------------------------------------------------
-    // Bus commands: aimed at the loop-thread dispatcher that owns the
-    // long-lived `Downloader` / `ModelStore` collaborators. The
-    // reducer treats them as observability (the `Downloads::apply`
-    // catch-all returns `Ok(true)` and `UiState::apply` ignores
-    // them); only the dispatcher's `dispatch` consumes them. Reply
-    // channels are `mpsc::sync_channel(1)` oneshots.
+    // Events are routed to consumers only after SQLite accepts them.
+    // Follow-up stages publish new events instead of calling another consumer.
     // -----------------------------------------------------------------
-    /// Resolver saw Enter/Retry on a block. The dispatcher ensures both
-    /// models for the language and targets the reply by block id.
+    /// Resolve model availability for a language and publish `LanguageSelected`
+    /// plus model requests. Downloads begin when those requests are consumed.
     BeginLanguage {
         block: u8,
         language: &'static LanguageProfile,
         source_rev: Option<u32>,
     },
     /// Quit-time cleanup: drop the staged archive and unpack
-    /// scratch directory for `model`. The dispatcher answers with a
+    /// scratch directory for `model`. The consumer asks the store to discard it.
     DiscardInflight { model: std::sync::Arc<str> },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
 /// whole API they see, and cloning is the only way to get one.
 #[derive(Debug, Clone)]
-pub struct EventSender(mpsc::Sender<AppEvent>);
+pub struct EventSender(mpsc::UnboundedSender<AppEvent>);
 
 impl EventSender {
-    /// Wrap an `mpsc::Sender`. Sole constructor — the field is
-    /// private so producers have to come through [`EventBus`],
-    /// which is what guarantees the bus and its senders are
-    /// constructed together. Tests that used to inline the tuple
-    /// (`EventSender(mpsc::channel().0)`) now go through
-    /// `EventBus::new().sender()` to keep the same coupling.
-    pub fn from_mpsc(sender: mpsc::Sender<AppEvent>) -> Self {
-        Self(sender)
-    }
-
     /// Best-effort: send only fails when the bus is gone, i.e. the loop is
     /// shutting down — dropping the event is correct then.
     pub fn publish(&self, event: AppEvent) {
@@ -239,24 +229,28 @@ impl EventSender {
     }
 }
 
-/// Single-consumer pub/sub over `std::sync::mpsc`.
+/// Single-consumer pub/sub over Tokio's unbounded channel.
 pub struct EventBus {
-    sender: mpsc::Sender<AppEvent>,
-    receiver: mpsc::Receiver<AppEvent>,
+    sender: mpsc::UnboundedSender<AppEvent>,
+    receiver: mpsc::UnboundedReceiver<AppEvent>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     pub fn sender(&self) -> EventSender {
-        EventSender::from_mpsc(self.sender.clone())
+        EventSender(self.sender.clone())
     }
 
     pub fn drain(&mut self) -> impl Iterator<Item = AppEvent> + '_ {
-        self.receiver.try_iter()
+        std::iter::from_fn(|| self.receiver.try_recv().ok())
+    }
+
+    pub async fn recv(&mut self) -> Option<AppEvent> {
+        self.receiver.recv().await
     }
 }
 
@@ -417,5 +411,18 @@ mod tests {
             .expect("serialize missing model");
         assert_eq!(missing["event"], "ModelMissing");
         assert_eq!(missing["id"], language.live.id);
+    }
+
+    #[test]
+    fn availability_observations_serialize_model_metadata_and_boolean() {
+        let model = &crate::picker::CATALOG[0];
+        let observation = serde_json::to_value(AppEvent::ModelAvailabilityChanged {
+            model,
+            available: false,
+        }).expect("serialize model observation");
+        assert_eq!(observation["event"], "ModelAvailabilityChanged");
+        assert_eq!(observation["model"]["id"], model.id);
+        assert_eq!(observation["model"]["size_mb"], model.size_mb);
+        assert_eq!(observation["available"], false);
     }
 }

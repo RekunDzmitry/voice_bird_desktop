@@ -83,8 +83,8 @@ impl EventLog {
     /// Errors are swallowed: a full disk or a rotated inode is not
     /// worth surfacing to the UI mid-frame. The next successful
     /// write covers the gap silently.
-    /// Borrow by reference so the drain loop can log, repo-apply and
-    /// state-apply the same event in turn without cloning. The inner
+    /// Borrow by reference so the drain loop can log, database-gate and
+    /// view-apply the same event in turn without cloning. The inner
     /// `Record` already holds a `&'a AppEvent`, so the move from
     /// owned to borrowed is a signature change, not a behaviour change.
     pub fn append(&mut self, event: &AppEvent) {
@@ -342,7 +342,7 @@ mod tests {
     }
     #[test]
     fn source_transitions_log_explicit_steps_revisions_and_selection() {
-        use crate::audio_source::FunnelStep;
+        use crate::audio_sources::FunnelStep;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("source.jsonl");
         let file = OpenOptions::new()

@@ -10,12 +10,14 @@ speakers require a running app first (there is no all-apps option). Backspace
 walks back one picker step, restoring the selected device or app row. An empty
 app list shows `no running apps`; go back or close the block. An
 `AudioSourceSnapshot` captures the enumerated devices and running apps on a
-serialized background worker when a new block is requested. Slow native queries
-do not block input or Quit. Other platforms, or an unavailable/empty device
-snapshot, open the language picker directly.
+serialized `producer::audio_sources` task using `spawn_blocking` for native
+queries. Slow queries do not block input or Quit; runtime shutdown never waits
+for stalled work.
+Other platforms, or an unavailable/empty device snapshot, open the language
+picker directly.
 A Rust panic during enumeration disables that catalog for the session; the
 current, queued, and future requests open the language picker instead. The
-caught panic does not restore or print over the live terminal. This handles
+contained panic does not restore or print over the live terminal. This handles
 unwinding panics, not process aborts or native crashes.
 
 Arrows move the highlight inside the focused picker; Enter advances a source
@@ -46,6 +48,10 @@ The commands above target only `voice-bird-next`, not the legacy app. The
 optional `next/hooks/pre-commit` hook runs strict Clippy with default features
 and without default features when staged changes touch `next/`, the workspace
 manifest, or the lockfile. It checks working-tree source, not a staged snapshot.
+
+Fix dead-code warnings by removing unused code, not by adding
+`#[allow(dead_code)]`. Startup cleanup uses `CacheDirStore::sweep_staging`;
+quit cleanup uses `ModelStore::discard_inflight`.
 
 To opt in from the repository root:
 
@@ -84,52 +90,96 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | path | role |
 |---|---|
 | `src/language.rs` | language registry mapping each code to live + refine models |
-| `src/audio_source.rs` | point-in-time audio source snapshots and macOS device/running-app enumeration |
+| `src/audio_sources.rs` | shared source types, `AudioSourcesCatalog`, and native macOS catalog |
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
-| `src/bus.rs` | `AppEvent` commands/UI events + `EventBus` / `EventSender` |
-| `src/state.rs` | `UiState` + `BlockState` + pure reducer |
-| `src/model_watch.rs` | per-tick presence checks for installed models used by active blocks |
-| `src/ui.rs` | `render(f, &UiState)` — language rows, per-role gauges, borders |
+| `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
+| `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
+| `src/producer/model_watch.rs` | startup/tick disk checks for the entire catalog, persisted in SQLite |
+| `src/ui.rs` | `render(f, &UiView)` — language rows, per-role gauges, borders |
 | `src/input.rs` | `map_key(KeyEvent) -> Option<Intent>` |
 | `src/db/downloads.rs` | persistent in-flight download claims, progress, and cancellation |
+| `src/db/models.rs` | observed model availability, independent of download lifecycle |
+| `src/db/model_staging.rs` | exact attempt-scoped staging paths and preparation errors observed by the store |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
-| `src/download.rs` | `Downloader`, `HttpDownloader`, per-model workers, language orchestration |
-| `src/producer.rs` | intent-to-command resolution and last-waiter cancellation |
-| `src/dispatcher.rs` | source-catalog block creation and command-side model preparation |
+| `src/download.rs` | shared download errors, async `Downloader`, and HTTP streaming transport |
+| `src/producer/audio_sources.rs` | serialized native queries, session panic containment, and source-result events |
+| `src/producer/downloads.rs` | fetch workers, progress throttling, and download-result events |
+| `src/producer/model_store.rs` | blocking installation workers and install-result events |
+| `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
+| `src/producer/mod.rs` | external input and background worker services |
+| `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
+| `src/consumer/audio_sources.rs` | accepted source-request handoff to the enumeration producer |
+| `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
+| `src/consumer/downloads.rs` | attempt-aware SQLite claims, request reconciliation, and fetch handoff |
+| `src/consumer/model_store.rs` | staging preparation, installation eligibility/handoff, and quit-time staging sweep |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
-| `src/main.rs` | terminal guard and event loop (the only file touching a real terminal) |
+| `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
 | `tests/` | render goldens/properties and end-to-end language download flows |
 
 ## Growth rules
 
-1. **State is plain data.** No `Instant`, runtime handles, channels or
-   `JoinHandle`s in `UiState`. The loop (or later, adapters) writes into it.
+1. **The UI view is plain data.** No `Instant`, runtime handles, channels or
+   `JoinHandle`s in `UiView`. The consumer projects accepted events into it.
 2. **Every render fn gets a `render_to_string` test** next to it.
 3. **Side effects live behind traits** (audio, engines, cloud), never in
-   `UiState`; tests use fixture implementations.
+   `UiView`; tests use fixture implementations.
 4. **Input flows through the bus.** `input::map_key` returns
-   `Option<Intent>`; the resolver in `main.rs` translates to bus events
-   and `UiState::apply` folds them in. There is no direct input→state
-   mutation.
-5. **The producer resolves user intent; the dispatcher owns side effects.**
-   `BeginLanguage` carries the target block id and registry profile. The
-   dispatcher checks both models, publishes `LanguageSelected` before worker
-   events, and deduplicates each per-model claim through SQLite. Closing the
-   last waiter cancels only that model's in-flight work.
-6. **SQLite owns download lifecycle; `UiState::downloads` is its render
-   projection.** Decisions read SQLite. Accepted worker events update the table
-   before the UI, and the table publishes `DownloadStatusChanged` after every
-   persisted transition. Terminal status events reconcile outcomes that raced
-   ahead of `LanguageSelected`, without a second ready/failed cache in
-   `UiState`.
+   `Option<Intent>`; `producer/input.rs` reads focus/cursors from the view and
+   domain facts from SQLite, then publishes events. There is no direct
+   input→view mutation.
+5. **Consumers decide; producers execute background work.** `Consumer` owns
+   `Consumers` and routes accepted events to the UI projection and event-specific
+   handlers. Consumers retain lifecycle, attempt, and staging decisions, then hand
+   work to `producer::audio_sources`, `producer::downloads`, or `producer::model_store`.
+   Those producers own task spawning and every worker progress/result publication.
+   Consumers may publish synchronous commands or decision failures; those events
+   also cross the bus/log/SQLite gate. No handler calls another consumer to advance a flow.
+   While a block is `PickingLanguage`, input produces `BeginLanguage`.
+   The language consumer publishes `LanguageSelected` and model requests.
+   Those requests must cross the bus/log/SQLite gate before the download
+   consumer claims work. Cached models lead straight to Recording; otherwise
+   download success events move Waiting blocks to Recording.
+   `DownloadRequested` carries the intended attempt: a terminal result that
+   overtakes a join is reconciled, not silently retried. Superseded requests
+   and old-attempt terminal notifications/replays are rejected. An explicit retry requests the
+   next attempt. A cancelled/interrupted late join enters Failed rather than
+   waiting forever. Requests without waiters or after Quit launch no work.
+   Duplicate valid requests share one SQLite claim. Closing the last waiter
+   cancels only that model's in-flight work.
+   Downloads read their exact attempt's staging path from SQLite. The watcher
+   prepares paths at startup/ticks; the store consumer also prepares new requests
+   before claiming, so immediate retries need no intervening tick. Preparation
+   failures fail waiters without fetching. Verified fetches publish
+   `DownloadFetched`; its gate atomically claims Installing and rejects duplicate,
+   stale, cancelled, or terminal handoffs. Only then does the store consumer
+   hand verified work to the installation producer, which runs on the blocking
+   pool and publishes the outcome. Fast GGUF installation keeps the download
+   gauge; slow package installation shows its own phase. No service calls
+   `std::thread::spawn`: producers schedule asynchronous work with Tokio;
+   native enumeration and installation use `spawn_blocking`.
+6. **SQLite is the source of truth; `UiView::downloads` is its render
+   projection.** Every event enters the JSONL log before the database gate.
+   Accepted worker events update the table before the view, and the table
+   publishes `DownloadStatusChanged` after every persisted transition.
+   Installation success commits the Succeeded row and model availability in one
+   immediate transaction. Availability-write or commit failures roll back both;
+   the lifecycle notification is published only after commit, never for rolled-back success.
+   Each download projection stores its attempt. Newer requests reset its gauge;
+   same-attempt joins preserve progress. Since SQLite accepts a whole batch before
+   consumers claim new work, the projection also rejects mismatched worker events
+   and terminal status replays: an accepted old cancellation/failure cannot hide
+   a newer gauge or fail its waiters. Attempt-zero pre-claim errors remain
+   actionable; terminal replay without an active gauge still reconciles late joins.
+   Terminal status events reconcile outcomes that raced ahead of
+   `LanguageSelected`, without a second ready/failed cache in `UiView`.
    Source transitions are CAS-gated the same way: `SourceStepChanged` names the
    block, from/to steps, expected revision, and resulting selections. SQLite
    increments the revision on every forward/back edge; duplicate and stale
    transitions publish `SourceStepRejected`. Source `BeginLanguage` atomically
-   commits Language → Committed before dispatch, so a racing Backspace cannot
-   orphan a started download. Only accepted events reach the dispatcher.
+   commits Language → Committed before consumption, so a racing Backspace cannot
+   orphan a started download. Only accepted events reach the consumer.
    Block steps live in a connection-local SQLite TEMP table: another app
    instance cannot wipe or collide with them, and disconnect discards them.
    `BlockClosed` carries its target id and deletes the step row through the
@@ -141,13 +191,32 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    only in `main.rs`; everything else uses `FixtureDownloader`.
 8. **Installed models outlive sessions.** `CacheDirStore` reuses completed
    live and refine artifacts from `<cache_dir>/voice-bird/models/`.
-   SQLite tracks in-flight work; quit cleanup removes staging artifacts only.
-   Active blocks re-verify their installed models every 100 ms tick, including
-   hidden sessions and ready models in Waiting blocks. A missing model sends
-   every affected block back to Waiting and re-claims a shared download; success
-   resumes Recording automatically. Failure enters Failed, where `r` retries.
+   SQLite tracks availability separately from in-flight work; quit cleanup
+   removes staging artifacts only. Before accepting input, the model watcher
+   refreshes every catalog model from disk, correcting stale persisted rows.
+   The loop repeats that scan every 100 ms, including unused models.
+   The watcher has no `UiView` dependency: inserted or changed availability rows
+   publish `ModelAvailabilityChanged`; unchanged ticks publish nothing.
+   SQLite rejects observations that no longer match persisted availability.
+   Consumers select interested sessions and publish `ModelMissing` through the
+   bus before the view changes or a language consumer requests shared work.
+   `LanguageConsumer` has no model-store dependency: it queries the availability
+   table, then download history only for missing models. Accepted installation
+   successes update availability before consumption; rejected stale successes
+   cannot change it. A missing ready model sends every affected block, including
+   hidden sessions and the ready subset of Waiting blocks, back to Waiting and
+   re-claims a shared download; pending, picker, and Failed sessions launch no
+   automatic work. Duplicate notifications and observations after Quit do not
+   launch work. Success resumes Recording automatically; failure enters Failed,
+   where `r` retries.
    Presence checks do not detect corruption of files that still exist, and
    Recording remains mocked (no real audio device is stopped yet).
+   Async downloads use a separate SQLite `CancelProbe` connection; it polls
+   the current attempt's row every 50 ms between streamed chunks. Quit marks
+   active rows Cancelling, consumes `DiscardInflight` through the same log/database
+   gate, and calls `shutdown_background` without joining workers. The model-store
+   consumer handles that command even after Quit and sweeps `.part` files and
+   `.tmp` directories, preserving installed models.
 
 ## Refreshing the golden snapshot
 

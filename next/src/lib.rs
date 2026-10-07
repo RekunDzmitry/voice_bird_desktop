@@ -1,25 +1,21 @@
 //! `voice-bird-next`: the incremental rewrite of the Voice Bird TUI.
 //!
 //! Ground rules (see README.md):
-//! - [`state::UiState`] is plain data — no `Instant`, runtime handles or
-//!   channels — so every render is deterministic and testable.
-//! - [`ui::render`] is a pure function of `&UiState`.
-//! - Side effects (terminal, audio, engines, cloud) live in `main.rs` or
-//!   behind traits, never inside the state struct.
-//! - Input maps keys to [`bus::AppEvent`]; the bus transports them; a pure
-//!   reducer on `UiState::apply` folds them in. Input never mutates state.
-pub mod audio_source;
+//! - [`consumer::UiView`] is plain data: no runtime handles or channels.
+//! - [`ui::render`] is a pure function of the UI view.
+//! - Consumers make accepted-event decisions and hand background work to producers.
+//! - Every event is logged before SQLite gates domain transitions.
+//! - Producers schedule workers and publish results; blocking work uses `spawn_blocking`.
+pub mod audio_sources;
 pub mod bus;
+pub mod consumer;
+pub mod db;
+pub mod download;
 pub mod event_log;
 pub mod input;
-pub mod dispatcher;
 pub mod language;
-pub mod model_watch;
 pub mod picker;
-pub mod state;
-pub mod db;
 pub mod producer;
-pub mod download;
-pub mod transcription_models;
 pub mod testing;
+pub mod transcription_models;
 pub mod ui;

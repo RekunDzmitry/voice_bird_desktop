@@ -5,7 +5,7 @@
 //! out of `main.rs` keeps the binary entry point focused on terminal
 //! plumbing (raw mode, alt screen, panic hook, the render loop) and
 //! puts everything that talks to the bus next to the bus itself.
-use crate::audio_source::{DeviceKind, FunnelStep};
+use crate::audio_sources::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
 
@@ -13,14 +13,14 @@ use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
-use crate::state::{BlockState, UiState};
+use crate::consumer::ui_view::{BlockState, UiView};
 /// Stamp the `from_language`/`to_language` codes onto `PickerMoved`.
 /// The input layer has no registry context, so the resolver reads the
 /// focused block's picker without mutating it.
-pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::PickerMove) {
-    let (from_language, to_language) = match state.focused() {
+pub fn stamp_picker_move(tx: &EventSender, ui_view: &UiView, direction: picker::PickerMove) {
+    let (from_language, to_language) = match ui_view.focused() {
         Some(block) => match &block.state {
-            BlockState::Picking(picker) => {
+            BlockState::PickingLanguage(picker) => {
                 let from = LANGUAGES[picker.index].code;
                 let to = LANGUAGES[picker::step(picker.index, LANGUAGES.len(), direction)].code;
                 (Some(from), Some(to))
@@ -38,17 +38,17 @@ pub fn stamp_picker_move(tx: &EventSender, state: &UiState, direction: picker::P
 /// Resolve one [`Intent`] into bus events. The reducer does the rest.
 ///
 /// - `Confirm` and `Retry` publish [`AppEvent::BeginLanguage`] with the
-///   target block id. The dispatcher owns the downloader and model store.
+///   target block id. The consumer routes it to the language consumer.
 /// - All other intents are direct mappings.
 ///
 /// [`AppEvent::BeginLanguage`]: crate::bus::AppEvent::BeginLanguage
-pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &EventSender) {
+pub fn resolve_intent(intent: Intent, ui_view: &UiView, db: &mut Database, tx: &EventSender) {
     // intents are hijacked to drive the menu instead of falling
-    // through to their default reducer. Branch on `state.menu.is_some()`
+    // through to their default reducer. Branch on `ui_view.menu.is_some()`
     // FIRST so the menu's behaviour is local and obvious; everything
     // that doesn't intercept (`AddBlock`, `Quit`, `Retry`, focus
     // moves) keeps its old semantics even with the menu open.
-    let menu_open = state.menu.is_some();
+    let menu_open = ui_view.menu.is_some();
     if menu_open {
         match intent {
             Intent::ToggleMenu => {
@@ -71,11 +71,11 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
                 // Publish a SessionShown for the menu's selected row.
                 // The reducer closes the menu, runs `show_block` to
                 // evict the oldest-focused visible peer if needed, and
-                // moves focus to the chosen id. `state.menu` is the
+                // moves focus to the chosen id. `ui_view.menu` is the
                 // session menu's struct, not the picker — `index` is
-                // a position in `state.blocks`.
-                if let Some(menu) = state.menu.as_ref() {
-                    if let Some(block) = state.blocks.get(menu.index) {
+                // a position in `ui_view.blocks`.
+                if let Some(menu) = ui_view.menu.as_ref() {
+                    if let Some(block) = ui_view.blocks.get(menu.index) {
                         tx.publish(AppEvent::SessionShown { id: block.id });
                     }
                 }
@@ -103,10 +103,10 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
         Intent::FocusNext => tx.publish(AppEvent::FocusMoved {
             direction: FocusMove::Next,
         }),
-        Intent::PickerPrev => stamp_picker_move(tx, state, picker::PickerMove::Up),
-        Intent::PickerNext => stamp_picker_move(tx, state, picker::PickerMove::Down),
+        Intent::PickerPrev => stamp_picker_move(tx, ui_view, picker::PickerMove::Up),
+        Intent::PickerNext => stamp_picker_move(tx, ui_view, picker::PickerMove::Down),
         Intent::Confirm => {
-            if let Some(block) = state.focused() {
+            if let Some(block) = ui_view.focused() {
                 match &block.state {
                     BlockState::PickingDevice(cursor) => {
                         if let Some(source) = &block.source {
@@ -146,7 +146,7 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
                             }
                         }
                     }
-                    BlockState::Picking(picker) => tx.publish(AppEvent::BeginLanguage {
+                    BlockState::PickingLanguage(picker) => tx.publish(AppEvent::BeginLanguage {
                         block: block.id,
                         language: &LANGUAGES[picker.index],
                         source_rev: block.source.as_ref().map(|source| source.rev),
@@ -156,11 +156,11 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
             }
         }
         Intent::StepBack => {
-            if let Some(block) = state.focused() {
+            if let Some(block) = ui_view.focused() {
                 if let Some(source) = &block.source {
                     let edge = match block.state {
                         BlockState::PickingApp(_) => Some((FunnelStep::App, FunnelStep::Device)),
-                        BlockState::Picking(_) => Some((
+                        BlockState::PickingLanguage(_) => Some((
                             FunnelStep::Language,
                             if source.app.is_some() {
                                 FunnelStep::App
@@ -184,7 +184,7 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
             }
         }
         Intent::Retry => {
-            if let Some(block) = state.focused() {
+            if let Some(block) = ui_view.focused() {
                 if let BlockState::Failed { language, .. } = &block.state {
                     tx.publish(AppEvent::BeginLanguage {
                         block: block.id,
@@ -195,9 +195,9 @@ pub fn resolve_intent(intent: Intent, state: &UiState, db: &mut Database, tx: &E
             }
         }
         Intent::BlockClosed => {
-            if let Some(block) = state.focused() {
+            if let Some(block) = ui_view.focused() {
                 for &model in block.pending_models() {
-                    let any_other = state.blocks.iter().any(|other| {
+                    let any_other = ui_view.blocks.iter().any(|other| {
                         other.id != block.id && other.pending_models().contains(&model)
                     });
                     if !any_other {
@@ -225,7 +225,7 @@ mod tests {
     use crate::db::Database;
     use crate::language::{LanguageProfile, LANGUAGES};
     use crate::picker::SessionMenu;
-    use crate::state::Block;
+    use crate::consumer::ui_view::Block;
 
     fn english() -> &'static LanguageProfile {
         &LANGUAGES[0]
@@ -244,11 +244,11 @@ mod tests {
         DbHandle { db, _tmp: tmp }
     }
 
-    /// The state with five Picking blocks (one focused). Mirrors the
-    /// original `state_with_five_blocks` helper but walks the bus so
+    /// The UI view with five PickingLanguage blocks (one focused). Mirrors the
+    /// original `ui_view_with_five_blocks` helper but walks the bus so
     /// the reducer's AddBlock path — including `show_block` — runs.
-    fn state_with_five_blocks() -> UiState {
-        let mut s = UiState::default();
+    fn ui_view_with_five_blocks() -> UiView {
+        let mut s = UiView::default();
         for _ in 0..5 {
             s.apply(&AppEvent::AddBlock);
         }
@@ -264,9 +264,9 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
-        state.apply(&AppEvent::AddBlock);
-        resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
+        let mut ui_view = UiView::default();
+        ui_view.apply(&AppEvent::AddBlock);
+        resolve_intent(Intent::Confirm, &ui_view, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
         assert!(matches!(
             events.as_slice(),
@@ -280,8 +280,8 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
-        resolve_intent(Intent::Quit, &state, &mut h.db, &tx);
+        let ui_view = UiView::default();
+        resolve_intent(Intent::Quit, &ui_view, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
         assert!(
             matches!(events.last(), Some(AppEvent::Quit)),
@@ -294,18 +294,18 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
+        let mut ui_view = UiView::default();
         for model in english().models() {
             crate::db::downloads::start(&mut h.db, model.id).unwrap();
         }
-        state.blocks.push(Block::new(
+        ui_view.blocks.push(Block::new(
             1,
             BlockState::Waiting {
                 language: english(),
                 pending: english().models().map(|model| model.id).to_vec(),
             },
         ));
-        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
+        resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);
         let events: Vec<_> = bus.drain().collect();
         assert!(!events
             .iter()
@@ -322,8 +322,8 @@ mod tests {
         let tx = bus.sender();
         let mut h = db_with(&bus);
         crate::db::downloads::start(&mut h.db, english().refine.id).unwrap();
-        let mut state = UiState::default();
-        state.blocks.push(Block::new(
+        let mut ui_view = UiView::default();
+        ui_view.blocks.push(Block::new(
             1,
             BlockState::Failed {
                 language: english(),
@@ -332,7 +332,7 @@ mod tests {
             },
         ));
 
-        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
+        resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);
 
         let row = crate::db::downloads::get(&h.db, english().refine.id)
             .unwrap()
@@ -349,8 +349,8 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
-        resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
+        let ui_view = UiView::default();
+        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
             matches!(events.as_slice(), [AppEvent::MenuOpened]),
@@ -363,11 +363,11 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState {
+        let ui_view = UiView {
             menu: Some(SessionMenu::open_at(0)),
-            ..UiState::default()
+            ..UiView::default()
         };
-        resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
+        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
             matches!(events.as_slice(), [AppEvent::MenuClosed]),
@@ -380,11 +380,11 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = state_with_five_blocks();
+        let mut ui_view = ui_view_with_five_blocks();
         // Highlight the first block in the menu list — that's the
         // hidden block 1.
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
+        ui_view.menu = Some(SessionMenu::open_at(0));
+        resolve_intent(Intent::Confirm, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert_eq!(
             events.len(),
@@ -402,9 +402,9 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::BlockClosed, &state, &mut h.db, &tx);
+        let mut ui_view = ui_view_with_five_blocks();
+        ui_view.menu = Some(SessionMenu::open_at(0));
+        resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert_eq!(
             events.len(),
@@ -422,10 +422,10 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::PickerPrev, &state, &mut h.db, &tx);
-        resolve_intent(Intent::PickerNext, &state, &mut h.db, &tx);
+        let mut ui_view = ui_view_with_five_blocks();
+        ui_view.menu = Some(SessionMenu::open_at(0));
+        resolve_intent(Intent::PickerPrev, &ui_view, &mut h.db, &tx);
+        resolve_intent(Intent::PickerNext, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert_eq!(events.len(), 2, "expected two events; got {events:?}");
         assert!(
@@ -457,9 +457,9 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = state_with_five_blocks();
-        state.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Quit, &state, &mut h.db, &tx);
+        let mut ui_view = ui_view_with_five_blocks();
+        ui_view.menu = Some(SessionMenu::open_at(0));
+        resolve_intent(Intent::Quit, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
             matches!(events.as_slice(), [AppEvent::Quit]),
@@ -474,29 +474,29 @@ mod tests {
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let state = UiState::default();
-        resolve_intent(Intent::ToggleMenu, &state, &mut h.db, &tx);
+        let ui_view = UiView::default();
+        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert!(
             matches!(events.as_slice(), [AppEvent::MenuOpened]),
-            "ToggleMenu on a fresh state must publish MenuOpened; got {events:?}"
+            "ToggleMenu on a fresh UI view must publish MenuOpened; got {events:?}"
         );
     }
 
     #[test]
     fn session_shown_picks_up_menu_index_for_block_id() {
         // Sanity: SessionShown reads the id from the menu's selected
-        // row, not from `state.focus`. Highlight the last row in a
-        // 3-block state — id=3, even though focus=2.
+        // row, not from `ui_view.focus`. Highlight the last row in a
+        // 3-block UI view — id=3, even though focus=2.
         let mut bus = EventBus::new();
         let tx = bus.sender();
         let mut h = db_with(&bus);
-        let mut state = UiState::default();
+        let mut ui_view = UiView::default();
         for _ in 0..3 {
-            state.apply(&AppEvent::AddBlock);
+            ui_view.apply(&AppEvent::AddBlock);
         }
-        state.menu = Some(SessionMenu::open_at(2));
-        resolve_intent(Intent::Confirm, &state, &mut h.db, &tx);
+        ui_view.menu = Some(SessionMenu::open_at(2));
+        resolve_intent(Intent::Confirm, &ui_view, &mut h.db, &tx);
         let events: Vec<AppEvent> = bus.drain().collect();
         assert_eq!(
             events.len(),

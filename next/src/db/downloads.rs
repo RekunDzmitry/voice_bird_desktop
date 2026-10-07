@@ -20,12 +20,11 @@
 //!
 //! ## Lifecycle transitions
 //!
-//! Every state change funnels through [`transition`],
-//! which is the only path that publishes
-//! [`AppEvent::DownloadStatusChanged`]. Because the publish happens
-//! *after* the SQL `UPDATE` returns, the SQL state and the bus log
-//! can never disagree — the row is the truth, the log is the audit
-//! trail, and the publish lives where both can see it.
+//! Persisted transitions publish [`AppEvent::DownloadStatusChanged`] only after
+//! their SQL commits. Installation success commits its lifecycle and model
+//! availability together through the database coordinator; rollback publishes
+//! no success. Pre-claim failure notifications (`from: None`) still report a
+//! failed claim without a persisted row.
 //!
 //! On startup, [`Database::open`] rewrites every leftover
 //! non-terminal row (Downloading / Installing / Cancelling) to
@@ -181,7 +180,7 @@ fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
 /// Callers pass the whole database, then pick the table they need.
 /// Adding a second table later is one new module of free functions
 /// and one more `&Database` borrow — no signature churn in
-/// `producer::resolve_intent`, `download::begin_language`,
+/// `producer::input::resolve_intent`, `consumer::downloads::DownloadsConsumer::request`,
 /// `main::handle_key`, etc.
 pub fn get(db: &Database, model: &str) -> rusqlite::Result<Option<DownloadRow>> {
     db.conn_ref()
@@ -287,11 +286,9 @@ pub fn cancel(db: &mut Database, model: &str) -> rusqlite::Result<bool> {
 /// drop instead of silently filtering it.
 pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     match ev {
-        AppEvent::DownloadRequested(_) => {
-            // `DownloadRequested` is published by the resolver
-            // *after* a successful claim — `start` already
-            // inserted the row. The event itself carries no
-            // attempt, so it's not a transition.
+        AppEvent::DownloadRequested { .. } => {
+            // A request precedes its claim. The requested attempt is a
+            // consumer precondition, not a persisted lifecycle transition.
             Ok(true)
         }
         AppEvent::DownloadProgress {
@@ -313,35 +310,48 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
                 Ok(false)
             }
         }
-        AppEvent::DownloadInstalling { attempt, model } => {
-            if !matches_attempt(db, model, *attempt)? {
+        AppEvent::DownloadFetched { attempt, model } => {
+            let current = get(db, model)?;
+            if current.as_ref().is_some_and(|row| {
+                row.attempt == *attempt && row.status == DownloadStatus::Downloading
+            }) {
+                transition(
+                    db,
+                    model,
+                    *attempt,
+                    Some(DownloadStatus::Downloading),
+                    DownloadStatus::Installing,
+                    None,
+                )?;
+                Ok(true)
+            } else {
                 reject(db, ev, *attempt);
-                return Ok(false);
+                if current.is_some_and(|row| {
+                    row.attempt == *attempt && row.status == DownloadStatus::Cancelling
+                }) {
+                    // Fetch finished, and the rejected handoff cannot create
+                    // an install worker to acknowledge cancellation.
+                    db.tx().publish(AppEvent::DownloadCancelled {
+                        attempt: *attempt,
+                        model,
+                    });
+                }
+                Ok(false)
             }
-            transition(
-                db,
-                model,
-                *attempt,
-                Some(DownloadStatus::Downloading),
-                DownloadStatus::Installing,
-                None,
-            )?;
-            Ok(true)
+        }
+        AppEvent::DownloadInstalling { attempt, model } => {
+            let current = get(db, model)?;
+            if current.is_some_and(|row| {
+                row.attempt == *attempt && row.status == DownloadStatus::Installing
+            }) {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
         }
         AppEvent::DownloadSucceeded { attempt, model } => {
-            if !matches_attempt(db, model, *attempt)? {
-                reject(db, ev, *attempt);
-                return Ok(false);
-            }
-            transition(
-                db,
-                model,
-                *attempt,
-                Some(DownloadStatus::Installing),
-                DownloadStatus::Succeeded,
-                None,
-            )?;
-            Ok(true)
+            super::complete_installation(db, ev, model, *attempt)
         }
         AppEvent::DownloadClaimFailed {
             attempt,
@@ -411,6 +421,34 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
             )?;
             Ok(true)
         }
+        AppEvent::DownloadStatusChanged {
+            model,
+            attempt,
+            from: Some(from),
+            to,
+            ..
+        } if from == to => {
+            // A replay describes the current row, not a historical transition.
+            // It must not fail a newer retry that started before this bus pass.
+            let current = get(db, model)?;
+            if current.is_some_and(|row| row.attempt == *attempt && row.status == *to) {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
+        }
+        AppEvent::DownloadStatusChanged { model, attempt, from: Some(_), .. } => {
+            // Persisted transitions can be queued behind a new claim. Keep
+            // them in the audit log, but never project an old attempt onto
+            // the current attempt's waiters.
+            if matches_attempt(db, model, *attempt)? {
+                Ok(true)
+            } else {
+                reject(db, ev, *attempt);
+                Ok(false)
+            }
+        }
         _ => Ok(true),
     }
 }
@@ -433,9 +471,7 @@ pub fn probe(db: &Database, model: &'static str, attempt: u32) -> CancelProbe {
     }
 }
 
-/// Single UPDATE path. Used by `apply` (transitions driven by
-/// worker events) and `cancel` (driver-driven). Returns the
-/// prior status so the publish can stamp `from` correctly.
+/// Write an ordinary lifecycle transition, then publish its committed result.
 fn transition(
     db: &mut Database,
     model: &str,
@@ -444,23 +480,7 @@ fn transition(
     to: DownloadStatus,
     error: Option<String>,
 ) -> rusqlite::Result<()> {
-    let now_s = format_ts(Utc::now());
-    // The UPDATE is gated by attempt so a stale event whose
-    // attempt has been superseded cannot repaint the new row.
-    // `apply` already pre-checked, but checking again here is
-    // cheap and means `transition` is safe to call directly.
-    let changed = db.conn_mut().execute(
-        "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
-         WHERE model = ?4 AND attempt = ?5",
-        params![
-            status_to_sql(to),
-            error.as_deref(),
-            now_s,
-            model,
-            attempt,
-        ],
-    )?;
-    if changed == 0 {
+    if !set_status_on(db.conn_ref(), model, attempt, to, error.as_deref())? {
         // Row gone or attempt mismatch — log the rejection and
         // skip the publish.
         db.tx().publish(AppEvent::DownloadEventRejected {
@@ -471,6 +491,35 @@ fn transition(
         });
         return Ok(());
     }
+    publish_status(db, model, attempt, from, to, error);
+    Ok(())
+}
+
+/// The shared conditional UPDATE, also used inside the success transaction.
+pub(super) fn set_status_on(
+    connection: &Connection,
+    model: &str,
+    attempt: u32,
+    to: DownloadStatus,
+    error: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
+         WHERE model = ?4 AND attempt = ?5",
+        params![status_to_sql(to), error, format_ts(Utc::now()), model, attempt],
+    )?;
+    Ok(changed != 0)
+}
+
+/// Publish only after the caller's SQL writes have committed.
+pub(super) fn publish_status(
+    db: &Database,
+    model: &str,
+    attempt: u32,
+    from: Option<DownloadStatus>,
+    to: DownloadStatus,
+    error: Option<String>,
+) {
     db.tx().publish(AppEvent::DownloadStatusChanged {
         model: Arc::from(model),
         attempt,
@@ -478,7 +527,6 @@ fn transition(
         to,
         error,
     });
-    Ok(())
 }
 
 /// Returns true if the row exists and its `attempt` matches
@@ -494,13 +542,15 @@ fn matches_attempt(db: &Database, model: &str, attempt: u32) -> rusqlite::Result
 /// `apply` when an event's attempt doesn't match the row's.
 /// Logging the rejection here (instead of inside `apply`) keeps
 /// the rejection's row-attempt field accurate.
-fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
+pub(super) fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
     let (model, name): (&str, &'static str) = match ev {
         AppEvent::DownloadProgress { model, .. } => (*model, "DownloadProgress"),
+        AppEvent::DownloadFetched { model, .. } => (*model, "DownloadFetched"),
         AppEvent::DownloadInstalling { model, .. } => (*model, "DownloadInstalling"),
         AppEvent::DownloadSucceeded { model, .. } => (*model, "DownloadSucceeded"),
         AppEvent::DownloadFailed { model, .. } => (*model, "DownloadFailed"),
         AppEvent::DownloadCancelled { model, .. } => (*model, "DownloadCancelled"),
+        AppEvent::DownloadStatusChanged { model, .. } => (model.as_ref(), "DownloadStatusChanged"),
         _ => ("", "Unknown"),
     };
     // Best-effort: re-read the row to capture the live attempt
@@ -961,5 +1011,96 @@ mod tests {
         let active = active(&d, ).unwrap();
         assert_eq!(active.len(), 1, "only tiny.en is active");
         assert_eq!(active[0].model.as_ref(), "tiny.en");
+    }
+    #[test]
+    fn fetched_handoff_claims_installing_once_and_rejects_duplicates() {
+        let (_tmp, path) = tmp_db();
+        let (mut bus, tx) = bus();
+        let mut db = Database::open(&path, tx).unwrap();
+        let attempt = start(&mut db, "tiny.en").unwrap();
+        bus.drain().for_each(drop);
+        let fetched = AppEvent::DownloadFetched { model: "tiny.en", attempt };
+
+        assert!(apply(&mut db, &fetched).unwrap());
+        assert!(!apply(&mut db, &fetched).unwrap());
+        let row = get(&db, "tiny.en").unwrap().unwrap();
+        assert_eq!(row.status, DownloadStatus::Installing);
+        let events: Vec<_> = bus.drain().collect();
+        assert_eq!(events, vec![
+            AppEvent::DownloadStatusChanged {
+                model: Arc::from("tiny.en"),
+                attempt,
+                from: Some(DownloadStatus::Downloading),
+                to: DownloadStatus::Installing,
+                error: None,
+            },
+            AppEvent::DownloadEventRejected {
+                model: Arc::from("tiny.en"),
+                rejected: "DownloadFetched",
+                event_attempt: attempt,
+                row_attempt: Some(attempt),
+            },
+        ]);
+    }
+
+    #[test]
+    fn fetched_handoff_rejects_cancelled_and_terminal_rows() {
+        for status in [
+            DownloadStatus::Installing,
+            DownloadStatus::Cancelling,
+            DownloadStatus::Cancelled,
+            DownloadStatus::Succeeded,
+            DownloadStatus::Failed,
+            DownloadStatus::Interrupted,
+        ] {
+            let (_tmp, path) = tmp_db();
+            let (mut bus, tx) = bus();
+            let mut db = Database::open(&path, tx).unwrap();
+            let attempt = start(&mut db, "tiny.en").unwrap();
+            transition(&mut db, "tiny.en", attempt, Some(DownloadStatus::Downloading), status, None).unwrap();
+            bus.drain().for_each(drop);
+
+            assert!(!apply(&mut db, &AppEvent::DownloadFetched { model: "tiny.en", attempt }).unwrap());
+            assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, status);
+            let events: Vec<_> = bus.drain().collect();
+            assert!(matches!(events.first(), Some(AppEvent::DownloadEventRejected {
+                rejected: "DownloadFetched", event_attempt, row_attempt: Some(row_attempt), ..
+            }) if *event_attempt == attempt && *row_attempt == attempt));
+            if status == DownloadStatus::Cancelling {
+                let ack = events.iter().find(|event| matches!(event, AppEvent::DownloadCancelled { .. }))
+                    .expect("finished fetch must acknowledge cancellation");
+                assert!(apply(&mut db, ack).unwrap());
+                assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, DownloadStatus::Cancelled);
+            } else {
+                assert!(!events.iter().any(|event| matches!(event, AppEvent::DownloadCancelled { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn installing_projection_event_cannot_regress_cancellation_or_terminal_rows() {
+        let (_tmp, path) = tmp_db();
+        let (mut bus, tx) = bus();
+        let mut db = Database::open(&path, tx).unwrap();
+        let attempt = start(&mut db, "tiny.en").unwrap();
+        let installing = AppEvent::DownloadInstalling { model: "tiny.en", attempt };
+        assert!(!apply(&mut db, &installing).unwrap());
+        assert!(apply(&mut db, &AppEvent::DownloadFetched { model: "tiny.en", attempt }).unwrap());
+        assert!(apply(&mut db, &installing).unwrap());
+        for status in [
+            DownloadStatus::Cancelling,
+            DownloadStatus::Cancelled,
+            DownloadStatus::Succeeded,
+            DownloadStatus::Failed,
+            DownloadStatus::Interrupted,
+        ] {
+            transition(&mut db, "tiny.en", attempt, None, status, None).unwrap();
+            bus.drain().for_each(drop);
+            assert!(!apply(&mut db, &installing).unwrap());
+            assert_eq!(get(&db, "tiny.en").unwrap().unwrap().status, status);
+            assert!(bus.drain().any(|event| matches!(event, AppEvent::DownloadEventRejected {
+                rejected: "DownloadInstalling", ..
+            })));
+        }
     }
 }
