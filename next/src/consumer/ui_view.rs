@@ -145,6 +145,8 @@ impl Default for Block {
 /// rendering remains a pure function of `UiView`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadState {
+    /// Worker lineage for this gauge, independent of batch-time SQLite checks.
+    pub attempt: u32,
     pub phase: DownloadPhase,
     pub bytes: u64,
     pub total: Option<u64>,
@@ -397,6 +399,27 @@ impl UiView {
     }
 
     pub fn apply(&mut self, event: &AppEvent) {
+        let download_attempt = match event {
+            AppEvent::DownloadSucceeded { attempt, model }
+            | AppEvent::DownloadFailed { attempt, model, .. }
+            | AppEvent::DownloadCancelled { attempt, model } => Some((*model, *attempt)),
+            AppEvent::DownloadClaimFailed { attempt, model, .. } if *attempt != 0 => {
+                Some((*model, *attempt))
+            }
+            AppEvent::DownloadStatusChanged { attempt, model, .. } => {
+                Some((model.as_ref(), *attempt))
+            }
+            _ => None,
+        };
+        // SQLite gates the whole batch before consumers can claim a newer
+        // attempt. Do not let an already-accepted old result change its gauge
+        // or waiters. No gauge still permits terminal replay for late joiners;
+        // attempt-zero claim errors have no worker lineage and remain actionable.
+        if let Some((model, attempt)) = download_attempt {
+            if self.downloads.get(model).is_some_and(|row| row.attempt != attempt) {
+                return;
+            }
+        }
         match event {
             AppEvent::AddBlock => self.push_block(None),
             AppEvent::AddSourceBlock { snapshot } => self.push_block(Some(snapshot.clone())),
@@ -531,8 +554,12 @@ impl UiView {
             }
             AppEvent::ModelAlreadyCached(entry) => self.mark_ready(entry.id),
             AppEvent::ModelMissing(entry) => self.mark_missing(entry.id),
-            AppEvent::DownloadRequested { model: entry, .. } => {
-                self.downloads.entry(entry.id).or_insert(DownloadState {
+            AppEvent::DownloadRequested { model: entry, attempt } => {
+                if self.downloads.get(entry.id).is_some_and(|row| row.attempt >= *attempt) {
+                    return;
+                }
+                self.downloads.insert(entry.id, DownloadState {
+                    attempt: *attempt,
                     phase: DownloadPhase::Fetching,
                     bytes: 0,
                     total: None,
@@ -540,20 +567,20 @@ impl UiView {
                 });
             }
             AppEvent::DownloadProgress {
-                attempt: _,
+                attempt,
                 model,
                 bytes,
                 total,
                 bytes_per_sec,
             } => {
-                if let Some(row) = self.downloads.get_mut(*model) {
+                if let Some(row) = self.downloads.get_mut(*model).filter(|row| row.attempt == *attempt) {
                     row.bytes = *bytes;
                     row.total = *total;
                     row.bytes_per_sec = *bytes_per_sec;
                 }
             }
-            AppEvent::DownloadInstalling { attempt: _, model } => {
-                if let Some(row) = self.downloads.get_mut(*model) {
+            AppEvent::DownloadInstalling { attempt, model } => {
+                if let Some(row) = self.downloads.get_mut(*model).filter(|row| row.attempt == *attempt) {
                     row.phase = DownloadPhase::Installing;
                 }
             }
@@ -1442,6 +1469,7 @@ mod tests {
     #[test]
     fn ratio_clamps_when_bytes_exceed_total() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 200,
             total: Some(100),
@@ -1453,6 +1481,7 @@ mod tests {
     #[test]
     fn ratio_is_none_without_total() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 100,
             total: None,
@@ -1464,12 +1493,69 @@ mod tests {
     #[test]
     fn ratio_with_zero_total_is_one() {
         let state = DownloadState {
+            attempt: 1,
             phase: DownloadPhase::Fetching,
             bytes: 0,
             total: Some(0),
             bytes_per_sec: 0,
         };
         assert_eq!(state.ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn download_attempts_isolate_gauges_and_waiters() {
+        use crate::bus::DownloadStatus;
+        let mut view = UiView::default();
+        let model = english().live;
+        view.apply(&AppEvent::AddBlock);
+        view.apply(&select(1, vec![model.id]));
+        let first = AppEvent::DownloadRequested { model, attempt: 1 };
+        view.apply(&first);
+        view.apply(&AppEvent::DownloadProgress {
+            attempt: 1, model: model.id, bytes: 64, total: Some(128), bytes_per_sec: 32,
+        });
+        view.apply(&AppEvent::DownloadInstalling { attempt: 1, model: model.id });
+        let joining = view.downloads[model.id].clone();
+        view.apply(&first);
+        assert_eq!(view.downloads[model.id], joining);
+
+        view.apply(&AppEvent::DownloadRequested { model, attempt: 2 });
+        assert_eq!(view.downloads[model.id], DownloadState {
+            attempt: 2, phase: DownloadPhase::Fetching, bytes: 0, total: None, bytes_per_sec: 0,
+        });
+        view.apply(&AppEvent::DownloadProgress {
+            attempt: 2, model: model.id, bytes: 7, total: Some(20), bytes_per_sec: 5,
+        });
+        let current = view.downloads[model.id].clone();
+        let mut stale = vec![
+            first,
+            AppEvent::DownloadProgress {
+                attempt: 1, model: model.id, bytes: 999, total: Some(999), bytes_per_sec: 999,
+            },
+            AppEvent::DownloadInstalling { attempt: 1, model: model.id },
+            AppEvent::DownloadSucceeded { attempt: 1, model: model.id },
+            AppEvent::DownloadFailed { attempt: 1, model: model.id, error: "old failure".into() },
+            AppEvent::DownloadCancelled { attempt: 1, model: model.id },
+            AppEvent::DownloadClaimFailed { attempt: 1, model: model.id, error: "old claim".into() },
+        ];
+        stale.extend([
+            DownloadStatus::Succeeded, DownloadStatus::Failed,
+            DownloadStatus::Cancelled, DownloadStatus::Interrupted,
+        ].into_iter().map(|to| AppEvent::DownloadStatusChanged {
+            model: model.id.into(), attempt: 1, from: Some(DownloadStatus::Downloading),
+            to, error: Some("old status".into()),
+        }));
+        for event in stale {
+            view.apply(&event);
+            assert_eq!(view.downloads[model.id], current, "{event:?}");
+            assert!(matches!(&view.blocks[0].state, BlockState::Waiting { pending, .. }
+                if pending.as_slice() == [model.id]), "{event:?}");
+        }
+        view.apply(&AppEvent::DownloadInstalling { attempt: 2, model: model.id });
+        assert_eq!(view.downloads[model.id].phase, DownloadPhase::Installing);
+        view.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: model.id });
+        assert!(!view.downloads.contains_key(model.id));
+        assert!(matches!(view.blocks[0].state, BlockState::Recording { .. }));
     }
 
     // ----- visible-cap and menu reducer arms -----

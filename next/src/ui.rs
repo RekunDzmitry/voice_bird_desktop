@@ -584,6 +584,7 @@ mod tests {
             ui_view.downloads.insert(
                 model.id,
                 DownloadState {
+                    attempt: 1,
                     phase: DownloadPhase::Fetching,
                     bytes: 50,
                     total: Some(100),
@@ -639,6 +640,7 @@ mod tests {
             ui_view.downloads.insert(
                 model.id,
                 DownloadState {
+                    attempt: 1,
                     phase: DownloadPhase::Installing,
                     bytes: 0,
                     total: Some(100),
@@ -668,6 +670,7 @@ mod tests {
         ui_view.downloads.insert(
             LANGUAGES[0].live.id,
             DownloadState {
+                attempt: 1,
                 phase: DownloadPhase::Fetching,
                 bytes: 1024,
                 total: None,

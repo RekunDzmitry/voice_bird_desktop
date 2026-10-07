@@ -116,6 +116,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
         ui_view.downloads.insert(
             model.id,
             DownloadState {
+                attempt: 1,
                 phase: DownloadPhase::Fetching,
                 bytes: 50,
                 total: Some(100),
@@ -594,6 +595,7 @@ proptest! {
         ui_view.downloads.insert(
             LANGUAGES[0].live.id,
             DownloadState {
+                attempt: 1,
                 phase: DownloadPhase::Fetching,
                 bytes,
                 total,

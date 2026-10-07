@@ -163,6 +163,12 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    projection.** Every event enters the JSONL log before the database gate.
    Accepted worker events update the table before the view, and the table
    publishes `DownloadStatusChanged` after every persisted transition.
+   Each download projection stores its attempt. Newer requests reset its gauge;
+   same-attempt joins preserve progress. Since SQLite accepts a whole batch before
+   consumers claim new work, the projection also rejects mismatched worker events
+   and terminal status replays: an accepted old cancellation/failure cannot hide
+   a newer gauge or fail its waiters. Attempt-zero pre-claim errors remain
+   actionable; terminal replay without an active gauge still reconciles late joins.
    Terminal status events reconcile outcomes that raced ahead of
    `LanguageSelected`, without a second ready/failed cache in `UiView`.
    Source transitions are CAS-gated the same way: `SourceStepChanged` names the

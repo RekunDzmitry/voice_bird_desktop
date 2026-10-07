@@ -37,6 +37,10 @@
   including their task spawning and progress/result events. Consumers retain
   lifecycle and dispatch decisions and hand accepted work to those services.
   Move shared source catalogs/types and download transport/errors to neutral modules.
+- Track the attempt in each UI download projection. Ignore stale worker events
+  and terminal status replays accepted before a same-batch retry is claimed,
+  preserving the new attempt's progress gauge and waiters. Keep same-attempt
+  joins, late-join reconciliation, and pre-claim failures unchanged.
 
 ## 0.5.0 (2026-08-05)
 

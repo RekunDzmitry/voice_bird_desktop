@@ -308,6 +308,75 @@ async fn cancelled_fetch_handoff_cannot_fail_an_immediate_retry() {
 }
 
 #[tokio::test]
+async fn stale_terminal_in_retry_batch_preserves_new_attempt_progress() {
+    for terminal in [
+        AppEvent::DownloadCancelled { attempt: 1, model: english().live.id },
+        AppEvent::DownloadFailed {
+            attempt: 1,
+            model: english().live.id,
+            error: "old fetch failed".to_string(),
+        },
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
+        std::fs::write(
+            store.root().join(format!("{}.gguf", english().refine.id)),
+            b"cached refine",
+        ).unwrap();
+        let mut consumer = Consumer::new(Consumers::new(
+            Arc::new(WritingDownloader { calls: Arc::new(AtomicUsize::new(0)) }),
+            store.clone(),
+            Arc::new(NoSources),
+        ));
+        let mut bus = EventBus::new();
+        let mut handle = downloads_with(&bus);
+        let tx = bus.sender();
+        ModelWatcher::new(store.clone()).check(&mut handle.db, &tx).unwrap();
+        drain_consume(&mut bus, &mut consumer, &mut handle.db);
+
+        // Model the first worker's outstanding cancellation after its last
+        // waiter closes, without scheduling another fetch in this fixture.
+        assert_eq!(downloads::start(&mut handle.db, english().live.id).unwrap(), 1);
+        assert!(downloads::cancel(&mut handle.db, english().live.id).unwrap());
+        drain_consume(&mut bus, &mut consumer, &mut handle.db);
+        consume_batch(vec![AppEvent::AddBlock], &mut consumer, &mut handle.db, &tx);
+        let block = consumer.consumers.ui_view.blocks[0].id;
+        consume_batch(
+            vec![AppEvent::LanguageSelected {
+                block, language: english(), pending: vec![english().live.id],
+            }],
+            &mut consumer, &mut handle.db, &tx,
+        );
+
+        // Like consume_logged: accept the entire batch against attempt 1,
+        // then let the consumer claim attempt 2 before projecting the old result.
+        let accepted = consume_batch(
+            vec![AppEvent::DownloadRequested { model: english().live, attempt: 2 }, terminal.clone()],
+            &mut consumer, &mut handle.db, &tx,
+        );
+        assert!(accepted.contains(&terminal));
+        assert_eq!(downloads::get(&handle.db, english().live.id).unwrap().unwrap().attempt, 2);
+        assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting { .. }));
+        assert!(consumer.consumers.ui_view.downloads.contains_key(english().live.id));
+
+        loop {
+            let event = timeout(Duration::from_secs(5), bus.recv()).await.unwrap().unwrap();
+            let progress = matches!(event, AppEvent::DownloadProgress { attempt: 2, .. });
+            consume_batch(vec![event], &mut consumer, &mut handle.db, &tx);
+            if progress {
+                assert_eq!(consumer.consumers.ui_view.downloads[english().live.id].bytes, 13);
+                break;
+            }
+        }
+        settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
+            matches!(view.blocks[0].state, BlockState::Recording { .. })
+        }).await;
+        assert!(store.is_available(english().live));
+        assert_eq!(downloads::get(&handle.db, english().live.id).unwrap().unwrap().status, DownloadStatus::Succeeded);
+    }
+}
+
+#[tokio::test]
 async fn closing_or_quitting_before_language_followups_never_starts_orphan_downloads() {
     for stop in [AppEvent::BlockClosed { block: 1 }, AppEvent::Quit] {
         let tmp = tempfile::tempdir().unwrap();
