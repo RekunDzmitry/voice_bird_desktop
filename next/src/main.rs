@@ -15,9 +15,9 @@ use std::time::Duration;
 use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
 use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::consumer::{Consumer, Consumers, UiView};
-use voice_bird_next::producer::download::Downloader;
+use voice_bird_next::download::Downloader;
 #[cfg(feature = "net")]
-use voice_bird_next::producer::download::HttpDownloader;
+use voice_bird_next::download::HttpDownloader;
 use voice_bird_next::producer::model_watch::ModelWatcher;
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 use voice_bird_next::{input, producer};
@@ -52,7 +52,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        if voice_bird_next::producer::sources::source_query_panicking() {
+        if voice_bird_next::audio_sources::source_query_panicking() {
             return;
         }
         if std::thread::current().id() == ui_thread {
@@ -121,7 +121,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     let mut consumer = Consumer::new(Consumers::new(
         downloader,
         model_store.clone(),
-        voice_bird_next::producer::sources::system_sources(),
+        voice_bird_next::audio_sources::system_sources(),
     ));
     let watcher = ModelWatcher::new(model_store);
     watcher.check(&mut db, &tx).map_err(io::Error::other)?;

@@ -15,7 +15,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::producer::sources::DeviceKind;
+use crate::audio_sources::DeviceKind;
 use crate::language::{LanguageProfile, LANGUAGES};
 use crate::picker::ListPicker;
 use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView};

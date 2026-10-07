@@ -606,7 +606,7 @@ proptest! {
 
 fn source_block_view(state: BlockState, device: Option<usize>, app: Option<usize>) -> UiView {
     let snapshot = voice_bird_next::testing::sample_source_snapshot();
-    let source = voice_bird_next::producer::sources::SourceSelection {
+    let source = voice_bird_next::audio_sources::SourceSelection {
         device: device.map(|index| snapshot.devices[index].clone()),
         app: app.map(|index| snapshot.apps[index].clone()),
         snapshot,
@@ -743,7 +743,7 @@ fn long_source_lists_keep_selection_and_back_visible_on_resize() {
     );
     let source = ui_view.blocks[0].source.as_mut().unwrap();
     source.snapshot.apps = (0..40)
-        .map(|index| voice_bird_next::producer::sources::AppTarget {
+        .map(|index| voice_bird_next::audio_sources::AppTarget {
             id: format!("app.{index}"),
             name: format!("App {index}"),
             pid: index,

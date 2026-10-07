@@ -342,7 +342,7 @@ mod tests {
     }
     #[test]
     fn source_transitions_log_explicit_steps_revisions_and_selection() {
-        use crate::producer::sources::FunnelStep;
+        use crate::audio_sources::FunnelStep;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("source.jsonl");
         let file = OpenOptions::new()

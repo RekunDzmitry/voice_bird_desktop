@@ -33,6 +33,10 @@
   from `voice-bird-next`; remove dead-code warning suppressions.
 - Unify download progress and completion reporting in `Throttle::call`; preserve
   unconditional known-total completion updates, including zero-byte downloads.
+- Move source enumeration, fetch, and installation workers into producer services,
+  including their task spawning and progress/result events. Consumers retain
+  lifecycle and dispatch decisions and hand accepted work to those services.
+  Move shared source catalogs/types and download transport/errors to neutral modules.
 
 ## 0.5.0 (2026-08-05)
 

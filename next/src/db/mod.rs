@@ -169,7 +169,7 @@ impl Database {
 #[cfg(test)]
 impl Database {
     /// Build a `Database` from a caller-supplied connection.
-    /// Used by `producer::download::tests::*` to drive `downloads::start`
+    /// Used by `consumer::downloads::tests::*` to drive `downloads::start`
     /// failure paths (e.g. a read-only connection whose writes
     /// return `SQLITE_READONLY`).
     pub fn from_connection_for_test(conn: Connection, path: PathBuf, tx: EventSender) -> Self {

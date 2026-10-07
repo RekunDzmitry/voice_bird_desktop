@@ -1,6 +1,6 @@
 //! Capturable devices, running apps, and native audio source catalogs.
 //!
-//! Catalog queries are synchronous; the audio-sources consumer runs them on
+//! Catalog queries are synchronous; the audio-sources producer runs them on
 //! Tokio's blocking pool and owns serialization and session panic fallback.
 //! Only macOS currently supplies source snapshots.
 

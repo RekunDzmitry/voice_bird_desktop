@@ -1,7 +1,8 @@
-//! External inputs and transports that publish application events.
+//! External input and worker services that publish application events.
 
-pub mod download;
+pub mod audio_sources;
+pub mod downloads;
 pub mod input;
+pub mod model_store;
 pub mod model_watch;
-pub mod sources;
 

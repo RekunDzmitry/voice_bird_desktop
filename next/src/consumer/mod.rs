@@ -1,16 +1,16 @@
 //! Routes accepted events to event-specific consumers.
 //!
-//! Consumers may publish follow-up events. Those events return through the bus
-//! and SQLite gate before another consumer handles them; no handler directly
-//! invokes the next stage of a flow.
+//! Consumers make lifecycle decisions and hand accepted work to producer services.
+//! Producers own worker spawning and result publications. Decision events and
+//! worker results return through the bus and SQLite gate before consumption.
 
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, EventSender};
 use crate::db::Database;
 use crate::picker::CATALOG;
-use crate::producer::download::Downloader;
-use crate::producer::sources::AudioSourcesCatalog;
+use crate::download::{truncate_error, Downloader};
+use crate::audio_sources::AudioSourcesCatalog;
 use crate::transcription_models::ModelStore;
 
 pub mod audio_sources;
@@ -106,7 +106,7 @@ impl Consumer {
                         Err(error) => tx.publish(AppEvent::DownloadClaimFailed {
                             attempt: 0,
                             model: model.id,
-                            error: downloads::truncate_error(&format!("model staging table: {error}")),
+                            error: truncate_error(&format!("model staging table: {error}")),
                         }),
                     }
                 }

@@ -16,10 +16,10 @@ use voice_bird_next::db::downloads::CancelCheck;
 use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::input::Intent;
 use voice_bird_next::language::{LanguageProfile, LANGUAGES};
-use voice_bird_next::producer::download::{DownloadError, Downloader};
+use voice_bird_next::download::{DownloadError, Downloader};
 use voice_bird_next::producer::input::resolve_intent;
 use voice_bird_next::producer::model_watch::ModelWatcher;
-use voice_bird_next::producer::sources::{FunnelStep, NoSources};
+use voice_bird_next::audio_sources::{FunnelStep, NoSources};
 use voice_bird_next::testing::{FixtureDownloader, FixtureStore, Outcome};
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 

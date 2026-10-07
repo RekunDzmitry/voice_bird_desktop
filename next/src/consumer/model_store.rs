@@ -1,15 +1,13 @@
-//! Prepares staging metadata, installs fetched models, and discards inflight files.
+//! Decides staging, installation handoff, and inflight-file discard.
 
 use std::sync::Arc;
 
 use crate::bus::{AppEvent, DownloadStatus, EventSender};
-use crate::db::downloads::CancelCheck;
 use crate::db::{downloads, model_staging, Database};
 use crate::picker::{ModelEntry, CATALOG};
-use crate::producer::download::DownloadError;
-use crate::transcription_models::{handler_for, ModelStore};
-
-use super::downloads::truncate_error;
+use crate::download::truncate_error;
+use crate::producer::model_store;
+use crate::transcription_models::ModelStore;
 
 pub struct ModelStoreConsumer {
     pub model_store: Arc<dyn ModelStore>,
@@ -85,36 +83,14 @@ impl ModelStoreConsumer {
                 return;
             }
         };
-        let store = self.model_store.clone();
-        let mut probe = downloads::probe(db, entry.id, attempt);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let model = entry.id;
-            if handler_for(entry.format).install_is_slow() {
-                tx.publish(AppEvent::DownloadInstalling { attempt, model });
-            }
-            let result = tokio::task::spawn_blocking(move || {
-                // Use a fresh probe here: cancellation after fetch must be
-                // observed even by a fast handler that only renames a file.
-                if probe.is_cancelled() {
-                    return Err(DownloadError::Cancelled);
-                }
-                store.install(entry, &staged, &mut probe)
-            })
-            .await
-            .unwrap_or_else(|error| Err(DownloadError::Install(error.to_string())));
-            match result {
-                Ok(()) => tx.publish(AppEvent::DownloadSucceeded { attempt, model }),
-                Err(DownloadError::Cancelled) => {
-                    tx.publish(AppEvent::DownloadCancelled { attempt, model });
-                }
-                Err(error) => tx.publish(AppEvent::DownloadFailed {
-                    attempt,
-                    model,
-                    error: truncate_error(&error.to_string()),
-                }),
-            }
-        });
+        model_store::start(
+            self.model_store.clone(),
+            entry,
+            staged,
+            downloads::probe(db, entry.id, attempt),
+            attempt,
+            tx.clone(),
+        );
     }
 
     pub fn discard_inflight(&self, model: &str) {
@@ -130,8 +106,10 @@ mod tests {
     use crate::bus::EventBus;
     use crate::consumer::ui_view::BlockState;
     use crate::consumer::UiView;
+    use crate::db::downloads::CancelCheck;
+    use crate::download::DownloadError;
     use crate::language::LANGUAGES;
-    use crate::transcription_models::CacheDirStore;
+    use crate::transcription_models::{handler_for, CacheDirStore};
 
     fn stage(
         consumer: &ModelStoreConsumer,

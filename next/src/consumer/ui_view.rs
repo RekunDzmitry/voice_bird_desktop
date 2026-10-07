@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::producer::sources::{AudioSourceSnapshot, FunnelStep, SourceSelection};
+use crate::audio_sources::{AudioSourceSnapshot, FunnelStep, SourceSelection};
 use crate::bus::{AppEvent, FocusMove};
 use crate::language::LanguageProfile;
 use crate::picker::{ListPicker, ModelEntry, PickerEvent, SessionMenu};

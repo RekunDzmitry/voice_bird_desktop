@@ -111,7 +111,7 @@ mod tests {
     use crate::db::downloads::CancelCheck;
     use crate::picker::CATALOG;
     use crate::testing::FixtureStore;
-    use crate::transcription_models::DownloadError;
+    use crate::download::DownloadError;
     use std::path::Path;
 
     struct PreparationStore;

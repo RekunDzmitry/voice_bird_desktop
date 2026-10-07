@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::consumer::UiView;
 use crate::db::downloads::CancelCheck;
-use crate::producer::download::{DownloadError, Downloader};
-use crate::producer::sources::{
+use crate::download::{DownloadError, Downloader};
+use crate::audio_sources::{
     AppTarget, AudioDevice, AudioSourceSnapshot, AudioSourcesCatalog, DeviceKind,
 };
 use crate::picker::ModelEntry;

@@ -30,12 +30,9 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 
 use crate::db::downloads::CancelCheck;
+use crate::download::DownloadError;
 use crate::picker::{ModelEntry, ModelFormat};
 
-/// Result type for the model-store surface. `DownloadError` lives in
-/// `download.rs` because the IO+HTTP+install taxonomy is one error
-/// vocabulary; this module just re-uses it.
-pub use crate::producer::download::DownloadError;
 
 /// Everything format-specific about getting a model onto disk and
 /// deciding whether it is already there.

@@ -3,9 +3,9 @@
 use crate::bus::{AppEvent, EventSender};
 use crate::db::downloads::Claim;
 use crate::db::{downloads, models, Database};
+use crate::download::truncate_error;
 use crate::language::LanguageProfile;
 use crate::picker::ModelEntry;
-use super::downloads::truncate_error;
 
 pub struct LanguageConsumer;
 

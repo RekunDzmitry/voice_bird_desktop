@@ -10,7 +10,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{Database, Table};
-use crate::producer::sources::{DeviceKind, FunnelStep};
+use crate::audio_sources::{DeviceKind, FunnelStep};
 use crate::bus::AppEvent;
 
 pub struct BlockStepsTable;
@@ -162,7 +162,7 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::producer::sources::{AppTarget, AudioDevice};
+    use crate::audio_sources::{AppTarget, AudioDevice};
     use crate::bus::EventBus;
     use crate::language::LANGUAGES;
 

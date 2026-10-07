@@ -1,25 +1,12 @@
-//! Claims accepted download requests and owns their asynchronous fetch workers.
+//! Claims accepted download requests and delegates their fetches to a producer.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::task::JoinHandle;
-
 use crate::bus::{AppEvent, DownloadStatus, EventSender};
-use crate::db::downloads::{CancelProbe, Claim};
+use crate::db::downloads::Claim;
 use crate::db::{downloads, model_staging, Database};
+use crate::download::{truncate_error, Downloader};
 use crate::picker::ModelEntry;
-use crate::producer::download::{DownloadError, Downloader, Throttle};
-
-pub(super) fn truncate_error(s: &str) -> String {
-    const MAX: usize = 160;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(MAX).collect();
-        format!("{truncated}…")
-    }
-}
 
 pub struct DownloadsConsumer {
     pub downloader: Arc<dyn Downloader>,
@@ -90,7 +77,8 @@ impl DownloadsConsumer {
                         return;
                     }
                 };
-                self.spawn(
+                crate::producer::downloads::start(
+                    self.downloader.clone(),
                     entry,
                     downloads::probe(db, entry.id, attempt),
                     attempt,
@@ -142,48 +130,6 @@ impl DownloadsConsumer {
                 }
             },
         }
-    }
-
-    fn spawn(
-        &self,
-        entry: &'static ModelEntry,
-        probe: CancelProbe,
-        attempt: u32,
-        staged: PathBuf,
-        tx: EventSender,
-    ) -> JoinHandle<()> {
-        let downloader = self.downloader.clone();
-        tokio::spawn(async move {
-            let url = entry.download_url;
-            let sha = entry.download_sha256;
-            let model = entry.id;
-            let mut throttle = Throttle::new();
-            let mut probe = probe;
-            let result = {
-                let mut progress = |bytes: u64, total: Option<u64>| {
-                    throttle.call(attempt, bytes, total, &tx, model);
-                };
-                downloader
-                    .fetch(url, &staged, sha, &mut probe, &mut progress)
-                    .await
-            };
-            match result {
-                Ok(()) => {
-                    if let Some(total) = throttle.last_total() {
-                        throttle.call(attempt, total, Some(total), &tx, model);
-                    }
-                    tx.publish(AppEvent::DownloadFetched { attempt, model });
-                }
-                Err(DownloadError::Cancelled) => {
-                    tx.publish(AppEvent::DownloadCancelled { attempt, model });
-                }
-                Err(e) => tx.publish(AppEvent::DownloadFailed {
-                    attempt,
-                    model,
-                    error: truncate_error(&e.to_string()),
-                }),
-            }
-        })
     }
 }
 

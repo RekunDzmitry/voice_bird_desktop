@@ -16,7 +16,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::producer::sources::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
+use crate::audio_sources::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
 use crate::language::LanguageProfile;
 use crate::picker::{ModelEntry, PickerMove};
 

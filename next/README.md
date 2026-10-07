@@ -10,8 +10,9 @@ speakers require a running app first (there is no all-apps option). Backspace
 walks back one picker step, restoring the selected device or app row. An empty
 app list shows `no running apps`; go back or close the block. An
 `AudioSourceSnapshot` captures the enumerated devices and running apps on a
-serialized Tokio task using `spawn_blocking` for native queries. Slow queries
-do not block input or Quit; runtime shutdown never waits for stalled work.
+serialized `producer::audio_sources` task using `spawn_blocking` for native
+queries. Slow queries do not block input or Quit; runtime shutdown never waits
+for stalled work.
 Other platforms, or an unavailable/empty device snapshot, open the language
 picker directly.
 A Rust panic during enumeration disables that catalog for the session; the
@@ -89,7 +90,7 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | path | role |
 |---|---|
 | `src/language.rs` | language registry mapping each code to live + refine models |
-| `src/producer/sources.rs` | audio source snapshots, `AudioSourcesCatalog`, and macOS enumeration |
+| `src/audio_sources.rs` | shared source types, `AudioSourcesCatalog`, and native macOS catalog |
 | `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
 | `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
@@ -101,14 +102,17 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 | `src/db/model_staging.rs` | exact attempt-scoped staging paths and preparation errors observed by the store |
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
-| `src/producer/download.rs` | async `Downloader`, HTTP streaming, and progress throttling |
+| `src/download.rs` | shared download errors, async `Downloader`, and HTTP streaming transport |
+| `src/producer/audio_sources.rs` | serialized native queries, session panic containment, and source-result events |
+| `src/producer/downloads.rs` | fetch workers, progress throttling, and download-result events |
+| `src/producer/model_store.rs` | blocking installation workers and install-result events |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
-| `src/producer/mod.rs` | external input and transport modules; no consumer-owned producer aggregate |
+| `src/producer/mod.rs` | external input and background worker services |
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
-| `src/consumer/audio_sources.rs` | serialized audio-source requests and session panic containment |
+| `src/consumer/audio_sources.rs` | accepted source-request handoff to the enumeration producer |
 | `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
-| `src/consumer/downloads.rs` | attempt-aware SQLite claims and async fetch workers; no model-store dependency |
-| `src/consumer/model_store.rs` | staging preparation, gated installation, and quit-time staging sweep |
+| `src/consumer/downloads.rs` | attempt-aware SQLite claims, request reconciliation, and fetch handoff |
+| `src/consumer/model_store.rs` | staging preparation, installation eligibility/handoff, and quit-time staging sweep |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
@@ -125,10 +129,13 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    `Option<Intent>`; `producer/input.rs` reads focus/cursors from the view and
    domain facts from SQLite, then publishes events. There is no direct
    input→view mutation.
-5. **Consumers can produce the next stage of a flow.** `Consumer` owns
-   `Consumers`, not producer handles. It routes events to the UI projection,
-   audio-source, language, download, and model-store consumers. Each handler owns its
-   collaborators; it never calls another consumer to advance the flow.
+5. **Consumers decide; producers execute background work.** `Consumer` owns
+   `Consumers` and routes accepted events to the UI projection and event-specific
+   handlers. Consumers retain lifecycle, attempt, and staging decisions, then hand
+   work to `producer::audio_sources`, `producer::downloads`, or `producer::model_store`.
+   Those producers own task spawning and every worker progress/result publication.
+   Consumers may publish synchronous commands or decision failures; those events
+   also cross the bus/log/SQLite gate. No handler calls another consumer to advance a flow.
    While a block is `PickingLanguage`, input produces `BeginLanguage`.
    The language consumer publishes `LanguageSelected` and model requests.
    Those requests must cross the bus/log/SQLite gate before the download
@@ -147,9 +154,10 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    failures fail waiters without fetching. Verified fetches publish
    `DownloadFetched`; its gate atomically claims Installing and rejects duplicate,
    stale, cancelled, or terminal handoffs. Only then does the store consumer
-   install on the blocking pool and publish the outcome. Fast GGUF installation
-   keeps the download gauge; slow package installation shows its own phase.
-   No service calls `std::thread::spawn`: Tokio schedules asynchronous work;
+   hand verified work to the installation producer, which runs on the blocking
+   pool and publishes the outcome. Fast GGUF installation keeps the download
+   gauge; slow package installation shows its own phase. No service calls
+   `std::thread::spawn`: producers schedule asynchronous work with Tokio;
    native enumeration and installation use `spawn_blocking`.
 6. **SQLite is the source of truth; `UiView::downloads` is its render
    projection.** Every event enters the JSONL log before the database gate.
