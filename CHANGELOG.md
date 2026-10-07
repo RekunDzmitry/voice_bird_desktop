@@ -41,6 +41,9 @@
   and terminal status replays accepted before a same-batch retry is claimed,
   preserving the new attempt's progress gauge and waiters. Keep same-attempt
   joins, late-join reconciliation, and pre-claim failures unchanged.
+- Commit installation success and model availability in one SQLite transaction.
+  Roll back both on write/commit failure and publish lifecycle success only
+  after commit, preventing partially persisted success and false ready notifications.
 
 ## 0.5.0 (2026-08-05)
 

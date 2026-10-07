@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
-use crate::bus::{AppEvent, EventSender};
+use crate::bus::{AppEvent, DownloadStatus, EventSender};
 
 /// A table in the local SQLite file. Implementing this trait is the
 /// only obligation: name + definition. New tables plug into
@@ -192,11 +192,28 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
     if !block_steps::apply(db, ev)? {
         return Ok(false);
     }
-    if !downloads::apply(db, ev)? {
+    downloads::apply(db, ev)
+}
+
+/// Commit installation success and availability together before publishing.
+fn complete_installation(
+    db: &mut Database,
+    event: &AppEvent,
+    model: &str,
+    attempt: u32,
+) -> rusqlite::Result<bool> {
+    let transaction = db
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !downloads::set_status_on(&transaction, model, attempt, DownloadStatus::Succeeded, None)? {
+        transaction.rollback()?;
+        downloads::reject(db, event, attempt);
         return Ok(false);
     }
-    if let AppEvent::DownloadSucceeded { model, .. } = ev {
-        models::set_available(db, model, true)?;
-    }
+    models::set_available_on(&transaction, model, true)?;
+    transaction.commit()?;
+    downloads::publish_status(
+        db, model, attempt, Some(DownloadStatus::Installing), DownloadStatus::Succeeded, None,
+    );
     Ok(true)
 }

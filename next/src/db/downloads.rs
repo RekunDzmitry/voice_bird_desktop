@@ -20,12 +20,11 @@
 //!
 //! ## Lifecycle transitions
 //!
-//! Every state change funnels through [`transition`],
-//! which is the only path that publishes
-//! [`AppEvent::DownloadStatusChanged`]. Because the publish happens
-//! *after* the SQL `UPDATE` returns, the SQL state and the bus log
-//! can never disagree — the row is the truth, the log is the audit
-//! trail, and the publish lives where both can see it.
+//! Persisted transitions publish [`AppEvent::DownloadStatusChanged`] only after
+//! their SQL commits. Installation success commits its lifecycle and model
+//! availability together through the database coordinator; rollback publishes
+//! no success. Pre-claim failure notifications (`from: None`) still report a
+//! failed claim without a persisted row.
 //!
 //! On startup, [`Database::open`] rewrites every leftover
 //! non-terminal row (Downloading / Installing / Cancelling) to
@@ -352,19 +351,7 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
             }
         }
         AppEvent::DownloadSucceeded { attempt, model } => {
-            if !matches_attempt(db, model, *attempt)? {
-                reject(db, ev, *attempt);
-                return Ok(false);
-            }
-            transition(
-                db,
-                model,
-                *attempt,
-                Some(DownloadStatus::Installing),
-                DownloadStatus::Succeeded,
-                None,
-            )?;
-            Ok(true)
+            super::complete_installation(db, ev, model, *attempt)
         }
         AppEvent::DownloadClaimFailed {
             attempt,
@@ -484,9 +471,7 @@ pub fn probe(db: &Database, model: &'static str, attempt: u32) -> CancelProbe {
     }
 }
 
-/// Single UPDATE path. Used by `apply` (transitions driven by
-/// worker events) and `cancel` (driver-driven). Returns the
-/// prior status so the publish can stamp `from` correctly.
+/// Write an ordinary lifecycle transition, then publish its committed result.
 fn transition(
     db: &mut Database,
     model: &str,
@@ -495,23 +480,7 @@ fn transition(
     to: DownloadStatus,
     error: Option<String>,
 ) -> rusqlite::Result<()> {
-    let now_s = format_ts(Utc::now());
-    // The UPDATE is gated by attempt so a stale event whose
-    // attempt has been superseded cannot repaint the new row.
-    // `apply` already pre-checked, but checking again here is
-    // cheap and means `transition` is safe to call directly.
-    let changed = db.conn_mut().execute(
-        "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
-         WHERE model = ?4 AND attempt = ?5",
-        params![
-            status_to_sql(to),
-            error.as_deref(),
-            now_s,
-            model,
-            attempt,
-        ],
-    )?;
-    if changed == 0 {
+    if !set_status_on(db.conn_ref(), model, attempt, to, error.as_deref())? {
         // Row gone or attempt mismatch — log the rejection and
         // skip the publish.
         db.tx().publish(AppEvent::DownloadEventRejected {
@@ -522,6 +491,35 @@ fn transition(
         });
         return Ok(());
     }
+    publish_status(db, model, attempt, from, to, error);
+    Ok(())
+}
+
+/// The shared conditional UPDATE, also used inside the success transaction.
+pub(super) fn set_status_on(
+    connection: &Connection,
+    model: &str,
+    attempt: u32,
+    to: DownloadStatus,
+    error: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE downloads SET status = ?1, error = ?2, updated_at = ?3 \
+         WHERE model = ?4 AND attempt = ?5",
+        params![status_to_sql(to), error, format_ts(Utc::now()), model, attempt],
+    )?;
+    Ok(changed != 0)
+}
+
+/// Publish only after the caller's SQL writes have committed.
+pub(super) fn publish_status(
+    db: &Database,
+    model: &str,
+    attempt: u32,
+    from: Option<DownloadStatus>,
+    to: DownloadStatus,
+    error: Option<String>,
+) {
     db.tx().publish(AppEvent::DownloadStatusChanged {
         model: Arc::from(model),
         attempt,
@@ -529,7 +527,6 @@ fn transition(
         to,
         error,
     });
-    Ok(())
 }
 
 /// Returns true if the row exists and its `attempt` matches
@@ -545,7 +542,7 @@ fn matches_attempt(db: &Database, model: &str, attempt: u32) -> rusqlite::Result
 /// `apply` when an event's attempt doesn't match the row's.
 /// Logging the rejection here (instead of inside `apply`) keeps
 /// the rejection's row-attempt field accurate.
-fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
+pub(super) fn reject(db: &Database, ev: &AppEvent, event_attempt: u32) {
     let (model, name): (&str, &'static str) = match ev {
         AppEvent::DownloadProgress { model, .. } => (*model, "DownloadProgress"),
         AppEvent::DownloadFetched { model, .. } => (*model, "DownloadFetched"),

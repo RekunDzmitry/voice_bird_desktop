@@ -163,6 +163,9 @@ the same package-scoped Clippy commands provides pull-request enforcement.
    projection.** Every event enters the JSONL log before the database gate.
    Accepted worker events update the table before the view, and the table
    publishes `DownloadStatusChanged` after every persisted transition.
+   Installation success commits the Succeeded row and model availability in one
+   immediate transaction. Availability-write or commit failures roll back both;
+   the lifecycle notification is published only after commit, never for rolled-back success.
    Each download projection stores its attempt. Newer requests reset its gauge;
    same-attempt joins preserve progress. Since SQLite accepts a whole batch before
    consumers claim new work, the projection also rejects mismatched worker events
