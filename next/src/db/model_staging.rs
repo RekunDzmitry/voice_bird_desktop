@@ -131,10 +131,6 @@ mod tests {
             unreachable!("metadata observation must not install")
         }
 
-        fn clear_staging(&self, _: &ModelEntry) {
-            unreachable!("metadata observation must not clear staging")
-        }
-
         fn discard_inflight(&self, _: &ModelEntry) {
             unreachable!("metadata observation must not discard staging")
         }

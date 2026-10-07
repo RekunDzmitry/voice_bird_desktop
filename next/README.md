@@ -48,6 +48,10 @@ optional `next/hooks/pre-commit` hook runs strict Clippy with default features
 and without default features when staged changes touch `next/`, the workspace
 manifest, or the lockfile. It checks working-tree source, not a staged snapshot.
 
+Fix dead-code warnings by removing unused code, not by adding
+`#[allow(dead_code)]`. Startup cleanup uses `CacheDirStore::sweep_staging`;
+quit cleanup uses `ModelStore::discard_inflight`.
+
 To opt in from the repository root:
 
 ```bash

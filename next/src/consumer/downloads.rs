@@ -170,7 +170,7 @@ impl DownloadsConsumer {
             match result {
                 Ok(()) => {
                     if let Some(total) = throttle.last_total() {
-                        throttle.finalize(attempt, total, Some(total), &tx, model);
+                        throttle.call(attempt, total, Some(total), &tx, model);
                     }
                     tx.publish(AppEvent::DownloadFetched { attempt, model });
                 }

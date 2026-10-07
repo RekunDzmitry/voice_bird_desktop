@@ -94,7 +94,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     let tx = bus.sender();
     let mut log = voice_bird_next::event_log::EventLog::open();
 
-    let store: Arc<dyn ModelStore> = match CacheDirStore::new() {
+    let model_store: Arc<dyn ModelStore> = match CacheDirStore::new() {
         Ok(s) => {
             let _ = s.sweep_staging();
             Arc::new(s)
@@ -120,10 +120,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     let downloader: Arc<dyn Downloader> = cfg_build_downloader();
     let mut consumer = Consumer::new(Consumers::new(
         downloader,
-        store.clone(),
+        model_store.clone(),
         voice_bird_next::producer::sources::system_sources(),
     ));
-    let watcher = ModelWatcher::new(store);
+    let watcher = ModelWatcher::new(model_store);
     watcher.check(&mut db, &tx).map_err(io::Error::other)?;
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);

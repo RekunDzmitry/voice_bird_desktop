@@ -13,7 +13,7 @@ use crate::producer::sources::{
     AppTarget, AudioDevice, AudioSourceSnapshot, AudioSourcesCatalog, DeviceKind,
 };
 use crate::picker::ModelEntry;
-use crate::transcription_models::{handler_for, ModelStore};
+use crate::transcription_models::ModelStore;
 use crate::ui;
 use ratatui::{backend::TestBackend, Terminal};
 use tokio::io::AsyncWriteExt;
@@ -93,14 +93,11 @@ impl CancelCheck for &AtomicBool {
 }
 
 /// In-memory `ModelStore` for integration tests. Lets a test declare
-/// which models are present (`present: &["tiny.en"]`) and tracks
-/// `install` calls so the assertions can confirm what the resolver
-/// actually did.
+/// which models are present (`present: &["tiny.en"]`) and marks installed
+/// models present for subsequent availability checks.
 pub struct FixtureStore {
     pub root: PathBuf,
     pub present: Mutex<Vec<&'static str>>,
-    pub installed: Mutex<Vec<&'static str>>,
-    pub clear_staging_calls: Mutex<Vec<&'static str>>,
 }
 
 impl FixtureStore {
@@ -108,8 +105,6 @@ impl FixtureStore {
         Self {
             root,
             present: Mutex::new(present.to_vec()),
-            installed: Mutex::new(Vec::new()),
-            clear_staging_calls: Mutex::new(Vec::new()),
         }
     }
 }
@@ -148,14 +143,7 @@ impl ModelStore for FixtureStore {
         Ok(())
     }
 
-    fn clear_staging(&self, entry: &ModelEntry) {
-        self.clear_staging_calls.lock().unwrap().push(entry.id);
-        let _ = std::fs::remove_file(self.staging_path(entry, 1).unwrap());
-    }
-
     fn discard_inflight(&self, entry: &ModelEntry) {
-        // Record the call so tests can assert Quit-time cleanup ran.
-        self.clear_staging_calls.lock().unwrap().push(entry.id);
         // Walk every per-attempt artifact that might still be on
         // disk. Attempts are bounded in practice (the store's
         // monotonic counter increments by 1 per Restart); capping
@@ -280,11 +268,4 @@ impl Downloader for FixtureDownloader {
         }
         Ok(())
     }
-}
-
-#[allow(dead_code)]
-fn _handler_used(
-    f: crate::picker::ModelFormat,
-) -> &'static dyn crate::transcription_models::ModelFormatHandler {
-    handler_for(f)
 }

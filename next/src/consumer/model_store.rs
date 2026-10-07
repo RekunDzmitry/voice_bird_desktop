@@ -338,10 +338,6 @@ mod tests {
                 self.inner.install(entry, staged, cancel)
             }
 
-            fn clear_staging(&self, entry: &ModelEntry) {
-                self.inner.clear_staging(entry);
-            }
-
             fn discard_inflight(&self, entry: &ModelEntry) {
                 self.inner.discard_inflight(entry);
             }

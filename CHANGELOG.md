@@ -29,6 +29,10 @@
   fetches through a gated model-store consumer for installation, and send
   `DiscardInflight` there for staging sweeps. Reject duplicate/stale handoffs and
   old-attempt status notifications so immediate cancellation retries stay independent.
+- Remove unused model-store cleanup APIs, fixture tracking, and throttle state
+  from `voice-bird-next`; remove dead-code warning suppressions.
+- Unify download progress and completion reporting in `Throttle::call`; preserve
+  unconditional known-total completion updates, including zero-byte downloads.
 
 ## 0.5.0 (2026-08-05)
 

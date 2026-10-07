@@ -316,8 +316,6 @@ pub trait ModelStore: Send + Sync + 'static {
         staged: &Path,
         cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError>;
-    /// Delete a leftover staging file (cancellation, and the startup sweep).
-    fn clear_staging(&self, entry: &ModelEntry);
     /// Drop BOTH the staged archive and the unpack scratch directory
     /// for one model, regardless of which phase the worker is in.
     /// Called at Quit for every in-flight model so the cache dir
@@ -408,16 +406,6 @@ impl ModelStore for CacheDirStore {
         handler_for(entry.format).install(&self.root, entry.id, staged, cancel)
     }
 
-    fn clear_staging(&self, entry: &ModelEntry) {
-        // `clear_staging` is called from tests and the startup sweep
-        // for a model id with no attempt context — assume attempt 1,
-        // which is the conventional id for the very first attempt.
-        let p = handler_for(entry.format).staging_path(&self.root, entry.id, 1);
-        if p.is_file() {
-            let _ = fs::remove_file(&p);
-        }
-    }
-
     fn discard_inflight(&self, _entry: &ModelEntry) {
         // Both startup and quit cleanup sweep every attempt's staging artifacts,
         // including archives and unpack scratch directories, but never installed
@@ -445,10 +433,6 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
-
-    fn tiny_entry() -> &'static ModelEntry {
-        &CATALOG[5]
-    }
 
     fn nemotron_entry() -> &'static ModelEntry {
         &CATALOG[3]
@@ -613,22 +597,7 @@ mod tests {
             fs::create_dir(&bad).unwrap();
             fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
         }
-        // Suppress the unused-variable warning when not unix.
-        let _ = root.join("bad");
         assert_eq!(locate_nemotron_dir(&root), Some(good));
-    }
-
-    #[test]
-    fn clear_staging_removes_part_file() {
-        let tmp = TempDir::new().unwrap();
-        let store = CacheDirStore {
-            root: tmp.path().to_path_buf(),
-        };
-        let staged = store.staging_path(tiny_entry(), 1).unwrap();
-        write(&staged, b"x");
-        assert!(staged.exists());
-        store.clear_staging(tiny_entry());
-        assert!(!staged.exists());
     }
 
     #[test]

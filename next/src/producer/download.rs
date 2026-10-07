@@ -136,7 +136,6 @@ impl Downloader for HttpDownloader {
 
 pub struct Throttle {
     last_pct: i32,
-    last_bytes: u64,
     last_total: Option<u64>,
     last_emit_ms: u128,
     last_emit_bytes: u64,
@@ -152,15 +151,14 @@ impl Default for Throttle {
     fn default() -> Self {
         Self {
             last_pct: -1,
-            last_bytes: 0,
             last_total: None,
             last_emit_ms: 0,
             last_emit_bytes: 0,
         }
     }
 }
-#[allow(dead_code)]
 impl Throttle {
+    /// Throttle intermediate progress; always emit when a known total is reached.
     pub fn call(
         &mut self,
         attempt: u32,
@@ -175,18 +173,6 @@ impl Throttle {
         }
     }
 
-    pub fn finalize(
-        &mut self,
-        attempt: u32,
-        bytes: u64,
-        total: Option<u64>,
-        tx: &EventSender,
-        model: &'static str,
-    ) {
-        let now_ms = Self::now_ms();
-        self.emit_progress(attempt, bytes, total, now_ms, tx, model);
-    }
-
     pub(crate) fn should_emit(&mut self, bytes: u64, total: Option<u64>, now_ms: u128) -> bool {
         match total {
             Some(t) if t > 0 => {
@@ -198,6 +184,7 @@ impl Throttle {
                     false
                 }
             }
+            Some(t) if bytes == t => true,
             _ => {
                 if now_ms.saturating_sub(self.last_emit_ms) >= Self::NO_TOTAL_TICK_MS {
                     // Don't bump last_emit_ms here — bytes_per_sec
@@ -229,7 +216,6 @@ impl Throttle {
             total,
             bytes_per_sec: self.bytes_per_sec(now_ms, bytes),
         });
-        self.last_bytes = bytes;
         self.last_total = total;
         self.last_emit_bytes = bytes;
         // Bookkeeping moved out of should_emit so the timestamp
@@ -489,5 +475,19 @@ mod tests {
             throttle.should_emit(4096, None, 1_260),
             "260 ms later is past the gate"
         );
+    }
+
+    #[test]
+    fn throttle_completion_bypasses_cooldown_including_empty_downloads() {
+        let mut throttle = Throttle::new();
+        throttle.last_emit_ms = 1_000;
+        throttle.last_pct = 100;
+        assert!(!throttle.should_emit(0, None, 1_000));
+        for total in [0, 100] {
+            assert!(
+                throttle.should_emit(total, Some(total), 1_000),
+                "completion must emit even inside the cooldown: total={total}"
+            );
+        }
     }
 }
