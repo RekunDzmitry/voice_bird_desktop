@@ -119,6 +119,10 @@ mod tests {
     impl ModelStore for PreparationStore {
         fn is_available(&self, _: &ModelEntry) -> bool { false }
 
+        fn installed_path(&self, entry: &ModelEntry) -> PathBuf {
+            PathBuf::from(format!("custom/{}.gguf", entry.id))
+        }
+
         fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
             if attempt == 1 {
                 Err(DownloadError::Io("cache directory is read-only".into()))

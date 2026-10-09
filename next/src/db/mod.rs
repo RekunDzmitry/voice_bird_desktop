@@ -52,10 +52,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Run every table's `CREATE TABLE IF NOT EXISTS` definition on
-/// `conn`. Each [`Table::DEFINITION`] is idempotent so this is safe
-/// to call on an existing database — the call is the entire migration
-/// surface today.
+/// Run each table's idempotent `CREATE TABLE IF NOT EXISTS` definition.
+/// [`Database::open`] also upgrades existing measurement columns before use.
 pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()> {
     for t in tables {
         conn.execute_batch(t.definition())?;
@@ -63,20 +61,17 @@ pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()
     Ok(())
 }
 
-/// Path the database file lives at. Mirrors
-/// [`crate::event_log::EventLog`]'s `log_dir`: the platform data
-/// directory via `directories`, falling back to the system temp
-/// directory only when the OS can't provide one. Returns `None` so
-/// `main` can exit with a clear error instead of panicking.
+/// Shared local data root for the session store and SQLite index.
+/// Retains the established ProjectDirs identity and temp-directory fallback.
+pub fn data_dir() -> PathBuf {
+    ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next")
+        .map(|proj| proj.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("voice-bird-next"))
+}
+
+/// Established database filename, kept stable for existing installations.
 pub fn db_path() -> Option<PathBuf> {
-    if let Some(proj) = ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next") {
-        return Some(proj.data_dir().join("downloads.sqlite"));
-    }
-    Some(
-        std::env::temp_dir()
-            .join("voice-bird-next")
-            .join("downloads.sqlite"),
-    )
+    Some(data_dir().join("downloads.sqlite"))
 }
 
 /// Extension trait so each `Table` impl can hand its `DEFINITION` /
@@ -124,12 +119,18 @@ impl Database {
         migrate(&conn, &[block_steps::BlockStepsTable])?;
         migrate(&conn, &[models::ModelsTable])?;
         migrate(&conn, &[model_staging::ModelStagingTable])?;
+        migrate(&conn, &[recordings::RecordingsTable])?;
+        migrate(&conn, &[transcription_metrics::TranscriptionMetricsTable])?;
+        transcription_metrics::upgrade(&conn)?;
+        migrate(&conn, &[transcription_jobs::TranscriptionJobsTable])?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
             tx,
         };
         downloads::recover_interrupted(&mut db)?;
+        transcription_jobs::recover_interrupted(&mut db)?;
+        recordings::recover_interrupted(&mut db)?;
         Ok(db)
     }
 
@@ -181,6 +182,9 @@ pub mod block_steps;
 pub mod downloads;
 pub mod model_staging;
 pub mod models;
+pub mod recordings;
+pub mod transcription_metrics;
+pub mod transcription_jobs;
 
 /// Apply every table's event gate. Only a `true` result may reach
 /// the consumer: a rejected source-language command
@@ -190,6 +194,12 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
         return Ok(models::is_available(db, model.id)? == *available);
     }
     if !block_steps::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !recordings::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !transcription_jobs::apply(db, ev)? {
         return Ok(false);
     }
     downloads::apply(db, ev)

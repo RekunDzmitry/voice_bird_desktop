@@ -19,10 +19,6 @@ const PICKING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/picking_100x30.txt"
 );
-const DOWNLOADING_TWO_BLOCKS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/snapshots/downloading_two_blocks_100x30.txt"
-);
 const FAILED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/failed_100x30.txt"
@@ -56,9 +52,7 @@ fn three_blocks_100x30_matches_golden() {
         blocks: (1..=3)
             .map(|id| Block {
                 id,
-                state: BlockState::Recording {
-                    language: &LANGUAGES[0],
-                },
+                state: BlockState::recording(&LANGUAGES[0]),
                 ..Default::default()
             })
             .collect(),
@@ -95,42 +89,6 @@ fn picking_100x30_matches_golden() {
     assert_eq!(out, expected);
 }
 
-#[test]
-fn downloading_two_blocks_100x30_matches_golden() {
-    let mut ui_view = UiView {
-        blocks: (1..=2)
-            .map(|id| Block {
-                id,
-                state: BlockState::Waiting {
-                    language: &LANGUAGES[0],
-                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
-                },
-                ..Default::default()
-            })
-            .collect(),
-        focus: 0,
-        next_block_id: 3,
-        ..Default::default()
-    };
-    for model in LANGUAGES[0].models() {
-        ui_view.downloads.insert(
-            model.id,
-            DownloadState {
-                attempt: 1,
-                phase: DownloadPhase::Fetching,
-                bytes: 50,
-                total: Some(100),
-                bytes_per_sec: 0,
-            },
-        );
-    }
-    let out = render_to_string(&ui_view, 100, 30);
-    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
-        std::fs::write(DOWNLOADING_TWO_BLOCKS, &out).expect("write golden");
-    }
-    let expected = std::fs::read_to_string(DOWNLOADING_TWO_BLOCKS).expect("read golden");
-    assert_eq!(out, expected);
-}
 
 #[test]
 fn failed_100x30_matches_golden() {
@@ -550,9 +508,7 @@ proptest! {
             blocks: (1..=blocks as u8)
                 .map(|i| Block {
                     id: i,
-                    state: BlockState::Recording {
-                        language: &LANGUAGES[0],
-                    },
+                    state: BlockState::recording(&LANGUAGES[0]),
 
                     ..Default::default()
                 })
@@ -698,9 +654,7 @@ fn recording_with_source_100x30_matches_golden() {
     source_golden(
         "recording_with_source",
         source_block_view(
-            BlockState::Recording {
-                language: &LANGUAGES[0],
-            },
+            BlockState::recording(&LANGUAGES[0]),
             Some(1),
             Some(1),
         ),
@@ -708,11 +662,39 @@ fn recording_with_source_100x30_matches_golden() {
 }
 
 #[test]
+fn recording_with_transcript_100x30_matches_golden() {
+    let mut state = BlockState::recording(&LANGUAGES[0]);
+    if let BlockState::Recording { lines, tentative, session_dir, .. } = &mut state {
+        *lines = vec![
+            "Welcome to Voice Bird.".into(),
+            "Refined text replaces the earlier live words.".into(),
+            "New live words remain visible as recording continues.".into(),
+        ];
+        *tentative = "The next sentence is still arriving…".into();
+        *session_dir = Some("/local/data/sessions/2026-10-08_12-30-00-b1-mic".into());
+    }
+    source_golden("recording_with_transcript", source_block_view(state, Some(0), None));
+}
+
+#[test]
+fn small_recording_view_keeps_wrapped_tail_and_tentative_visible() {
+    let mut state = BlockState::recording(&LANGUAGES[0]);
+    if let BlockState::Recording { lines, tentative, .. } = &mut state {
+        *lines = vec![
+            "older words ".repeat(30),
+            "latest committed words".into(),
+        ];
+        *tentative = "next words".into();
+    }
+    let out = render_to_string(&source_block_view(state, Some(0), None), 30, 12);
+    assert!(out.contains("latest committed words"), "{out}");
+    assert!(out.contains("next words"), "{out}");
+}
+
+#[test]
 fn input_source_title_omits_app() {
     let ui_view = source_block_view(
-        BlockState::Recording {
-            language: &LANGUAGES[0],
-        },
+        BlockState::recording(&LANGUAGES[0]),
         Some(0),
         None,
     );

@@ -6,6 +6,7 @@
 //! - Consumers make accepted-event decisions and hand background work to producers.
 //! - Every event is logged before SQLite gates domain transitions.
 //! - Producers schedule workers and publish results; blocking work uses `spawn_blocking`.
+pub mod audio;
 pub mod audio_sources;
 pub mod bus;
 pub mod consumer;
@@ -17,5 +18,7 @@ pub mod language;
 pub mod picker;
 pub mod producer;
 pub mod testing;
+pub mod session_store;
+pub mod transcribe;
 pub mod transcription_models;
 pub mod ui;

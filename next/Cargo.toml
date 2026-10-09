@@ -15,14 +15,15 @@ name = "voice-bird-next"
 path = "src/main.rs"
 
 [features]
-# Default-on: pulls `reqwest` + `sha2` + `hex` for the live downloader.
-# Tests and `download_flow.rs` exercise the full flow through the
-# fixture downloader without this feature; running
-# `cargo test --no-default-features` finishes in seconds.
-default = ["net"]
+# Native Whisper is optional so no-default-feature checks do not build whisper.cpp.
+default = ["net", "local-engine"]
 net = ["dep:reqwest"]
+local-engine = ["dep:whisper-rs"]
 
 [dependencies]
+anyhow = "1"
+rubato = "0.14"
+parking_lot = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = "0.4"
 directories = "5"
@@ -37,6 +38,8 @@ async-trait = "0.1"
 # verified staging file is meaningless if we can't actually install it.
 flate2 = "1"
 tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+log = "0.4"
 
 [dependencies.reqwest]
 version = "0.12"
@@ -54,8 +57,21 @@ version = "0.4"
 cpal = "0.15"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSError", "NSObject", "NSProcessInfo", "NSString"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "libc", "objc2-core-media"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGWindow"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+whisper-rs = { version = "0.13", optional = true, features = ["metal", "coreml", "whisper-cpp-log", "raw-api"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.13", optional = true, features = ["whisper-cpp-log"] }
 
 [dev-dependencies]
+hound = "3"
 pretty_assertions = "1"
 proptest = "1"
 tempfile = "3"

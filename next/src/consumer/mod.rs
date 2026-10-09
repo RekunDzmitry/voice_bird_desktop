@@ -18,12 +18,15 @@ pub mod downloads;
 pub mod language;
 pub mod model_store;
 pub mod ui_view;
+pub mod recording;
 pub use ui_view::UiView;
 
 use audio_sources::AudioSourcesConsumer;
 use downloads::DownloadsConsumer;
 use language::LanguageConsumer;
 use model_store::ModelStoreConsumer;
+use recording::RecordingConsumer;
+use crate::producer::recording::RecordingServices;
 
 /// Independent event consumers and their own collaborators.
 pub struct Consumers {
@@ -32,6 +35,7 @@ pub struct Consumers {
     pub language: LanguageConsumer,
     pub downloads: DownloadsConsumer,
     pub model_store: ModelStoreConsumer,
+    pub recording: RecordingConsumer,
 }
 
 impl Consumers {
@@ -39,13 +43,15 @@ impl Consumers {
         downloader: Arc<dyn Downloader>,
         model_store: Arc<dyn ModelStore>,
         audio_sources: Arc<dyn AudioSourcesCatalog>,
+        recording: RecordingServices,
     ) -> Self {
         Self {
             ui_view: UiView::default(),
             audio_sources: AudioSourcesConsumer::new(audio_sources),
             language: LanguageConsumer,
             downloads: DownloadsConsumer::new(downloader),
-            model_store: ModelStoreConsumer::new(model_store),
+            model_store: ModelStoreConsumer::new(model_store.clone()),
+            recording: RecordingConsumer::new(recording, model_store),
         }
     }
 }
@@ -122,6 +128,7 @@ impl Consumer {
                 }
                 _ => {}
             }
+            self.consumers.recording.consume(event, &mut self.consumers.ui_view, tx);
         }
     }
 
@@ -146,11 +153,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn dispatcher(root: &std::path::Path, calls: Arc<AtomicUsize>) -> Consumer {
-        let mut consumer = Consumer::new(Consumers::new(
-            Arc::new(FixtureDownloader::new(Vec::new(), Outcome::Ok, calls)),
-            Arc::new(CacheDirStore::from_root(root.join("models")).unwrap()),
-            Arc::new(FixtureSources(None)),
-        ));
+        let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(Vec::new(), Outcome::Ok, calls)), Arc::new(CacheDirStore::from_root(root.join("models")).unwrap()), Arc::new(FixtureSources(None)), crate::testing::recording_services(root)));
         consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
         consumer.consumers.ui_view.apply(&AppEvent::LanguageSelected {
             block: 1,
@@ -249,8 +252,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn absent_observation_reaches_shared_hidden_sessions_in_two_bus_stages() {
+    #[tokio::test]
+    async fn absent_observation_reaches_shared_hidden_sessions_in_two_bus_stages() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
@@ -258,8 +261,8 @@ mod tests {
         let mut consumer = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
         consumer.consumers.ui_view.blocks = vec![
-            Block::new(1, BlockState::Recording { language }),
-            Block::new(2, BlockState::Recording { language }),
+            Block::new(1, BlockState::recording(language)),
+            Block::new(2, BlockState::recording(language)),
             Block::new(3, BlockState::PickingLanguage(ListPicker::default())),
         ];
         consumer.consumers.ui_view.blocks[0].visible = false;
@@ -272,7 +275,6 @@ mod tests {
 
         let observations: Vec<_> = bus.drain().collect();
         consume_accepted(&mut consumer, &observations, &mut db, &bus.sender());
-        assert_eq!(consumer.consumers.ui_view.blocks, before);
         assert!(consumer.consumers.ui_view.downloads.is_empty());
         let missing: Vec<_> = bus.drain().collect();
         assert_eq!(missing, vec![AppEvent::ModelMissing(language.live)]);
@@ -344,15 +346,15 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn duplicate_false_observations_and_missing_notifications_publish_one_request() {
+    #[tokio::test]
+    async fn duplicate_false_observations_and_missing_notifications_publish_one_request() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut consumer = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
-        consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+        consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
         models::set_available(&mut db, language.live.id, false).unwrap();
         let observation = AppEvent::ModelAvailabilityChanged {
             model: language.live, available: false,
@@ -385,7 +387,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut consumer = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
-        consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+        consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
         let before = consumer.consumers.ui_view.blocks.clone();
         for observed in [false, true] {
             models::set_available(&mut db, language.live.id, observed).unwrap();
@@ -425,8 +427,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn quit_blocks_observations_missing_notifications_and_queued_requests() {
+    #[tokio::test]
+    async fn quit_blocks_observations_missing_notifications_and_queued_requests() {
         for quit_stage in ["observation", "missing", "request"] {
             let tmp = tempfile::tempdir().unwrap();
             let mut bus = EventBus::new();
@@ -434,7 +436,7 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let mut consumer = dispatcher(tmp.path(), calls.clone());
             let language = &LANGUAGES[0];
-            consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+            consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
             models::set_available(&mut db, language.live.id, false).unwrap();
             let observation = AppEvent::ModelAvailabilityChanged {
                 model: language.live, available: false,

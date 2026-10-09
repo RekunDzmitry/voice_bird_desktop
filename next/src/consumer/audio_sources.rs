@@ -93,6 +93,7 @@ mod tests {
                 )),
                 store,
                 consumer_audio_sources,
+                crate::testing::recording_services(&root),
             ));
             consumer.consume(&[AppEvent::RequestBlock], &mut db, &tx);
             proceed_rx.blocking_recv().unwrap();

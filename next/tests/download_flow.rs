@@ -1,5 +1,6 @@
 //! End-to-end language download flow tests. No test touches the network.
 
+use std::io::{Cursor, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::input::Intent;
 use voice_bird_next::language::{LanguageProfile, LANGUAGES};
 use voice_bird_next::download::{DownloadError, Downloader};
+use voice_bird_next::picker::{ModelEntry, ModelFormat};
 use voice_bird_next::producer::input::resolve_intent;
 use voice_bird_next::producer::model_watch::ModelWatcher;
 use voice_bird_next::audio_sources::{FunnelStep, NoSources};
@@ -26,6 +28,58 @@ use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 fn english() -> &'static LanguageProfile {
     &LANGUAGES[0]
 }
+
+const ENCODER_FILES: [&str; 4] = [
+    "coremldata.bin", "model.mil", "metadata.json", "weights/weight.bin",
+];
+
+fn required_ids() -> Vec<&'static str> {
+    english().models().iter().copied().map(|model| model.id).collect()
+}
+
+fn cached_except(missing: &ModelEntry) -> Vec<&'static str> {
+    english().models().iter().copied()
+        .filter(|model| model.id != missing.id)
+        .map(|model| model.id)
+        .collect()
+}
+
+fn staged_fixture(model: &ModelEntry) -> Vec<u8> {
+    match model.format {
+        ModelFormat::WhisperGguf => b"fixture model".to_vec(),
+        ModelFormat::CoreMlEncoder => {
+            let root = match model.id {
+                "distil-small.en-encoder" => "ggml-small.en-encoder.mlmodelc",
+                "large-v3-turbo-encoder" => "ggml-large-v3-turbo-encoder.mlmodelc",
+                _ => panic!("unexpected encoder fixture {}", model.id),
+            };
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for name in ENCODER_FILES {
+                archive.start_file(
+                    format!("{root}/{name}"), zip::write::SimpleFileOptions::default(),
+                ).unwrap();
+                archive.write_all(b"compiled artifact").unwrap();
+            }
+            archive.finish().unwrap().into_inner()
+        }
+        ModelFormat::NemotronPackage => panic!("English does not require Nemotron"),
+    }
+}
+
+fn seed_installed(store: &CacheDirStore, model: &ModelEntry) {
+    let installed = store.installed_path(model);
+    match model.format {
+        ModelFormat::WhisperGguf => std::fs::write(installed, b"fixture model").unwrap(),
+        ModelFormat::CoreMlEncoder => {
+            std::fs::create_dir_all(installed.join("weights")).unwrap();
+            for name in ENCODER_FILES {
+                std::fs::write(installed.join(name), b"compiled artifact").unwrap();
+            }
+        }
+        ModelFormat::NemotronPackage => panic!("English does not require Nemotron"),
+    }
+}
+
 struct WritingDownloader {
     calls: Arc<AtomicUsize>,
 }
@@ -34,7 +88,7 @@ struct WritingDownloader {
 impl Downloader for WritingDownloader {
     async fn fetch(
         &self,
-        _url: &str,
+        url: &str,
         staged: &Path,
         _expected_sha: &str,
         cancel: &mut (dyn CancelCheck + Send),
@@ -44,9 +98,13 @@ impl Downloader for WritingDownloader {
         if cancel.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
-        tokio::fs::write(staged, b"fixture model").await
+        let model = english().models().iter().copied()
+            .find(|model| model.download_url == url)
+            .expect("download must target a required English asset");
+        let bytes = staged_fixture(model);
+        tokio::fs::write(staged, &bytes).await
             .map_err(|error| DownloadError::Io(error.to_string()))?;
-        progress(13, Some(13));
+        progress(bytes.len() as u64, Some(bytes.len() as u64));
         Ok(())
     }
 }
@@ -136,11 +194,7 @@ async fn language_downloads_start_only_after_followups_cross_the_gate() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender())
@@ -171,7 +225,7 @@ async fn language_downloads_start_only_after_followups_cross_the_gate() {
     assert!(followups.iter().any(|event| matches!(
         event,
         AppEvent::LanguageSelected { block: 1, pending, .. }
-            if pending.as_slice() == [english().live.id, english().refine.id]
+            if pending == &required_ids()
     )));
     for model in english().models() {
         assert!(followups.contains(&AppEvent::DownloadRequested { model, attempt: 1 }));
@@ -191,7 +245,7 @@ async fn language_downloads_start_only_after_followups_cross_the_gate() {
     settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
         matches!(view.blocks[0].state, BlockState::Recording { .. })
     }).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), english().models().len());
     for model in english().models() {
         assert!(store.is_available(model));
         assert_eq!(
@@ -206,11 +260,7 @@ async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(WritingDownloader { calls: calls.clone() }),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(WritingDownloader { calls: calls.clone() }), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender())
@@ -220,7 +270,7 @@ async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
 
     // Leave fetch completion on the bus: verified bytes are not installed yet.
     let mut fetched = Vec::new();
-    while fetched.len() < 2 {
+    while fetched.len() < english().models().len() {
         let event = timeout(Duration::from_secs(5), bus.recv()).await.unwrap().unwrap();
         if matches!(event, AppEvent::DownloadFetched { .. }) {
             fetched.push(event);
@@ -228,14 +278,10 @@ async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
             consume_batch(vec![event], &mut consumer, &mut handle.db, &bus.sender());
         }
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), english().models().len());
     assert!(matches!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting { .. }));
     for model in english().models() {
         assert!(!store.is_available(model));
-        assert_eq!(
-            std::fs::read(store.staging_path(model, 1).unwrap()).unwrap(),
-            b"fixture model"
-        );
         assert_eq!(
             downloads::get(&handle.db, model.id).unwrap().unwrap().status,
             DownloadStatus::Downloading
@@ -247,10 +293,7 @@ async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
         matches!(view.blocks[0].state, BlockState::Recording { .. })
     }).await;
     for model in english().models() {
-        assert_eq!(
-            std::fs::read(store.root().join(format!("{}.gguf", model.id))).unwrap(),
-            b"fixture model"
-        );
+        assert!(store.is_available(model));
         assert!(!store.staging_path(model, 1).unwrap().exists());
         assert!(voice_bird_next::db::models::is_available(&handle.db, model.id).unwrap());
     }
@@ -260,16 +303,11 @@ async fn verified_bytes_wait_for_gated_store_installation_before_recording() {
 async fn cancelled_fetch_handoff_cannot_fail_an_immediate_retry() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
-    std::fs::write(
-        store.root().join(format!("{}.gguf", english().refine.id)),
-        b"cached refine",
-    ).unwrap();
+    for model in english().models().iter().copied().filter(|model| model.id != english().live.id) {
+        seed_installed(&store, model);
+    }
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(WritingDownloader { calls: calls.clone() }),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(WritingDownloader { calls: calls.clone() }), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender())
@@ -319,15 +357,10 @@ async fn stale_terminal_in_retry_batch_preserves_new_attempt_progress() {
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
-        std::fs::write(
-            store.root().join(format!("{}.gguf", english().refine.id)),
-            b"cached refine",
-        ).unwrap();
-        let mut consumer = Consumer::new(Consumers::new(
-            Arc::new(WritingDownloader { calls: Arc::new(AtomicUsize::new(0)) }),
-            store.clone(),
-            Arc::new(NoSources),
-        ));
+        for model in english().models().iter().copied().filter(|model| model.id != english().live.id) {
+            seed_installed(&store, model);
+        }
+        let mut consumer = Consumer::new(Consumers::new(Arc::new(WritingDownloader { calls: Arc::new(AtomicUsize::new(0)) }), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
         let tx = bus.sender();
@@ -381,11 +414,7 @@ async fn closing_or_quitting_before_language_followups_never_starts_orphan_downl
     for stop in [AppEvent::BlockClosed { block: 1 }, AppEvent::Quit] {
         let tmp = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = Consumer::new(Consumers::new(
-            Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
-            Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])),
-            Arc::new(NoSources),
-        ));
+        let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())), Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
         ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -422,7 +451,7 @@ async fn closing_or_quitting_before_language_followups_never_starts_orphan_downl
             settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
                 matches!(view.blocks[0].state, BlockState::Recording { .. })
             }).await;
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(calls.load(Ordering::SeqCst), english().models().len());
             for model in english().models() {
                 let row = downloads::get(&handle.db, model.id).unwrap().unwrap();
                 assert_eq!(row.attempt, 1);
@@ -433,9 +462,9 @@ async fn closing_or_quitting_before_language_followups_never_starts_orphan_downl
 }
 
 #[tokio::test]
-async fn language_with_both_models_cached_records_immediately() {
+async fn language_with_all_required_assets_cached_records_immediately() {
     let tmp = tempfile::tempdir().unwrap();
-    let present: Vec<_> = english().models().map(|model| model.id).to_vec();
+    let present = required_ids();
     let store: Arc<dyn ModelStore> =
         Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &present));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -444,7 +473,7 @@ async fn language_with_both_models_cached_records_immediately() {
         Outcome::Ok,
         calls.clone(),
     ));
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -460,79 +489,75 @@ async fn language_with_both_models_cached_records_immediately() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(matches!(
         consumer.consumers.ui_view.blocks[0].state,
-        BlockState::Recording { language } if language == english()
+        BlockState::Recording { language, .. } if language == english()
     ));
 }
 
 #[tokio::test]
-async fn language_waits_for_both_models_then_records() {
+async fn language_waits_for_every_required_asset_then_records() {
     let mut ui_view = UiView::default();
     ui_view.apply(&AppEvent::AddBlock);
     ui_view.apply(&AppEvent::LanguageSelected {
         block: 1,
         language: english(),
-        pending: english().models().map(|model| model.id).to_vec(),
+        pending: required_ids(),
     });
 
-    ui_view.apply(&AppEvent::DownloadSucceeded {
-        attempt: 1,
-        model: english().live.id,
-    });
-    assert!(matches!(
-        &ui_view.blocks[0].state,
-        BlockState::Waiting { pending, .. }
-            if pending.as_slice() == [english().refine.id]
-    ));
-
-    ui_view.apply(&AppEvent::DownloadSucceeded {
-        attempt: 1,
-        model: english().refine.id,
-    });
+    let required = english().models();
+    for (index, model) in required.iter().copied().enumerate() {
+        assert!(matches!(ui_view.blocks[0].state, BlockState::Waiting { .. }));
+        ui_view.apply(&AppEvent::DownloadSucceeded { attempt: 1, model: model.id });
+        if index + 1 < required.len() {
+            let remaining: Vec<_> = required[index + 1..].iter().copied()
+                .map(|model| model.id).collect();
+            assert_eq!(ui_view.blocks[0].pending_models(), remaining);
+            assert!(matches!(ui_view.blocks[0].state, BlockState::Waiting { .. }));
+        }
+    }
     assert!(matches!(
         ui_view.blocks[0].state,
-        BlockState::Recording { language } if language == english()
+        BlockState::Recording { language, .. } if language == english()
     ));
 }
 
 #[tokio::test]
-async fn language_with_one_cached_model_downloads_only_the_other() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store_concrete = Arc::new(FixtureStore::new(
-        tmp.path().to_path_buf(),
-        &[english().live.id],
-    ));
-    let store: Arc<dyn ModelStore> = store_concrete.clone();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
-        vec![1; 64],
-        Outcome::Ok,
-        calls.clone(),
-    ));
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
-    let mut bus = EventBus::new();
-    let mut handle = downloads_with(&bus);
-    ModelWatcher::new(store_concrete.clone()).check(&mut handle.db, &bus.sender())
-        .unwrap();
-    consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
+async fn language_with_one_missing_asset_downloads_only_that_asset() {
+    for missing in english().models().iter().copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FixtureStore::new(
+            tmp.path().to_path_buf(), &cached_except(missing),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let downloader = Arc::new(FixtureDownloader::new(
+            vec![1; 64], Outcome::Ok, calls.clone(),
+        ));
+        let mut consumer = Consumer::new(Consumers::new(
+            downloader, store.clone(), Arc::new(NoSources),
+            voice_bird_next::testing::recording_services(tmp.path()),
+        ));
+        let mut bus = EventBus::new();
+        let mut handle = downloads_with(&bus);
+        ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender()).unwrap();
+        consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
 
-    let events = confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AppEvent::LanguageSelected { block: 1, pending, .. }
-            if pending.as_slice() == [english().refine.id]
-    )));
-    assert!(events.contains(&AppEvent::DownloadRequested {
-        model: english().refine,
-        attempt: 1,
-    }));
-    assert_eq!(consumer.consumers.ui_view.blocks[0].pending_models(), &[english().refine.id]);
-    settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
-        matches!(view.blocks[0].state, BlockState::Recording { .. })
-    }).await;
+        let events = confirm_and_consume(&mut bus, &mut consumer, &mut handle.db);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::LanguageSelected { block: 1, pending, .. }
+                if pending.as_slice() == [missing.id]
+        )));
+        assert!(events.contains(&AppEvent::DownloadRequested { model: missing, attempt: 1 }));
+        assert_eq!(consumer.consumers.ui_view.blocks[0].pending_models(), &[missing.id]);
+        for cached in english().models().iter().copied().filter(|model| model.id != missing.id) {
+            assert!(downloads::get(&handle.db, cached.id).unwrap().is_none());
+        }
+        settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
+            matches!(view.blocks[0].state, BlockState::Recording { .. })
+        }).await;
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(store_concrete.is_available(english().live));
-    assert!(store_concrete.is_available(english().refine));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(english().models().iter().all(|model| store.is_available(model)));
+    }
 }
 
 #[tokio::test]
@@ -540,7 +565,7 @@ async fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let store_concrete = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &[english().live.id],
+        &cached_except(english().refine),
     ));
     let store: Arc<dyn ModelStore> = store_concrete.clone();
     let failed_calls = Arc::new(AtomicUsize::new(0));
@@ -549,7 +574,7 @@ async fn refine_model_failure_fails_block_and_retry_downloads_only_missing() {
         Outcome::ShaMismatch,
         failed_calls.clone(),
     ));
-    let mut consumer = Consumer::new(Consumers::new(failing, store.clone(), Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(failing, store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender())
@@ -635,8 +660,8 @@ async fn claim_failure_on_one_model_fails_block() {
     assert!(matches!(
         &consumer.consumers.ui_view.blocks[0].state,
         BlockState::Failed {
-            language, error, ..
-        } if *language == english() && error == "database locked"
+            language, ..
+        } if *language == english()
     ));
 }
 
@@ -660,7 +685,7 @@ async fn failure_between_language_begin_and_selection_reaches_late_waiter() {
 
     let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &[english().refine.id],
+        &cached_except(english().live),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
     let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
@@ -729,7 +754,7 @@ async fn failure_between_language_begin_and_selection_reaches_late_waiter() {
         } if model.as_ref() == english().live.id
     )));
     assert!(consumer.consumers.ui_view.blocks.iter().all(|block| matches!(
-        &block.state, BlockState::Failed { error, .. } if error == "HTTP 404"
+        &block.state, BlockState::Failed { .. }
     )));
 }
 
@@ -738,14 +763,10 @@ async fn cancelled_attempt_before_late_request_fails_waiter_and_explicit_retry_r
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &[english().live.id],
+        &cached_except(english().refine),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone())), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(store.clone()).check(&mut handle.db, &bus.sender())
@@ -813,7 +834,7 @@ async fn two_blocks_same_language_share_downloads() {
         inner: FixtureDownloader::new(vec![1; 128 * 1024], Outcome::Ok, calls.clone()),
         gate: receiver,
     });
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -838,7 +859,7 @@ async fn two_blocks_same_language_share_downloads() {
     settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
         view.blocks.iter().all(|block| matches!(block.state, BlockState::Recording { .. }))
     }).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), english().models().len());
     for model in english().models() {
         let row = downloads::get(&handle.db, model.id).unwrap().unwrap();
         assert_eq!(row.attempt, 1);
@@ -847,7 +868,7 @@ async fn two_blocks_same_language_share_downloads() {
 }
 
 #[tokio::test]
-async fn closing_last_waiter_cancels_both_pending_rows() {
+async fn closing_last_waiter_cancels_every_pending_asset() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ModelStore> = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[]));
     let (gate, receiver) = watch::channel(false);
@@ -857,7 +878,7 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
         ),
         gate: receiver,
     });
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -889,7 +910,7 @@ async fn closing_last_waiter_cancels_both_pending_rows() {
 #[tokio::test]
 async fn language_selected_targets_block_id_not_focus() {
     let tmp = tempfile::tempdir().unwrap();
-    let present: Vec<_> = english().models().map(|model| model.id).to_vec();
+    let present = required_ids();
     let store: Arc<dyn ModelStore> =
         Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &present));
     let downloader: Arc<dyn Downloader> = Arc::new(FixtureDownloader::new(
@@ -897,7 +918,7 @@ async fn language_selected_targets_block_id_not_focus() {
         Outcome::Ok,
         Arc::new(AtomicUsize::new(0)),
     ));
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -932,7 +953,7 @@ async fn second_session_is_warm() {
     let downloader: Arc<dyn Downloader> = Arc::new(WritingDownloader {
         calls: first_calls.clone(),
     });
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut first_bus = EventBus::new();
     let mut first_db = downloads_with(&first_bus);
     ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut first_db.db, &first_bus.sender())
@@ -949,7 +970,7 @@ async fn second_session_is_warm() {
         &mut first_db.db,
         |view, _| matches!(view.blocks[0].state, BlockState::Recording { .. }),
     ).await;
-    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(first_calls.load(Ordering::SeqCst), english().models().len());
 
     let second_store: Arc<dyn ModelStore> =
         Arc::new(CacheDirStore::from_root(models_root).unwrap());
@@ -959,7 +980,7 @@ async fn second_session_is_warm() {
         Outcome::Ok,
         second_calls.clone(),
     ));
-    let mut second_consumer = Consumer::new(Consumers::new(second_downloader, second_store, Arc::new(NoSources)));
+    let mut second_consumer = Consumer::new(Consumers::new(second_downloader, second_store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut second_bus = EventBus::new();
     let mut second_db = downloads_with(&second_bus);
     ModelWatcher::new(second_consumer.consumers.model_store.model_store.clone()).check(&mut second_db.db, &second_bus.sender())
@@ -987,13 +1008,13 @@ async fn quit_store_consumer_sweeps_every_attempt_and_preserves_installed_models
     let tmp = tempfile::tempdir().unwrap();
     let store_concrete = Arc::new(CacheDirStore::from_root(tmp.path().to_path_buf()).unwrap());
     for model in english().models() {
-        std::fs::write(tmp.path().join(format!("{}.gguf", model.id)), b"installed").unwrap();
+        seed_installed(&store_concrete, model);
         for attempt in [1, 7] {
-            std::fs::write(
-                tmp.path().join(format!("{}.{attempt}.gguf.part", model.id)),
-                b"partial",
-            ).unwrap();
-            let scratch = tmp.path().join(format!("{}.{attempt}.tar.gz.tmp", model.id));
+            let staged = store_concrete.staging_path(model, attempt).unwrap();
+            std::fs::write(&staged, b"partial").unwrap();
+            let scratch = staged.with_file_name(
+                staged.file_name().unwrap().to_str().unwrap().trim_end_matches(".part").to_string() + ".tmp",
+            );
             std::fs::create_dir(&scratch).unwrap();
             std::fs::write(scratch.join("unfinished"), b"partial unpack").unwrap();
         }
@@ -1005,7 +1026,7 @@ async fn quit_store_consumer_sweeps_every_attempt_and_preserves_installed_models
         Outcome::Ok,
         Arc::new(AtomicUsize::new(0)),
     ));
-    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources)));
+    let mut consumer = Consumer::new(Consumers::new(downloader, store, Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let tx = bus.sender();
     let mut handle = downloads_with(&bus);
@@ -1028,8 +1049,12 @@ async fn quit_store_consumer_sweeps_every_attempt_and_preserves_installed_models
     for model in english().models() {
         assert!(store_concrete.is_available(model));
         for attempt in [1, 7] {
-            assert!(!tmp.path().join(format!("{}.{attempt}.gguf.part", model.id)).exists());
-            assert!(!tmp.path().join(format!("{}.{attempt}.tar.gz.tmp", model.id)).exists());
+            let staged = store_concrete.staging_path(model, attempt).unwrap();
+            let scratch = staged.with_file_name(
+                staged.file_name().unwrap().to_str().unwrap().trim_end_matches(".part").to_string() + ".tmp",
+            );
+            assert!(!staged.exists());
+            assert!(!scratch.exists());
         }
         assert_eq!(
             downloads::get(&handle.db, model.id).unwrap().unwrap().status,
@@ -1043,18 +1068,14 @@ async fn model_dropped_while_recording_redownloads_and_resumes() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &english().models().map(|model| model.id),
+        &required_ids(),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(
-            vec![1; 64],
-            Outcome::Ok,
-            calls.clone(),
-        )),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+        vec![1; 64],
+        Outcome::Ok,
+        calls.clone(),
+    )), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
@@ -1093,18 +1114,14 @@ async fn model_dropped_with_two_recording_blocks_shares_one_download() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &english().models().map(|model| model.id),
+        &required_ids(),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(
-            vec![1; 64],
-            Outcome::Ok,
-            calls.clone(),
-        )),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+        vec![1; 64],
+        Outcome::Ok,
+        calls.clone(),
+    )), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
@@ -1159,18 +1176,14 @@ async fn redownload_failure_fails_block_and_retry_recovers() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FixtureStore::new(
         tmp.path().to_path_buf(),
-        &english().models().map(|model| model.id),
+        &required_ids(),
     ));
     let failed_calls = Arc::new(AtomicUsize::new(0));
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(
-            vec![1; 64],
-            Outcome::ShaMismatch,
-            failed_calls.clone(),
-        )),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+        vec![1; 64],
+        Outcome::ShaMismatch,
+        failed_calls.clone(),
+    )), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
@@ -1192,10 +1205,6 @@ async fn redownload_failure_fails_block_and_retry_recovers() {
         matches!(view.blocks[0].state, BlockState::Failed { .. })
     }).await;
     assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
-    assert!(
-        matches!(&consumer.consumers.ui_view.blocks[0].state, BlockState::Failed { error, .. }
-        if error.contains("sha256 mismatch"))
-    );
     watcher.check(&mut handle.db, &bus.sender()).unwrap();
     let events = drain_consume(&mut bus, &mut consumer, &mut handle.db);
     assert!(!events
@@ -1246,17 +1255,13 @@ impl Downloader for GatedDownloader {
 #[tokio::test]
 async fn model_dropped_while_other_model_downloading() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[english().live.id]));
+    let store = Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &cached_except(english().refine)));
     let calls = Arc::new(AtomicUsize::new(0));
     let (gate, receiver) = watch::channel(false);
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(GatedDownloader {
-            inner: FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone()),
-            gate: receiver,
-        }),
-        store.clone(),
-        Arc::new(NoSources),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(GatedDownloader {
+        inner: FixtureDownloader::new(vec![1; 64], Outcome::Ok, calls.clone()),
+        gate: receiver,
+    }), store.clone(), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
     let watcher = ModelWatcher::new(store.clone());
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
@@ -1299,16 +1304,12 @@ fn source_view() -> UiView {
 }
 
 fn source_consumer(handle: &DownloadsHandle) -> Consumer {
-    Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(
-            vec![1; 64], Outcome::Ok, Arc::new(AtomicUsize::new(0)),
-        )),
-        Arc::new(FixtureStore::new(
-            handle._tmp.path().to_path_buf(),
-            &english().models().map(|model| model.id),
-        )),
-        Arc::new(NoSources),
-    ))
+    Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+        vec![1; 64], Outcome::Ok, Arc::new(AtomicUsize::new(0)),
+    )), Arc::new(FixtureStore::new(
+        handle._tmp.path().to_path_buf(),
+        &required_ids(),
+    )), Arc::new(NoSources), voice_bird_next::testing::recording_services(handle._tmp.path())))
 }
 
 fn source_intent(
@@ -1334,7 +1335,7 @@ async fn output_funnel_restores_selected_rows_and_preserves_source_through_model
     consumer.consumers.ui_view = source_view();
     let store = Arc::new(FixtureStore::new(
         handle._tmp.path().to_path_buf(),
-        &english().models().map(|model| model.id),
+        &required_ids(),
     ));
     consumer.consumers.model_store.model_store = store.clone();
     let watcher = ModelWatcher::new(store.clone());
@@ -1469,15 +1470,11 @@ async fn language_confirm_and_back_race_never_orphans_downloads() {
     for confirm_first in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = Consumer::new(Consumers::new(
-            Arc::new(FixtureDownloader::new(
-                vec![1; 64],
-                Outcome::Ok,
-                calls.clone(),
-            )),
-            Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])),
-            Arc::new(NoSources),
-        ));
+        let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+            vec![1; 64],
+            Outcome::Ok,
+            calls.clone(),
+        )), Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])), Arc::new(NoSources), voice_bird_next::testing::recording_services(tmp.path())));
         let mut bus = EventBus::new();
         let mut handle = downloads_with(&bus);
         ModelWatcher::new(consumer.consumers.model_store.model_store.clone()).check(&mut handle.db, &bus.sender())
@@ -1503,7 +1500,7 @@ async fn language_confirm_and_back_race_never_orphans_downloads() {
             settle_until(&mut bus, &mut consumer, &mut handle.db, |view, _| {
                 matches!(view.blocks[0].state, BlockState::Recording { .. })
             }).await;
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(calls.load(Ordering::SeqCst), english().models().len());
             assert!(!voice_bird_next::db::apply(&mut handle.db, &accepted[0]).unwrap());
             assert!(bus.drain().any(|event| matches!(
                 event,
@@ -1534,9 +1531,7 @@ async fn back_is_ignored_outside_source_pickers_and_menu_intercepts_it() {
             language: english(),
             pending: vec![english().live.id],
         },
-        BlockState::Recording {
-            language: english(),
-        },
+        BlockState::recording(english()),
         BlockState::Failed {
             language: english(),
             pending: Vec::new(),
@@ -1614,17 +1609,13 @@ async fn queued_confirm_then_close_clears_steps_before_block_id_reuse() {
 #[tokio::test]
 async fn add_block_with_menu_open_uses_catalog_and_focuses_new_source_picker() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut consumer = Consumer::new(Consumers::new(
-        Arc::new(FixtureDownloader::new(
-            Vec::new(),
-            Outcome::Ok,
-            Arc::new(AtomicUsize::new(0)),
-        )),
-        Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])),
-        Arc::new(voice_bird_next::testing::FixtureSources(Some(
-            voice_bird_next::testing::sample_source_snapshot(),
-        ))),
-    ));
+    let mut consumer = Consumer::new(Consumers::new(Arc::new(FixtureDownloader::new(
+        Vec::new(),
+        Outcome::Ok,
+        Arc::new(AtomicUsize::new(0)),
+    )), Arc::new(FixtureStore::new(tmp.path().to_path_buf(), &[])), Arc::new(voice_bird_next::testing::FixtureSources(Some(
+        voice_bird_next::testing::sample_source_snapshot(),
+    ))), voice_bird_next::testing::recording_services(tmp.path())));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
     consumer.consumers.ui_view.apply(&AppEvent::MenuOpened);

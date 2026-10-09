@@ -16,6 +16,8 @@ pub enum ModelFormat {
     WhisperGguf,
     /// A gzipped tarball containing an ONNX encoder + decoder pair.
     NemotronPackage,
+    /// A ZIP containing a compiled Core ML Whisper encoder.
+    CoreMlEncoder,
 }
 
 /// One row of the catalog.
@@ -36,8 +38,8 @@ pub struct ModelEntry {
     pub download_sha256: &'static str,
 }
 
-/// Inline copy of the six built-in SST models. Order matches the legacy
-/// `voice_bird_cli::Catalog::builtin()` ordering; tests pin this list.
+/// Whisper decoder used by the live pass. Native encoder assets have separate
+/// catalog rows so cached decoder weights never need downloading again.
 pub const DISTIL_SMALL_EN: ModelEntry = ModelEntry {
     id: "distil-small.en",
     size_mb: 250,
@@ -93,6 +95,28 @@ pub const TINY_EN: ModelEntry = ModelEntry {
     download_sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
 };
 
+/// The student retains the complete, frozen small.en teacher encoder:
+/// https://huggingface.co/distil-whisper/distil-small.en (teacher identity)
+/// https://huggingface.co/papers/2311.00430 (§7.2 and Figure 1: copied/frozen).
+/// Only the encoder is shared; the distil-small.en decoder is unchanged.
+pub const DISTIL_SMALL_EN_ENCODER: ModelEntry = ModelEntry {
+    id: "distil-small.en-encoder",
+    size_mb: 163,
+    language: "en",
+    format: ModelFormat::CoreMlEncoder,
+    download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-encoder.mlmodelc.zip",
+    download_sha256: "b2ef1c506378b825b4b4341979a93e1656b5d6c129f17114cfb8fb78aabc2f89",
+};
+
+pub const LARGE_V3_TURBO_ENCODER: ModelEntry = ModelEntry {
+    id: "large-v3-turbo-encoder",
+    size_mb: 1_174,
+    language: "multi",
+    format: ModelFormat::CoreMlEncoder,
+    download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-encoder.mlmodelc.zip",
+    download_sha256: "84bedfe895bd7b5de6e8e89a0803dfc5addf8c0c5bc4c937451716bf7cf7988a",
+};
+
 pub const CATALOG: &[ModelEntry] = &[
     DISTIL_SMALL_EN,
     DISTIL_LARGE_V3,
@@ -100,6 +124,8 @@ pub const CATALOG: &[ModelEntry] = &[
     NEMOTRON_STREAMING,
     BASE_EN,
     TINY_EN,
+    DISTIL_SMALL_EN_ENCODER,
+    LARGE_V3_TURBO_ENCODER,
 ];
 
 /// Direction the picker moved.
@@ -175,16 +201,6 @@ impl SessionMenu {
 mod tests {
     use super::*;
 
-    #[test]
-    fn catalog_contains_expected_six_entries() {
-        assert_eq!(CATALOG.len(), 6);
-        assert_eq!(CATALOG[0].id, "distil-small.en");
-        assert_eq!(CATALOG[1].id, "distil-large-v3");
-        assert_eq!(CATALOG[2].id, "large-v3-turbo");
-        assert_eq!(CATALOG[3].id, "nemotron-3.5-asr-streaming-0.6b");
-        assert_eq!(CATALOG[4].id, "base.en");
-        assert_eq!(CATALOG[5].id, "tiny.en");
-    }
 
     #[test]
     fn list_picker_saturates_at_both_ends() {

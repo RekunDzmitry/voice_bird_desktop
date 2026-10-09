@@ -1,6 +1,6 @@
 ┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
 │┌ 1 · en ───────────────────────┐│ 2 · en                       ││ 3 · en                        ││
-││● recording (mocked)           ││● recording (mocked)          ││● recording (mocked)           ││
+││● recording                    ││● recording                   ││● recording                    ││
 ││                               ││                              ││                               ││
 ││                               ││                              ││                               ││
 ││                               ││                              ││                               ││

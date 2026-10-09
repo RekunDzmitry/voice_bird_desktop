@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::audio_sources::{AudioSourceSnapshot, FunnelStep, SourceSelection};
-use crate::bus::{AppEvent, FocusMove};
+use crate::bus::{AppEvent, FocusMove, TranscriptPass};
 use crate::language::LanguageProfile;
 use crate::picker::{ListPicker, ModelEntry, PickerEvent, SessionMenu};
 
@@ -20,6 +20,18 @@ pub enum DownloadPhase {
 /// the session menu (`Tab`).
 pub const MAX_VISIBLE_BLOCKS: usize = 4;
 
+/// Bound render-side history independently of the on-disk transcript.
+pub const MAX_TRANSCRIPT_SEGMENTS: usize = 100;
+pub const MAX_TRANSCRIPT_LINES: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSegment {
+    pub pass: TranscriptPass,
+    pub t_start_ms: u64,
+    pub t_end_ms: u64,
+    pub text: String,
+}
+
 /// State of one block. The block is the unit of interaction: it picks a
 /// language, waits for both of its models, then records with that language.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,9 +46,15 @@ pub enum BlockState {
         language: &'static LanguageProfile,
         pending: Vec<&'static str>,
     },
-    /// Mocked in this PR — no audio device; the state only changes rendering.
     /// Recording stops when either required model goes missing.
-    Recording { language: &'static LanguageProfile },
+    Recording {
+        language: &'static LanguageProfile,
+        lines: Vec<String>,
+        tentative: String,
+        session_dir: Option<String>,
+        recording: Option<u64>,
+        segments: Vec<TranscriptSegment>,
+    },
     /// A required model failed. Retry re-checks both models on disk.
     Failed {
         language: &'static LanguageProfile,
@@ -44,6 +62,19 @@ pub enum BlockState {
         /// Required models that are still running after the failure.
         pending: Vec<&'static str>,
     },
+}
+
+impl BlockState {
+    pub fn recording(language: &'static LanguageProfile) -> Self {
+        Self::Recording {
+            language,
+            lines: Vec::new(),
+            tentative: String::new(),
+            session_dir: None,
+            recording: None,
+            segments: Vec::new(),
+        }
+    }
 }
 
 /// A single inner column. Pure data — no threads, no handles, no clock.
@@ -101,7 +132,7 @@ impl Block {
                 None
             }
             BlockState::Waiting { language, .. }
-            | BlockState::Recording { language }
+            | BlockState::Recording { language, .. }
             | BlockState::Failed { language, .. } => Some(language),
         }
     }
@@ -116,7 +147,7 @@ impl Block {
     /// Models this active block counts as installed, excluding pending work.
     pub fn ready_models(&self) -> impl Iterator<Item = &'static ModelEntry> + '_ {
         let models = match &self.state {
-            BlockState::Recording { language } | BlockState::Waiting { language, .. } => {
+            BlockState::Recording { language, .. } | BlockState::Waiting { language, .. } => {
                 Some(language.models())
             }
             BlockState::PickingLanguage(_)
@@ -127,6 +158,7 @@ impl Block {
         models
             .into_iter()
             .flatten()
+            .copied()
             .filter(|model| !self.pending_models().contains(&model.id))
     }
 }
@@ -218,6 +250,19 @@ impl Default for UiView {
 }
 
 impl UiView {
+    /// Claim a worker identity before it can publish results for this block.
+    pub fn begin_session(&mut self, block: u8, id: u64) {
+        if let Some(BlockState::Recording {
+            recording, lines, tentative, session_dir, segments, ..
+        }) = self.blocks.iter_mut().find(|candidate| candidate.id == block).map(|block| &mut block.state) {
+            *recording = Some(id);
+            lines.clear();
+            tentative.clear();
+            *session_dir = None;
+            segments.clear();
+        }
+    }
+
     pub fn focused(&self) -> Option<&Block> {
         self.blocks.get(self.focus)
     }
@@ -344,7 +389,7 @@ impl UiView {
                 _ => None,
             };
             if let Some(language) = completed_language {
-                block.state = BlockState::Recording { language };
+                block.state = BlockState::recording(language);
             }
         }
     }
@@ -352,7 +397,7 @@ impl UiView {
     fn mark_missing(&mut self, model: &'static str) {
         for block in &mut self.blocks {
             match &mut block.state {
-                BlockState::Recording { language }
+                BlockState::Recording { language, .. }
                     if language.models().iter().any(|entry| entry.id == model) =>
                 {
                     block.state = BlockState::Waiting {
@@ -421,6 +466,78 @@ impl UiView {
             }
         }
         match event {
+            AppEvent::RecordingStarted { block, recording: id, session_dir: path, .. } => {
+                if let Some(BlockState::Recording { recording, session_dir, .. }) =
+                    self.blocks.iter_mut().find(|candidate| candidate.id == *block).map(|block| &mut block.state)
+                {
+                    if *recording == Some(*id) {
+                        *session_dir = Some(path.clone());
+                    }
+                }
+            }
+            AppEvent::TranscriptTentative { block, recording: id, text, .. } => {
+                if let Some(BlockState::Recording { recording, tentative, .. }) =
+                    self.blocks.iter_mut().find(|candidate| candidate.id == *block).map(|block| &mut block.state)
+                {
+                    if *recording == Some(*id) {
+                        tentative.clone_from(text);
+                    }
+                }
+            }
+            AppEvent::TranscriptCommitted { block, recording: id, pass, t_start_ms, t_end_ms, text, .. } => {
+                if let Some(BlockState::Recording { recording, lines, segments, .. }) =
+                    self.blocks.iter_mut().find(|candidate| candidate.id == *block).map(|block| &mut block.state)
+                {
+                    if *recording != Some(*id) {
+                        return;
+                    }
+                    let overlaps = |segment: &TranscriptSegment| {
+                        segment.t_start_ms < *t_end_ms && *t_start_ms < segment.t_end_ms
+                    };
+                    if *pass == TranscriptPass::Live
+                        && segments.iter().any(|segment| segment.pass == TranscriptPass::Refined && overlaps(segment))
+                    {
+                        return;
+                    }
+                    if *pass == TranscriptPass::Refined {
+                        segments.retain(|segment| !overlaps(segment));
+                    }
+                    segments.push(TranscriptSegment {
+                        pass: *pass,
+                        t_start_ms: *t_start_ms,
+                        t_end_ms: *t_end_ms,
+                        text: text.clone(),
+                    });
+                    segments.sort_by_key(|segment| (segment.t_start_ms, segment.t_end_ms));
+                    let excess = segments.len().saturating_sub(MAX_TRANSCRIPT_SEGMENTS);
+                    segments.drain(..excess);
+                    *lines = segments.iter().flat_map(|segment| segment.text.lines().map(str::to_owned)).collect();
+                    let excess = lines.len().saturating_sub(MAX_TRANSCRIPT_LINES);
+                    lines.drain(..excess);
+                }
+            }
+            AppEvent::RecordingStopped { block, recording: id } => {
+                if let Some(BlockState::Recording { recording, .. }) =
+                    self.blocks.iter_mut().find(|candidate| candidate.id == *block).map(|block| &mut block.state)
+                {
+                    if *recording == Some(*id) {
+                        *recording = None;
+                    }
+                }
+            }
+            AppEvent::RecordingFailed { block, recording: id, error } => {
+                if let Some(block) = self.blocks.iter_mut().find(|candidate| candidate.id == *block) {
+                    if let BlockState::Recording { language, recording, .. } = &block.state {
+                        if *recording == Some(*id) {
+                            block.state = BlockState::Failed {
+                                language,
+                                error: error.clone(),
+                                pending: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
             AppEvent::AddBlock => self.push_block(None),
             AppEvent::AddSourceBlock { snapshot } => self.push_block(Some(snapshot.clone())),
             AppEvent::SourceStepChanged {
@@ -542,7 +659,7 @@ impl UiView {
                         BlockState::PickingLanguage(_) | BlockState::Failed { .. }
                     ) {
                         block.state = if pending.is_empty() {
-                            BlockState::Recording { language }
+                            BlockState::recording(language)
                         } else {
                             BlockState::Waiting {
                                 language,
@@ -698,6 +815,10 @@ impl UiView {
             AppEvent::RequestBlock
             | AppEvent::DownloadFetched { .. }
             | AppEvent::BeginLanguage { .. }
+            | AppEvent::TranscriptionRequested { .. }
+            | AppEvent::TranscriptionStarted { .. }
+            | AppEvent::TranscriptionFinished { .. }
+            | AppEvent::TranscriptionFailed { .. }
             | AppEvent::DiscardInflight { .. } => {}
         }
     }
@@ -720,13 +841,103 @@ mod tests {
         }
     }
 
+    fn recording_view() -> UiView {
+        let mut view = UiView {
+            blocks: vec![Block::new(1, BlockState::recording(english()))],
+            ..UiView::default()
+        };
+        view.begin_session(1, 7);
+        view
+    }
+
+    fn commit(id: u64, pass: TranscriptPass, start: u64, end: u64, text: &str) -> AppEvent {
+        AppEvent::TranscriptCommitted {
+            block: 1, recording: id, pass, t_start_ms: start, t_end_ms: end, text: text.into(),
+            job: 1, worker: 1,
+            transcription: crate::bus::TranscriptionMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn resumed_block_rejects_old_worker_results_and_terminal_events() {
+        let mut view = recording_view();
+        view.apply(&commit(7, TranscriptPass::Live, 0, 1000, "old text"));
+        view.apply(&AppEvent::TranscriptTentative { block: 1, recording: 7, job: 1, worker: 1, text: "old tentative".into(), transcription: crate::bus::TranscriptionMetrics::default() });
+        view.begin_session(1, 8);
+        let expected = view.blocks[0].state.clone();
+        for event in [
+            commit(7, TranscriptPass::Refined, 0, 1000, "stale text"),
+            AppEvent::TranscriptTentative { block: 1, recording: 7, job: 1, worker: 1, text: "stale tentative".into(), transcription: crate::bus::TranscriptionMetrics::default() },
+            AppEvent::RecordingStopped { block: 1, recording: 7 },
+            AppEvent::RecordingFailed { block: 1, recording: 7, error: "stale failure".into() },
+            AppEvent::RecordingStarted {
+                block: 1, recording: 7, session_dir: "/stale".into(),
+                source: crate::audio::CaptureSource::Mic { device_name: String::new() },
+                language: "en".into(), started_at: "2026-10-08T12:00:00Z".into(),
+            },
+        ] {
+            view.apply(&event);
+            assert_eq!(view.blocks[0].state, expected);
+        }
+        view.apply(&commit(8, TranscriptPass::Live, 0, 1000, "new text"));
+        let BlockState::Recording { lines, recording, .. } = &view.blocks[0].state else { panic!("recording expected") };
+        assert_eq!(lines, &["new text"]);
+        assert_eq!(*recording, Some(8));
+    }
+
+    #[test]
+    fn refined_overlap_replaces_live_but_preserves_later_live_and_tentative() {
+        let mut view = recording_view();
+        view.apply(&commit(7, TranscriptPass::Live, 0, 1000, "early"));
+        view.apply(&commit(7, TranscriptPass::Live, 1000, 2000, "later"));
+        view.apply(&AppEvent::TranscriptTentative { block: 1, recording: 7, job: 1, worker: 1, text: "pending".into(), transcription: crate::bus::TranscriptionMetrics::default() });
+        view.apply(&commit(7, TranscriptPass::Refined, 0, 1000, "corrected"));
+        view.apply(&commit(7, TranscriptPass::Live, 500, 900, "delayed early"));
+        view.apply(&commit(7, TranscriptPass::Live, 2000, 3000, "newest"));
+        let BlockState::Recording { lines, tentative, segments, .. } = &view.blocks[0].state else { panic!("recording expected") };
+        assert_eq!(lines, &["corrected", "later", "newest"]);
+        assert_eq!(tentative, "pending");
+        assert_eq!(segments[0].pass, TranscriptPass::Refined);
+        assert_eq!(segments[1].t_start_ms, 1000);
+    }
+
+    #[test]
+    fn transcript_history_retains_only_bounded_newest_segments_and_lines() {
+        let mut view = recording_view();
+        for index in 0..MAX_TRANSCRIPT_SEGMENTS + 20 {
+            view.apply(&commit(7, TranscriptPass::Live, index as u64, index as u64 + 1, &format!("line {index}\nsecond {index}")));
+        }
+        let BlockState::Recording { lines, segments, .. } = &view.blocks[0].state else { panic!("recording expected") };
+        assert_eq!(segments.len(), MAX_TRANSCRIPT_SEGMENTS);
+        assert_eq!(segments[0].t_start_ms, 20);
+        assert_eq!(lines.len(), MAX_TRANSCRIPT_LINES);
+        assert_eq!(lines.first().unwrap(), "line 70");
+        assert_eq!(lines.last().unwrap(), "second 119");
+    }
+
+    #[test]
+    fn current_worker_stop_and_failure_are_applied_only_while_recording() {
+        let mut view = recording_view();
+        view.apply(&commit(7, TranscriptPass::Live, 0, 1000, "retained"));
+        view.apply(&AppEvent::RecordingStopped { block: 1, recording: 7 });
+        let BlockState::Recording { recording, lines, .. } = &view.blocks[0].state else { panic!("recording expected") };
+        assert_eq!(*recording, None);
+        assert_eq!(lines, &["retained"]);
+        view.begin_session(1, 8);
+        view.apply(&AppEvent::RecordingFailed { block: 1, recording: 8, error: "capture denied".into() });
+        let BlockState::Failed { language, error, pending } = &view.blocks[0].state else { panic!("failure expected") };
+        assert_eq!(*language, english());
+        assert_eq!(error, "capture denied");
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn missing_model_stops_every_affected_recording_block_and_success_resumes() {
         let language = english();
         let mut s = UiView {
             blocks: vec![
-                Block::new(1, BlockState::Recording { language }),
-                Block::new(2, BlockState::Recording { language }),
+                Block::new(1, BlockState::recording(language)),
+                Block::new(2, BlockState::recording(language)),
             ],
             ..UiView::default()
         };
@@ -737,32 +948,36 @@ mod tests {
                 language,
                 pending: vec![language.live.id],
             });
-            assert_eq!(block.ready_models().collect::<Vec<_>>(), vec![language.refine]);
+            let ready: Vec<_> = language.models().iter().copied()
+                .filter(|model| model.id != language.live.id).collect();
+            assert_eq!(block.ready_models().collect::<Vec<_>>(), ready);
         }
         s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
         for block in &s.blocks {
-            assert_eq!(block.state, BlockState::Recording { language });
+            assert_eq!(block.state, BlockState::recording(language));
             assert_eq!(block.ready_models().collect::<Vec<_>>(), language.models());
         }
     }
 
     #[test]
-    fn missing_model_extends_waiting_once_and_requires_both_models_to_resume() {
+    fn missing_model_extends_waiting_once_and_requires_all_assets_to_resume() {
         let language = english();
         let mut s = UiView::default();
         s.apply(&AppEvent::AddBlock);
-        s.apply(&select(1, vec![language.refine.id]));
+        let mut pending: Vec<_> = language.models().iter()
+            .filter(|model| model.id != language.live.id).map(|model| model.id).collect();
+        s.apply(&select(1, pending.clone()));
         s.apply(&AppEvent::ModelMissing(language.live));
         s.apply(&AppEvent::ModelMissing(language.live));
-        assert_eq!(s.blocks[0].state, BlockState::Waiting {
-            language,
-            pending: vec![language.refine.id, language.live.id],
-        });
+        pending.push(language.live.id);
+        assert_eq!(s.blocks[0].state, BlockState::Waiting { language, pending });
         assert!(s.blocks[0].ready_models().next().is_none());
-        s.apply(&AppEvent::DownloadSucceeded { attempt: 1, model: language.refine.id });
+        for model in language.models().iter().filter(|model| model.id != language.live.id) {
+            s.apply(&AppEvent::DownloadSucceeded { attempt: 1, model: model.id });
+        }
         assert_eq!(s.blocks[0].pending_models(), &[language.live.id]);
         s.apply(&AppEvent::DownloadSucceeded { attempt: 2, model: language.live.id });
-        assert_eq!(s.blocks[0].state, BlockState::Recording { language });
+        assert_eq!(s.blocks[0].state, BlockState::recording(language));
     }
 
     #[test]
@@ -771,6 +986,7 @@ mod tests {
             code: "other",
             live: &crate::picker::BASE_EN,
             refine: &crate::picker::TINY_EN,
+            required: &[&crate::picker::BASE_EN, &crate::picker::TINY_EN],
         };
         let language = english();
         assert!(OTHER.models().iter().all(|model| model.id != language.live.id));
@@ -780,7 +996,7 @@ mod tests {
                 Block::new(1, BlockState::Failed {
                     language, error: "failure".to_string(), pending: vec![],
                 }),
-                Block::new(2, BlockState::Recording { language: &OTHER }),
+                Block::new(2, BlockState::recording(&OTHER)),
                 Block::new(3, BlockState::Waiting {
                     language: &OTHER, pending: vec![OTHER.refine.id],
                 }),
@@ -823,7 +1039,7 @@ mod tests {
         assert_eq!(s.focus, 1);
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
         assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
@@ -1097,7 +1313,7 @@ mod tests {
         assert_eq!(picker_index, 0);
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
     }
 
@@ -1109,7 +1325,7 @@ mod tests {
         s.apply(&select(1, Vec::new()));
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
         assert!(matches!(s.blocks[1].state, BlockState::PickingLanguage(_)));
     }
@@ -1122,7 +1338,7 @@ mod tests {
         s.apply(&select(1, vec![english().live.id]));
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
     }
 
@@ -1292,7 +1508,7 @@ mod tests {
         });
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
     }
 
@@ -1317,7 +1533,7 @@ mod tests {
 
         assert!(matches!(
             s.blocks[0].state,
-            BlockState::Recording { language } if language == english()
+            BlockState::Recording { language, .. } if language == english()
         ));
     }
 

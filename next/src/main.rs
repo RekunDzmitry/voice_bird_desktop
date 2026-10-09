@@ -122,6 +122,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
         downloader,
         model_store.clone(),
         voice_bird_next::audio_sources::system_sources(),
+        voice_bird_next::producer::recording::RecordingServices {
+            capture: voice_bird_next::audio::system_capture(),
+            engines: voice_bird_next::transcribe::system_engines(),
+            sessions_root: voice_bird_next::db::data_dir().join("sessions"),
+        },
     ));
     let watcher = ModelWatcher::new(model_store);
     watcher.check(&mut db, &tx).map_err(io::Error::other)?;
@@ -129,6 +134,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
+    let result: io::Result<()> = async {
     loop {
         if dirty {
             terminal.draw(|f| voice_bird_next::ui::render(f, &consumer.consumers.ui_view))?;
@@ -155,11 +161,29 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
             }
         }
         if consumer.consumers.ui_view.should_quit {
-            cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);
             break;
         }
     }
-    Ok(())
+        Ok(())
+    }.await;
+    // All exit paths finalize recordings, including input/terminal failures.
+    if !consumer.consumers.ui_view.should_quit {
+        consume_logged(vec![AppEvent::Quit], &mut log, &mut consumer, &mut db, &tx);
+    }
+    consumer.consumers.recording.producer.begin_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !consumer.consumers.recording.producer.shutdown_finished() {
+        match tokio::time::timeout_at(deadline, bus.recv()).await {
+            Ok(Some(event)) => {
+                let events = std::iter::once(event).chain(bus.drain()).collect();
+                consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    consumer.consumers.recording.producer.finish_shutdown(&tx);
+    cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);
+    result
 }
 
 /// Log before the database gate; only accepted events reach the consumer.
@@ -175,12 +199,17 @@ fn consume_logged(
         if let Some(log) = log.as_mut() {
             log.append(&event);
         }
-        match voice_bird_next::db::apply(db, &event) {
-            Ok(true) => accepted.push(event),
-            Ok(false) => {}
+        let admitted = match voice_bird_next::db::apply(db, &event) {
+            Ok(admitted) => admitted,
             Err(error) => {
                 eprintln!("voice-bird-next: event gate failed for {event:?}: {error}");
+                false
             }
+        };
+        if admitted {
+            accepted.push(event);
+        } else if let AppEvent::TranscriptionRequested { request } = event {
+            consumer.consumers.recording.producer.reject_unaccepted(&request);
         }
     }
     consumer.consume(&accepted, db, tx);
@@ -208,7 +237,10 @@ fn cleanup_inflight(
 ) {
     let active = match downloads::active(db) {
         Ok(a) => a,
-        Err(_) => return,
+        Err(error) => {
+            eprintln!("voice-bird-next: cannot query downloads during shutdown: {error}");
+            Vec::new()
+        }
     };
     for row in &active {
         let _ = downloads::cancel(db, row.model.as_ref());

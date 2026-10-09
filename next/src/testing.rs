@@ -114,6 +114,10 @@ impl ModelStore for FixtureStore {
         self.present.lock().unwrap().contains(&entry.id)
     }
 
+    fn installed_path(&self, entry: &ModelEntry) -> PathBuf {
+        crate::transcription_models::handler_for(entry.format).installed_path(&self.root, entry.id)
+    }
+
     fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<PathBuf, DownloadError> {
         // Per-attempt suffix so two concurrent attempts of the
         // same model write to different paths; mirrors the
@@ -267,5 +271,115 @@ impl Downloader for FixtureDownloader {
             });
         }
         Ok(())
+    }
+}
+
+/// Scripted normalized PCM, followed by an idle stream until requested stop.
+pub struct FixtureCapture {
+    pub sources: Mutex<Vec<crate::audio::CaptureSource>>,
+    pub calls: AtomicUsize,
+    chunks: Vec<Vec<f32>>,
+    failures: Mutex<std::collections::VecDeque<String>>,
+}
+
+impl FixtureCapture {
+    pub fn new(chunks: Vec<Vec<f32>>) -> Self {
+        Self {
+            sources: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            chunks,
+            failures: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub fn fail_next_open(&self, error: impl Into<String>) {
+        self.failures.lock().unwrap().push_back(error.into());
+    }
+}
+
+impl crate::audio::AudioCapture for FixtureCapture {
+    fn open(&self, source: &crate::audio::CaptureSource) -> anyhow::Result<Box<dyn crate::audio::CaptureStream>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.sources.lock().unwrap().push(source.clone());
+        if let Some(error) = self.failures.lock().unwrap().pop_front() {
+            anyhow::bail!(error);
+        }
+        let (keepalive, wait) = std::sync::mpsc::channel();
+        Ok(Box::new(FixtureStream {
+            chunks: self.chunks.clone().into(),
+            _keepalive: keepalive,
+            wait,
+        }))
+    }
+}
+
+struct FixtureStream {
+    chunks: std::collections::VecDeque<Vec<f32>>,
+    _keepalive: std::sync::mpsc::Sender<()>,
+    wait: std::sync::mpsc::Receiver<()>,
+}
+
+impl crate::audio::CaptureStream for FixtureStream {
+    fn next_chunk(&mut self, timeout: Duration) -> anyhow::Result<crate::audio::CaptureChunk> {
+        if let Some(pcm) = self.chunks.pop_front() {
+            return Ok(crate::audio::CaptureChunk::Data(pcm));
+        }
+        let _ = self.wait.recv_timeout(timeout);
+        Ok(crate::audio::CaptureChunk::Timeout)
+    }
+
+    fn queued_samples(&self) -> u64 {
+        self.chunks.iter().map(|chunk| chunk.len() as u64).sum()
+    }
+}
+
+/// Separate live/refine outputs at each feed and at finalization.
+#[derive(Default)]
+pub struct FixtureTranscriberFactory {
+    pub live_steps: Vec<Vec<crate::transcribe::TranscriptOut>>,
+    pub refine_steps: Vec<Vec<crate::transcribe::TranscriptOut>>,
+    pub live_finish: Vec<crate::transcribe::TranscriptOut>,
+    pub refine_finish: Vec<crate::transcribe::TranscriptOut>,
+}
+
+pub struct FixtureTranscriber {
+    steps: std::collections::VecDeque<Vec<crate::transcribe::TranscriptOut>>,
+    finish: Vec<crate::transcribe::TranscriptOut>,
+}
+
+impl crate::transcribe::TranscriberFactory for FixtureTranscriberFactory {
+    fn live(&self, _: &Path, _: &str) -> anyhow::Result<Box<dyn crate::transcribe::Transcriber>> {
+        Ok(Box::new(FixtureTranscriber {
+            steps: self.live_steps.clone().into(), finish: self.live_finish.clone(),
+        }))
+    }
+
+    fn refine(&self, _: &Path, _: &str) -> anyhow::Result<Box<dyn crate::transcribe::Transcriber>> {
+        Ok(Box::new(FixtureTranscriber {
+            steps: self.refine_steps.clone().into(), finish: self.refine_finish.clone(),
+        }))
+    }
+}
+
+impl crate::transcribe::Transcriber for FixtureTranscriber {
+    fn feed(&mut self, _: &[f32]) -> anyhow::Result<Vec<crate::transcribe::TranscriptOut>> {
+        Ok(self.steps.pop_front().unwrap_or_default())
+    }
+
+    fn feed_chunks(&mut self, _: &[crate::audio::buffer::PcmSlice]) -> anyhow::Result<Vec<crate::transcribe::TranscriptOut>> {
+        Ok(self.steps.pop_front().unwrap_or_default())
+    }
+
+    fn finish(&mut self) -> anyhow::Result<Vec<crate::transcribe::TranscriptOut>> {
+        Ok(std::mem::take(&mut self.finish))
+    }
+}
+
+/// Isolated, idle recording collaborators for download/source lifecycle tests.
+pub fn recording_services(root: &Path) -> crate::producer::recording::RecordingServices {
+    crate::producer::recording::RecordingServices {
+        capture: Arc::new(FixtureCapture::new(Vec::new())),
+        engines: Arc::new(FixtureTranscriberFactory::default()),
+        sessions_root: root.join("sessions"),
     }
 }

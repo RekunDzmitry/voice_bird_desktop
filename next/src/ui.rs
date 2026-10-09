@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Stylize,
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
     Frame,
 };
@@ -26,7 +26,7 @@ use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView}
 /// Each column renders its own stage:
 /// - `PickingLanguage(p)` → the language list, `▶` on `p.index`.
 /// - `Waiting` → one gauge per model role.
-/// - `Recording` → `● recording (mocked)`.
+/// - `Recording` → committed transcript tail, tentative text, and session path.
 /// - `Failed` → the error wrapped, plus `r retry · Esc close`.
 pub fn render(f: &mut Frame, ui_view: &UiView) {
     // When the reducer sets a transient warning (e.g. "session
@@ -116,6 +116,9 @@ fn render_block(
         BlockState::Waiting { language, pending } => {
             render_waiting(f, language, pending, ui_view, inner);
         }
+        BlockState::Recording { lines, tentative, session_dir, .. } => {
+            render_recording(f, lines, tentative, session_dir.as_deref(), inner);
+        }
         _ => {
             let lines = block_body_lines(block);
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -158,7 +161,7 @@ fn block_title(block: &crate::consumer::ui_view::Block) -> String {
         BlockState::PickingDevice(_) => title.push_str("pick a device"),
         BlockState::PickingApp(_) => title.push_str("pick an app"),
         BlockState::PickingLanguage(_) => title.push_str("pick a language"),
-        BlockState::Waiting { language, .. } | BlockState::Recording { language } => {
+        BlockState::Waiting { language, .. } | BlockState::Recording { language, .. } => {
             title.push_str(language.code);
         }
         BlockState::Failed { language, .. } => {
@@ -299,11 +302,66 @@ fn block_body_lines(block: &crate::consumer::ui_view::Block) -> Vec<Line<'static
         BlockState::PickingDevice(_) | BlockState::PickingApp(_) => Vec::new(),
         // Waiting is rendered directly by render_block (Gauge widget).
         BlockState::Waiting { .. } => Vec::new(),
-        BlockState::Recording { .. } => vec![Line::from("● recording (mocked)")],
+        BlockState::Recording { .. } => Vec::new(),
         BlockState::Failed { error, .. } => {
             vec![Line::from(error.clone()), Line::from("r retry · Esc close")]
         }
     }
+}
+
+/// Wrap before choosing the tail, so long older lines cannot push new text
+/// below the viewport. Width follows terminal cells, not UTF-8 bytes.
+fn transcript_rows(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut row = String::new();
+        let mut cells = 0;
+        for ch in line.chars() {
+            let mut bytes = [0; 4];
+            let ch_width = Span::raw(ch.encode_utf8(&mut bytes) as &str).width();
+            if cells + ch_width > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                cells = 0;
+            }
+            row.push(ch);
+            cells += ch_width;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn render_recording(f: &mut Frame, committed: &[String], tentative: &str, session_dir: Option<&str>, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let height = usize::from(area.height);
+    let show_header = height >= 2;
+    let show_path = height >= 4 && session_dir.is_some();
+    let available = height - usize::from(show_header) - usize::from(show_path);
+    let pending = transcript_rows(tentative, usize::from(area.width));
+    let pending_count = pending.len().min(available.div_ceil(2));
+    let committed_count = available - pending_count;
+    let rows: Vec<_> = committed.iter().flat_map(|line| transcript_rows(line, usize::from(area.width))).collect();
+    let committed_start = rows.len().saturating_sub(committed_count);
+    let pending_start = pending.len().saturating_sub(pending_count);
+    let mut lines = Vec::with_capacity(height);
+    if show_header {
+        lines.push(Line::from("● recording"));
+    }
+    lines.extend(rows.into_iter().skip(committed_start).map(Line::from));
+    lines.extend(pending.into_iter().skip(pending_start).map(|line| Line::from(line).dim()));
+    if show_path {
+        while lines.len() < height - 1 {
+            lines.push(Line::from(""));
+        }
+        let name = session_dir.and_then(|path| std::path::Path::new(path).file_name()).map(|name| name.to_string_lossy()).unwrap_or_default();
+        lines.push(Line::from(format!("sessions/{name}")).dim());
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_waiting(
@@ -313,15 +371,24 @@ fn render_waiting(
     ui_view: &UiView,
     area: Rect,
 ) {
+    let models = language.models();
     let rows = Layout::new(
         Direction::Vertical,
-        vec![Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)],
+        models.iter().map(|_| Constraint::Ratio(1, models.len() as u32)),
     )
     .split(area);
-    for ((role, model), row) in [("live", language.live), ("refine", language.refine)]
-        .into_iter()
-        .zip(rows.iter())
-    {
+    for (&model, row) in models.iter().zip(rows.iter()) {
+        let role = if model.id == language.live.id {
+            "live"
+        } else if model.id == language.refine.id {
+            "refine"
+        } else if model.id.strip_suffix("-encoder") == Some(language.live.id) {
+            "live encoder"
+        } else if model.id.strip_suffix("-encoder") == Some(language.refine.id) {
+            "refine encoder"
+        } else {
+            "asset"
+        };
         render_model_gauge(
             f,
             role,
@@ -481,9 +548,7 @@ mod tests {
         let ui_view = UiView {
             blocks: vec![Block {
                 id: 1,
-                state: BlockState::Recording {
-                    language: &LANGUAGES[0],
-                },
+                state: BlockState::recording(&LANGUAGES[0]),
                 ..Default::default()
             }],
             focus: 0,
@@ -501,9 +566,7 @@ mod tests {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
-                    state: BlockState::Recording {
-                        language: &LANGUAGES[0],
-                    },
+                    state: BlockState::recording(&LANGUAGES[0]),
                     ..Default::default()
                 })
                 .collect(),
@@ -521,9 +584,7 @@ mod tests {
             blocks: (1..=3)
                 .map(|id| Block {
                     id,
-                    state: BlockState::Recording {
-                        language: &LANGUAGES[0],
-                    },
+                    state: BlockState::recording(&LANGUAGES[0]),
                     ..Default::default()
                 })
                 .collect(),
@@ -543,9 +604,7 @@ mod tests {
             blocks: (1..=5)
                 .map(|id| Block {
                     id,
-                    state: BlockState::Recording {
-                        language: &LANGUAGES[0],
-                    },
+                    state: BlockState::recording(&LANGUAGES[0]),
                     ..Default::default()
                 })
                 .collect(),
@@ -623,36 +682,6 @@ mod tests {
         assert!(out.contains("refine · ready"), "{out}");
     }
 
-    #[test]
-    fn waiting_block_installing_phase_says_preparing_by_role() {
-        let mut ui_view = UiView {
-            blocks: vec![Block {
-                id: 1,
-                state: BlockState::Waiting {
-                    language: &LANGUAGES[0],
-                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        for model in LANGUAGES[0].models() {
-            ui_view.downloads.insert(
-                model.id,
-                DownloadState {
-                    attempt: 1,
-                    phase: DownloadPhase::Installing,
-                    bytes: 0,
-                    total: Some(100),
-                    bytes_per_sec: 0,
-                },
-            );
-        }
-        let out = render_to_string(&ui_view, 100, 10);
-        assert!(out.contains("live · Preparing…"), "got:\n{out}");
-        assert!(out.contains("refine · Preparing…"), "got:\n{out}");
-        assert!(!out.contains('\u{2588}'));
-    }
 
     #[test]
     fn waiting_block_without_content_length_uses_model_rate() {

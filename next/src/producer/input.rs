@@ -302,7 +302,7 @@ mod tests {
             1,
             BlockState::Waiting {
                 language: english(),
-                pending: english().models().map(|model| model.id).to_vec(),
+                pending: english().models().iter().map(|model| model.id).collect(),
             },
         ));
         resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);

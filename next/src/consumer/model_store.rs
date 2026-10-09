@@ -175,7 +175,7 @@ mod tests {
         );
         assert!(crate::db::apply(&mut db, &succeeded).unwrap());
         view.apply(&succeeded);
-        assert_eq!(view.blocks[0].state, BlockState::Recording { language });
+        assert_eq!(view.blocks[0].state, BlockState::recording(language));
         assert!(crate::db::models::is_available(&db, entry.id).unwrap());
         assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Succeeded);
     }
@@ -298,6 +298,10 @@ mod tests {
         impl ModelStore for BlockingStore {
             fn is_available(&self, entry: &ModelEntry) -> bool {
                 self.inner.is_available(entry)
+            }
+
+            fn installed_path(&self, entry: &ModelEntry) -> std::path::PathBuf {
+                self.inner.installed_path(entry)
             }
 
             fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<std::path::PathBuf, DownloadError> {
