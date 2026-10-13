@@ -74,6 +74,8 @@
   hardcoded pass range, and create round-robin cursors on first use.
 - Clarify inference failure ownership: rename pool-wide handling to `fail_queue`
   and its startup/runtime failure state to `terminal_error`; behavior is unchanged.
+- Restore the two-block download rendering snapshot and regression test with an
+  explicit two-model fixture, keeping its layout stable with or without Core ML.
 
 ## 0.5.0 (2026-08-05)
 

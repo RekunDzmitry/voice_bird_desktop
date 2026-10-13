@@ -19,6 +19,10 @@ const PICKING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/picking_100x30.txt"
 );
+const DOWNLOADING_TWO_BLOCKS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/downloading_two_blocks_100x30.txt"
+);
 const FAILED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/failed_100x30.txt"
@@ -86,6 +90,54 @@ fn picking_100x30_matches_golden() {
         std::fs::write(PICKING, &out).expect("write golden");
     }
     let expected = std::fs::read_to_string(PICKING).expect("read golden");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn downloading_two_blocks_100x30_matches_golden() {
+    // Keep this two-model layout independent of optional Core ML sidecars.
+    static LANGUAGE: voice_bird_next::language::LanguageProfile =
+        voice_bird_next::language::LanguageProfile {
+            code: "en",
+            live: &voice_bird_next::picker::DISTIL_SMALL_EN,
+            refine: &voice_bird_next::picker::LARGE_V3_TURBO,
+            required: &[
+                &voice_bird_next::picker::DISTIL_SMALL_EN,
+                &voice_bird_next::picker::LARGE_V3_TURBO,
+            ],
+        };
+    let mut ui_view = UiView {
+        blocks: (1..=2)
+            .map(|id| Block {
+                id,
+                state: BlockState::Waiting {
+                    language: &LANGUAGE,
+                    pending: vec![LANGUAGE.live.id, LANGUAGE.refine.id],
+                },
+                ..Default::default()
+            })
+            .collect(),
+        focus: 0,
+        next_block_id: 3,
+        ..Default::default()
+    };
+    for model in LANGUAGE.models() {
+        ui_view.downloads.insert(
+            model.id,
+            DownloadState {
+                attempt: 1,
+                phase: DownloadPhase::Fetching,
+                bytes: 50,
+                total: Some(100),
+                bytes_per_sec: 0,
+            },
+        );
+    }
+    let out = render_to_string(&ui_view, 100, 30);
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(DOWNLOADING_TWO_BLOCKS, &out).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(DOWNLOADING_TWO_BLOCKS).expect("read golden");
     assert_eq!(out, expected);
 }
 
