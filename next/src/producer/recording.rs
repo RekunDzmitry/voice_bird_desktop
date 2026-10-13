@@ -16,7 +16,9 @@ use crate::bus::{
 };
 use crate::db::{recording_workers, Database};
 use crate::session_write::SessionWriter;
-use crate::transcribe::{Transcriber, TranscriberFactory, TranscriptOut};
+use crate::transcribe::{
+    Transcriber, TranscriberFactory, TranscriptOut, LIVE_HOP_SAMPLES, REFINE_WINDOW_SAMPLES,
+};
 
 pub struct RecordingServices {
     pub capture: Arc<dyn AudioCapture>,
@@ -367,7 +369,7 @@ fn coordinate(
             engine: Some(refine),
             active: None,
             done: false,
-            next_sample: 80_000,
+            next_sample: REFINE_WINDOW_SAMPLES as u64,
         },
     ];
     let (replies, results) = mpsc::channel();
@@ -397,7 +399,9 @@ fn coordinate(
             let end = if index == 0 {
                 pending.end
             } else {
-                pending.end.min(pending.start + 80_000)
+                pending
+                    .end
+                    .min(pending.start + REFINE_WINDOW_SAMPLES as u64)
             };
             let finishing = pending.finished && end == pending.end;
             let job = next_monotonic_id();
@@ -428,7 +432,12 @@ fn coordinate(
                 replies: replies.clone(),
             });
             pass.active = Some(job);
-            pass.next_sample = end + if index == 0 { 12_000 } else { 80_000 };
+            pass.next_sample = end
+                + if index == 0 {
+                    LIVE_HOP_SAMPLES as u64
+                } else {
+                    REFINE_WINDOW_SAMPLES as u64
+                };
         }
         if passes.iter().all(|pass| pass.done) {
             let capture_error = buffer.take_error();

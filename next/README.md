@@ -121,9 +121,13 @@ overruns still fail the block rather than silently dropping speech.
 The engine factory caches model weights by canonical path. Each recording/pass
 has an exclusive mutable decoder state. A persistent inference pool sizes itself
 from available CPU parallelism and total RAM at startup. Every worker serves either
-pass, choosing runnable live work before refinement, round-robin across recordings
-within each pass. Multiple recordings can run live jobs concurrently; jobs for the
-same recording/pass never overlap. Running refinement is not preempted.
+pass. Each pass offers its next runnable recording in round-robin order; the worker
+chooses the candidate with the earlier audio-time deadline: capture origin plus
+the job's audio end plus 750 ms for live or five seconds for refinement. Live wins
+ties, but overdue refinement is not starved by newly queued live work. Deadlines
+follow audio age, not enqueue time, so startup backlog is prioritized too.
+Multiple recordings can run live jobs concurrently; jobs for the same
+recording/pass never overlap. Running refinement is not preempted.
 Live tasks consume all available audio and decode only the newest hypothesis;
 refinement processes ordered five-second windows without skipping audio.
 At Quit the pool uses its separate shutdown budget; workers retain the same policy.
@@ -319,7 +323,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 | `src/producer/model_store.rs` | blocking installation workers and install-result events |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
 | `src/producer/recording.rs` | capture threads, per-recording coordinators, stop flags, and bounded shutdown |
-| `src/producer/inference.rs` | private tasks, shared live-priority workers, hardware-derived concurrency, and lifecycle events |
+| `src/producer/inference.rs` | private tasks, shared audio-deadline workers, hardware-derived concurrency, and lifecycle events |
 | `src/producer/inference_limits.rs` | CPU/RAM-derived startup worker, recording, and shutdown budgets |
 | `src/producer/mod.rs` | external input and background worker services |
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |

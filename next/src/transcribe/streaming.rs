@@ -1,13 +1,13 @@
 use crate::audio::buffer::PcmSlice;
 
 use super::local_agreement::{pending, segments, step, uncommitted, Token};
-use super::{Transcriber, TranscriptOut};
+use super::{
+    Transcriber, TranscriptOut, LIVE_HOP_SAMPLES as HOP, REFINE_WINDOW_SAMPLES as REFINE_WINDOW,
+};
 
 const RATE: usize = 16_000;
-const HOP: usize = RATE * 3 / 4;
 const LIVE_CAP: usize = RATE * 30;
 const LIVE_OVERLAP: usize = RATE / 5;
-const REFINE_WINDOW: usize = RATE * 5;
 const REFINE_OVERLAP: usize = RATE;
 
 pub(super) trait Decoder: Send {

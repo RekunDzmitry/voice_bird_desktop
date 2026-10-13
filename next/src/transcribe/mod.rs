@@ -9,6 +9,8 @@ use std::sync::Arc;
 use crate::audio::buffer::PcmSlice;
 
 pub(crate) const DECODER_THREADS: usize = 2;
+pub(crate) const LIVE_HOP_SAMPLES: usize = 12_000;
+pub(crate) const REFINE_WINDOW_SAMPLES: usize = 80_000;
 
 #[cfg(all(feature = "local-engine", target_os = "macos"))]
 mod coreml;

@@ -4,13 +4,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::audio::buffer::PcmSlice;
 use crate::bus::{AppEvent, EventSender, TranscriptPass, TranscriptionJob, TranscriptionMetrics};
 use crate::db::inference_queue::Queue;
 use crate::producer::inference_limits::InferenceLimits;
-use crate::transcribe::{Transcriber, TranscriptOut};
+use crate::transcribe::{Transcriber, TranscriptOut, LIVE_HOP_SAMPLES, REFINE_WINDOW_SAMPLES};
 
 pub struct InferenceTask {
     pub request: TranscriptionJob,
@@ -135,12 +135,27 @@ impl State {
         {
             return Ok(None);
         }
-        let (pass, recording) = match self.db().next_ready(TranscriptPass::Live)? {
-            Some((recording, _)) => (TranscriptPass::Live, recording),
-            None => match self.db().next_ready(TranscriptPass::Refined)? {
-                Some((recording, _)) => (TranscriptPass::Refined, recording),
-                None => return Ok(None),
-            },
+        let live = self.db().next_ready(TranscriptPass::Live)?;
+        let refined = self.db().next_ready(TranscriptPass::Refined)?;
+        // Give live its short latency target without starving ordered
+        // refinement. Audio-time deadlines also prioritize a startup backlog,
+        // even if its next five-second job was only just queued.
+        let deadline = |slot: usize, interval_ms: u64| {
+            let task = self.tasks[slot]
+                .as_ref()
+                .expect("ready private inference task");
+            task.origin + Duration::from_millis(task.request.t_end_ms.saturating_add(interval_ms))
+        };
+        let (pass, recording) = match (live, refined) {
+            (Some((_, live_slot)), Some((recording, refined_slot)))
+                if deadline(refined_slot, REFINE_WINDOW_SAMPLES as u64 * 1000 / 16_000)
+                    < deadline(live_slot, LIVE_HOP_SAMPLES as u64 * 1000 / 16_000) =>
+            {
+                (TranscriptPass::Refined, recording)
+            }
+            (Some((recording, _)), _) => (TranscriptPass::Live, recording),
+            (_, Some((recording, _))) => (TranscriptPass::Refined, recording),
+            (None, None) => return Ok(None),
         };
         let slot = self.db_mut().claim(recording, pass, worker)?;
         let task = self.tasks[slot]
@@ -694,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn every_worker_prioritizes_live_and_respects_the_recording_budget() {
+    fn fresh_live_work_meets_its_latency_target_within_the_recording_budget() {
         let h = Harness::new();
         h.queue(request(10, 1, TranscriptPass::Live));
         h.queue(request(20, 1, TranscriptPass::Refined));
@@ -715,6 +730,70 @@ mod tests {
         assert_eq!(next_refine.0.request.pass, TranscriptPass::Refined);
         h.finish(3, next_live);
         h.finish(2, next_refine);
+    }
+
+    #[test]
+    fn overdue_refinement_runs_before_replenished_live_work() {
+        let h = Harness::with_limits(InferenceLimits::for_system(10, 16 * 1024 * 1024 * 1024));
+        for recording in 1..=4 {
+            h.queue(request(recording, 1, TranscriptPass::Live));
+            let refined = request(recording, 2, TranscriptPass::Refined);
+            let mut aged = task(refined, h.bus.sender(), h.replies.clone());
+            aged.origin = Instant::now() - Duration::from_secs(6);
+            h.scheduler.prepare(aged);
+            assert!(h.scheduler.dispatch(&refined));
+        }
+        let mut taken = Vec::new();
+        for worker in 1..=4 {
+            let job = h.take(worker).expect("available recording slot");
+            assert_eq!(job.0.request.pass, TranscriptPass::Refined);
+            assert_eq!(job.0.request.recording, u64::from(worker));
+            taken.push(job);
+        }
+        assert!(h.take(5).is_none(), "recording budget must remain bounded");
+        for (worker, job) in (1..=4).zip(taken) {
+            h.finish(worker, job);
+        }
+        let next = h.take(1).expect("live work still admitted");
+        assert_eq!(next.0.request.pass, TranscriptPass::Live);
+        h.finish(1, next);
+    }
+
+    #[test]
+    fn audio_deadlines_use_each_recordings_own_origin() {
+        let h = Harness::new();
+        let live = request(10, 1, TranscriptPass::Live);
+        let mut aged_live = task(live, h.bus.sender(), h.replies.clone());
+        aged_live.origin = Instant::now() - Duration::from_secs(8);
+        h.scheduler.prepare(aged_live);
+        assert!(h.scheduler.dispatch(&live));
+        let refined = request(20, 1, TranscriptPass::Refined);
+        let mut aged_refined = task(refined, h.bus.sender(), h.replies.clone());
+        aged_refined.origin = Instant::now() - Duration::from_secs(6);
+        h.scheduler.prepare(aged_refined);
+        assert!(h.scheduler.dispatch(&refined));
+        let first = h.take(1).expect("earliest deadline");
+        assert_eq!(first.0.request, live);
+        h.finish(1, first);
+        let next = h.take(1).expect("remaining overdue refinement");
+        assert_eq!(next.0.request, refined);
+        h.finish(1, next);
+    }
+
+    #[test]
+    fn recently_queued_refinement_catches_up_its_older_audio() {
+        let h = Harness::new();
+        h.queue(request(10, 1, TranscriptPass::Live));
+        let mut refined = request(20, 1, TranscriptPass::Refined);
+        refined.t_end_ms = 5000;
+        refined.queued_at_ms = 15_000;
+        let mut delayed = task(refined, h.bus.sender(), h.replies.clone());
+        delayed.origin = Instant::now() - Duration::from_secs(15);
+        h.scheduler.prepare(delayed);
+        assert!(h.scheduler.dispatch(&refined));
+        let next = h.take(1).expect("older refinement audio needs catchup");
+        assert_eq!(next.0.request, refined);
+        h.finish(1, next);
     }
 
     #[test]
