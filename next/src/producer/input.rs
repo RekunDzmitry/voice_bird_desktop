@@ -9,11 +9,11 @@ use crate::audio_sources::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
 use crate::picker::PickerMove;
 
+use crate::consumer::ui_view::{BlockState, UiView};
 use crate::db::{downloads, Database};
 use crate::input::Intent;
 use crate::language::LANGUAGES;
 use crate::picker;
-use crate::consumer::ui_view::{BlockState, UiView};
 /// Stamp the `from_language`/`to_language` codes onto `PickerMoved`.
 /// The input layer has no registry context, so the resolver reads the
 /// focused block's picker without mutating it.
@@ -222,10 +222,10 @@ pub fn resolve_intent(intent: Intent, ui_view: &UiView, db: &mut Database, tx: &
 mod tests {
     use super::*;
     use crate::bus::EventBus;
+    use crate::consumer::ui_view::Block;
     use crate::db::Database;
     use crate::language::{LanguageProfile, LANGUAGES};
     use crate::picker::SessionMenu;
-    use crate::consumer::ui_view::Block;
 
     fn english() -> &'static LanguageProfile {
         &LANGUAGES[0]
@@ -302,7 +302,7 @@ mod tests {
             1,
             BlockState::Waiting {
                 language: english(),
-                pending: english().models().map(|model| model.id).to_vec(),
+                pending: english().models().iter().map(|model| model.id).collect(),
             },
         ));
         resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);

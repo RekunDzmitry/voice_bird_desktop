@@ -13,5 +13,7 @@ else
     fi
 fi
 
+cargo fmt -p voice-bird-next --check
+
 cargo clippy --locked -p voice-bird-next --all-targets -- -D warnings
 cargo clippy --locked -p voice-bird-next --all-targets --no-default-features -- -D warnings

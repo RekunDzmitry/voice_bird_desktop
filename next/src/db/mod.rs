@@ -2,9 +2,10 @@
 //!
 //! One file per machine, opened at the OS data directory (the same
 //! resolution [`crate::event_log`] uses). The module is kept small
-//! on purpose: every table is an implementation of [`Table`], and
-//! [`Database::open`] runs each table's migration and session recovery.
-//! Table operations take `&mut Database`; [`apply`] composes their
+//! on purpose: every table implements [`Table`]. Application tables
+//! migrate in [`Database::open`]; the inference queue migrates its pool-local
+//! in-memory connection separately.
+//! Application table operations take `&mut Database`; [`apply`] composes their
 //! event gates before the consumer can observe an event.
 
 use std::path::{Path, PathBuf};
@@ -52,10 +53,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Run every table's `CREATE TABLE IF NOT EXISTS` definition on
-/// `conn`. Each [`Table::DEFINITION`] is idempotent so this is safe
-/// to call on an existing database — the call is the entire migration
-/// surface today.
+/// Run each table's idempotent `CREATE TABLE IF NOT EXISTS` definition.
 pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()> {
     for t in tables {
         conn.execute_batch(t.definition())?;
@@ -63,20 +61,17 @@ pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()
     Ok(())
 }
 
-/// Path the database file lives at. Mirrors
-/// [`crate::event_log::EventLog`]'s `log_dir`: the platform data
-/// directory via `directories`, falling back to the system temp
-/// directory only when the OS can't provide one. Returns `None` so
-/// `main` can exit with a clear error instead of panicking.
+/// Shared local data root for the session writer and SQLite index.
+/// Retains the established ProjectDirs identity and temp-directory fallback.
+pub fn data_dir() -> PathBuf {
+    ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next")
+        .map(|proj| proj.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("voice-bird-next"))
+}
+
+/// Established database filename, kept stable for existing installations.
 pub fn db_path() -> Option<PathBuf> {
-    if let Some(proj) = ProjectDirs::from("com", "RekunDzmitry", "voice-bird-next") {
-        return Some(proj.data_dir().join("downloads.sqlite"));
-    }
-    Some(
-        std::env::temp_dir()
-            .join("voice-bird-next")
-            .join("downloads.sqlite"),
-    )
+    Some(data_dir().join("downloads.sqlite"))
 }
 
 /// Extension trait so each `Table` impl can hand its `DEFINITION` /
@@ -102,7 +97,8 @@ impl<T: Table> TableExt for T {}
 /// The connection is wrapped here rather than at each table call so
 /// `Database::open` can run migration once, recover leftover
 /// non-terminal rows once, and hand callers a handle that's ready to
-/// read or write. Tables never construct their own connection.
+/// read or write. Application tables never construct their own connection;
+/// the inference queue owns a separate pool-local in-memory connection.
 pub struct Database {
     conn: Connection,
     path: PathBuf,
@@ -124,12 +120,18 @@ impl Database {
         migrate(&conn, &[block_steps::BlockStepsTable])?;
         migrate(&conn, &[models::ModelsTable])?;
         migrate(&conn, &[model_staging::ModelStagingTable])?;
+        migrate(&conn, &[recordings::RecordingsTable])?;
+        migrate(&conn, &[recording_workers::RecordingWorkersTable])?;
+        migrate(&conn, &[transcription_metrics::TranscriptionMetricsTable])?;
+        migrate(&conn, &[transcription_jobs::TranscriptionJobsTable])?;
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
             tx,
         };
         downloads::recover_interrupted(&mut db)?;
+        transcription_jobs::recover_interrupted(&mut db)?;
+        recordings::recover_interrupted(&mut db)?;
         Ok(db)
     }
 
@@ -179,8 +181,13 @@ impl Database {
 
 pub mod block_steps;
 pub mod downloads;
+pub(crate) mod inference_queue;
 pub mod model_staging;
 pub mod models;
+pub mod recording_workers;
+pub mod recordings;
+pub mod transcription_jobs;
+pub mod transcription_metrics;
 
 /// Apply every table's event gate. Only a `true` result may reach
 /// the consumer: a rejected source-language command
@@ -190,6 +197,12 @@ pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
         return Ok(models::is_available(db, model.id)? == *available);
     }
     if !block_steps::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !recordings::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !transcription_jobs::apply(db, ev)? {
         return Ok(false);
     }
     downloads::apply(db, ev)
@@ -205,7 +218,13 @@ fn complete_installation(
     let transaction = db
         .conn_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if !downloads::set_status_on(&transaction, model, attempt, DownloadStatus::Succeeded, None)? {
+    if !downloads::set_status_on(
+        &transaction,
+        model,
+        attempt,
+        DownloadStatus::Succeeded,
+        None,
+    )? {
         transaction.rollback()?;
         downloads::reject(db, event, attempt);
         return Ok(false);
@@ -213,7 +232,12 @@ fn complete_installation(
     models::set_available_on(&transaction, model, true)?;
     transaction.commit()?;
     downloads::publish_status(
-        db, model, attempt, Some(DownloadStatus::Installing), DownloadStatus::Succeeded, None,
+        db,
+        model,
+        attempt,
+        Some(DownloadStatus::Installing),
+        DownloadStatus::Succeeded,
+        None,
     );
     Ok(true)
 }

@@ -10,18 +10,32 @@ pub struct LanguageProfile {
     pub live: &'static ModelEntry,
     #[serde(skip_serializing)]
     pub refine: &'static ModelEntry,
+    #[serde(skip_serializing)]
+    pub required: &'static [&'static ModelEntry],
 }
 
 impl LanguageProfile {
-    pub fn models(&self) -> [&'static ModelEntry; 2] {
-        [self.live, self.refine]
+    /// Required assets, including native acceleration sidecars on macOS.
+    pub fn models(&self) -> &'static [&'static ModelEntry] {
+        self.required
     }
 }
+
+#[cfg(all(target_os = "macos", feature = "local-engine"))]
+const EN_REQUIRED: &[&ModelEntry] = &[
+    &DISTIL_SMALL_EN,
+    &LARGE_V3_TURBO,
+    &crate::picker::DISTIL_SMALL_EN_ENCODER,
+    &crate::picker::LARGE_V3_TURBO_ENCODER,
+];
+#[cfg(not(all(target_os = "macos", feature = "local-engine")))]
+const EN_REQUIRED: &[&ModelEntry] = &[&DISTIL_SMALL_EN, &LARGE_V3_TURBO];
 
 pub const LANGUAGES: &[LanguageProfile] = &[LanguageProfile {
     code: "en",
     live: &DISTIL_SMALL_EN,
     refine: &LARGE_V3_TURBO,
+    required: EN_REQUIRED,
 }];
 
 pub fn find(code: &str) -> Option<&'static LanguageProfile> {

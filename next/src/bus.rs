@@ -14,6 +14,11 @@
 //! tests stops compiling, which is why progress is `bytes`/`total` and
 //! never a pre-computed ratio.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use tokio::sync::mpsc;
 
 use crate::audio_sources::{AppTarget, AudioDevice, AudioSourceSnapshot, FunnelStep};
@@ -45,6 +50,67 @@ pub enum DownloadStatus {
     Interrupted,
 }
 
+/// Transcription stage; PCM and floating-point timestamps never enter the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum TranscriptPass {
+    Live,
+    Refined,
+}
+
+/// One inference job's processing span, excluding capture, publication and disk I/O.
+/// Times are monotonic milliseconds since capture opened. Queue sizes are
+/// pending 16 kHz mono samples for this pass, excluding the current job and context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TranscriptionMetrics {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub duration_ms: u64,
+    pub queue_size_start: u64,
+    pub queue_size_end: u64,
+}
+
+/// Immutable identity and captured-audio extent for one inference job.
+/// Decoder state and PCM remain private to the inference scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct TranscriptionJob {
+    pub block: u8,
+    pub recording: u64,
+    pub job: u64,
+    pub pass: TranscriptPass,
+    pub t_start_ms: u64,
+    pub t_end_ms: u64,
+    pub sample_count: u64,
+    pub queued_at_ms: u64,
+    pub finishing: bool,
+}
+
+/// Immutable capture command; worker services and handles never enter the bus.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordingRequest {
+    pub block: u8,
+    pub recording: u64,
+    pub source: crate::audio::CaptureSource,
+    pub language: &'static LanguageProfile,
+    pub live_model: PathBuf,
+    pub refine_model: PathBuf,
+}
+
+/// Process-wide increasing IDs for recording sessions and transcription jobs,
+/// seeded from Unix epoch microseconds.
+pub fn next_monotonic_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock precedes Unix epoch")
+        .as_micros() as u64;
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+        Some(now.max(previous + 1))
+    })
+    .unwrap()
+    .max(now - 1)
+        + 1
+}
+
 /// Everything that can happen in the app, as plain data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
@@ -73,7 +139,9 @@ pub enum AppEvent {
         actual: Option<(FunnelStep, u32)>,
     },
     /// `←` / `→`: move focus between blocks.
-    FocusMoved { direction: FocusMove },
+    FocusMoved {
+        direction: FocusMove,
+    },
     /// `↑` / `↓` while the focused block is `PickingLanguage`: move the
     /// highlight inside that block's language list. The language
     /// codes are stamped by the resolver for the event log.
@@ -91,7 +159,9 @@ pub enum AppEvent {
         pending: Vec<&'static str>,
     },
     /// Remove the named block after its queued transitions have been gated.
-    BlockClosed { block: u8 },
+    BlockClosed {
+        block: u8,
+    },
     /// Model was available in SQLite when the language was selected. The
     /// reducer fans this availability out to any existing waiter; the
     /// selection itself excludes the model from its `pending` list.
@@ -130,11 +200,20 @@ pub enum AppEvent {
     },
     /// The downloader verified the staged bytes. SQLite claims Installing once
     /// for the current Downloading attempt before the store consumer installs.
-    DownloadFetched { attempt: u32, model: &'static str },
+    DownloadFetched {
+        attempt: u32,
+        model: &'static str,
+    },
     /// Bytes verified; the format handler is unpacking.
-    DownloadInstalling { attempt: u32, model: &'static str },
+    DownloadInstalling {
+        attempt: u32,
+        model: &'static str,
+    },
     /// Fans out to EVERY block waiting on `model`.
-    DownloadSucceeded { attempt: u32, model: &'static str },
+    DownloadSucceeded {
+        attempt: u32,
+        model: &'static str,
+    },
     /// `error` carries an actionable message.
     DownloadFailed {
         attempt: u32,
@@ -156,7 +235,10 @@ pub enum AppEvent {
     /// Last waiter for `model` closed. Removes the repo row and the
     /// UiView.downloads entry; the in-flight task observes the
     /// cancellation row separately.
-    DownloadCancelled { attempt: u32, model: &'static str },
+    DownloadCancelled {
+        attempt: u32,
+        model: &'static str,
+    },
     /// Emitted after the downloads table persists a lifecycle transition, or
     /// to replay its current outcome for a request overtaken by that transition.
     /// The reducer reconciles outcomes that raced ahead of `LanguageSelected`;
@@ -192,11 +274,87 @@ pub enum AppEvent {
     MenuClosed,
     /// `↑` / `↓` while the menu is open. Reuses the picker's move
     /// direction so clamp semantics live in one place.
-    MenuMoved { direction: PickerMove },
+    MenuMoved {
+        direction: PickerMove,
+    },
     /// `Enter` on a menu row: reveal the selected session on screen,
     /// FIFO-evicting the oldest-focused visible one. Reducer closes
     /// the menu itself.
-    SessionShown { id: u8 },
+    SessionShown {
+        id: u8,
+    },
+    /// Consumer-resolved capture work, logged and gated before worker execution.
+    RecordingRequested {
+        request: Arc<RecordingRequest>,
+    },
+    /// Stop only this recording identity, never a replacement on the same block.
+    RecordingStopRequested {
+        block: u8,
+        recording: u64,
+    },
+    RecordingStarted {
+        block: u8,
+        recording: u64,
+        session_dir: String,
+        source: crate::audio::CaptureSource,
+        language: String,
+        started_at: String,
+    },
+    /// SQLite admits this job before the scheduler may dispatch its PCM.
+    TranscriptionRequested {
+        request: TranscriptionJob,
+    },
+    TranscriptionStarted {
+        request: TranscriptionJob,
+        worker: u8,
+        start_ms: u64,
+        queue_jobs: u32,
+        queue_size_start: u64,
+    },
+    /// Emitted for every completed inference call, including calls with no text.
+    TranscriptionFinished {
+        request: TranscriptionJob,
+        worker: u8,
+        transcription: TranscriptionMetrics,
+        queue_wait_ms: u64,
+        queue_jobs: u32,
+    },
+    TranscriptionFailed {
+        request: TranscriptionJob,
+        worker: Option<u8>,
+        transcription: Option<TranscriptionMetrics>,
+        queue_wait_ms: u64,
+        queue_jobs: u32,
+        error: String,
+    },
+    TranscriptTentative {
+        block: u8,
+        recording: u64,
+        job: u64,
+        worker: u8,
+        text: String,
+        transcription: TranscriptionMetrics,
+    },
+    TranscriptCommitted {
+        block: u8,
+        recording: u64,
+        job: u64,
+        worker: u8,
+        pass: TranscriptPass,
+        t_start_ms: u64,
+        t_end_ms: u64,
+        text: String,
+        transcription: TranscriptionMetrics,
+    },
+    RecordingStopped {
+        block: u8,
+        recording: u64,
+    },
+    RecordingFailed {
+        block: u8,
+        recording: u64,
+        error: String,
+    },
     /// `q` / Ctrl-C: quit. Always honoured, including mid-download.
     Quit,
 
@@ -213,7 +371,9 @@ pub enum AppEvent {
     },
     /// Quit-time cleanup: drop the staged archive and unpack
     /// scratch directory for `model`. The consumer asks the store to discard it.
-    DiscardInflight { model: std::sync::Arc<str> },
+    DiscardInflight {
+        model: std::sync::Arc<str>,
+    },
 }
 
 /// Cloneable producer handle. Producers only need this — `publish` is the
@@ -387,7 +547,7 @@ mod tests {
         let selected = AppEvent::LanguageSelected {
             block: 3,
             language,
-            pending: language.models().map(|model| model.id).to_vec(),
+            pending: language.models().iter().map(|model| model.id).collect(),
         };
         let selected: serde_json::Value =
             serde_json::to_value(selected).expect("serialize language selection");
@@ -419,7 +579,8 @@ mod tests {
         let observation = serde_json::to_value(AppEvent::ModelAvailabilityChanged {
             model,
             available: false,
-        }).expect("serialize model observation");
+        })
+        .expect("serialize model observation");
         assert_eq!(observation["event"], "ModelAvailabilityChanged");
         assert_eq!(observation["model"]["id"], model.id);
         assert_eq!(observation["model"]["size_mb"], model.size_mb);

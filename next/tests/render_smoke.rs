@@ -1,9 +1,9 @@
 use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 use voice_bird_next::{
+    consumer::ui_view::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     language::LANGUAGES,
     picker::{ListPicker, SessionMenu, CATALOG},
-    consumer::ui_view::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     testing::render_to_string,
 };
 
@@ -56,9 +56,7 @@ fn three_blocks_100x30_matches_golden() {
         blocks: (1..=3)
             .map(|id| Block {
                 id,
-                state: BlockState::Recording {
-                    language: &LANGUAGES[0],
-                },
+                state: BlockState::recording(&LANGUAGES[0]),
                 ..Default::default()
             })
             .collect(),
@@ -80,7 +78,7 @@ fn picking_100x30_matches_golden() {
         blocks: vec![Block {
             id: 1,
             state: BlockState::PickingLanguage(ListPicker::default()),
-    
+
             ..Default::default()
         }],
         focus: 0,
@@ -97,13 +95,24 @@ fn picking_100x30_matches_golden() {
 
 #[test]
 fn downloading_two_blocks_100x30_matches_golden() {
+    // Keep this two-model layout independent of optional Core ML sidecars.
+    static LANGUAGE: voice_bird_next::language::LanguageProfile =
+        voice_bird_next::language::LanguageProfile {
+            code: "en",
+            live: &voice_bird_next::picker::DISTIL_SMALL_EN,
+            refine: &voice_bird_next::picker::LARGE_V3_TURBO,
+            required: &[
+                &voice_bird_next::picker::DISTIL_SMALL_EN,
+                &voice_bird_next::picker::LARGE_V3_TURBO,
+            ],
+        };
     let mut ui_view = UiView {
         blocks: (1..=2)
             .map(|id| Block {
                 id,
                 state: BlockState::Waiting {
-                    language: &LANGUAGES[0],
-                    pending: vec![LANGUAGES[0].live.id, LANGUAGES[0].refine.id],
+                    language: &LANGUAGE,
+                    pending: vec![LANGUAGE.live.id, LANGUAGE.refine.id],
                 },
                 ..Default::default()
             })
@@ -112,7 +121,7 @@ fn downloading_two_blocks_100x30_matches_golden() {
         next_block_id: 3,
         ..Default::default()
     };
-    for model in LANGUAGES[0].models() {
+    for model in LANGUAGE.models() {
         ui_view.downloads.insert(
             model.id,
             DownloadState {
@@ -142,7 +151,7 @@ fn failed_100x30_matches_golden() {
                 error: "HTTP 404".to_string(),
                 pending: Vec::new(),
             },
-    
+
             ..Default::default()
         }],
         focus: 0,
@@ -550,9 +559,7 @@ proptest! {
             blocks: (1..=blocks as u8)
                 .map(|i| Block {
                     id: i,
-                    state: BlockState::Recording {
-                        language: &LANGUAGES[0],
-                    },
+                    state: BlockState::recording(&LANGUAGES[0]),
 
                     ..Default::default()
                 })
@@ -697,25 +704,52 @@ fn app_picker_hides_retained_app_and_restores_app_cursor() {
 fn recording_with_source_100x30_matches_golden() {
     source_golden(
         "recording_with_source",
-        source_block_view(
-            BlockState::Recording {
-                language: &LANGUAGES[0],
-            },
-            Some(1),
-            Some(1),
-        ),
+        source_block_view(BlockState::recording(&LANGUAGES[0]), Some(1), Some(1)),
     );
 }
 
 #[test]
-fn input_source_title_omits_app() {
-    let ui_view = source_block_view(
-        BlockState::Recording {
-            language: &LANGUAGES[0],
-        },
-        Some(0),
-        None,
+fn recording_with_transcript_100x30_matches_golden() {
+    let mut state = BlockState::recording(&LANGUAGES[0]);
+    if let BlockState::Recording {
+        lines,
+        tentative,
+        session_dir,
+        ..
+    } = &mut state
+    {
+        *lines = vec![
+            "Welcome to Voice Bird.".into(),
+            "Refined text replaces the earlier live words.".into(),
+            "New live words remain visible as recording continues.".into(),
+        ];
+        *tentative = "The next sentence is still arriving…".into();
+        *session_dir = Some("/local/data/sessions/2026-10-08_12-30-00-b1-mic".into());
+    }
+    source_golden(
+        "recording_with_transcript",
+        source_block_view(state, Some(0), None),
     );
+}
+
+#[test]
+fn small_recording_view_keeps_wrapped_tail_and_tentative_visible() {
+    let mut state = BlockState::recording(&LANGUAGES[0]);
+    if let BlockState::Recording {
+        lines, tentative, ..
+    } = &mut state
+    {
+        *lines = vec!["older words ".repeat(30), "latest committed words".into()];
+        *tentative = "next words".into();
+    }
+    let out = render_to_string(&source_block_view(state, Some(0), None), 30, 12);
+    assert!(out.contains("latest committed words"), "{out}");
+    assert!(out.contains("next words"), "{out}");
+}
+
+#[test]
+fn input_source_title_omits_app() {
+    let ui_view = source_block_view(BlockState::recording(&LANGUAGES[0]), Some(0), None);
     let out = render_to_string(&ui_view, 100, 30);
     assert!(out.contains("1 · Mic · en"), "{out}");
     assert!(!out.contains("Spotify"), "{out}");

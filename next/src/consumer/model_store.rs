@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::bus::{AppEvent, DownloadStatus, EventSender};
 use crate::db::{downloads, model_staging, Database};
-use crate::picker::{ModelEntry, CATALOG};
 use crate::download::truncate_error;
+use crate::picker::{ModelEntry, CATALOG};
 use crate::producer::model_store;
 use crate::transcription_models::ModelStore;
 
@@ -46,12 +46,13 @@ impl ModelStoreConsumer {
         tx: &EventSender,
     ) {
         match downloads::get(db, entry.id) {
-            Ok(Some(row))
-                if row.attempt == attempt && row.status == DownloadStatus::Installing => {}
-            Ok(Some(row))
-                if row.attempt == attempt && row.status == DownloadStatus::Cancelling =>
-            {
-                tx.publish(AppEvent::DownloadCancelled { attempt, model: entry.id });
+            Ok(Some(row)) if row.attempt == attempt && row.status == DownloadStatus::Installing => {
+            }
+            Ok(Some(row)) if row.attempt == attempt && row.status == DownloadStatus::Cancelling => {
+                tx.publish(AppEvent::DownloadCancelled {
+                    attempt,
+                    model: entry.id,
+                });
                 return;
             }
             Ok(_) => return,
@@ -145,9 +146,15 @@ mod tests {
             language,
             pending: vec![entry.id],
         });
-        view.apply(&AppEvent::DownloadRequested { model: entry, attempt });
+        view.apply(&AppEvent::DownloadRequested {
+            model: entry,
+            attempt,
+        });
 
-        let fetched = AppEvent::DownloadFetched { model: entry.id, attempt };
+        let fetched = AppEvent::DownloadFetched {
+            model: entry.id,
+            attempt,
+        };
         assert!(crate::db::apply(&mut db, &fetched).unwrap());
         view.apply(&fetched);
         for event in bus.drain() {
@@ -157,8 +164,14 @@ mod tests {
         }
         assert!(!store.is_available(entry));
         assert!(matches!(view.blocks[0].state, BlockState::Waiting { .. }));
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Installing);
-        assert_eq!(view.downloads[entry.id].phase, crate::consumer::ui_view::DownloadPhase::Fetching);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Installing
+        );
+        assert_eq!(
+            view.downloads[entry.id].phase,
+            crate::consumer::ui_view::DownloadPhase::Fetching
+        );
 
         consumer.install(entry, attempt, &db, &bus.sender());
         assert!(!store.is_available(entry));
@@ -166,18 +179,24 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(succeeded, AppEvent::DownloadSucceeded { model, attempt: a } if model == entry.id && a == attempt));
+        assert!(
+            matches!(succeeded, AppEvent::DownloadSucceeded { model, attempt: a } if model == entry.id && a == attempt)
+        );
         assert!(store.is_available(entry));
         assert!(!staged.exists());
         assert_eq!(
-            std::fs::read(handler_for(entry.format).installed_path(store.root(), entry.id)).unwrap(),
+            std::fs::read(handler_for(entry.format).installed_path(store.root(), entry.id))
+                .unwrap(),
             b"verified model bytes"
         );
         assert!(crate::db::apply(&mut db, &succeeded).unwrap());
         view.apply(&succeeded);
-        assert_eq!(view.blocks[0].state, BlockState::Recording { language });
+        assert_eq!(view.blocks[0].state, BlockState::recording(language));
         assert!(crate::db::models::is_available(&db, entry.id).unwrap());
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Succeeded);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Succeeded
+        );
     }
 
     #[test]
@@ -185,17 +204,32 @@ mod tests {
         for cancelled in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let bus = EventBus::new();
-            let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+            let mut db =
+                Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
             let store = Arc::new(CacheDirStore::from_root(tmp.path().join("models")).unwrap());
             let consumer = ModelStoreConsumer::new(store.clone());
             let entry = LANGUAGES[0].live;
             let attempt = downloads::start(&mut db, entry.id).unwrap();
             let staged = stage(&consumer, &mut db, entry, attempt);
-            assert!(crate::db::apply(&mut db, &AppEvent::DownloadFetched { model: entry.id, attempt }).unwrap());
+            assert!(crate::db::apply(
+                &mut db,
+                &AppEvent::DownloadFetched {
+                    model: entry.id,
+                    attempt
+                }
+            )
+            .unwrap());
             let terminal = if cancelled {
-                AppEvent::DownloadCancelled { model: entry.id, attempt }
+                AppEvent::DownloadCancelled {
+                    model: entry.id,
+                    attempt,
+                }
             } else {
-                AppEvent::DownloadFailed { model: entry.id, attempt, error: "fetch was cancelled".into() }
+                AppEvent::DownloadFailed {
+                    model: entry.id,
+                    attempt,
+                    error: "fetch was cancelled".into(),
+                }
             };
             assert!(crate::db::apply(&mut db, &terminal).unwrap());
 
@@ -205,7 +239,11 @@ mod tests {
             assert!(!store.is_available(entry));
             assert_eq!(
                 downloads::get(&db, entry.id).unwrap().unwrap().status,
-                if cancelled { DownloadStatus::Cancelled } else { DownloadStatus::Failed }
+                if cancelled {
+                    DownloadStatus::Cancelled
+                } else {
+                    DownloadStatus::Failed
+                }
             );
         }
     }
@@ -225,13 +263,26 @@ mod tests {
         let staged = stage(&consumer, &mut db, entry, attempt);
         bus.drain().for_each(drop);
 
-        assert!(!crate::db::apply(&mut db, &AppEvent::DownloadFetched { model: entry.id, attempt: old_attempt }).unwrap());
+        assert!(!crate::db::apply(
+            &mut db,
+            &AppEvent::DownloadFetched {
+                model: entry.id,
+                attempt: old_attempt
+            }
+        )
+        .unwrap());
         consumer.install(entry, old_attempt, &db, &bus.sender());
         assert!(old_staged.is_file());
         assert!(staged.is_file());
         assert!(!store.is_available(entry));
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().attempt, attempt);
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Downloading);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().attempt,
+            attempt
+        );
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Downloading
+        );
         assert!(bus.drain().any(|event| matches!(event,
             AppEvent::DownloadEventRejected { rejected: "DownloadFetched", event_attempt, row_attempt: Some(row_attempt), .. }
                 if event_attempt == old_attempt && row_attempt == attempt
@@ -248,7 +299,14 @@ mod tests {
         let entry = LANGUAGES[0].live;
         let attempt = downloads::start(&mut db, entry.id).unwrap();
         let staged = stage(&consumer, &mut db, entry, attempt);
-        assert!(crate::db::apply(&mut db, &AppEvent::DownloadFetched { model: entry.id, attempt }).unwrap());
+        assert!(crate::db::apply(
+            &mut db,
+            &AppEvent::DownloadFetched {
+                model: entry.id,
+                attempt
+            }
+        )
+        .unwrap());
         bus.drain().for_each(drop);
 
         consumer.install(entry, attempt, &db, &bus.sender());
@@ -258,11 +316,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(cancelled, AppEvent::DownloadCancelled { model, attempt: a } if model == entry.id && a == attempt));
+        assert!(
+            matches!(cancelled, AppEvent::DownloadCancelled { model, attempt: a } if model == entry.id && a == attempt)
+        );
         assert!(staged.is_file());
         assert!(!store.is_available(entry));
         assert!(crate::db::apply(&mut db, &cancelled).unwrap());
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Cancelled);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Cancelled
+        );
     }
     #[test]
     fn cancellation_after_accepted_fetch_acknowledges_without_starting_install() {
@@ -274,15 +337,31 @@ mod tests {
         let entry = LANGUAGES[0].live;
         let attempt = downloads::start(&mut db, entry.id).unwrap();
         let staged = stage(&consumer, &mut db, entry, attempt);
-        assert!(crate::db::apply(&mut db, &AppEvent::DownloadFetched { model: entry.id, attempt }).unwrap());
+        assert!(crate::db::apply(
+            &mut db,
+            &AppEvent::DownloadFetched {
+                model: entry.id,
+                attempt
+            }
+        )
+        .unwrap());
         downloads::cancel(&mut db, entry.id).unwrap();
         bus.drain().for_each(drop);
 
         consumer.install(entry, attempt, &db, &bus.sender());
         let events: Vec<_> = bus.drain().collect();
-        assert_eq!(events, vec![AppEvent::DownloadCancelled { model: entry.id, attempt }]);
+        assert_eq!(
+            events,
+            vec![AppEvent::DownloadCancelled {
+                model: entry.id,
+                attempt
+            }]
+        );
         assert!(crate::db::apply(&mut db, &events[0]).unwrap());
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Cancelled);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Cancelled
+        );
         assert!(staged.is_file());
         assert!(!store.is_available(entry));
     }
@@ -300,16 +379,34 @@ mod tests {
                 self.inner.is_available(entry)
             }
 
-            fn staging_path(&self, entry: &ModelEntry, attempt: u32) -> Result<std::path::PathBuf, DownloadError> {
+            fn installed_path(&self, entry: &ModelEntry) -> std::path::PathBuf {
+                self.inner.installed_path(entry)
+            }
+
+            fn staging_path(
+                &self,
+                entry: &ModelEntry,
+                attempt: u32,
+            ) -> Result<std::path::PathBuf, DownloadError> {
                 self.inner.staging_path(entry, attempt)
             }
 
-            fn install(&self, entry: &ModelEntry, staged: &std::path::Path, cancel: &mut dyn CancelCheck) -> Result<(), DownloadError> {
+            fn install(
+                &self,
+                entry: &ModelEntry,
+                staged: &std::path::Path,
+                cancel: &mut dyn CancelCheck,
+            ) -> Result<(), DownloadError> {
                 self.entered.send(()).unwrap();
-                tokio::runtime::Handle::current().block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(2), self.release.notified(),
-                )).map_err(|error| DownloadError::Install(error.to_string()))?;
-                std::thread::sleep(std::time::Duration::from_millis(downloads::CANCEL_PROBE_INTERVAL_MS + 5));
+                tokio::runtime::Handle::current()
+                    .block_on(tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        self.release.notified(),
+                    ))
+                    .map_err(|error| DownloadError::Install(error.to_string()))?;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    downloads::CANCEL_PROBE_INTERVAL_MS + 5,
+                ));
                 if cancel.is_cancelled() {
                     return Err(DownloadError::Cancelled);
                 }
@@ -334,22 +431,43 @@ mod tests {
         let entry = LANGUAGES[0].live;
         let attempt = downloads::start(&mut db, entry.id).unwrap();
         let staged = stage(&consumer, &mut db, entry, attempt);
-        assert!(crate::db::apply(&mut db, &AppEvent::DownloadFetched { model: entry.id, attempt }).unwrap());
+        assert!(crate::db::apply(
+            &mut db,
+            &AppEvent::DownloadFetched {
+                model: entry.id,
+                attempt
+            }
+        )
+        .unwrap());
         bus.drain().for_each(drop);
         consumer.install(entry, attempt, &db, &bus.sender());
-        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(2)))
-            .await.unwrap().unwrap();
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
         downloads::cancel(&mut db, entry.id).unwrap();
         bus.drain().for_each(drop);
 
         consumer.discard_inflight(entry.id);
-        assert!(!staged.exists(), "sweep must finish before the installer is released");
+        assert!(
+            !staged.exists(),
+            "sweep must finish before the installer is released"
+        );
         store.release.notify_one();
         let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
-            .await.unwrap().unwrap();
-        assert!(matches!(cancelled, AppEvent::DownloadCancelled { model, attempt: a } if model == entry.id && a == attempt));
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(cancelled, AppEvent::DownloadCancelled { model, attempt: a } if model == entry.id && a == attempt)
+        );
         assert!(!store.is_available(entry));
         assert!(crate::db::apply(&mut db, &cancelled).unwrap());
-        assert_eq!(downloads::get(&db, entry.id).unwrap().unwrap().status, DownloadStatus::Cancelled);
+        assert_eq!(
+            downloads::get(&db, entry.id).unwrap().unwrap().status,
+            DownloadStatus::Cancelled
+        );
     }
 }

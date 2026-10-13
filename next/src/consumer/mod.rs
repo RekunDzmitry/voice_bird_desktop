@@ -1,22 +1,23 @@
 //! Routes accepted events to event-specific consumers.
 //!
-//! Consumers make lifecycle decisions and hand accepted work to producer services.
+//! Consumers make lifecycle decisions and delegate to runtime-owned producer services.
 //! Producers own worker spawning and result publications. Decision events and
 //! worker results return through the bus and SQLite gate before consumption.
 
 use std::sync::Arc;
 
+use crate::audio_sources::AudioSourcesCatalog;
 use crate::bus::{AppEvent, EventSender};
 use crate::db::Database;
-use crate::picker::CATALOG;
 use crate::download::{truncate_error, Downloader};
-use crate::audio_sources::AudioSourcesCatalog;
+use crate::picker::CATALOG;
 use crate::transcription_models::ModelStore;
 
 pub mod audio_sources;
 pub mod downloads;
 pub mod language;
 pub mod model_store;
+pub mod recording;
 pub mod ui_view;
 pub use ui_view::UiView;
 
@@ -24,6 +25,7 @@ use audio_sources::AudioSourcesConsumer;
 use downloads::DownloadsConsumer;
 use language::LanguageConsumer;
 use model_store::ModelStoreConsumer;
+use recording::RecordingConsumer;
 
 /// Independent event consumers and their own collaborators.
 pub struct Consumers {
@@ -32,6 +34,7 @@ pub struct Consumers {
     pub language: LanguageConsumer,
     pub downloads: DownloadsConsumer,
     pub model_store: ModelStoreConsumer,
+    pub recording: RecordingConsumer,
 }
 
 impl Consumers {
@@ -45,7 +48,8 @@ impl Consumers {
             audio_sources: AudioSourcesConsumer::new(audio_sources),
             language: LanguageConsumer,
             downloads: DownloadsConsumer::new(downloader),
-            model_store: ModelStoreConsumer::new(model_store),
+            model_store: ModelStoreConsumer::new(model_store.clone()),
+            recording: RecordingConsumer::new(model_store),
         }
     }
 }
@@ -74,26 +78,36 @@ impl Consumer {
             // create a projection or claim for work nobody needs anymore.
             if let AppEvent::DownloadRequested { model: entry, .. } = event {
                 if self.consumers.ui_view.should_quit
-                    || !self.consumers.ui_view.blocks.iter().any(|block| {
-                        block.pending_models().contains(&entry.id)
-                    })
+                    || !self
+                        .consumers
+                        .ui_view
+                        .blocks
+                        .iter()
+                        .any(|block| block.pending_models().contains(&entry.id))
                 {
                     continue;
                 }
             }
             self.consumers.ui_view.apply(event);
             match event {
-                AppEvent::ModelAvailabilityChanged { model, available: false }
-                    if self.model_is_ready(model.id) =>
-                {
+                AppEvent::ModelAvailabilityChanged {
+                    model,
+                    available: false,
+                } if self.model_is_ready(model.id) => {
                     tx.publish(AppEvent::ModelMissing(model));
                 }
                 AppEvent::RequestBlock if !self.consumers.ui_view.should_quit => {
                     self.consumers.audio_sources.request(tx);
                 }
-                AppEvent::BeginLanguage { block, language, .. }
-                    if !self.consumers.ui_view.should_quit
-                        && self.consumers.ui_view.blocks.iter().any(|candidate| candidate.id == *block) =>
+                AppEvent::BeginLanguage {
+                    block, language, ..
+                } if !self.consumers.ui_view.should_quit
+                    && self
+                        .consumers
+                        .ui_view
+                        .blocks
+                        .iter()
+                        .any(|candidate| candidate.id == *block) =>
                 {
                     self.consumers.language.begin(*block, language, db, tx);
                 }
@@ -101,7 +115,11 @@ impl Consumer {
                     self.consumers.language.model_missing(entry, db, tx);
                 }
                 AppEvent::DownloadRequested { model, attempt } => {
-                    match self.consumers.model_store.prepare_staging(model, *attempt, db) {
+                    match self
+                        .consumers
+                        .model_store
+                        .prepare_staging(model, *attempt, db)
+                    {
                         Ok(()) => self.consumers.downloads.request(model, *attempt, db, tx),
                         Err(error) => tx.publish(AppEvent::DownloadClaimFailed {
                             attempt: 0,
@@ -122,14 +140,25 @@ impl Consumer {
                 }
                 _ => {}
             }
+            if let Err(error) =
+                self.consumers
+                    .recording
+                    .consume(&mut self.consumers.ui_view, db, tx)
+            {
+                eprintln!("voice-bird-next: recording reconciliation failed: {error}");
+                self.consumers.ui_view.warning = Some(format!("recordings table: {error}"));
+            }
         }
     }
 
     fn model_is_ready(&self, model: &str) -> bool {
         !self.consumers.ui_view.should_quit
-            && self.consumers.ui_view.blocks.iter().any(|block| {
-                block.ready_models().any(|ready| ready.id == model)
-            })
+            && self
+                .consumers
+                .ui_view
+                .blocks
+                .iter()
+                .any(|block| block.ready_models().any(|ready| ready.id == model))
     }
 }
 
@@ -139,25 +168,35 @@ mod tests {
     use crate::bus::{DownloadStatus, EventBus};
     use crate::consumer::ui_view::{Block, BlockState};
     use crate::db::{downloads, models};
-    use crate::picker::ListPicker;
     use crate::language::LANGUAGES;
+    use crate::picker::ListPicker;
+    use crate::producer::recording::RecordingProducer;
     use crate::testing::{FixtureDownloader, FixtureSources, Outcome};
     use crate::transcription_models::CacheDirStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn dispatcher(root: &std::path::Path, calls: Arc<AtomicUsize>) -> Consumer {
+    fn dispatcher(
+        root: &std::path::Path,
+        calls: Arc<AtomicUsize>,
+    ) -> (Consumer, RecordingProducer) {
         let mut consumer = Consumer::new(Consumers::new(
             Arc::new(FixtureDownloader::new(Vec::new(), Outcome::Ok, calls)),
             Arc::new(CacheDirStore::from_root(root.join("models")).unwrap()),
             Arc::new(FixtureSources(None)),
         ));
         consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
-        consumer.consumers.ui_view.apply(&AppEvent::LanguageSelected {
-            block: 1,
-            language: &LANGUAGES[0],
-            pending: vec![LANGUAGES[0].live.id],
-        });
         consumer
+            .consumers
+            .ui_view
+            .apply(&AppEvent::LanguageSelected {
+                block: 1,
+                language: &LANGUAGES[0],
+                pending: vec![LANGUAGES[0].live.id],
+            });
+        (
+            consumer,
+            RecordingProducer::new(crate::testing::recording_services(root)),
+        )
     }
 
     fn consume_accepted(
@@ -165,12 +204,50 @@ mod tests {
         events: &[AppEvent],
         db: &mut Database,
         tx: &EventSender,
+        recording: &mut RecordingProducer,
     ) -> Vec<AppEvent> {
-        let accepted: Vec<_> = events.iter()
+        let accepted: Vec<_> = events
+            .iter()
             .filter(|event| crate::db::apply(db, event).unwrap())
-            .cloned().collect();
+            .cloned()
+            .collect();
+        for event in &accepted {
+            recording.produce(event, db, tx).unwrap();
+        }
         consumer.consume(&accepted, db, tx);
         accepted
+    }
+
+    #[test]
+    fn unreadable_recording_lifecycle_reports_warning_without_requesting_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+        let (mut consumer, _) = dispatcher(tmp.path(), Arc::new(AtomicUsize::new(0)));
+        consumer.consumers.ui_view.blocks[0].state = BlockState::recording(&LANGUAGES[0]);
+        db.conn_mut()
+            .execute_batch("DROP TABLE recording_requests")
+            .unwrap();
+
+        consumer.consume(&[AppEvent::MenuOpened], &mut db, &bus.sender());
+
+        assert!(matches!(
+            consumer.consumers.ui_view.blocks[0].state,
+            BlockState::Recording {
+                recording: None,
+                ..
+            }
+        ));
+        assert!(consumer
+            .consumers
+            .ui_view
+            .warning
+            .as_ref()
+            .unwrap()
+            .contains("recording_requests"));
+        assert!(!bus
+            .drain()
+            .any(|event| matches!(event, AppEvent::RecordingRequested { .. })));
     }
 
     #[test]
@@ -178,19 +255,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
-        db.conn_mut().execute_batch("DROP TABLE model_staging").unwrap();
+        db.conn_mut()
+            .execute_batch("DROP TABLE model_staging")
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, _) = dispatcher(tmp.path(), calls.clone());
         let entry = LANGUAGES[0].live;
 
-        consumer.consume(&[AppEvent::DownloadRequested { model: entry, attempt: 1 }], &mut db, &bus.sender());
+        consumer.consume(
+            &[AppEvent::DownloadRequested {
+                model: entry,
+                attempt: 1,
+            }],
+            &mut db,
+            &bus.sender(),
+        );
         let failures: Vec<_> = bus.drain().collect();
         assert!(failures.iter().any(|event| matches!(event,
             AppEvent::DownloadClaimFailed { attempt: 0, model, error }
                 if *model == entry.id && error.contains("model staging") && error.contains("no such table")
         )));
-        let accepted: Vec<_> = failures.into_iter()
-            .filter(|event| crate::db::apply(&mut db, event).unwrap()).collect();
+        let accepted: Vec<_> = failures
+            .into_iter()
+            .filter(|event| crate::db::apply(&mut db, event).unwrap())
+            .collect();
         consumer.consume(&accepted, &mut db, &bus.sender());
         assert!(downloads::get(&db, entry.id).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -205,15 +293,20 @@ mod tests {
         for kind in ["join", "terminal", "superseded"] {
             let tmp = tempfile::tempdir().unwrap();
             let mut bus = EventBus::new();
-            let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+            let mut db =
+                Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
             let entry = LANGUAGES[0].live;
             let requested_attempt = downloads::start(&mut db, entry.id).unwrap();
             if kind == "terminal" {
-                crate::db::apply(&mut db, &AppEvent::DownloadFailed {
-                    model: entry.id,
-                    attempt: requested_attempt,
-                    error: "original fetch failure".into(),
-                }).unwrap();
+                crate::db::apply(
+                    &mut db,
+                    &AppEvent::DownloadFailed {
+                        model: entry.id,
+                        attempt: requested_attempt,
+                        error: "original fetch failure".into(),
+                    },
+                )
+                .unwrap();
             } else if kind == "superseded" {
                 downloads::cancel(&mut db, entry.id).unwrap();
                 downloads::start(&mut db, entry.id).unwrap();
@@ -221,16 +314,29 @@ mod tests {
             let prior = downloads::get(&db, entry.id).unwrap().unwrap();
             // A metadata write would fail, so a stale request must not even
             // try it and turn that unrelated error into a current UI failure.
-            db.conn_mut().execute_batch("DROP TABLE model_staging").unwrap();
+            db.conn_mut()
+                .execute_batch("DROP TABLE model_staging")
+                .unwrap();
             bus.drain().for_each(drop);
             let calls = Arc::new(AtomicUsize::new(0));
-            let mut consumer = dispatcher(tmp.path(), calls.clone());
+            let (mut consumer, _) = dispatcher(tmp.path(), calls.clone());
 
-            consumer.consume(&[AppEvent::DownloadRequested { model: entry, attempt: requested_attempt }], &mut db, &bus.sender());
+            consumer.consume(
+                &[AppEvent::DownloadRequested {
+                    model: entry,
+                    attempt: requested_attempt,
+                }],
+                &mut db,
+                &bus.sender(),
+            );
             let events: Vec<_> = bus.drain().collect();
-            assert!(!events.iter().any(|event| matches!(event, AppEvent::DownloadClaimFailed { .. })));
-            let accepted: Vec<_> = events.into_iter()
-                .filter(|event| crate::db::apply(&mut db, event).unwrap()).collect();
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AppEvent::DownloadClaimFailed { .. })));
+            let accepted: Vec<_> = events
+                .into_iter()
+                .filter(|event| crate::db::apply(&mut db, event).unwrap())
+                .collect();
             consumer.consume(&accepted, &mut db, &bus.sender());
             let row = downloads::get(&db, entry.id).unwrap().unwrap();
             assert_eq!(row.attempt, prior.attempt);
@@ -249,47 +355,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn absent_observation_reaches_shared_hidden_sessions_in_two_bus_stages() {
+    #[tokio::test]
+    async fn absent_observation_reaches_shared_hidden_sessions_in_two_bus_stages() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
         consumer.consumers.ui_view.blocks = vec![
-            Block::new(1, BlockState::Recording { language }),
-            Block::new(2, BlockState::Recording { language }),
+            Block::new(1, BlockState::recording(language)),
+            Block::new(2, BlockState::recording(language)),
             Block::new(3, BlockState::PickingLanguage(ListPicker::default())),
         ];
+        // Observe existing sessions, not blocks awaiting their initial capture request.
+        consumer.consumers.ui_view.begin_session(1, 1);
+        consumer.consumers.ui_view.begin_session(2, 2);
         consumer.consumers.ui_view.blocks[0].visible = false;
         consumer.consumers.ui_view.blocks[1].visible = false;
         let before = consumer.consumers.ui_view.blocks.clone();
         models::set_available(&mut db, language.live.id, false).unwrap();
         bus.sender().publish(AppEvent::ModelAvailabilityChanged {
-            model: language.live, available: false,
+            model: language.live,
+            available: false,
         });
 
         let observations: Vec<_> = bus.drain().collect();
-        consume_accepted(&mut consumer, &observations, &mut db, &bus.sender());
-        assert_eq!(consumer.consumers.ui_view.blocks, before);
+        consume_accepted(
+            &mut consumer,
+            &observations,
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert!(consumer.consumers.ui_view.downloads.is_empty());
         let missing: Vec<_> = bus.drain().collect();
         assert_eq!(missing, vec![AppEvent::ModelMissing(language.live)]);
         assert!(downloads::get(&db, language.live.id).unwrap().is_none());
 
-        consume_accepted(&mut consumer, &missing, &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &missing,
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         for block in &consumer.consumers.ui_view.blocks[..2] {
-            assert_eq!(block.state, BlockState::Waiting {
-                language, pending: vec![language.live.id],
-            });
+            assert_eq!(
+                block.state,
+                BlockState::Waiting {
+                    language,
+                    pending: vec![language.live.id],
+                }
+            );
         }
         assert_eq!(consumer.consumers.ui_view.blocks[2], before[2]);
         assert!(!consumer.consumers.ui_view.blocks[0].visible);
         assert!(!consumer.consumers.ui_view.blocks[1].visible);
-        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![
-            AppEvent::DownloadRequested { model: language.live, attempt: 1 },
-        ]);
+        assert_eq!(
+            bus.drain().collect::<Vec<_>>(),
+            vec![AppEvent::DownloadRequested {
+                model: language.live,
+                attempt: 1
+            },]
+        );
         assert!(downloads::get(&db, language.live.id).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -300,78 +429,153 @@ mod tests {
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
         consumer.consumers.ui_view.blocks = vec![
             Block::new(1, BlockState::PickingLanguage(ListPicker::default())),
-            Block::new(2, BlockState::Failed {
-                language, error: "failed".into(), pending: vec![],
-            }),
-            Block::new(3, BlockState::Waiting {
-                language, pending: vec![language.refine.id],
-            }),
+            Block::new(
+                2,
+                BlockState::Failed {
+                    language,
+                    error: "failed".into(),
+                    pending: vec![],
+                },
+            ),
+            Block::new(
+                3,
+                BlockState::Waiting {
+                    language,
+                    pending: vec![language.refine.id],
+                },
+            ),
         ];
-        let inactive = CATALOG.iter().find(|model| {
-            !language.models().iter().any(|required| required.id == model.id)
-        }).unwrap();
+        let inactive = CATALOG
+            .iter()
+            .find(|model| {
+                !language
+                    .models()
+                    .iter()
+                    .any(|required| required.id == model.id)
+            })
+            .unwrap();
         let before = consumer.consumers.ui_view.blocks.clone();
         for model in [language.refine, inactive] {
             models::set_available(&mut db, model.id, false).unwrap();
-            consume_accepted(&mut consumer, &[
-                AppEvent::ModelAvailabilityChanged { model, available: false },
-                AppEvent::ModelMissing(model),
-            ], &mut db, &bus.sender());
+            consume_accepted(
+                &mut consumer,
+                &[
+                    AppEvent::ModelAvailabilityChanged {
+                        model,
+                        available: false,
+                    },
+                    AppEvent::ModelMissing(model),
+                ],
+                &mut db,
+                &bus.sender(),
+                &mut recording,
+            );
             assert_eq!(consumer.consumers.ui_view.blocks, before);
             assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
             assert!(downloads::get(&db, model.id).unwrap().is_none());
         }
 
         models::set_available(&mut db, language.live.id, false).unwrap();
-        consume_accepted(&mut consumer, &[
-            AppEvent::ModelAvailabilityChanged { model: language.live, available: false },
-        ], &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &[AppEvent::ModelAvailabilityChanged {
+                model: language.live,
+                available: false,
+            }],
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert_eq!(consumer.consumers.ui_view.blocks, before);
         let missing: Vec<_> = bus.drain().collect();
         assert_eq!(missing, vec![AppEvent::ModelMissing(language.live)]);
-        consume_accepted(&mut consumer, &missing, &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &missing,
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert_eq!(consumer.consumers.ui_view.blocks[..2], before[..2]);
-        assert_eq!(consumer.consumers.ui_view.blocks[2].state, BlockState::Waiting {
-            language, pending: vec![language.refine.id, language.live.id],
-        });
-        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![
-            AppEvent::DownloadRequested { model: language.live, attempt: 1 },
-        ]);
+        assert_eq!(
+            consumer.consumers.ui_view.blocks[2].state,
+            BlockState::Waiting {
+                language,
+                pending: vec![language.refine.id, language.live.id],
+            }
+        );
+        assert_eq!(
+            bus.drain().collect::<Vec<_>>(),
+            vec![AppEvent::DownloadRequested {
+                model: language.live,
+                attempt: 1
+            },]
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn duplicate_false_observations_and_missing_notifications_publish_one_request() {
+    #[tokio::test]
+    async fn duplicate_false_observations_and_missing_notifications_publish_one_request() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
-        consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+        consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
+        consumer.consumers.ui_view.begin_session(1, 1);
         models::set_available(&mut db, language.live.id, false).unwrap();
         let observation = AppEvent::ModelAvailabilityChanged {
-            model: language.live, available: false,
+            model: language.live,
+            available: false,
         };
-        consume_accepted(&mut consumer, &[observation.clone(), observation.clone()], &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &[observation.clone(), observation.clone()],
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         let missing: Vec<_> = bus.drain().collect();
-        assert_eq!(missing, vec![
-            AppEvent::ModelMissing(language.live), AppEvent::ModelMissing(language.live),
-        ]);
-        consume_accepted(&mut consumer, &missing, &mut db, &bus.sender());
-        assert_eq!(consumer.consumers.ui_view.blocks[0].state, BlockState::Waiting {
-            language, pending: vec![language.live.id],
-        });
-        assert_eq!(bus.drain().collect::<Vec<_>>(), vec![
-            AppEvent::DownloadRequested { model: language.live, attempt: 1 },
-        ]);
-        consume_accepted(&mut consumer, &[
-            observation, AppEvent::ModelMissing(language.live),
-        ], &mut db, &bus.sender());
+        assert_eq!(
+            missing,
+            vec![
+                AppEvent::ModelMissing(language.live),
+                AppEvent::ModelMissing(language.live),
+            ]
+        );
+        consume_accepted(
+            &mut consumer,
+            &missing,
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
+        assert_eq!(
+            consumer.consumers.ui_view.blocks[0].state,
+            BlockState::Waiting {
+                language,
+                pending: vec![language.live.id],
+            }
+        );
+        assert_eq!(
+            bus.drain().collect::<Vec<_>>(),
+            vec![AppEvent::DownloadRequested {
+                model: language.live,
+                attempt: 1
+            },]
+        );
+        consume_accepted(
+            &mut consumer,
+            &[observation, AppEvent::ModelMissing(language.live)],
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
         assert!(downloads::get(&db, language.live.id).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -383,20 +587,33 @@ mod tests {
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
-        consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+        consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
         let before = consumer.consumers.ui_view.blocks.clone();
         for observed in [false, true] {
             models::set_available(&mut db, language.live.id, observed).unwrap();
             let queued = AppEvent::ModelAvailabilityChanged {
-                model: language.live, available: observed,
+                model: language.live,
+                available: observed,
             };
             models::set_available(&mut db, language.live.id, !observed).unwrap();
-            assert_eq!(consume_accepted(&mut consumer, &[queued], &mut db, &bus.sender()), vec![]);
+            assert_eq!(
+                consume_accepted(
+                    &mut consumer,
+                    &[queued],
+                    &mut db,
+                    &bus.sender(),
+                    &mut recording
+                ),
+                vec![]
+            );
             assert_eq!(consumer.consumers.ui_view.blocks, before);
             assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
-            assert_eq!(models::is_available(&db, language.live.id).unwrap(), !observed);
+            assert_eq!(
+                models::is_available(&db, language.live.id).unwrap(),
+                !observed
+            );
         }
         assert!(downloads::get(&db, language.live.id).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -408,16 +625,28 @@ mod tests {
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
-        consumer.consumers.ui_view.blocks.push(Block::new(2, BlockState::Failed {
-            language, error: "original failure".into(), pending: vec![],
-        }));
+        consumer.consumers.ui_view.blocks.push(Block::new(
+            2,
+            BlockState::Failed {
+                language,
+                error: "original failure".into(),
+                pending: vec![],
+            },
+        ));
         let before = consumer.consumers.ui_view.blocks.clone();
         models::set_available(&mut db, language.live.id, true).unwrap();
-        consume_accepted(&mut consumer, &[
-            AppEvent::ModelAvailabilityChanged { model: language.live, available: true },
-        ], &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &[AppEvent::ModelAvailabilityChanged {
+                model: language.live,
+                available: true,
+            }],
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert_eq!(consumer.consumers.ui_view.blocks, before);
         assert!(consumer.consumers.ui_view.downloads.is_empty());
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
@@ -425,36 +654,61 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn quit_blocks_observations_missing_notifications_and_queued_requests() {
+    #[tokio::test]
+    async fn quit_blocks_observations_missing_notifications_and_queued_requests() {
         for quit_stage in ["observation", "missing", "request"] {
             let tmp = tempfile::tempdir().unwrap();
             let mut bus = EventBus::new();
-            let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+            let mut db =
+                Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
-            let mut consumer = dispatcher(tmp.path(), calls.clone());
+            let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
             let language = &LANGUAGES[0];
-            consumer.consumers.ui_view.blocks[0].state = BlockState::Recording { language };
+            consumer.consumers.ui_view.blocks[0].state = BlockState::recording(language);
+            consumer.consumers.ui_view.begin_session(1, 1);
             models::set_available(&mut db, language.live.id, false).unwrap();
             let observation = AppEvent::ModelAvailabilityChanged {
-                model: language.live, available: false,
+                model: language.live,
+                available: false,
             };
             let queued = match quit_stage {
                 "observation" => vec![observation, AppEvent::ModelMissing(language.live)],
                 "missing" => {
-                    consume_accepted(&mut consumer, &[observation], &mut db, &bus.sender());
+                    consume_accepted(
+                        &mut consumer,
+                        &[observation],
+                        &mut db,
+                        &bus.sender(),
+                        &mut recording,
+                    );
                     let missing: Vec<_> = bus.drain().collect();
                     assert_eq!(missing, vec![AppEvent::ModelMissing(language.live)]);
                     missing
                 }
                 "request" => {
-                    consume_accepted(&mut consumer, &[observation], &mut db, &bus.sender());
+                    consume_accepted(
+                        &mut consumer,
+                        &[observation],
+                        &mut db,
+                        &bus.sender(),
+                        &mut recording,
+                    );
                     let missing: Vec<_> = bus.drain().collect();
-                    consume_accepted(&mut consumer, &missing, &mut db, &bus.sender());
+                    consume_accepted(
+                        &mut consumer,
+                        &missing,
+                        &mut db,
+                        &bus.sender(),
+                        &mut recording,
+                    );
                     let requests: Vec<_> = bus.drain().collect();
-                    assert_eq!(requests, vec![
-                        AppEvent::DownloadRequested { model: language.live, attempt: 1 },
-                    ]);
+                    assert_eq!(
+                        requests,
+                        vec![AppEvent::DownloadRequested {
+                            model: language.live,
+                            attempt: 1
+                        },]
+                    );
                     requests
                 }
                 _ => unreachable!(),
@@ -462,7 +716,13 @@ mod tests {
             let before = consumer.consumers.ui_view.blocks.clone();
             let mut events = vec![AppEvent::Quit];
             events.extend(queued);
-            consume_accepted(&mut consumer, &events, &mut db, &bus.sender());
+            consume_accepted(
+                &mut consumer,
+                &events,
+                &mut db,
+                &bus.sender(),
+                &mut recording,
+            );
             assert!(consumer.consumers.ui_view.should_quit);
             assert_eq!(consumer.consumers.ui_view.blocks, before);
             assert!(consumer.consumers.ui_view.downloads.is_empty());
@@ -478,17 +738,28 @@ mod tests {
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut consumer = dispatcher(tmp.path(), calls.clone());
+        let (mut consumer, mut recording) = dispatcher(tmp.path(), calls.clone());
         let language = &LANGUAGES[0];
         consumer.consumers.ui_view.blocks[0].state = BlockState::Failed {
-            language, error: "failed".into(), pending: vec![],
+            language,
+            error: "failed".into(),
+            pending: vec![],
         };
         let before = consumer.consumers.ui_view.blocks.clone();
         models::set_available(&mut db, language.live.id, false).unwrap();
-        consume_accepted(&mut consumer, &[
-            AppEvent::ModelAvailabilityChanged { model: language.live, available: false },
-            AppEvent::ModelMissing(language.live),
-        ], &mut db, &bus.sender());
+        consume_accepted(
+            &mut consumer,
+            &[
+                AppEvent::ModelAvailabilityChanged {
+                    model: language.live,
+                    available: false,
+                },
+                AppEvent::ModelMissing(language.live),
+            ],
+            &mut db,
+            &bus.sender(),
+            &mut recording,
+        );
         assert_eq!(consumer.consumers.ui_view.blocks, before);
         assert_eq!(bus.drain().collect::<Vec<_>>(), vec![]);
         assert!(downloads::get(&db, language.live.id).unwrap().is_none());

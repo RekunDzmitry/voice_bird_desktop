@@ -227,9 +227,7 @@ mod tests {
                 )
                 .unwrap();
             bootstrap
-                .execute_batch(
-                    <crate::db::models::ModelsTable as crate::db::Table>::DEFINITION,
-                )
+                .execute_batch(<crate::db::models::ModelsTable as crate::db::Table>::DEFINITION)
                 .unwrap();
             for model in LANGUAGES[0].models() {
                 bootstrap
@@ -285,7 +283,10 @@ mod tests {
         for event in &events {
             if downloads::apply(&mut db, event).unwrap() {
                 ui_view.apply(event);
-                if let AppEvent::BeginLanguage { block, language, .. } = event {
+                if let AppEvent::BeginLanguage {
+                    block, language, ..
+                } = event
+                {
                     language_consumer.begin(*block, language, &db, &bus.sender());
                 }
             }
@@ -366,13 +367,11 @@ mod tests {
 
     fn fixture_consumer() -> (DownloadsConsumer, Arc<std::sync::atomic::AtomicUsize>) {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let consumer = DownloadsConsumer::new(
-            Arc::new(crate::testing::FixtureDownloader::new(
-                Vec::new(),
-                Outcome::Ok,
-                calls.clone(),
-            )),
-        );
+        let consumer = DownloadsConsumer::new(Arc::new(crate::testing::FixtureDownloader::new(
+            Vec::new(),
+            Outcome::Ok,
+            calls.clone(),
+        )));
         (consumer, calls)
     }
 
@@ -487,10 +486,9 @@ mod tests {
                 ..
             } if *event_attempt == attempt - 1 && *row_attempt == attempt
         )));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            AppEvent::DownloadStatusChanged { .. }
-        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AppEvent::DownloadStatusChanged { .. })));
         let row = downloads::get(&db, model.id).unwrap().unwrap();
         assert_eq!(row.attempt, attempt);
         assert_eq!(row.status, DownloadStatus::Failed);
@@ -501,17 +499,22 @@ mod tests {
         for failure in ["missing", "preparation", "query"] {
             let tmp = tempfile::tempdir().unwrap();
             let mut bus = crate::bus::EventBus::new();
-            let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
+            let mut db =
+                Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
             let model = crate::language::LANGUAGES[0].live;
             match failure {
                 "preparation" => {
-                    db.conn_mut().execute(
-                        "INSERT INTO model_staging (model, attempt, error) VALUES (?1, 1, ?2)",
-                        rusqlite::params![model.id, "cache directory is read-only"],
-                    ).unwrap();
+                    db.conn_mut()
+                        .execute(
+                            "INSERT INTO model_staging (model, attempt, error) VALUES (?1, 1, ?2)",
+                            rusqlite::params![model.id, "cache directory is read-only"],
+                        )
+                        .unwrap();
                 }
                 "query" => {
-                    db.conn_mut().execute_batch("DROP TABLE model_staging").unwrap();
+                    db.conn_mut()
+                        .execute_batch("DROP TABLE model_staging")
+                        .unwrap();
                 }
                 _ => {}
             }
@@ -521,14 +524,22 @@ mod tests {
 
             consumer.request(model, 1, &mut db, &bus.sender());
             let events: Vec<_> = bus.drain().collect();
-            let error = events.iter().find_map(|event| match event {
-                AppEvent::DownloadFailed { attempt: 1, model: failed_model, error }
-                    if *failed_model == model.id => Some(error),
-                _ => None,
-            }).expect("metadata failure must belong to the persisted claim");
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    AppEvent::DownloadFailed {
+                        attempt: 1,
+                        model: failed_model,
+                        error,
+                    } if *failed_model == model.id => Some(error),
+                    _ => None,
+                })
+                .expect("metadata failure must belong to the persisted claim");
             match failure {
                 "preparation" => assert!(error.contains("read-only")),
-                "query" => assert!(error.contains("model staging") && error.contains("no such table")),
+                "query" => {
+                    assert!(error.contains("model staging") && error.contains("no such table"))
+                }
                 _ => assert!(error.contains(model.id) && error.contains("attempt 1")),
             }
             for event in &events {
