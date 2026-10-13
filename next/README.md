@@ -98,11 +98,17 @@ platforms currently report that native audio capture is unavailable.
 
 Each Recording block owns a capture thread and a coordinator. The capture thread
 opens, reads, downmixes/resamples to 16 kHz mono, finishes, and drops its native
-stream; it keeps draining capture while model states initialize. A bounded shared
-PCM buffer supplies independent live/refinement cursors. Immutable chunks are
-shared with inference tasks; PCM never enters the event bus. Callback and
-normalized PCM queues are bounded to 30 seconds. Overruns fail the block rather
-than silently dropping speech.
+stream; it keeps draining capture while model states initialize. A shared PCM
+buffer supplies independent live/refinement cursors. Immutable chunks are shared
+with inference tasks; PCM never enters the event bus. Callback queues remain
+bounded to 30 seconds. The shared buffer starts its 30-second overrun limit only
+after both live and refinement decoders are loaded. Audio captured during model
+initialization is retained without that limit, including time spent waiting for
+shared model loading or first-time Core ML compilation. This startup backlog is
+exempt while it drains; at most 30 seconds of unread post-ready audio may accumulate.
+Once both passes consume the startup backlog, the usual 30-second retention bound
+applies. Startup memory therefore grows with decoder initialization time. Active
+overruns still fail the block rather than silently dropping speech.
 
 The engine factory caches model weights by canonical path. Each recording/pass
 has an exclusive mutable decoder state. A persistent inference pool sizes itself

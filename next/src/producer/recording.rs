@@ -317,6 +317,7 @@ fn capture_and_transcribe(
         // cannot leave an apparently recording session without queued audio.
         let live = engines.live(&request.live_model, request.language.code)?;
         let refine = engines.refine(&request.refine_model, request.language.code)?;
+        buffer.start_limit();
         coordinate(
             request,
             [live, refine],

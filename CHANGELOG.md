@@ -76,6 +76,10 @@
   and its startup/runtime failure state to `terminal_error`; behavior is unchanged.
 - Restore the two-block download rendering snapshot and regression test with an
   explicit two-model fixture, keeping its layout stable with or without Core ML.
+- Start the shared recording buffer's 30-second overrun limit only after both
+  decoders load. Preserve uncapped startup audio while it drains, and keep the
+  post-ready limit tied to the slowest pass so cold model/Core ML initialization
+  does not falsely fail capture before transcription can begin.
 
 ## 0.5.0 (2026-08-05)
 

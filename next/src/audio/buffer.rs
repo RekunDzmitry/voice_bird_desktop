@@ -31,6 +31,7 @@ struct State {
     cursors: [u64; 2],
     end: u64,
     origin: Option<Instant>,
+    limited_from: Option<u64>,
     finished: bool,
     error: Option<String>,
 }
@@ -56,6 +57,7 @@ impl Default for CaptureBuffer {
                 cursors: [0; 2],
                 end: 0,
                 origin: None,
+                limited_from: None,
                 finished: false,
                 error: None,
             }),
@@ -69,17 +71,27 @@ impl CaptureBuffer {
         self.state.lock().origin = Some(Instant::now());
     }
 
+    /// Bound new audio once both decoders are ready, preserving the startup backlog.
+    pub fn start_limit(&self) {
+        let mut state = self.state.lock();
+        let end = state.end;
+        state.limited_from.get_or_insert(end);
+    }
+
     pub fn append(&self, pcm: Vec<f32>) -> anyhow::Result<()> {
         if pcm.is_empty() {
             return Ok(());
         }
         let mut state = self.state.lock();
         let count = pcm.len() as u64;
-        let retained = state.end - *state.cursors.iter().min().unwrap();
-        anyhow::ensure!(
-            retained + count <= MAX_SAMPLES,
-            "audio transcription buffer overrun: inference could not keep up"
-        );
+        if let Some(limited_from) = state.limited_from {
+            let consumed = *state.cursors.iter().min().unwrap();
+            let retained = state.end - consumed.max(limited_from);
+            anyhow::ensure!(
+                retained + count <= MAX_SAMPLES,
+                "audio transcription buffer overrun: inference could not keep up"
+            );
+        }
         let start = state.end;
         state.chunks.push_back(Chunk {
             start,
@@ -182,11 +194,50 @@ mod tests {
     #[test]
     fn slowest_pass_bounds_retention_and_releases_capacity_after_catchup() {
         let buffer = CaptureBuffer::default();
+        buffer.start_limit();
         buffer.append(vec![0.0; MAX_SAMPLES as usize]).unwrap();
         buffer.take(0, MAX_SAMPLES);
         assert!(buffer.append(vec![1.0]).is_err());
         buffer.take(1, MAX_SAMPLES);
         buffer.append(vec![1.0]).unwrap();
         assert_eq!(buffer.pending(1).end, MAX_SAMPLES + 1);
+    }
+
+    #[test]
+    fn startup_backlog_is_preserved_without_consuming_active_capacity() {
+        let buffer = CaptureBuffer::default();
+        let startup = MAX_SAMPLES as usize + 1;
+        buffer.append(vec![0.25; startup]).unwrap();
+        buffer.start_limit();
+        buffer.append(vec![0.5; MAX_SAMPLES as usize]).unwrap();
+        // Repeated readiness notifications cannot reset the overrun allowance.
+        buffer.start_limit();
+        assert!(buffer.append(vec![1.0]).is_err());
+
+        let end = startup as u64 + MAX_SAMPLES;
+        for pass in 0..2 {
+            let chunks = buffer.take(pass, end);
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].samples(), vec![0.25; startup]);
+            assert_eq!(chunks[1].samples(), vec![0.5; MAX_SAMPLES as usize]);
+        }
+        buffer.append(vec![1.0; MAX_SAMPLES as usize]).unwrap();
+        assert!(buffer.append(vec![2.0]).is_err());
+    }
+
+    #[test]
+    fn partial_startup_consumption_does_not_release_post_ready_capacity() {
+        let buffer = CaptureBuffer::default();
+        buffer.append(vec![0.25; MAX_SAMPLES as usize + 1]).unwrap();
+        buffer.start_limit();
+        buffer.append(vec![0.5; MAX_SAMPLES as usize]).unwrap();
+        buffer.take(0, MAX_SAMPLES);
+        buffer.take(1, MAX_SAMPLES);
+        assert!(buffer.append(vec![1.0]).is_err());
+        buffer.take(0, MAX_SAMPLES + 2);
+        assert!(buffer.append(vec![1.0]).is_err());
+        buffer.take(1, MAX_SAMPLES + 2);
+        buffer.append(vec![1.0]).unwrap();
+        assert!(buffer.append(vec![1.0]).is_err());
     }
 }
