@@ -202,6 +202,13 @@ Timed-out workers are indexed as failed; already-fsynced JSONL remains readable
 even without final files. Slow native model initialization or long decoding
 on quiet input can exhaust this deadline; pooling does not guarantee a clean
 four-stream drain in three seconds.
+Scheduler teardown rejects remaining queued jobs and drops worker handles without
+joining. Unfinished inference workers detach rather than extend Quit's drain
+deadline, including decodes orphaned by a recording write error.
+Each detached worker retains its shared queue, PCM, and exclusive decoder until
+the current call returns, then releases them and exits without taking another
+job. Native decoding is not forcibly interrupted; process exit can terminate
+it before completion.
 
 ### Transcription telemetry
 

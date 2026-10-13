@@ -2,6 +2,9 @@
 
 ## Next (unreleased)
 
+- Keep inference teardown from extending Quit's three-second drain deadline.
+  Reject queued jobs and detach ongoing decodes with their owned state until
+  they return, including refinement orphaned by a recording write error.
 - Refactor `voice-bird-next` into producers, an event bus, the SQLite gate,
   and a consumer-owned `UiView`; remove the dispatcher and old state modules.
 - Schedule input, source enumeration, downloads, and model-watch ticks with

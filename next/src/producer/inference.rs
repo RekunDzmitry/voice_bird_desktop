@@ -391,12 +391,10 @@ impl Drop for InferenceScheduler {
         }
         drop(state);
         self.shared.changed.notify_all();
-        // Workers own Shared, not InferenceScheduler. The last scheduler Arc
-        // always reaches this shutdown, and active inference finishes before
-        // its decoder and reply channel are released.
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
+        // Quit already gave coordinators a bounded drain window. Never extend
+        // it by waiting for a decode here. Unfinished workers detach and retain
+        // Shared and their exclusive decoder until execution returns, then exit.
+        self.workers.clear();
     }
 }
 
@@ -1084,6 +1082,80 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_pool_does_not_wait_for_orphaned_refinement() {
+        let scheduler =
+            InferenceScheduler::with_limits(InferenceLimits::for_system(2, 8 * 1024 * 1024 * 1024));
+        let shared = Arc::downgrade(&scheduler.shared);
+        let mut bus = EventBus::new();
+        let (replies, results) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active = request(10, 1, TranscriptPass::Refined);
+        let mut next = task(active, bus.sender(), replies);
+        next.engine = Box::new(GatedEngine {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        scheduler.prepare(next);
+        assert!(scheduler.dispatch(&active));
+        entered_rx
+            .recv_timeout(DEADLINE)
+            .expect("refinement started");
+        // A recording write error can drop the coordinator's reply receiver
+        // while its accepted refinement job is still decoding.
+        drop(results);
+
+        let (replies, results) = mpsc::channel();
+        let pending = request(20, 2, TranscriptPass::Live);
+        scheduler.prepare(task(pending, bus.sender(), replies));
+        assert!(scheduler.dispatch(&pending));
+        scheduler.begin_shutdown();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            drop(scheduler);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        let rejected = results
+            .recv_timeout(DEADLINE)
+            .expect("pending job rejected");
+        // Release the decoder before asserting, so even a blocking-drop
+        // regression cannot strand a test worker.
+        release_tx.send(()).expect("release refinement");
+        shutdown.join().expect("shutdown thread");
+        wait_for_workers(&shared);
+
+        assert!(
+            dropped.is_ok(),
+            "scheduler teardown waited for an orphaned refinement decode"
+        );
+        assert_eq!(rejected.request, pending);
+        assert_eq!(rejected.worker, 0);
+        assert_eq!(rejected.output.unwrap_err(), "inference scheduler stopped");
+        assert!(rejected.engine.is_some());
+        let events: Vec<_> = bus.drain().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::TranscriptionFinished { request, .. } if *request == active
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AppEvent::TranscriptionStarted { request, .. } if *request == pending
+        )));
+    }
+
+    fn wait_for_workers(shared: &std::sync::Weak<Shared>) {
+        let deadline = Instant::now() + DEADLINE;
+        while shared.strong_count() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            shared.upgrade().is_none(),
+            "workers released their shared state"
+        );
+    }
+
+    #[test]
     fn capture_progress_during_inference_is_measured_without_current_job_samples() {
         let scheduler = InferenceScheduler::new();
         let bus = EventBus::new();
@@ -1114,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_pool_joins_idle_workers_and_returns_prepared_decoder_state() {
+    fn dropping_the_pool_releases_idle_workers_and_returns_prepared_decoder_state() {
         let scheduler = InferenceScheduler::new();
         let shared = Arc::downgrade(&scheduler.shared);
         let bus = EventBus::new();
@@ -1127,10 +1199,7 @@ mod tests {
         assert_eq!(result.worker, 0);
         assert_eq!(result.output.unwrap_err(), "inference scheduler stopped");
         assert!(result.engine.is_some());
-        assert!(
-            shared.upgrade().is_none(),
-            "workers released their shared state"
-        );
+        wait_for_workers(&shared);
     }
 
     #[test]
