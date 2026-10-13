@@ -29,6 +29,14 @@ titles show only selections before the current picker step; active blocks use
 `id · device · app · language` (app omitted for inputs). Recording captures
 real audio on macOS and shows committed and tentative text inside the block.
 
+At most four sessions can be open, including source/language pickers and blocks
+waiting for models. Each recording owns decoder state, capture, and audio buffers;
+the cap bounds per-session memory for laptop stability. A fifth `+` leaves the
+sessions and focus unchanged and shows
+`session limit (4) reached; close a session to make room` in the red title bar.
+Closing a session with Esc clears that warning and allows another session.
+Every session remains visible; there is no hidden-session menu, and Tab does nothing.
+
 The registry currently maps `en` to `distil-small.en` for live
 transcription and `large-v3-turbo` for refinement. macOS also requires their
 compiled Core ML encoders; the distilled model uses its frozen small.en teacher
@@ -272,7 +280,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 
 | key | intent |
 |---|---|
-| `+` | add a block at the device picker on macOS, otherwise language picker |
+| `+` | add a block (maximum four) at the device picker on macOS, otherwise language picker |
 | `←` / `→` | move focus between blocks |
 | `↑` / `↓` | move picker highlight in the focused block |
 | `Enter` | select device/app, or resolve language and prepare all required assets |
@@ -287,7 +295,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 |---|---|
 | `src/language.rs` | language registry mapping codes to live/refine models and required assets |
 | `src/audio_sources.rs` | shared source types, `AudioSourcesCatalog`, and native macOS catalog |
-| `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
+| `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
 | `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
 | `src/producer/model_watch.rs` | startup/tick disk checks for the entire catalog, persisted in SQLite |
@@ -319,7 +327,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 | `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
 | `src/consumer/downloads.rs` | attempt-aware SQLite claims, request reconciliation, and fetch handoff |
 | `src/consumer/model_store.rs` | staging preparation, installation eligibility/handoff, and quit-time staging sweep |
-| `src/consumer/recording.rs` | reconcile visible/hidden blocks against SQLite lifecycle state and publish identity-scoped start/stop commands |
+| `src/consumer/recording.rs` | reconcile all sessions against SQLite lifecycle state and publish identity-scoped start/stop commands |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
@@ -412,7 +420,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
    table, then download history only for missing models. Accepted installation
    successes update availability before consumption; rejected stale successes
    cannot change it. A missing ready model sends every affected block, including
-   hidden sessions and the ready subset of Waiting blocks, back to Waiting and
+   the ready subset of Waiting blocks, back to Waiting and
    re-claims a shared download; pending, picker, and Failed sessions launch no
    automatic work. Duplicate notifications and observations after Quit do not
    launch work. Success resumes Recording automatically; failure enters Failed,

@@ -7,7 +7,6 @@
 //! puts everything that talks to the bus next to the bus itself.
 use crate::audio_sources::{DeviceKind, FunnelStep};
 use crate::bus::{AppEvent, EventSender, FocusMove};
-use crate::picker::PickerMove;
 
 use crate::consumer::ui_view::{BlockState, UiView};
 use crate::db::{downloads, Database};
@@ -43,58 +42,6 @@ pub fn stamp_picker_move(tx: &EventSender, ui_view: &UiView, direction: picker::
 ///
 /// [`AppEvent::BeginLanguage`]: crate::bus::AppEvent::BeginLanguage
 pub fn resolve_intent(intent: Intent, ui_view: &UiView, db: &mut Database, tx: &EventSender) {
-    // intents are hijacked to drive the menu instead of falling
-    // through to their default reducer. Branch on `ui_view.menu.is_some()`
-    // FIRST so the menu's behaviour is local and obvious; everything
-    // that doesn't intercept (`AddBlock`, `Quit`, `Retry`, focus
-    // moves) keeps its old semantics even with the menu open.
-    let menu_open = ui_view.menu.is_some();
-    if menu_open {
-        match intent {
-            Intent::ToggleMenu => {
-                tx.publish(AppEvent::MenuClosed);
-                return;
-            }
-            Intent::PickerPrev => {
-                tx.publish(AppEvent::MenuMoved {
-                    direction: PickerMove::Up,
-                });
-                return;
-            }
-            Intent::PickerNext => {
-                tx.publish(AppEvent::MenuMoved {
-                    direction: PickerMove::Down,
-                });
-                return;
-            }
-            Intent::Confirm => {
-                // Publish a SessionShown for the menu's selected row.
-                // The reducer closes the menu, runs `show_block` to
-                // evict the oldest-focused visible peer if needed, and
-                // moves focus to the chosen id. `ui_view.menu` is the
-                // session menu's struct, not the picker — `index` is
-                // a position in `ui_view.blocks`.
-                if let Some(menu) = ui_view.menu.as_ref() {
-                    if let Some(block) = ui_view.blocks.get(menu.index) {
-                        tx.publish(AppEvent::SessionShown { id: block.id });
-                    }
-                }
-                return;
-            }
-            Intent::StepBack => return,
-            Intent::BlockClosed => {
-                // Esc closes the menu instead of the focused block.
-                tx.publish(AppEvent::MenuClosed);
-                return;
-            }
-            _ => {} // fall through to default handling
-        }
-    } else if matches!(intent, Intent::ToggleMenu) {
-        // Tab toggles open (the close branch above already returned).
-        tx.publish(AppEvent::MenuOpened);
-        return;
-    }
-
     match intent {
         Intent::AddBlock => tx.publish(AppEvent::RequestBlock),
         Intent::FocusPrev => tx.publish(AppEvent::FocusMoved {
@@ -214,7 +161,6 @@ pub fn resolve_intent(intent: Intent, ui_view: &UiView, db: &mut Database, tx: &
             }
         }
         Intent::Quit => tx.publish(AppEvent::Quit),
-        Intent::ToggleMenu => unreachable!("handled above"),
     }
 }
 
@@ -225,7 +171,6 @@ mod tests {
     use crate::consumer::ui_view::Block;
     use crate::db::Database;
     use crate::language::{LanguageProfile, LANGUAGES};
-    use crate::picker::SessionMenu;
 
     fn english() -> &'static LanguageProfile {
         &LANGUAGES[0]
@@ -243,21 +188,6 @@ mod tests {
         let db = Database::open(&path, bus.sender()).unwrap();
         DbHandle { db, _tmp: tmp }
     }
-
-    /// The UI view with five PickingLanguage blocks (one focused). Mirrors the
-    /// original `ui_view_with_five_blocks` helper but walks the bus so
-    /// the reducer's AddBlock path — including `show_block` — runs.
-    fn ui_view_with_five_blocks() -> UiView {
-        let mut s = UiView::default();
-        for _ in 0..5 {
-            s.apply(&AppEvent::AddBlock);
-        }
-        s
-    }
-
-    // -----------------------------------------------------------------
-    // Pre-menu intent tests (from 595e0a0)
-    // -----------------------------------------------------------------
 
     #[test]
     fn confirm_on_picking_block_invokes_begin_language() {
@@ -338,174 +268,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, crate::bus::DownloadStatus::Cancelling);
-    }
-
-    // -----------------------------------------------------------------
-    // Session-menu tests (from a231a62)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn menu_open_toggle_publishes_menu_opened() {
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let ui_view = UiView::default();
-        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(
-            matches!(events.as_slice(), [AppEvent::MenuOpened]),
-            "ToggleMenu on a closed menu must publish MenuOpened; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn menu_open_toggle_publishes_menu_closed_when_already_open() {
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let ui_view = UiView {
-            menu: Some(SessionMenu::open_at(0)),
-            ..UiView::default()
-        };
-        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(
-            matches!(events.as_slice(), [AppEvent::MenuClosed]),
-            "ToggleMenu on an open menu must publish MenuClosed; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn confirm_with_menu_open_publishes_session_shown_not_download() {
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut ui_view = ui_view_with_five_blocks();
-        // Highlight the first block in the menu list — that's the
-        // hidden block 1.
-        ui_view.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Confirm, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event; got {events:?}"
-        );
-        match &events[0] {
-            AppEvent::SessionShown { id } => assert_eq!(*id, 1),
-            other => panic!("expected SessionShown, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn esc_with_menu_open_publishes_menu_closed_not_block_closed() {
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut ui_view = ui_view_with_five_blocks();
-        ui_view.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::BlockClosed, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event; got {events:?}"
-        );
-        assert!(
-            matches!(events.as_slice(), [AppEvent::MenuClosed]),
-            "Esc with the menu open must publish MenuClosed, not BlockClosed; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn picker_prev_next_with_menu_open_publish_menu_moved() {
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut ui_view = ui_view_with_five_blocks();
-        ui_view.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::PickerPrev, &ui_view, &mut h.db, &tx);
-        resolve_intent(Intent::PickerNext, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(events.len(), 2, "expected two events; got {events:?}");
-        assert!(
-            matches!(
-                &events[0],
-                AppEvent::MenuMoved {
-                    direction: PickerMove::Up
-                }
-            ),
-            "first event must be MenuMoved Up; got {:?}",
-            events[0]
-        );
-        assert!(
-            matches!(
-                &events[1],
-                AppEvent::MenuMoved {
-                    direction: PickerMove::Down
-                }
-            ),
-            "second event must be MenuMoved Down; got {:?}",
-            events[1]
-        );
-    }
-
-    #[test]
-    fn quit_with_menu_open_still_publishes_quit() {
-        // Quit is not intercepted — the user must be able to leave
-        // the app even with the menu open.
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut ui_view = ui_view_with_five_blocks();
-        ui_view.menu = Some(SessionMenu::open_at(0));
-        resolve_intent(Intent::Quit, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(
-            matches!(events.as_slice(), [AppEvent::Quit]),
-            "Quit with the menu open must still publish Quit; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn menu_open_with_no_blocks_publishes_toggle_only() {
-        // Even without blocks, opening the menu must publish exactly
-        // one event so the loop drains cleanly.
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let ui_view = UiView::default();
-        resolve_intent(Intent::ToggleMenu, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert!(
-            matches!(events.as_slice(), [AppEvent::MenuOpened]),
-            "ToggleMenu on a fresh UI view must publish MenuOpened; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn session_shown_picks_up_menu_index_for_block_id() {
-        // Sanity: SessionShown reads the id from the menu's selected
-        // row, not from `ui_view.focus`. Highlight the last row in a
-        // 3-block UI view — id=3, even though focus=2.
-        let mut bus = EventBus::new();
-        let tx = bus.sender();
-        let mut h = db_with(&bus);
-        let mut ui_view = UiView::default();
-        for _ in 0..3 {
-            ui_view.apply(&AppEvent::AddBlock);
-        }
-        ui_view.menu = Some(SessionMenu::open_at(2));
-        resolve_intent(Intent::Confirm, &ui_view, &mut h.db, &tx);
-        let events: Vec<AppEvent> = bus.drain().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event; got {events:?}"
-        );
-        match &events[0] {
-            AppEvent::SessionShown { id } => assert_eq!(*id, 3),
-            other => panic!("expected SessionShown for id=3, got {other:?}"),
-        }
     }
 }

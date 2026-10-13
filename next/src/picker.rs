@@ -162,41 +162,6 @@ pub enum PickerEvent {
     Cancelled,
 }
 
-/// Left-hand session menu. Shares [`ListPicker`]'s saturating movement
-/// (never wraps) and uses [`PickerMove`] for direction events.
-///
-/// `index` is a position into [`crate::consumer::UiView::blocks`] — the
-/// menu lists *all* sessions in creation order, not just the visible
-/// ones, so the user can reach a hidden block through it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionMenu {
-    /// Position inside `UiView.blocks`. The reducer's `show_block`
-    /// helper looks the id up by index, so a stale position simply
-    /// misses and the resolver no-ops — no panics on a race.
-    pub index: usize,
-}
-
-impl SessionMenu {
-    /// Open the menu at the requested row. The caller owns the bounds
-    /// check on `blocks`; the reducer's `apply` arm for `MenuOpened`
-    /// passes `state.focus` (clamped to `len`).
-    pub fn open_at(index: usize) -> Self {
-        Self { index }
-    }
-
-    /// Apply a move event. Saturates at both ends; never wraps. The
-    /// menu's `index` is relative to the full session list (not the
-    /// visible subset), so the clamp lives at the menu layer rather
-    /// than at the resolver.
-    pub fn apply(&mut self, event: PickerEvent, len: usize) {
-        if let PickerEvent::Moved(direction) = event {
-            self.index = step(self.index, len, direction);
-        } else {
-            self.index = self.index.min(len.saturating_sub(1));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,60 +240,5 @@ mod tests {
         for entry in CATALOG {
             assert!(entry.download_url.starts_with("https://"), "{}", entry.id);
         }
-    }
-
-    #[test]
-    fn session_menu_open_at_sets_initial_index() {
-        let menu = SessionMenu::open_at(2);
-        assert_eq!(menu.index, 2);
-    }
-
-    #[test]
-    fn session_menu_apply_up_saturates_at_zero() {
-        let mut menu = SessionMenu::open_at(0);
-        menu.apply(PickerEvent::Moved(PickerMove::Up), 4);
-        assert_eq!(menu.index, 0);
-    }
-
-    #[test]
-    fn session_menu_apply_down_clamps_at_last() {
-        let mut menu = SessionMenu::open_at(3);
-        menu.apply(PickerEvent::Moved(PickerMove::Down), 4);
-        assert_eq!(menu.index, 3);
-    }
-
-    #[test]
-    fn session_menu_apply_down_then_up_returns_to_previous() {
-        let mut menu = SessionMenu::open_at(1);
-        menu.apply(PickerEvent::Moved(PickerMove::Down), 5);
-        assert_eq!(menu.index, 2);
-        menu.apply(PickerEvent::Moved(PickerMove::Up), 5);
-        assert_eq!(menu.index, 1);
-    }
-
-    #[test]
-    fn session_menu_apply_picked_or_cancelled_does_not_move_highlight() {
-        let mut menu = SessionMenu::open_at(2);
-        menu.apply(PickerEvent::Picked, 5);
-        assert_eq!(menu.index, 2);
-        menu.apply(PickerEvent::Cancelled, 5);
-        assert_eq!(menu.index, 2);
-    }
-
-    #[test]
-    fn session_menu_with_zero_rows_keeps_index_at_zero() {
-        let mut menu = SessionMenu::open_at(7);
-        menu.apply(PickerEvent::Moved(PickerMove::Down), 0);
-        assert_eq!(menu.index, 0);
-    }
-
-    #[test]
-    fn session_menu_clamps_a_stale_index_when_len_shrinks() {
-        // Race: a block closed while the menu was open, and the index
-        // was on the last row. The next move must land on the new last
-        // row, not panic on an out-of-bounds access.
-        let mut menu = SessionMenu::open_at(4);
-        menu.apply(PickerEvent::Moved(PickerMove::Down), 3);
-        assert_eq!(menu.index, 2);
     }
 }

@@ -1620,7 +1620,6 @@ async fn model_dropped_with_two_recording_blocks_shares_one_download() {
         confirm_and_consume(&mut bus, &mut consumer, &mut recording, &mut handle.db);
         drain_consume(&mut bus, &mut consumer, &mut recording, &mut handle.db);
     }
-    consumer.consumers.ui_view.blocks[1].visible = false;
     assert!(consumer
         .consumers
         .ui_view
@@ -2269,12 +2268,9 @@ async fn language_confirm_and_back_race_never_orphans_downloads() {
 }
 
 #[tokio::test]
-async fn back_is_ignored_outside_source_pickers_and_menu_intercepts_it() {
+async fn back_is_ignored_outside_source_pickers() {
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    let mut recording = RecordingProducer::new(voice_bird_next::testing::recording_services(
-        handle._tmp.path(),
-    ));
     let mut consumer = source_consumer(&handle);
     consumer.consumers.ui_view = source_view();
     let states = [
@@ -2302,22 +2298,6 @@ async fn back_is_ignored_outside_source_pickers_and_menu_intercepts_it() {
     }
     consumer.consumers.ui_view = UiView::default();
     consumer.consumers.ui_view.apply(&AppEvent::AddBlock);
-    resolve_intent(
-        Intent::StepBack,
-        &consumer.consumers.ui_view,
-        &mut handle.db,
-        &bus.sender(),
-    );
-    assert_eq!(bus.drain().count(), 0);
-    consumer.consumers.ui_view = source_view();
-    source_intent(
-        Intent::Confirm,
-        &mut consumer,
-        &mut recording,
-        &mut handle.db,
-        &mut bus,
-    );
-    consumer.consumers.ui_view.apply(&AppEvent::MenuOpened);
     resolve_intent(
         Intent::StepBack,
         &consumer.consumers.ui_view,
@@ -2454,7 +2434,7 @@ async fn queued_confirm_then_close_clears_steps_before_block_id_reuse() {
 }
 
 #[tokio::test]
-async fn add_block_with_menu_open_uses_catalog_and_focuses_new_source_picker() {
+async fn add_block_uses_catalog_and_focuses_new_source_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let mut recording =
         RecordingProducer::new(voice_bird_next::testing::recording_services(tmp.path()));
@@ -2471,7 +2451,6 @@ async fn add_block_with_menu_open_uses_catalog_and_focuses_new_source_picker() {
     ));
     let mut bus = EventBus::new();
     let mut handle = downloads_with(&bus);
-    consumer.consumers.ui_view.apply(&AppEvent::MenuOpened);
     resolve_intent(
         Intent::AddBlock,
         &consumer.consumers.ui_view,

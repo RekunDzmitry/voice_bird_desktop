@@ -229,7 +229,13 @@ mod tests {
             .execute_batch("DROP TABLE recording_requests")
             .unwrap();
 
-        consumer.consume(&[AppEvent::MenuOpened], &mut db, &bus.sender());
+        consumer.consume(
+            &[AppEvent::FocusMoved {
+                direction: crate::bus::FocusMove::Next,
+            }],
+            &mut db,
+            &bus.sender(),
+        );
 
         assert!(matches!(
             consumer.consumers.ui_view.blocks[0].state,
@@ -356,7 +362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_observation_reaches_shared_hidden_sessions_in_two_bus_stages() {
+    async fn absent_observation_reaches_shared_sessions_in_two_bus_stages() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bus = EventBus::new();
         let mut db = Database::open(&tmp.path().join("downloads.sqlite"), bus.sender()).unwrap();
@@ -366,13 +372,13 @@ mod tests {
         consumer.consumers.ui_view.blocks = vec![
             Block::new(1, BlockState::recording(language)),
             Block::new(2, BlockState::recording(language)),
-            Block::new(3, BlockState::PickingLanguage(ListPicker::default())),
+            Block::new(3, BlockState::recording(language)),
+            Block::new(4, BlockState::PickingLanguage(ListPicker::default())),
         ];
         // Observe existing sessions, not blocks awaiting their initial capture request.
         consumer.consumers.ui_view.begin_session(1, 1);
         consumer.consumers.ui_view.begin_session(2, 2);
-        consumer.consumers.ui_view.blocks[0].visible = false;
-        consumer.consumers.ui_view.blocks[1].visible = false;
+        consumer.consumers.ui_view.begin_session(3, 3);
         let before = consumer.consumers.ui_view.blocks.clone();
         models::set_available(&mut db, language.live.id, false).unwrap();
         bus.sender().publish(AppEvent::ModelAvailabilityChanged {
@@ -400,7 +406,7 @@ mod tests {
             &bus.sender(),
             &mut recording,
         );
-        for block in &consumer.consumers.ui_view.blocks[..2] {
+        for block in &consumer.consumers.ui_view.blocks[..3] {
             assert_eq!(
                 block.state,
                 BlockState::Waiting {
@@ -409,9 +415,7 @@ mod tests {
                 }
             );
         }
-        assert_eq!(consumer.consumers.ui_view.blocks[2], before[2]);
-        assert!(!consumer.consumers.ui_view.blocks[0].visible);
-        assert!(!consumer.consumers.ui_view.blocks[1].visible);
+        assert_eq!(consumer.consumers.ui_view.blocks[3], before[3]);
         assert_eq!(
             bus.drain().collect::<Vec<_>>(),
             vec![AppEvent::DownloadRequested {

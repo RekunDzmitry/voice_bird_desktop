@@ -1,5 +1,5 @@
 ┌ Voice Bird ──────────────────────────────────────────────────────────────────────────────────────┐
-││ 2 · pick a language   ││ 3 · pick a language  ││ 4 · pick a language   │┌ 5 · pick a language ─┐│
+││ 1 · pick a language   ││ 2 · pick a language  ││ 3 · pick a language   │┌ 4 · pick a language ─┐│
 ││▶ en                   ││▶ en                  ││▶ en                   ││▶ en                  ││
 ││                       ││                      ││                       ││                      ││
 ││                       ││                      ││                       ││                      ││
