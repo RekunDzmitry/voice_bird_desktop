@@ -93,7 +93,6 @@ mod tests {
                 )),
                 store,
                 consumer_audio_sources,
-                crate::testing::recording_services(&root),
             ));
             consumer.consume(&[AppEvent::RequestBlock], &mut db, &tx);
             proceed_rx.blocking_recv().unwrap();
@@ -116,7 +115,10 @@ mod tests {
         assert_eq!(timeout(WAIT, entered.recv()).await.unwrap().unwrap(), 0);
         proceed.send(()).unwrap();
         assert!(timeout(WAIT, event_loop).await.unwrap().unwrap());
-        assert!(!staged.exists(), "discard must complete before query release");
+        assert!(
+            !staged.exists(),
+            "discard must complete before query release"
+        );
         assert_eq!(audio_sources.calls.load(Ordering::SeqCst), 1);
         assert!(bus.drain().next().is_none());
 

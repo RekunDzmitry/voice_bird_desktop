@@ -207,8 +207,7 @@ mod tests {
         assert_eq!(
             result,
             Err(DownloadError::Sha256Mismatch {
-                got: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                    .into(),
+                got: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
                 expected: "deadbeef".into(),
             })
         );
@@ -282,14 +281,15 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let downloader = FixtureDownloader::new(vec![0u8; 1024], Outcome::Ok, Arc::clone(&calls));
-        let res = downloader.fetch(
-            "https://example.invalid/x",
-            &staged,
-            "deadbeef",
-            &mut { &cancel },
-            &mut |_, _| {},
-        )
-        .await;
+        let res = downloader
+            .fetch(
+                "https://example.invalid/x",
+                &staged,
+                "deadbeef",
+                &mut { &cancel },
+                &mut |_, _| {},
+            )
+            .await;
         assert_eq!(res, Err(DownloadError::Cancelled));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch was invoked once");
     }

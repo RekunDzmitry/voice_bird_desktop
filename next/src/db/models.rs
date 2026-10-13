@@ -87,29 +87,46 @@ mod tests {
         let stale_attempt = downloads::start(&mut db, model.id).unwrap();
         downloads::cancel(&mut db, model.id).unwrap();
         let current_attempt = downloads::start(&mut db, model.id).unwrap();
-        assert!(!db::apply(&mut db, &AppEvent::DownloadSucceeded {
-            attempt: stale_attempt,
-            model: model.id,
-        }).unwrap());
+        assert!(!db::apply(
+            &mut db,
+            &AppEvent::DownloadSucceeded {
+                attempt: stale_attempt,
+                model: model.id,
+            }
+        )
+        .unwrap());
         assert!(!is_available(&db, model.id).unwrap());
-        assert!(db::apply(&mut db, &AppEvent::DownloadSucceeded {
-            attempt: current_attempt,
-            model: model.id,
-        }).unwrap());
+        assert!(db::apply(
+            &mut db,
+            &AppEvent::DownloadSucceeded {
+                attempt: current_attempt,
+                model: model.id,
+            }
+        )
+        .unwrap());
         assert!(is_available(&db, model.id).unwrap());
-        assert!(!db::apply(&mut db, &AppEvent::ModelAvailabilityChanged {
-            model, available: false,
-        }).unwrap());
+        assert!(!db::apply(
+            &mut db,
+            &AppEvent::ModelAvailabilityChanged {
+                model,
+                available: false,
+            }
+        )
+        .unwrap());
         assert!(is_available(&db, model.id).unwrap());
 
         // A queued cached reply is an observation, not an installation.
         set_available(&mut db, model.id, false).unwrap();
         assert!(db::apply(&mut db, &AppEvent::ModelAlreadyCached(model)).unwrap());
         assert!(!is_available(&db, model.id).unwrap());
-        assert!(!db::apply(&mut db, &AppEvent::DownloadSucceeded {
-            attempt: stale_attempt,
-            model: model.id,
-        }).unwrap());
+        assert!(!db::apply(
+            &mut db,
+            &AppEvent::DownloadSucceeded {
+                attempt: stale_attempt,
+                model: model.id,
+            }
+        )
+        .unwrap());
         assert!(!is_available(&db, model.id).unwrap());
     }
 
@@ -119,9 +136,14 @@ mod tests {
         let bus = EventBus::new();
         let mut db = Database::open(&dir.path().join("models.sqlite"), bus.sender()).unwrap();
         db.conn_mut().execute("DROP TABLE models", []).unwrap();
-        let error = db::apply(&mut db, &AppEvent::ModelAvailabilityChanged {
-            model: LANGUAGES[0].live, available: false,
-        }).unwrap_err();
+        let error = db::apply(
+            &mut db,
+            &AppEvent::ModelAvailabilityChanged {
+                model: LANGUAGES[0].live,
+                available: false,
+            },
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("models"));
     }
 
@@ -137,24 +159,48 @@ mod tests {
                 set_available(&mut db, model.id, false).unwrap();
             }
             let attempt = downloads::start(&mut db, model.id).unwrap();
-            assert!(db::apply(&mut db, &AppEvent::DownloadFetched { attempt, model: model.id }).unwrap());
+            assert!(db::apply(
+                &mut db,
+                &AppEvent::DownloadFetched {
+                    attempt,
+                    model: model.id
+                }
+            )
+            .unwrap());
             bus.drain().for_each(drop);
             let operation = if existing { "UPDATE" } else { "INSERT" };
-            db.conn_mut().execute_batch(&format!(
-                "CREATE TRIGGER deny_availability BEFORE {operation} ON models
+            db.conn_mut()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER deny_availability BEFORE {operation} ON models
                  BEGIN SELECT RAISE(ABORT, 'availability write denied'); END;"
-            )).unwrap();
-            let success = AppEvent::DownloadSucceeded { attempt, model: model.id };
+                ))
+                .unwrap();
+            let success = AppEvent::DownloadSucceeded {
+                attempt,
+                model: model.id,
+            };
             assert!(db::apply(&mut db, &success).is_err());
-            assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Installing);
+            assert_eq!(
+                downloads::get(&db, model.id).unwrap().unwrap().status,
+                DownloadStatus::Installing
+            );
             assert!(!is_available(&db, model.id).unwrap());
-            assert!(!bus.drain().any(|event| matches!(event,
-                AppEvent::DownloadStatusChanged { to: DownloadStatus::Succeeded, .. }
+            assert!(!bus.drain().any(|event| matches!(
+                event,
+                AppEvent::DownloadStatusChanged {
+                    to: DownloadStatus::Succeeded,
+                    ..
+                }
             )));
 
-            db.conn_mut().execute_batch("DROP TRIGGER deny_availability").unwrap();
+            db.conn_mut()
+                .execute_batch("DROP TRIGGER deny_availability")
+                .unwrap();
             assert!(db::apply(&mut db, &success).unwrap());
-            assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Succeeded);
+            assert_eq!(
+                downloads::get(&db, model.id).unwrap().unwrap().status,
+                DownloadStatus::Succeeded
+            );
             assert!(is_available(&db, model.id).unwrap());
             assert!(bus.drain().any(|event| matches!(event,
                 AppEvent::DownloadStatusChanged { attempt: published, to: DownloadStatus::Succeeded, .. }
@@ -171,29 +217,53 @@ mod tests {
         let mut db = Database::open(&dir.path().join("models.sqlite"), bus.sender()).unwrap();
         let model = LANGUAGES[0].live;
         let attempt = downloads::start(&mut db, model.id).unwrap();
-        assert!(db::apply(&mut db, &AppEvent::DownloadFetched { attempt, model: model.id }).unwrap());
+        assert!(db::apply(
+            &mut db,
+            &AppEvent::DownloadFetched {
+                attempt,
+                model: model.id
+            }
+        )
+        .unwrap());
         bus.drain().for_each(drop);
-        db.conn_mut().execute_batch(
-            "PRAGMA foreign_keys = ON;
+        db.conn_mut()
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
              CREATE TABLE commit_targets (id INTEGER PRIMARY KEY);
              CREATE TABLE deferred_commit_check (
                  missing INTEGER REFERENCES commit_targets(id) DEFERRABLE INITIALLY DEFERRED
              );
              CREATE TRIGGER deny_success_commit AFTER INSERT ON models
-             BEGIN INSERT INTO deferred_commit_check VALUES (1); END;"
-        ).unwrap();
-        let success = AppEvent::DownloadSucceeded { attempt, model: model.id };
+             BEGIN INSERT INTO deferred_commit_check VALUES (1); END;",
+            )
+            .unwrap();
+        let success = AppEvent::DownloadSucceeded {
+            attempt,
+            model: model.id,
+        };
         assert!(db::apply(&mut db, &success).is_err());
         assert!(db.conn_ref().is_autocommit());
-        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Installing);
+        assert_eq!(
+            downloads::get(&db, model.id).unwrap().unwrap().status,
+            DownloadStatus::Installing
+        );
         assert!(!is_available(&db, model.id).unwrap());
-        assert!(!bus.drain().any(|event| matches!(event,
-            AppEvent::DownloadStatusChanged { to: DownloadStatus::Succeeded, .. }
+        assert!(!bus.drain().any(|event| matches!(
+            event,
+            AppEvent::DownloadStatusChanged {
+                to: DownloadStatus::Succeeded,
+                ..
+            }
         )));
 
-        db.conn_mut().execute_batch("DROP TRIGGER deny_success_commit").unwrap();
+        db.conn_mut()
+            .execute_batch("DROP TRIGGER deny_success_commit")
+            .unwrap();
         assert!(db::apply(&mut db, &success).unwrap());
         assert!(is_available(&db, model.id).unwrap());
-        assert_eq!(downloads::get(&db, model.id).unwrap().unwrap().status, DownloadStatus::Succeeded);
+        assert_eq!(
+            downloads::get(&db, model.id).unwrap().unwrap().status,
+            DownloadStatus::Succeeded
+        );
     }
 }

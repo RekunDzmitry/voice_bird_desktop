@@ -1,9 +1,9 @@
 use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 use voice_bird_next::{
+    consumer::ui_view::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     language::LANGUAGES,
     picker::{ListPicker, SessionMenu, CATALOG},
-    consumer::ui_view::{Block, BlockState, DownloadPhase, DownloadState, UiView},
     testing::render_to_string,
 };
 
@@ -74,7 +74,7 @@ fn picking_100x30_matches_golden() {
         blocks: vec![Block {
             id: 1,
             state: BlockState::PickingLanguage(ListPicker::default()),
-    
+
             ..Default::default()
         }],
         focus: 0,
@@ -89,7 +89,6 @@ fn picking_100x30_matches_golden() {
     assert_eq!(out, expected);
 }
 
-
 #[test]
 fn failed_100x30_matches_golden() {
     let ui_view = UiView {
@@ -100,7 +99,7 @@ fn failed_100x30_matches_golden() {
                 error: "HTTP 404".to_string(),
                 pending: Vec::new(),
             },
-    
+
             ..Default::default()
         }],
         focus: 0,
@@ -653,18 +652,20 @@ fn app_picker_hides_retained_app_and_restores_app_cursor() {
 fn recording_with_source_100x30_matches_golden() {
     source_golden(
         "recording_with_source",
-        source_block_view(
-            BlockState::recording(&LANGUAGES[0]),
-            Some(1),
-            Some(1),
-        ),
+        source_block_view(BlockState::recording(&LANGUAGES[0]), Some(1), Some(1)),
     );
 }
 
 #[test]
 fn recording_with_transcript_100x30_matches_golden() {
     let mut state = BlockState::recording(&LANGUAGES[0]);
-    if let BlockState::Recording { lines, tentative, session_dir, .. } = &mut state {
+    if let BlockState::Recording {
+        lines,
+        tentative,
+        session_dir,
+        ..
+    } = &mut state
+    {
         *lines = vec![
             "Welcome to Voice Bird.".into(),
             "Refined text replaces the earlier live words.".into(),
@@ -673,17 +674,20 @@ fn recording_with_transcript_100x30_matches_golden() {
         *tentative = "The next sentence is still arriving…".into();
         *session_dir = Some("/local/data/sessions/2026-10-08_12-30-00-b1-mic".into());
     }
-    source_golden("recording_with_transcript", source_block_view(state, Some(0), None));
+    source_golden(
+        "recording_with_transcript",
+        source_block_view(state, Some(0), None),
+    );
 }
 
 #[test]
 fn small_recording_view_keeps_wrapped_tail_and_tentative_visible() {
     let mut state = BlockState::recording(&LANGUAGES[0]);
-    if let BlockState::Recording { lines, tentative, .. } = &mut state {
-        *lines = vec![
-            "older words ".repeat(30),
-            "latest committed words".into(),
-        ];
+    if let BlockState::Recording {
+        lines, tentative, ..
+    } = &mut state
+    {
+        *lines = vec!["older words ".repeat(30), "latest committed words".into()];
         *tentative = "next words".into();
     }
     let out = render_to_string(&source_block_view(state, Some(0), None), 30, 12);
@@ -693,11 +697,7 @@ fn small_recording_view_keeps_wrapped_tail_and_tentative_visible() {
 
 #[test]
 fn input_source_title_omits_app() {
-    let ui_view = source_block_view(
-        BlockState::recording(&LANGUAGES[0]),
-        Some(0),
-        None,
-    );
+    let ui_view = source_block_view(BlockState::recording(&LANGUAGES[0]), Some(0), None);
     let out = render_to_string(&ui_view, 100, 30);
     assert!(out.contains("1 · Mic · en"), "{out}");
     assert!(!out.contains("Spotify"), "{out}");

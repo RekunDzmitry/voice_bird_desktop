@@ -6,19 +6,20 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
 use futures::StreamExt;
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
 use voice_bird_next::bus::{AppEvent, EventBus, EventSender};
-use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::consumer::{Consumer, Consumers, UiView};
+use voice_bird_next::db::{downloads, Database};
 use voice_bird_next::download::Downloader;
 #[cfg(feature = "net")]
 use voice_bird_next::download::HttpDownloader;
 use voice_bird_next::producer::model_watch::ModelWatcher;
+use voice_bird_next::producer::recording::{RecordingProducer, RecordingServices};
 use voice_bird_next::transcription_models::{CacheDirStore, ModelStore};
 use voice_bird_next::{input, producer};
 /// Runs `restore` on drop.
@@ -122,12 +123,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
         downloader,
         model_store.clone(),
         voice_bird_next::audio_sources::system_sources(),
-        voice_bird_next::producer::recording::RecordingServices {
-            capture: voice_bird_next::audio::system_capture(),
-            engines: voice_bird_next::transcribe::system_engines(),
-            sessions_root: voice_bird_next::db::data_dir().join("sessions"),
-        },
     ));
+    let mut recording = RecordingProducer::new(RecordingServices {
+        capture: voice_bird_next::audio::system_capture(),
+        engines: voice_bird_next::transcribe::system_engines(),
+        sessions_root: voice_bird_next::db::data_dir().join("sessions"),
+    });
     let watcher = ModelWatcher::new(model_store);
     watcher.check(&mut db, &tx).map_err(io::Error::other)?;
     let mut input = EventStream::new();
@@ -153,7 +154,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
             event = bus.recv() => {
                 let Some(event) = event else { break };
                 let events = std::iter::once(event).chain(bus.drain()).collect();
-                consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
+                consume_logged(events, &mut log, &mut consumer, &mut recording, &mut db, &tx);
                 dirty = true;
             }
             _ = tick.tick() => {
@@ -168,21 +169,37 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()
     }.await;
     // All exit paths finalize recordings, including input/terminal failures.
     if !consumer.consumers.ui_view.should_quit {
-        consume_logged(vec![AppEvent::Quit], &mut log, &mut consumer, &mut db, &tx);
+        consume_logged(
+            vec![AppEvent::Quit],
+            &mut log,
+            &mut consumer,
+            &mut recording,
+            &mut db,
+            &tx,
+        );
     }
-    consumer.consumers.recording.producer.begin_shutdown();
+    recording.begin_shutdown();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !consumer.consumers.recording.producer.shutdown_finished() {
+    while !recording.shutdown_finished() {
         match tokio::time::timeout_at(deadline, bus.recv()).await {
             Ok(Some(event)) => {
                 let events = std::iter::once(event).chain(bus.drain()).collect();
-                consume_logged(events, &mut log, &mut consumer, &mut db, &tx);
+                consume_logged(
+                    events,
+                    &mut log,
+                    &mut consumer,
+                    &mut recording,
+                    &mut db,
+                    &tx,
+                );
             }
             Ok(None) | Err(_) => break,
         }
     }
-    consumer.consumers.recording.producer.finish_shutdown(&tx);
-    cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut log);
+    if let Err(error) = recording.finish_shutdown(&mut db, &tx) {
+        eprintln!("voice-bird-next: recording shutdown failed: {error}");
+    }
+    cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut recording, &mut log);
     result
 }
 
@@ -191,6 +208,7 @@ fn consume_logged(
     events: Vec<AppEvent>,
     log: &mut Option<voice_bird_next::event_log::EventLog>,
     consumer: &mut Consumer,
+    recording: &mut RecordingProducer,
     db: &mut Database,
     tx: &EventSender,
 ) {
@@ -209,7 +227,20 @@ fn consume_logged(
         if admitted {
             accepted.push(event);
         } else if let AppEvent::TranscriptionRequested { request } = event {
-            consumer.consumers.recording.producer.reject_unaccepted(&request);
+            recording.reject_unaccepted(&request);
+        }
+    }
+    for event in &accepted {
+        if let Err(error) = recording.produce(event, db, tx) {
+            eprintln!("voice-bird-next: recording producer failed: {error}");
+            consumer.consumers.ui_view.warning = Some(format!("recording workers table: {error}"));
+            if let AppEvent::RecordingRequested { request } = event {
+                tx.publish(AppEvent::RecordingFailed {
+                    block: request.block,
+                    recording: request.recording,
+                    error: format!("recording worker claim: {error}"),
+                });
+            }
         }
     }
     consumer.consume(&accepted, db, tx);
@@ -233,6 +264,7 @@ fn cleanup_inflight(
     db: &mut Database,
     bus: &mut EventBus,
     consumer: &mut Consumer,
+    recording: &mut RecordingProducer,
     log: &mut Option<voice_bird_next::event_log::EventLog>,
 ) {
     let active = match downloads::active(db) {
@@ -256,7 +288,7 @@ fn cleanup_inflight(
         if events.is_empty() {
             break;
         }
-        consume_logged(events, log, consumer, db, &tx);
+        consume_logged(events, log, consumer, recording, db, &tx);
     }
 }
 

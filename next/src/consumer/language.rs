@@ -21,7 +21,8 @@ impl LanguageConsumer {
     ) {
         let events: Vec<_> = language
             .models()
-            .iter().copied()
+            .iter()
+            .copied()
             .map(|model| (model.id, Self::request_event(model, db)))
             .collect();
         let pending = events
@@ -103,16 +104,28 @@ mod tests {
         let events: Vec<_> = bus.drain().collect();
         assert_eq!(
             events,
-            std::iter::once(AppEvent::LanguageSelected { block: 1, language, pending: vec![] })
-                .chain(language.models().iter().copied().map(AppEvent::ModelAlreadyCached))
-                .collect::<Vec<_>>()
+            std::iter::once(AppEvent::LanguageSelected {
+                block: 1,
+                language,
+                pending: vec![]
+            })
+            .chain(
+                language
+                    .models()
+                    .iter()
+                    .copied()
+                    .map(AppEvent::ModelAlreadyCached)
+            )
+            .collect::<Vec<_>>()
         );
         for event in events {
             assert!(crate::db::apply(&mut db, &event).unwrap());
             view.apply(&event);
         }
-        assert!(matches!(view.blocks[0].state, BlockState::Recording { language: selected, .. }
-            if selected == language));
+        assert!(
+            matches!(view.blocks[0].state, BlockState::Recording { language: selected, .. }
+            if selected == language)
+        );
     }
 
     #[test]
@@ -121,7 +134,9 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let mut bus = EventBus::new();
             let mut db = Database::open(&tmp.path().join("models.sqlite"), bus.sender()).unwrap();
-            db.conn_mut().execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            db.conn_mut()
+                .execute_batch(&format!("DROP TABLE {table}"))
+                .unwrap();
             let language = &LANGUAGES[0];
             let mut view = UiView::default();
             view.apply(&AppEvent::AddBlock);
@@ -166,16 +181,25 @@ mod tests {
         }
         LanguageConsumer.begin(1, language, &db, &bus.sender());
         let events: Vec<_> = bus.drain().collect();
-        assert_eq!(events[0], AppEvent::LanguageSelected {
-            block: 1,
-            language,
-            pending: vec!["distil-small.en-encoder", "large-v3-turbo-encoder"],
-        });
-        let requested: Vec<_> = events.iter().filter_map(|event| match event {
-            AppEvent::DownloadRequested { model, .. } => Some(model.id),
-            _ => None,
-        }).collect();
-        assert_eq!(requested, ["distil-small.en-encoder", "large-v3-turbo-encoder"]);
+        assert_eq!(
+            events[0],
+            AppEvent::LanguageSelected {
+                block: 1,
+                language,
+                pending: vec!["distil-small.en-encoder", "large-v3-turbo-encoder"],
+            }
+        );
+        let requested: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::DownloadRequested { model, .. } => Some(model.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requested,
+            ["distil-small.en-encoder", "large-v3-turbo-encoder"]
+        );
         assert!(events.contains(&AppEvent::ModelAlreadyCached(language.live)));
         assert!(events.contains(&AppEvent::ModelAlreadyCached(language.refine)));
     }

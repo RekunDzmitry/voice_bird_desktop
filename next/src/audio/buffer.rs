@@ -76,10 +76,15 @@ impl CaptureBuffer {
         let mut state = self.state.lock();
         let count = pcm.len() as u64;
         let retained = state.end - *state.cursors.iter().min().unwrap();
-        anyhow::ensure!(retained + count <= MAX_SAMPLES,
-            "audio transcription buffer overrun: inference could not keep up");
+        anyhow::ensure!(
+            retained + count <= MAX_SAMPLES,
+            "audio transcription buffer overrun: inference could not keep up"
+        );
         let start = state.end;
-        state.chunks.push_back(Chunk { start, pcm: Arc::new(pcm) });
+        state.chunks.push_back(Chunk {
+            start,
+            pcm: Arc::new(pcm),
+        });
         state.end += count;
         self.captured.store(state.end, Ordering::Release);
         Ok(())
@@ -138,9 +143,11 @@ impl CaptureBuffer {
 
 fn reclaim(state: &mut State) {
     let consumed = *state.cursors.iter().min().unwrap();
-    while state.chunks.front().is_some_and(|chunk| {
-        chunk.start + chunk.pcm.len() as u64 <= consumed
-    }) {
+    while state
+        .chunks
+        .front()
+        .is_some_and(|chunk| chunk.start + chunk.pcm.len() as u64 <= consumed)
+    {
         state.chunks.pop_front();
     }
 }
@@ -150,7 +157,10 @@ mod tests {
     use super::*;
 
     fn samples(slices: &[PcmSlice]) -> Vec<f32> {
-        slices.iter().flat_map(|slice| slice.samples().iter().copied()).collect()
+        slices
+            .iter()
+            .flat_map(|slice| slice.samples().iter().copied())
+            .collect()
     }
 
     #[test]

@@ -24,8 +24,8 @@
 //! progress row either.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
@@ -33,7 +33,6 @@ use tar::Archive;
 use crate::db::downloads::CancelCheck;
 use crate::download::DownloadError;
 use crate::picker::{ModelEntry, ModelFormat};
-
 
 /// Everything format-specific about getting a model onto disk and
 /// deciding whether it is already there.
@@ -277,10 +276,13 @@ pub struct CoreMlEncoderHandler;
 /// bundle artifacts in the pinned official encoder archives. Native state
 /// creation additionally verifies that Core ML can actually load the bundle.
 pub(crate) fn coreml_bundle_present(path: &Path) -> bool {
-    let directory = |path: &Path| fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_dir());
-    let file = |path: &Path| fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0);
+    let directory = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    let file = |path: &Path| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
+    };
     directory(path)
         && directory(&path.join("weights"))
         && file(&path.join("coremldata.bin"))
@@ -303,14 +305,24 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
     }
 
     fn install(
-        &self, dir: &Path, id: &str, staged: &Path, cancel: &mut dyn CancelCheck,
+        &self,
+        dir: &Path,
+        id: &str,
+        staged: &Path,
+        cancel: &mut dyn CancelCheck,
     ) -> Result<(), DownloadError> {
         let archive_root = match id {
             "distil-small.en-encoder" => "ggml-small.en-encoder.mlmodelc",
             "large-v3-turbo-encoder" => "ggml-large-v3-turbo-encoder.mlmodelc",
-            _ => return Err(DownloadError::Install(format!("unknown Core ML encoder {id}"))),
+            _ => {
+                return Err(DownloadError::Install(format!(
+                    "unknown Core ML encoder {id}"
+                )))
+            }
         };
-        let name = staged.file_name().and_then(|name| name.to_str())
+        let name = staged
+            .file_name()
+            .and_then(|name| name.to_str())
             .ok_or_else(|| DownloadError::Io("staged file has no name component".into()))?;
         let scratch = dir.join(format!("{}.tmp", name.trim_end_matches(".part")));
         if scratch.exists() {
@@ -318,7 +330,8 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
         }
         fs::create_dir_all(&scratch).map_err(|error| DownloadError::Io(error.to_string()))?;
         let result = (|| {
-            let source = fs::File::open(staged).map_err(|error| DownloadError::Io(error.to_string()))?;
+            let source =
+                fs::File::open(staged).map_err(|error| DownloadError::Io(error.to_string()))?;
             let mut archive = zip::ZipArchive::new(source)
                 .map_err(|error| DownloadError::Install(format!("encoder ZIP: {error}")))?;
             let mut buffer = [0u8; 64 * 1024];
@@ -326,17 +339,24 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
                 if cancel.is_cancelled() {
                     return Err(DownloadError::Cancelled);
                 }
-                let mut entry = archive.by_index(index)
-                    .map_err(|error| DownloadError::Install(format!("encoder ZIP entry: {error}")))?;
-                let relative = entry.enclosed_name()
+                let mut entry = archive.by_index(index).map_err(|error| {
+                    DownloadError::Install(format!("encoder ZIP entry: {error}"))
+                })?;
+                let relative = entry
+                    .enclosed_name()
                     .ok_or_else(|| DownloadError::Install("unsafe encoder ZIP path".into()))?;
-                if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+                if relative
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
                     return Err(DownloadError::Install("unsafe encoder ZIP path".into()));
                 }
                 if let Some(mode) = entry.unix_mode() {
                     let kind = mode & 0o170000;
                     if kind != 0 && kind != 0o100000 && kind != 0o040000 {
-                        return Err(DownloadError::Install("encoder ZIP contains a link or special file".into()));
+                        return Err(DownloadError::Install(
+                            "encoder ZIP contains a link or special file".into(),
+                        ));
                     }
                 }
                 // ZIPs may also contain packaging metadata. Install only the
@@ -350,18 +370,25 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
                         .map_err(|error| DownloadError::Io(error.to_string()))?;
                 } else {
                     if let Some(parent) = destination.parent() {
-                        fs::create_dir_all(parent).map_err(|error| DownloadError::Io(error.to_string()))?;
+                        fs::create_dir_all(parent)
+                            .map_err(|error| DownloadError::Io(error.to_string()))?;
                     }
                     // Reject duplicate entries rather than silently overwriting.
-                    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(destination)
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(destination)
                         .map_err(|error| DownloadError::Io(error.to_string()))?;
                     loop {
                         if cancel.is_cancelled() {
                             return Err(DownloadError::Cancelled);
                         }
-                        let count = entry.read(&mut buffer)
-                            .map_err(|error| DownloadError::Install(format!("encoder ZIP data: {error}")))?;
-                        if count == 0 { break; }
+                        let count = entry.read(&mut buffer).map_err(|error| {
+                            DownloadError::Install(format!("encoder ZIP data: {error}"))
+                        })?;
+                        if count == 0 {
+                            break;
+                        }
                         file.write_all(&buffer[..count])
                             .map_err(|error| DownloadError::Io(error.to_string()))?;
                     }
@@ -369,7 +396,9 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
             }
             let bundle = scratch.join(archive_root);
             if !coreml_bundle_present(&bundle) {
-                return Err(DownloadError::Install("encoder ZIP contains an incomplete Core ML bundle".into()));
+                return Err(DownloadError::Install(
+                    "encoder ZIP contains an incomplete Core ML bundle".into(),
+                ));
             }
             if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
@@ -377,7 +406,8 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
             let target = self.installed_path(dir, id);
             if !coreml_bundle_present(&target) {
                 if target.exists() {
-                    fs::remove_dir_all(&target).map_err(|error| DownloadError::Io(error.to_string()))?;
+                    fs::remove_dir_all(&target)
+                        .map_err(|error| DownloadError::Io(error.to_string()))?;
                 }
                 fs::rename(bundle, target).map_err(|error| DownloadError::Io(error.to_string()))?;
             }
@@ -391,7 +421,9 @@ impl ModelFormatHandler for CoreMlEncoderHandler {
         result
     }
 
-    fn install_is_slow(&self) -> bool { true }
+    fn install_is_slow(&self) -> bool {
+        true
+    }
 }
 
 /// Locate the directory inside `root` that holds both ONNX artifacts.
@@ -576,7 +608,8 @@ mod tests {
     fn encoder_zip(path: &Path, files: &[&str]) {
         let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
         for name in files {
-            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(b"compiled artifact").unwrap();
         }
         zip.finish().unwrap();
@@ -604,7 +637,10 @@ mod tests {
         fs::remove_file(bundle.join("weights/weight.bin")).unwrap();
         assert!(!store.is_available(entry));
         assert!(!staged.exists());
-        assert!(!tmp.path().join("distil-small.en-encoder.7.mlmodelc.zip.tmp").exists());
+        assert!(!tmp
+            .path()
+            .join("distil-small.en-encoder.7.mlmodelc.zip.tmp")
+            .exists());
     }
 
     #[test]
@@ -614,7 +650,10 @@ mod tests {
         let store = CacheDirStore::from_root(tmp.path().to_owned()).unwrap();
         let staged = store.staging_path(entry, 1).unwrap();
         let mut files = ENCODER_FILES.to_vec();
-        files.extend(["__MACOSX/._ggml-small.en-encoder.mlmodelc", "release-notes.txt"]);
+        files.extend([
+            "__MACOSX/._ggml-small.en-encoder.mlmodelc",
+            "release-notes.txt",
+        ]);
         encoder_zip(&staged, &files);
         let cancel = AtomicBool::new(false);
         store.install(entry, &staged, &mut { &cancel }).unwrap();
@@ -631,18 +670,27 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let staged = h.staging_path(tmp.path(), id, 1);
         encoder_zip(&staged, ENCODER_FILES);
-        h.install(tmp.path(), id, &staged, &mut { &cancel }).unwrap();
+        h.install(tmp.path(), id, &staged, &mut { &cancel })
+            .unwrap();
         for (index, files) in [
             vec!["../escaped"],
             vec!["ggml-small.en-encoder.mlmodelc/../../escaped"],
             vec!["wrong-encoder.mlmodelc/coremldata.bin"],
             vec![ENCODER_FILES[0]],
-        ].iter().enumerate() {
+        ]
+        .iter()
+        .enumerate()
+        {
             let staged = h.staging_path(tmp.path(), id, index as u32 + 2);
             encoder_zip(&staged, files);
-            assert!(h.install(tmp.path(), id, &staged, &mut { &cancel }).is_err());
+            assert!(h
+                .install(tmp.path(), id, &staged, &mut { &cancel })
+                .is_err());
             assert!(h.is_installed(tmp.path(), id));
-            assert!(staged.exists(), "install-only retry retains its verified archive");
+            assert!(
+                staged.exists(),
+                "install-only retry retains its verified archive"
+            );
             assert!(!tmp.path().join("escaped").exists());
         }
     }
@@ -664,13 +712,20 @@ mod tests {
             }
         }
         let mut cancelled = CancelDuringCopy(0);
-        assert!(matches!(h.install(tmp.path(), id, &first, &mut cancelled), Err(DownloadError::Cancelled)));
+        assert!(matches!(
+            h.install(tmp.path(), id, &first, &mut cancelled),
+            Err(DownloadError::Cancelled)
+        ));
         assert!(!first.exists());
-        assert!(!tmp.path().join("distil-small.en-encoder.1.mlmodelc.zip.tmp").exists());
+        assert!(!tmp
+            .path()
+            .join("distil-small.en-encoder.1.mlmodelc.zip.tmp")
+            .exists());
         assert!(second.exists());
         assert!(!h.is_installed(tmp.path(), id));
         let active = AtomicBool::new(false);
-        h.install(tmp.path(), id, &second, &mut { &active }).unwrap();
+        h.install(tmp.path(), id, &second, &mut { &active })
+            .unwrap();
         assert!(h.is_installed(tmp.path(), id));
     }
 
@@ -685,10 +740,14 @@ mod tests {
             "ggml-small.en-encoder.mlmodelc/weights",
             "../outside",
             zip::write::SimpleFileOptions::default(),
-        ).unwrap();
+        )
+        .unwrap();
         zip.finish().unwrap();
         let cancel = AtomicBool::new(false);
-        assert!(matches!(h.install(tmp.path(), id, &staged, &mut { &cancel }), Err(DownloadError::Install(_))));
+        assert!(matches!(
+            h.install(tmp.path(), id, &staged, &mut { &cancel }),
+            Err(DownloadError::Install(_))
+        ));
         assert!(!h.installed_path(tmp.path(), id).exists());
         assert!(!tmp.path().join("outside").exists());
     }

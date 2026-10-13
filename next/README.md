@@ -42,15 +42,19 @@ Required assets are a static slice in `src/language.rs`.
 cargo run  -p voice-bird-next          # empty bordered window, `q` / Ctrl-C to quit
 cargo test -p voice-bird-next          # unit + integration tests, ~15 s
 cargo test -p voice-bird-next --no-default-features  # offline suite, ~12 s
+cargo fmt -p voice-bird-next --check   # enforce package formatting and line wrapping
 cargo clippy -p voice-bird-next --all-targets -- -D warnings
 ```
 
 ## Next-only linting
 
 The commands above target only `voice-bird-next`, not the legacy app. The
-optional `next/hooks/pre-commit` hook runs strict Clippy with default features
-and without default features when staged changes touch `next/`, the workspace
-manifest, or the lockfile. It checks working-tree source, not a staged snapshot.
+optional `next/hooks/pre-commit` hook checks rustfmt before strict Clippy with
+default features and without default features when staged changes touch `next/`,
+the workspace manifest, or the lockfile. It checks working-tree source, not a
+staged snapshot. `next/rustfmt.toml` sets a 100-column formatting target; rustfmt
+wraps code expressions where possible, not arbitrary strings or comments.
+Run `cargo fmt -p voice-bird-next` to apply the required formatting.
 
 Fix dead-code warnings by removing unused code, not by adding
 `#[allow(dead_code)]`. Startup cleanup uses `CacheDirStore::sweep_staging`;
@@ -101,13 +105,66 @@ normalized PCM queues are bounded to 30 seconds. Overruns fail the block rather
 than silently dropping speech.
 
 The engine factory caches model weights by canonical path. Each recording/pass
-has an exclusive mutable decoder state. A persistent three-worker inference pool
-uses one live lane and two refinement lanes, round-robin across recordings, with
-at most two backend calls running during recording and a reserved live slot.
+has an exclusive mutable decoder state. A persistent inference pool sizes itself
+from available CPU parallelism and total RAM at startup. Every worker serves either
+pass, choosing runnable live work before refinement, round-robin across recordings
+within each pass. Multiple recordings can run live jobs concurrently; jobs for the
+same recording/pass never overlap. Running refinement is not preempted.
 Live tasks consume all available audio and decode only the newest hypothesis;
 refinement processes ordered five-second windows without skipping audio.
-At Quit all three existing workers can drain either pass, prioritizing live work.
+At Quit the pool uses its separate shutdown budget; workers retain the same policy.
 The coordinator keeps at most one pending/in-flight task per recording/pass.
+Scheduler pending/active identities, dispatch readiness, cancellation fences, worker
+occupancy, and per-pass round-robin cursors live in SQLite, not Rust maps or sets.
+The pool owns a private in-memory connection protected by its scheduler mutex;
+its tables disappear with the pool and never replay unfinished inference.
+Rows index reusable Rust slots containing only the private PCM/decoder handoffs.
+The separate application database still admits metadata-only transcription requests.
+Queue initialization or SQL failures reject pending jobs with their decoder state
+instead of starting untracked work.
+Scheduler and queue APIs use `TranscriptPass`; numeric pass encoding is private to
+the SQLite queue. Cancellation drains the recording's actual undispatched rows,
+not a fixed pass range, and leaves admitted jobs to finish. Round-robin cursor rows
+are created when a pass first claims work.
+
+`src/producer/inference_limits.rs` derives conservative budgets once per pool:
+
+- Each native decoder call uses two CPU threads, shared with the sizing policy.
+- Recording reserves two CPU threads for capture/UI; its CPU call budget is
+  `max(1, floor((available_threads - 2) / 2))`, with saturating subtraction.
+- Shutdown can use `max(1, floor(available_threads / 2))` CPU calls.
+- The RAM call budget is `max(1, floor((total_RAM - 4 GiB) / 2 GiB))`,
+  with saturating subtraction. Unknown RAM limits the pool to one call.
+- Both call budgets are capped by RAM and an eight-call safety ceiling.
+  Persistent worker count equals shutdown capacity; pass assignment is independent
+  of worker ID. `InferenceScheduler::limits()` exposes all three values.
+
+For example, eight CPU threads and 16 GiB yield four workers, three recording calls,
+and four shutdown calls. An eight-GiB host caps RAM-based concurrency at two.
+These are startup resource heuristics, not allocation guarantees or measured
+accelerator throughput. The pool does not resize in response to transient load,
+free-memory changes, or thermal pressure.
+
+The application runtime owns the persistent recording producer and inference pool.
+The connection-local `recording_workers` table owns active block/recording identities
+and indexes a producer-owned vector of Rust task handles and atomic stop flags.
+SQLite reserves a slot before capture starts; only an exact identity may stop or
+retire it. Terminal completion and shutdown release rows and make slots reusable.
+Worker identities are not persisted across application restarts.
+`RecordingConsumer` publishes `RecordingRequested` and identity-scoped
+`RecordingStopRequested` commands instead of borrowing the producer.
+Commands return through the log and SQLite gate; connection-local request claims
+reject duplicate starts and stale stops, including replay after a session ends.
+The same table owns pending start/stop intent, command admission, and terminal
+state; `RecordingConsumer` queries SQLite instead of retaining a session map.
+Rebuilding the consumer therefore preserves stop/resume coordination and
+natural-end suppression. These TEMP rows live for the application connection;
+block identities reset on restart, while the recording index remains durable.
+The runtime routes accepted commands, transcription requests, and terminal results
+to the producer independently of consumers. PCM remains private to workers.
+Consumers wait for the old session's terminal acknowledgement before requesting a
+replacement; a naturally ended source stays stopped until an explicit resume.
+Queued starts received during shutdown fail without opening capture.
 
 Tasks are prepared privately, published as metadata-only requests, and dispatched
 only after SQLite admits the exact recording/job. Rejected requests return their
@@ -229,25 +286,27 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 | `src/db/block_steps.rs` | session-local source step/revision compare-and-set gate |
 | `src/db/recordings.rs` | durable session index, recording-ID gate, and interrupted recording recovery |
 | `src/db/transcription_jobs.rs` | durable inference admission, lifecycle fencing, and interrupted-job recovery |
+| `src/db/inference_queue.rs` | pool-local pending/active identities, readiness, cancellation fences, and round-robin cursors |
 | `src/db/transcription_metrics.rs` | per-transcript-event metrics linked to job/worker identities |
 | `src/transcription_models.rs` | format handlers, persistent `CacheDirStore`, staging sweep |
 | `src/audio/` | native capture, bounded callback bridge, shared PCM buffer/cursors, and 16 kHz resampling |
 | `src/transcribe/` | shared Whisper weights, isolated decoder states, verified Core ML loading, windows, and LocalAgreement |
-| `src/session_store.rs` | fsynced committed JSONL and atomic final transcript/metadata |
+| `src/session_write.rs` | `SessionWriter`: fsynced committed JSONL and atomic final transcript/metadata |
 | `src/download.rs` | shared download errors, async `Downloader`, and HTTP streaming transport |
 | `src/producer/audio_sources.rs` | serialized native queries, session panic containment, and source-result events |
 | `src/producer/downloads.rs` | fetch workers, progress throttling, and download-result events |
 | `src/producer/model_store.rs` | blocking installation workers and install-result events |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
 | `src/producer/recording.rs` | capture threads, per-recording coordinators, stop flags, and bounded shutdown |
-| `src/producer/inference.rs` | private tasks, fair worker lanes, bounded backend concurrency, and lifecycle events |
+| `src/producer/inference.rs` | private tasks, shared live-priority workers, hardware-derived concurrency, and lifecycle events |
+| `src/producer/inference_limits.rs` | CPU/RAM-derived startup worker, recording, and shutdown budgets |
 | `src/producer/mod.rs` | external input and background worker services |
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
 | `src/consumer/audio_sources.rs` | accepted source-request handoff to the enumeration producer |
 | `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
 | `src/consumer/downloads.rs` | attempt-aware SQLite claims, request reconciliation, and fetch handoff |
 | `src/consumer/model_store.rs` | staging preparation, installation eligibility/handoff, and quit-time staging sweep |
-| `src/consumer/recording.rs` | reconcile all visible/hidden recording blocks with worker lifecycle |
+| `src/consumer/recording.rs` | reconcile visible/hidden blocks against SQLite lifecycle state and publish identity-scoped start/stop commands |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |

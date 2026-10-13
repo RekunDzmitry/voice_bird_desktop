@@ -8,14 +8,16 @@ use std::sync::Arc;
 
 use crate::audio::buffer::PcmSlice;
 
+pub(crate) const DECODER_THREADS: usize = 2;
+
+#[cfg(all(feature = "local-engine", target_os = "macos"))]
+mod coreml;
 #[cfg(any(feature = "local-engine", test))]
 mod local_agreement;
 #[cfg(any(feature = "local-engine", test))]
 mod streaming;
 #[cfg(feature = "local-engine")]
 mod whisper;
-#[cfg(all(feature = "local-engine", target_os = "macos"))]
-mod coreml;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptOut {
@@ -56,7 +58,9 @@ impl TranscriberFactory for SystemEngines {
         #[cfg(feature = "local-engine")]
         {
             Ok(Box::new(streaming::Live::new(whisper::Decoder::open(
-                self.weights.get(model)?, language, false,
+                self.weights.get(model)?,
+                language,
+                false,
             )?)))
         }
         #[cfg(not(feature = "local-engine"))]
@@ -70,7 +74,9 @@ impl TranscriberFactory for SystemEngines {
         #[cfg(feature = "local-engine")]
         {
             Ok(Box::new(streaming::Refine::new(whisper::Decoder::open(
-                self.weights.get(model)?, language, true,
+                self.weights.get(model)?,
+                language,
+                true,
             )?)))
         }
         #[cfg(not(feature = "local-engine"))]

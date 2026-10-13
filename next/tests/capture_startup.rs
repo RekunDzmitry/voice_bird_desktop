@@ -4,18 +4,24 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use voice_bird_next::audio::{AudioCapture, CaptureChunk, CaptureSource, CaptureStream};
-use voice_bird_next::bus::{AppEvent, EventBus};
+use voice_bird_next::bus::{next_monotonic_id, AppEvent, EventBus, RecordingRequest};
 use voice_bird_next::db::{self, Database};
 use voice_bird_next::language::LANGUAGES;
-use voice_bird_next::producer::recording::{next_recording_id, RecordingProducer, RecordingRequest, RecordingServices};
+use voice_bird_next::producer::recording::{RecordingProducer, RecordingServices};
 use voice_bird_next::testing::FixtureTranscriberFactory;
 use voice_bird_next::transcribe::{Transcriber, TranscriberFactory};
 
 struct ProgressCapture(Arc<AtomicU64>);
-struct ProgressStream { samples: Arc<AtomicU64>, delivered: bool }
+struct ProgressStream {
+    samples: Arc<AtomicU64>,
+    delivered: bool,
+}
 impl AudioCapture for ProgressCapture {
     fn open(&self, _: &CaptureSource) -> anyhow::Result<Box<dyn CaptureStream>> {
-        Ok(Box::new(ProgressStream { samples: self.0.clone(), delivered: false }))
+        Ok(Box::new(ProgressStream {
+            samples: self.0.clone(),
+            delivered: false,
+        }))
     }
 }
 impl CaptureStream for ProgressStream {
@@ -29,7 +35,9 @@ impl CaptureStream for ProgressStream {
             Ok(CaptureChunk::Timeout)
         }
     }
-    fn queued_samples(&self) -> u64 { 0 }
+    fn queued_samples(&self) -> u64 {
+        0
+    }
 }
 struct LoadingFactory {
     entered: mpsc::Sender<()>,
@@ -57,35 +65,64 @@ async fn capture_drains_source_while_model_initialization_is_blocked() {
     let (release, waiting) = mpsc::channel();
     let mut producer = RecordingProducer::new(RecordingServices {
         capture: Arc::new(ProgressCapture(samples.clone())),
-        engines: Arc::new(LoadingFactory { entered, release: Mutex::new(waiting), fixture: FixtureTranscriberFactory::default() }),
+        engines: Arc::new(LoadingFactory {
+            entered,
+            release: Mutex::new(waiting),
+            fixture: FixtureTranscriberFactory::default(),
+        }),
         sessions_root: tmp.path().join("sessions"),
     });
-    let recording = next_recording_id();
-    producer.start(RecordingRequest {
-        block: 1, recording, source: CaptureSource::Mic { device_name: "test input".into() },
-        language: &LANGUAGES[0], live_model: "live.gguf".into(), refine_model: "refine.gguf".into(),
-    }, &bus.sender());
-    tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2))).await.unwrap().unwrap();
+    let recording = next_monotonic_id();
+    let start = AppEvent::RecordingRequested {
+        request: Arc::new(RecordingRequest {
+            block: 1,
+            recording,
+            source: CaptureSource::Mic {
+                device_name: "test input".into(),
+            },
+            language: &LANGUAGES[0],
+            live_model: "live.gguf".into(),
+            refine_model: "refine.gguf".into(),
+        }),
+    };
+    assert!(db::apply(&mut db, &start).unwrap());
+    producer.produce(&start, &mut db, &bus.sender()).unwrap();
+    tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
     while samples.load(Ordering::Acquire) < 16_000 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let captured_during_loading = samples.load(Ordering::Acquire);
-    producer.stop(1);
+    let stop = AppEvent::RecordingStopRequested {
+        block: 1,
+        recording,
+    };
+    assert!(db::apply(&mut db, &stop).unwrap());
+    producer.produce(&stop, &mut db, &bus.sender()).unwrap();
     release.send(()).unwrap();
-    assert_eq!(captured_during_loading, 16_000, "model initialization blocked source draining");
+    assert_eq!(
+        captured_during_loading, 16_000,
+        "model initialization blocked source draining"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let event = tokio::time::timeout_at(deadline, bus.recv()).await.unwrap().unwrap();
+        let event = tokio::time::timeout_at(deadline, bus.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let admitted = db::apply(&mut db, &event).unwrap();
         if !admitted {
-            if let AppEvent::TranscriptionRequested { request } = event { producer.reject_unaccepted(&request); }
+            if let AppEvent::TranscriptionRequested { request } = event {
+                producer.reject_unaccepted(&request);
+            }
             continue;
         }
+        producer.produce(&event, &mut db, &bus.sender()).unwrap();
         match event {
-            AppEvent::TranscriptionRequested { request } => producer.dispatch(&request),
-            AppEvent::RecordingStopped { block, recording: id } if id == recording => {
-                producer.complete(block, id, false);
+            AppEvent::RecordingStopped { recording: id, .. } if id == recording => {
                 break;
             }
             AppEvent::RecordingFailed { error, .. } => panic!("recording failed: {error}"),

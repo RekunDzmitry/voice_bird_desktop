@@ -31,7 +31,86 @@ impl Table for RecordingsTable {
         CREATE TEMP TABLE IF NOT EXISTS recording_watermarks (
             block        INTEGER PRIMARY KEY,
             recording    INTEGER NOT NULL
+        );
+        CREATE TEMP TABLE IF NOT EXISTS recording_requests (
+            block        INTEGER PRIMARY KEY,
+            recording    INTEGER NOT NULL,
+            start_admitted INTEGER NOT NULL DEFAULT 0 CHECK (start_admitted IN (0, 1)),
+            stopping     INTEGER NOT NULL DEFAULT 0 CHECK (stopping IN (0, 1)),
+            stop_admitted INTEGER NOT NULL DEFAULT 0 CHECK (stop_admitted IN (0, 1)),
+            terminal     TEXT CHECK (terminal IN ('stopped', 'failed'))
         )";
+}
+
+/// Consumer lifecycle snapshot. Admission flags track accepted bus commands;
+/// `stopping` tracks only consumer stop intent, never an external stop command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RequestState {
+    pub block: u8,
+    pub recording: u64,
+    pub stopping: bool,
+    pub stop_admitted: bool,
+    pub ended: bool,
+    pub failed: bool,
+}
+
+/// Collect before mutating requests, without retaining a SQLite statement borrow.
+pub(crate) fn requests(db: &Database) -> rusqlite::Result<Vec<RequestState>> {
+    let mut statement = db.conn_ref().prepare(
+        "SELECT block, recording, stopping, stop_admitted, terminal IS NOT NULL, \
+         terminal IS 'failed' FROM recording_requests ORDER BY block",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(RequestState {
+            block: row.get(0)?,
+            recording: row.get(1)?,
+            stopping: row.get(2)?,
+            stop_admitted: row.get(3)?,
+            ended: row.get(4)?,
+            failed: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Reserve an identity before publishing work. Start admission remains pending
+/// until its `RecordingRequested` event passes the gate.
+pub(crate) fn reserve_start(
+    db: &mut Database,
+    block: u8,
+    recording: u64,
+) -> rusqlite::Result<bool> {
+    Ok(db.conn_mut().execute(
+        "INSERT INTO recording_requests (block, recording) \
+         SELECT ?1, ?2 WHERE NOT EXISTS \
+         (SELECT 1 FROM recording_requests WHERE block = ?1) \
+         AND NOT EXISTS \
+         (SELECT 1 FROM recording_watermarks WHERE block = ?1 AND recording >= ?2)",
+        params![block, recording],
+    )? != 0)
+}
+
+/// Reserve consumer stop intent once, even before start admission. This does
+/// not admit the stop command; externally admitted stops never set this intent.
+pub(crate) fn reserve_stop(db: &mut Database, block: u8, recording: u64) -> rusqlite::Result<bool> {
+    Ok(db.conn_mut().execute(
+        "UPDATE recording_requests SET stopping = 1 \
+         WHERE block = ?1 AND recording = ?2 AND stopping = 0 AND terminal IS NULL",
+        params![block, recording],
+    )? != 0)
+}
+
+/// Release only this terminal identity; pending/live or replacement rows remain.
+pub(crate) fn release_ended(
+    db: &mut Database,
+    block: u8,
+    recording: u64,
+) -> rusqlite::Result<bool> {
+    Ok(db.conn_mut().execute(
+        "DELETE FROM recording_requests \
+         WHERE block = ?1 AND recording = ?2 AND terminal IS NOT NULL",
+        params![block, recording],
+    )? != 0)
 }
 
 /// The previous process cannot still finalize these sessions. Recovery changes
@@ -45,10 +124,29 @@ pub fn recover_interrupted(db: &mut Database) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Gate worker events before projection. IDs are process-wide monotonic epoch
-/// microseconds, supplied by the producer, and must fit SQLite's signed integer.
+/// Gate capture commands and worker events before execution/projection. IDs are
+/// process-wide monotonic epoch microseconds and must fit SQLite's signed integer.
 pub fn apply(db: &mut Database, event: &AppEvent) -> rusqlite::Result<bool> {
     match event {
+        AppEvent::RecordingRequested { request } => Ok(db.conn_mut().execute(
+            "INSERT INTO recording_requests (block, recording, start_admitted) \
+             SELECT ?1, ?2, 1 WHERE NOT EXISTS \
+             (SELECT 1 FROM recording_watermarks WHERE block = ?1 AND recording >= ?2) \
+             ON CONFLICT(block) DO UPDATE SET \
+             recording = excluded.recording, start_admitted = 1, \
+             stopping = CASE WHEN recording_requests.recording = excluded.recording \
+             THEN recording_requests.stopping ELSE 0 END, stop_admitted = 0, terminal = NULL \
+             WHERE recording_requests.recording < excluded.recording OR \
+             (recording_requests.recording = excluded.recording \
+             AND recording_requests.start_admitted = 0 AND recording_requests.terminal IS NULL)",
+            params![request.block, request.recording],
+        )? != 0),
+        AppEvent::RecordingStopRequested { block, recording } => Ok(db.conn_mut().execute(
+            "UPDATE recording_requests SET stop_admitted = 1 \
+             WHERE block = ?1 AND recording = ?2 AND start_admitted = 1 \
+             AND stop_admitted = 0 AND terminal IS NULL",
+            params![block, recording],
+        )? != 0),
         AppEvent::RecordingStarted {
             block,
             recording,
@@ -85,17 +183,42 @@ pub fn apply(db: &mut Database, event: &AppEvent) -> rusqlite::Result<bool> {
             Ok(changed != 0)
         }
         AppEvent::TranscriptTentative {
-            block, recording, job, worker, transcription, ..
-        } => insert_metrics(db, (*block, *recording), (*job, *worker), "tentative", "live", None, transcription),
-        AppEvent::TranscriptCommitted {
-            block, recording, job, worker, pass, t_start_ms, t_end_ms, transcription, ..
+            block,
+            recording,
+            job,
+            worker,
+            transcription,
+            ..
         } => insert_metrics(
-            db, (*block, *recording), (*job, *worker), "committed",
+            db,
+            (*block, *recording),
+            (*job, *worker),
+            "tentative",
+            "live",
+            None,
+            transcription,
+        ),
+        AppEvent::TranscriptCommitted {
+            block,
+            recording,
+            job,
+            worker,
+            pass,
+            t_start_ms,
+            t_end_ms,
+            transcription,
+            ..
+        } => insert_metrics(
+            db,
+            (*block, *recording),
+            (*job, *worker),
+            "committed",
             match pass {
                 TranscriptPass::Live => "live",
                 TranscriptPass::Refined => "refined",
             },
-            Some((*t_start_ms, *t_end_ms)), transcription,
+            Some((*t_start_ms, *t_end_ms)),
+            transcription,
         ),
         AppEvent::RecordingStopped { block, recording } => {
             terminal(db, *block, *recording, "stopped")
@@ -160,6 +283,13 @@ fn terminal(db: &mut Database, block: u8, recording: u64, status: &str) -> rusql
     } else {
         false
     };
+    if accepted {
+        transaction.execute(
+            "UPDATE recording_requests SET terminal = ?1 \
+             WHERE block = ?2 AND recording = ?3 AND terminal IS NULL",
+            params![status, block, recording],
+        )?;
+    }
     transaction.commit()?;
     Ok(accepted)
 }
@@ -168,7 +298,7 @@ fn terminal(db: &mut Database, block: u8, recording: u64, status: &str) -> rusql
 mod tests {
     use super::*;
     use crate::audio_sources::AppTarget;
-    use crate::bus::{EventBus, TranscriptPass};
+    use crate::bus::{EventBus, RecordingRequest, TranscriptPass};
     use rusqlite::OptionalExtension;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -221,6 +351,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_start_preserves_stop_intent_and_old_terminals_leave_successor_live() {
+        let (_dir, mut db) = database();
+        let requested = |recording| AppEvent::RecordingRequested {
+            request: std::sync::Arc::new(RecordingRequest {
+                block: 1,
+                recording,
+                source: CaptureSource::Mic {
+                    device_name: "Microphone".into(),
+                },
+                language: &crate::language::LANGUAGES[0],
+                live_model: "/models/live.bin".into(),
+                refine_model: "/models/refine.bin".into(),
+            }),
+        };
+        let stop = AppEvent::RecordingStopRequested {
+            block: 1,
+            recording: 100,
+        };
+        assert!(reserve_start(&mut db, 1, 100).unwrap());
+        assert!(!reserve_start(&mut db, 1, 101).unwrap());
+        assert!(!release_ended(&mut db, 1, 100).unwrap());
+        assert!(reserve_stop(&mut db, 1, 100).unwrap());
+        assert!(!reserve_stop(&mut db, 1, 100).unwrap());
+        assert!(!apply(&mut db, &stop).unwrap());
+        assert!(apply(&mut db, &requested(100)).unwrap());
+        assert!(!apply(&mut db, &requested(100)).unwrap());
+        assert_eq!(
+            requests(&db).unwrap(),
+            vec![RequestState {
+                block: 1,
+                recording: 100,
+                stopping: true,
+                stop_admitted: false,
+                ended: false,
+                failed: false,
+            }]
+        );
+        assert!(apply(&mut db, &stop).unwrap());
+        assert!(!apply(&mut db, &stop).unwrap());
+        assert!(apply(&mut db, &start(1, 100)).unwrap());
+        assert!(apply(&mut db, &requested(101)).unwrap());
+        assert!(apply(&mut db, &start(1, 101)).unwrap());
+
+        let old_terminal = AppEvent::RecordingStopped {
+            block: 1,
+            recording: 100,
+        };
+        assert!(apply(&mut db, &old_terminal).unwrap());
+        assert!(!apply(&mut db, &old_terminal).unwrap());
+        assert!(!apply(
+            &mut db,
+            &AppEvent::RecordingFailed {
+                block: 1,
+                recording: 100,
+                error: "late duplicate".into(),
+            }
+        )
+        .unwrap());
+        assert!(!release_ended(&mut db, 1, 100).unwrap());
+        assert!(apply(
+            &mut db,
+            &AppEvent::RecordingStopRequested {
+                block: 1,
+                recording: 101,
+            }
+        )
+        .unwrap());
+        assert_eq!(
+            requests(&db).unwrap(),
+            vec![RequestState {
+                block: 1,
+                recording: 101,
+                stopping: false,
+                stop_admitted: true,
+                ended: false,
+                failed: false,
+            }]
+        );
+        assert_eq!(row(&db, 100).unwrap().status, "stopped");
+        assert_eq!(row(&db, 101).unwrap().status, "recording");
+    }
+
     fn committed(block: u8, recording: u64) -> AppEvent {
         AppEvent::TranscriptCommitted {
             block,
@@ -235,20 +448,44 @@ mod tests {
         }
     }
 
-    type MetricRow = (u64, u64, u8, String, String, Option<u64>, Option<u64>, TranscriptionMetrics);
+    type MetricRow = (
+        u64,
+        u64,
+        u8,
+        String,
+        String,
+        Option<u64>,
+        Option<u64>,
+        TranscriptionMetrics,
+    );
 
     fn metric_rows(db: &Database) -> Vec<MetricRow> {
         let mut statement = db.conn_ref().prepare(
             "SELECT recording_id, job_id, worker, kind, pass, t_start_ms, t_end_ms, start_ms, end_ms, duration_ms, queue_size_start, queue_size_end \
              FROM transcription_metrics ORDER BY id"
         ).unwrap();
-        statement.query_map([], |r| Ok((
-            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-            TranscriptionMetrics {
-                start_ms: r.get(7)?, end_ms: r.get(8)?, duration_ms: r.get(9)?,
-                queue_size_start: r.get(10)?, queue_size_end: r.get(11)?,
-            },
-        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        statement
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    TranscriptionMetrics {
+                        start_ms: r.get(7)?,
+                        end_ms: r.get(8)?,
+                        duration_ms: r.get(9)?,
+                        queue_size_start: r.get(10)?,
+                        queue_size_end: r.get(11)?,
+                    },
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
     }
 
     #[test]
@@ -256,31 +493,74 @@ mod tests {
         let (dir, mut db) = database();
         assert!(apply(&mut db, &start(1, 100)).unwrap());
         let metrics = TranscriptionMetrics {
-            start_ms: 101, end_ms: 149, duration_ms: 48,
-            queue_size_start: 32_000, queue_size_end: 48_000,
+            start_ms: 101,
+            end_ms: 149,
+            duration_ms: 48,
+            queue_size_start: 32_000,
+            queue_size_end: 48_000,
         };
         let tentative = AppEvent::TranscriptTentative {
-            block: 1, recording: 100, text: "private tentative".into(),
-            job: 8, worker: 1,
+            block: 1,
+            recording: 100,
+            text: "private tentative".into(),
+            job: 8,
+            worker: 1,
             transcription: metrics,
         };
         assert!(apply(&mut db, &tentative).unwrap());
         for pass in [TranscriptPass::Live, TranscriptPass::Refined] {
             let event = AppEvent::TranscriptCommitted {
-                block: 1, recording: 100, pass, t_start_ms: 500, t_end_ms: 1500,
-                job: 9, worker: if pass == TranscriptPass::Live { 1 } else { 2 },
-                text: "private committed".into(), transcription: metrics,
+                block: 1,
+                recording: 100,
+                pass,
+                t_start_ms: 500,
+                t_end_ms: 1500,
+                job: 9,
+                worker: if pass == TranscriptPass::Live { 1 } else { 2 },
+                text: "private committed".into(),
+                transcription: metrics,
             };
             assert!(apply(&mut db, &event).unwrap());
         }
         let expected = vec![
-            (100, 8, 1, "tentative".into(), "live".into(), None, None, metrics),
-            (100, 9, 1, "committed".into(), "live".into(), Some(500), Some(1500), metrics),
-            (100, 9, 2, "committed".into(), "refined".into(), Some(500), Some(1500), metrics),
+            (
+                100,
+                8,
+                1,
+                "tentative".into(),
+                "live".into(),
+                None,
+                None,
+                metrics,
+            ),
+            (
+                100,
+                9,
+                1,
+                "committed".into(),
+                "live".into(),
+                Some(500),
+                Some(1500),
+                metrics,
+            ),
+            (
+                100,
+                9,
+                2,
+                "committed".into(),
+                "refined".into(),
+                Some(500),
+                Some(1500),
+                metrics,
+            ),
         ];
         assert_eq!(metric_rows(&db), expected);
         drop(db);
-        let reopened = Database::open(&dir.path().join("recordings.sqlite"), EventBus::new().sender()).unwrap();
+        let reopened = Database::open(
+            &dir.path().join("recordings.sqlite"),
+            EventBus::new().sender(),
+        )
+        .unwrap();
         assert_eq!(metric_rows(&reopened), expected);
     }
 
@@ -291,14 +571,28 @@ mod tests {
         assert!(apply(&mut db, &start(1, 101)).unwrap());
         for recording in [100, 101] {
             if recording == 101 {
-                assert!(apply(&mut db, &AppEvent::RecordingStopped { block: 1, recording }).unwrap());
+                assert!(apply(
+                    &mut db,
+                    &AppEvent::RecordingStopped {
+                        block: 1,
+                        recording
+                    }
+                )
+                .unwrap());
             }
             assert!(!apply(&mut db, &committed(1, recording)).unwrap());
-            assert!(!apply(&mut db, &AppEvent::TranscriptTentative {
-                block: 1, recording, text: "rejected".into(),
-                job: 7, worker: 1,
-                transcription: TranscriptionMetrics::default(),
-            }).unwrap());
+            assert!(!apply(
+                &mut db,
+                &AppEvent::TranscriptTentative {
+                    block: 1,
+                    recording,
+                    text: "rejected".into(),
+                    job: 7,
+                    worker: 1,
+                    transcription: TranscriptionMetrics::default(),
+                }
+            )
+            .unwrap());
         }
         assert_eq!(metric_rows(&db), vec![]);
     }
@@ -326,9 +620,19 @@ mod tests {
         assert_eq!(row(&reopened, 100).unwrap(), old);
         assert!(apply(&mut reopened, &start(1, 101)).unwrap());
         assert!(apply(&mut reopened, &committed(1, 101)).unwrap());
-        assert_eq!(metric_rows(&reopened), vec![
-            (101, 7, 1, "committed".into(), "live".into(), Some(0), Some(1000), TranscriptionMetrics::default()),
-        ]);
+        assert_eq!(
+            metric_rows(&reopened),
+            vec![(
+                101,
+                7,
+                1,
+                "committed".into(),
+                "live".into(),
+                Some(0),
+                Some(1000),
+                TranscriptionMetrics::default()
+            ),]
+        );
     }
 
     #[test]
@@ -484,9 +788,24 @@ mod tests {
             recording: 100,
             error: "cannot create session".into(),
         };
+        assert!(reserve_start(&mut db, 1, 100).unwrap());
         assert!(apply(&mut db, &failed).unwrap());
         assert!(!apply(&mut db, &failed).unwrap());
         assert!(row(&db, 100).is_none());
+        assert_eq!(
+            requests(&db).unwrap(),
+            vec![RequestState {
+                block: 1,
+                recording: 100,
+                stopping: false,
+                stop_admitted: false,
+                ended: true,
+                failed: true,
+            }]
+        );
+        assert!(!release_ended(&mut db, 1, 99).unwrap());
+        assert!(release_ended(&mut db, 1, 100).unwrap());
+        assert!(!reserve_start(&mut db, 1, 100).unwrap());
         assert!(!apply(&mut db, &start(1, 100)).unwrap());
         assert!(apply(&mut db, &start(1, 101)).unwrap());
         assert!(!apply(&mut db, &failed).unwrap());

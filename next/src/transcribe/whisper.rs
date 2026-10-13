@@ -25,7 +25,9 @@ impl WeightCache {
         let model = model.canonicalize().context("resolve whisper model path")?;
         #[cfg(target_os = "macos")]
         {
-            let stem = model.file_stem().and_then(|stem| stem.to_str())
+            let stem = model
+                .file_stem()
+                .and_then(|stem| stem.to_str())
                 .context("model stem is not valid UTF-8")?;
             let encoder = model.with_file_name(format!("{stem}-encoder.mlmodelc"));
             anyhow::ensure!(
@@ -44,7 +46,7 @@ impl WeightCache {
         params.flash_attn(true);
         let context = Arc::new(
             WhisperContext::new_with_params(path, params)
-                .with_context(|| format!("load whisper model {}", model.display()))?
+                .with_context(|| format!("load whisper model {}", model.display()))?,
         );
         contexts.insert(model, context.clone());
         Ok(context)
@@ -91,7 +93,7 @@ impl streaming::Decoder for Decoder {
             SamplingStrategy::Greedy { best_of: 1 }
         };
         let mut params = FullParams::new(strategy);
-        params.set_n_threads(2);
+        params.set_n_threads(super::DECODER_THREADS as i32);
         params.set_no_context(true);
         params.set_print_progress(false);
         params.set_print_realtime(false);

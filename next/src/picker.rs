@@ -201,7 +201,6 @@ impl SessionMenu {
 mod tests {
     use super::*;
 
-
     #[test]
     fn list_picker_saturates_at_both_ends() {
         let mut picker = ListPicker { index: 0 };

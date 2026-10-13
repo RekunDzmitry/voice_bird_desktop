@@ -8,11 +8,11 @@ use crate::audio_sources::{AppTarget, DeviceKind, SourceSelection};
 
 #[cfg(target_os = "macos")]
 mod app_macos;
+pub mod buffer;
 #[cfg(target_os = "macos")]
 mod mic;
 #[cfg(target_os = "macos")]
 mod native;
-pub mod buffer;
 pub mod resample;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

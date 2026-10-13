@@ -26,17 +26,21 @@ unsafe extern "C" fn observe_log(
     text: *const std::os::raw::c_char,
     _: *mut std::os::raw::c_void,
 ) {
-    if text.is_null() { return; }
+    if text.is_null() {
+        return;
+    }
     // SAFETY: whisper.cpp supplies a NUL-terminated string for this call.
     let text = unsafe { CStr::from_ptr(text) };
     let bytes = text.to_bytes();
     let _ = LOADED.try_with(|loaded| {
         if loaded.get().is_some() {
-            if bytes.windows(b": Core ML model loaded".len())
+            if bytes
+                .windows(b": Core ML model loaded".len())
                 .any(|window| window == b": Core ML model loaded")
             {
                 loaded.set(Some(true));
-            } else if bytes.windows(b": failed to load Core ML model".len())
+            } else if bytes
+                .windows(b": failed to load Core ML model".len())
                 .any(|window| window == b": failed to load Core ML model")
             {
                 loaded.set(Some(false));
@@ -57,10 +61,14 @@ unsafe extern "C" fn observe_log(
 struct ObserveInit;
 
 impl Drop for ObserveInit {
-    fn drop(&mut self) { LOADED.with(|loaded| loaded.set(None)); }
+    fn drop(&mut self) {
+        LOADED.with(|loaded| loaded.set(None));
+    }
 }
 
-pub(super) fn create_state(context: &whisper_rs::WhisperContext) -> anyhow::Result<whisper_rs::WhisperState> {
+pub(super) fn create_state(
+    context: &whisper_rs::WhisperContext,
+) -> anyhow::Result<whisper_rs::WhisperState> {
     LazyLock::force(&LOG_OBSERVER);
     LOADED.with(|loaded| loaded.set(Some(false)));
     let _scope = ObserveInit;
@@ -78,7 +86,13 @@ mod tests {
 
     fn emit(message: &str) {
         let message = std::ffi::CString::new(message).unwrap();
-        unsafe { observe_log(sys::ggml_log_level_GGML_LOG_LEVEL_INFO, message.as_ptr(), std::ptr::null_mut()) };
+        unsafe {
+            observe_log(
+                sys::ggml_log_level_GGML_LOG_LEVEL_INFO,
+                message.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
     }
 
     #[test]
@@ -102,7 +116,9 @@ mod tests {
             let _scope = ObserveInit;
             emit("whisper_init_state: Core ML model loaded\n");
             assert_eq!(LOADED.with(Cell::get), Some(true));
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
         assert_eq!(LOADED.with(Cell::get), Some(false));
     }
 }

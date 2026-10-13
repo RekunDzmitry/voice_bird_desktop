@@ -1,4 +1,4 @@
-//! Durable per-recording transcripts. PCM never enters this store.
+//! Durable per-recording transcript writing. PCM never enters this writer.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};

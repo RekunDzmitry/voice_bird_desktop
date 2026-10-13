@@ -1,6 +1,5 @@
 //! Persistent inference workers; PCM and exclusive decoder state stay off the bus.
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
@@ -9,9 +8,9 @@ use std::time::Instant;
 
 use crate::audio::buffer::PcmSlice;
 use crate::bus::{AppEvent, EventSender, TranscriptPass, TranscriptionJob, TranscriptionMetrics};
+use crate::db::inference_queue::Queue;
+use crate::producer::inference_limits::InferenceLimits;
 use crate::transcribe::{Transcriber, TranscriptOut};
-
-const BACKEND_CONCURRENCY: usize = 2;
 
 pub struct InferenceTask {
     pub request: TranscriptionJob,
@@ -33,145 +32,158 @@ pub struct InferenceResult {
     pub worker: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Key {
-    recording: u64,
-    lane: usize,
+struct State {
+    db: Option<Queue>,
+    tasks: Vec<Option<InferenceTask>>,
+    limits: InferenceLimits,
+    draining: bool,
+    stopping: bool,
+    terminal_error: Option<String>,
 }
 
-impl Key {
-    fn for_request(request: &TranscriptionJob) -> Self {
-        Self {
-            recording: request.recording,
-            lane: match request.pass {
-                TranscriptPass::Live => 0,
-                TranscriptPass::Refined => 1,
+impl State {
+    fn new(limits: InferenceLimits) -> Self {
+        match Queue::new() {
+            Ok(db) => Self {
+                db: Some(db),
+                tasks: Vec::new(),
+                limits,
+                draining: false,
+                stopping: false,
+                terminal_error: None,
+            },
+            Err(error) => Self {
+                db: None,
+                tasks: Vec::new(),
+                limits,
+                draining: false,
+                stopping: true,
+                terminal_error: Some(format!("initializing inference queue: {error}")),
             },
         }
     }
 }
 
-struct Pending {
-    task: InferenceTask,
-    dispatched: bool,
-}
-
-#[derive(Default)]
-struct RoundRobin {
-    recordings: BTreeSet<u64>,
-    last_served: Option<u64>,
-}
-
-#[derive(Default)]
-struct State {
-    pending: HashMap<Key, Pending>,
-    active: HashMap<Key, TranscriptionJob>,
-    cancelled: HashSet<u64>,
-    ready: [RoundRobin; 2],
-    worker_busy: [bool; 3],
-    draining: bool,
-    stopping: bool,
-    initialization_error: Option<String>,
-}
-
 impl State {
+    fn db(&self) -> &Queue {
+        self.db.as_ref().expect("initialized inference queue")
+    }
+
+    fn db_mut(&mut self) -> &mut Queue {
+        self.db.as_mut().expect("initialized inference queue")
+    }
+
+    /// Stop the pool and reject queued tasks; the caller still owns any unqueued task.
+    fn fail_queue(&mut self, error: rusqlite::Error) {
+        let error = format!("inference queue: {error}");
+        self.stopping = true;
+        self.terminal_error = Some(error.clone());
+        for task in self.tasks.iter_mut().filter_map(Option::take) {
+            reject(task, error.clone(), 0);
+        }
+    }
+
     fn dispatch(&mut self, request: &TranscriptionJob) -> bool {
-        let key = Key::for_request(request);
-        let Some(pending) = self.pending.get_mut(&key) else {
-            return false;
-        };
-        if self.stopping
-            || self.cancelled.contains(&request.recording)
-            || pending.dispatched
-            || pending.task.request != *request
-        {
+        if self.stopping {
             return false;
         }
-        pending.dispatched = true;
-        self.ready[key.lane].recordings.insert(key.recording);
-        true
+        match self.db().dispatch(request) {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                self.fail_queue(error);
+                false
+            }
+        }
     }
 
-    fn next_ready(&self, lane: usize) -> Option<Key> {
-        let ready = &self.ready[lane];
-        let available = |recording: &u64| {
-            !self.active.contains_key(&Key {
-                recording: *recording,
-                lane,
-            })
-        };
-        let recording = ready
-            .last_served
-            .and_then(|last| {
-                use std::ops::Bound::{Excluded, Unbounded};
-                ready
-                    .recordings
-                    .range((Excluded(last), Unbounded))
-                    .find(|recording| available(recording))
-            })
-            .or_else(|| ready.recordings.iter().find(|recording| available(recording)))?;
-        Some(Key {
-            recording: *recording,
-            lane,
-        })
-    }
-
-    fn queue_jobs(&self, lane: usize) -> u32 {
-        self.pending
-            .keys()
-            .filter(|key| key.lane == lane)
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX)
+    fn queue_jobs(&mut self, pass: TranscriptPass) -> u32 {
+        if self.stopping {
+            return 0;
+        }
+        match self.db().count(pass) {
+            Ok(count) => count,
+            Err(error) => {
+                self.fail_queue(error);
+                0
+            }
+        }
     }
 
     fn take(&mut self, worker: u8) -> Option<(InferenceTask, u32)> {
-        let limit = if self.draining { self.worker_busy.len() } else { BACKEND_CONCURRENCY };
-        if self.stopping || self.active.len() >= limit {
+        if self.stopping {
             return None;
         }
-        let worker_index = usize::from(worker - 1);
-        if self.worker_busy[worker_index] {
-            return None;
+        match self.take_ready(worker) {
+            Ok(task) => task,
+            Err(error) => {
+                self.fail_queue(error);
+                None
+            }
         }
-        let preferred = if self.draining { 0 } else { usize::from(worker != 1) };
-        let key = self.next_ready(preferred).or_else(|| {
-            if self.draining { self.next_ready(1 - preferred) } else { None }
-        })?;
-        let lane = key.lane;
-        // During recording, reserve a free backend slot for live work.
-        // At Quit all three existing workers may drain either pass: keeping
-        // final live hypotheses on a single lane can exceed the deadline.
-        if !self.draining && lane == 1 && !self.worker_busy[0] && self.next_ready(0).is_some() {
-            return None;
-        }
-        let pending = self.pending.remove(&key)?;
-        self.ready[lane].recordings.remove(&key.recording);
-        self.ready[lane].last_served = Some(key.recording);
-        self.worker_busy[worker_index] = true;
-        self.active.insert(key, pending.task.request);
-        Some((pending.task, self.queue_jobs(lane)))
     }
 
-    fn complete(&mut self, request: &TranscriptionJob, worker: u8) {
-        self.active.remove(&Key::for_request(request));
-        self.worker_busy[usize::from(worker - 1)] = false;
+    fn take_ready(&mut self, worker: u8) -> rusqlite::Result<Option<(InferenceTask, u32)>> {
+        let limit = if self.draining {
+            self.limits.shutdown()
+        } else {
+            self.limits.recording()
+        };
+        if worker == 0
+            || usize::from(worker) > self.limits.workers()
+            || self.db().active_count()? >= limit
+            || self.db().worker_busy(worker)?
+        {
+            return Ok(None);
+        }
+        let (pass, recording) = match self.db().next_ready(TranscriptPass::Live)? {
+            Some((recording, _)) => (TranscriptPass::Live, recording),
+            None => match self.db().next_ready(TranscriptPass::Refined)? {
+                Some((recording, _)) => (TranscriptPass::Refined, recording),
+                None => return Ok(None),
+            },
+        };
+        let slot = self.db_mut().claim(recording, pass, worker)?;
+        let task = self.tasks[slot]
+            .take()
+            .expect("claimed private inference task");
+        let queue_jobs = self.queue_jobs(pass);
+        if self.stopping {
+            reject(task, self.terminal_error.clone().expect("queue error"), 0);
+            return Ok(None);
+        }
+        Ok(Some((task, queue_jobs)))
     }
 
-    fn remove_pending(&mut self, key: Key) -> Option<InferenceTask> {
-        let pending = self.pending.remove(&key)?;
-        self.ready[key.lane].recordings.remove(&key.recording);
-        Some(pending.task)
+    fn complete(&mut self, request: &TranscriptionJob, worker: u8) -> rusqlite::Result<()> {
+        self.db().complete(request, worker)
+    }
+
+    fn remove_pending(
+        &mut self,
+        recording: u64,
+        pass: TranscriptPass,
+    ) -> rusqlite::Result<Option<InferenceTask>> {
+        Ok(self.db().remove(recording, pass)?.map(|slot| {
+            self.tasks[slot]
+                .take()
+                .expect("queued private inference task")
+        }))
     }
 }
 
-#[derive(Default)]
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
 }
 
 impl Shared {
+    fn new(limits: InferenceLimits) -> Self {
+        Self {
+            state: Mutex::new(State::new(limits)),
+            changed: Condvar::new(),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -184,10 +196,17 @@ pub struct InferenceScheduler {
 
 impl InferenceScheduler {
     pub fn new() -> Arc<Self> {
-        let shared = Arc::new(Shared::default());
-        let mut workers = Vec::with_capacity(3);
-        for worker in 1..=3 {
+        Self::with_limits(InferenceLimits::detect())
+    }
+
+    fn with_limits(limits: InferenceLimits) -> Arc<Self> {
+        let shared = Arc::new(Shared::new(limits));
+        let mut workers = Vec::with_capacity(limits.workers());
+        for worker in 1..=limits.workers() as u8 {
             let worker_shared = shared.clone();
+            if shared.lock().stopping {
+                break;
+            }
             match thread::Builder::new()
                 .name(format!("inference-{worker}"))
                 .spawn(move || worker_loop(worker_shared, worker))
@@ -196,9 +215,9 @@ impl InferenceScheduler {
                 Err(error) => {
                     // The public constructor is infallible. A failed pool
                     // rejects prepared jobs with real errors instead of using
-                    // a partial pool or silently losing a refinement lane.
+                    // a partial pool with less capacity than its budgets promise.
                     let mut state = shared.lock();
-                    state.initialization_error =
+                    state.terminal_error =
                         Some(format!("starting inference worker {worker}: {error}"));
                     state.stopping = true;
                     drop(state);
@@ -213,42 +232,74 @@ impl InferenceScheduler {
         Arc::new(Self { shared, workers })
     }
 
+    /// Startup hardware-derived budgets; workers have no pass affinity.
+    pub fn limits(&self) -> InferenceLimits {
+        self.shared.lock().limits
+    }
+
     /// Store the private PCM/decoder handoff before publishing its gate request.
     pub fn prepare(&self, task: InferenceTask) {
-        let key = Key::for_request(&task.request);
         let mut state = self.shared.lock();
         let error = if state.stopping {
             Some(
                 state
-                    .initialization_error
+                    .terminal_error
                     .clone()
                     .unwrap_or_else(|| "inference scheduler stopped".into()),
             )
-        } else if state.cancelled.contains(&key.recording) {
-            Some("inference recording cancelled".into())
-        } else if state.pending.contains_key(&key) {
-            Some("an inference job is already pending for this recording and pass".into())
-        } else if state.active.get(&key) == Some(&task.request) {
-            Some("this inference job is already running".into())
         } else {
-            None
+            match (|| -> rusqlite::Result<Option<String>> {
+                if state.db().cancelled(task.request.recording)? {
+                    Ok(Some("inference recording cancelled".into()))
+                } else if state
+                    .db()
+                    .pending(task.request.recording, task.request.pass)?
+                    .is_some()
+                {
+                    Ok(Some(
+                        "an inference job is already pending for this recording and pass".into(),
+                    ))
+                } else if state.db().active_matches(&task.request)? {
+                    Ok(Some("this inference job is already running".into()))
+                } else {
+                    Ok(None)
+                }
+            })() {
+                Ok(error) => error,
+                Err(error) => {
+                    state.fail_queue(error);
+                    state.terminal_error.clone()
+                }
+            }
         };
         if let Some(error) = error {
             task.tx.publish(AppEvent::TranscriptionRequested {
                 request: task.request,
             });
-            reject(task, error, state.queue_jobs(key.lane));
+            let queue_jobs = state.queue_jobs(task.request.pass);
+            reject(task, error, queue_jobs);
+            self.shared.changed.notify_all();
             return;
         }
         let request = task.request;
         let tx = task.tx.clone();
-        state.pending.insert(
-            key,
-            Pending {
-                task,
-                dispatched: false,
-            },
-        );
+        let slot = state
+            .tasks
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(state.tasks.len());
+        if let Err(error) = state.db().insert(&request, slot) {
+            state.fail_queue(error);
+            tx.publish(AppEvent::TranscriptionRequested { request });
+            reject(task, state.terminal_error.clone().expect("queue error"), 0);
+            self.shared.changed.notify_all();
+            return;
+        }
+        if slot == state.tasks.len() {
+            state.tasks.push(Some(task));
+        } else {
+            state.tasks[slot] = Some(task);
+        }
         // Publishing under the same lock prevents cancellation from overtaking
         // Requested. A fast bus consumer cannot observe a missing private job.
         tx.publish(AppEvent::TranscriptionRequested { request });
@@ -257,9 +308,7 @@ impl InferenceScheduler {
     /// Activate exactly the privately stored request after its database gate.
     pub fn dispatch(&self, request: &TranscriptionJob) -> bool {
         let dispatched = self.shared.lock().dispatch(request);
-        if dispatched {
-            self.shared.changed.notify_all();
-        }
+        self.shared.changed.notify_all();
         dispatched
     }
 
@@ -272,37 +321,59 @@ impl InferenceScheduler {
     /// of an already-dispatched request.
     pub fn reject_unaccepted(&self, request: &TranscriptionJob) {
         let mut state = self.shared.lock();
-        let key = Key::for_request(request);
-        if state.pending.get(&key).is_some_and(|pending| {
-            !pending.dispatched && pending.task.request == *request
-        }) {
-            let task = state.remove_pending(key).expect("matching pending request");
-            reject(task, "transcription request rejected by database gate".into(),
-                state.queue_jobs(key.lane));
+        if state.stopping {
+            return;
         }
+        let result = (|| -> rusqlite::Result<()> {
+            if state
+                .db()
+                .pending(request.recording, request.pass)?
+                .is_some_and(|pending| !pending.dispatched && pending.request == *request)
+            {
+                let task = state
+                    .remove_pending(request.recording, request.pass)?
+                    .expect("matching pending request");
+                let queue_jobs = state.queue_jobs(request.pass);
+                reject(
+                    task,
+                    "transcription request rejected by database gate".into(),
+                    queue_jobs,
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            state.fail_queue(error);
+        }
+        self.shared.changed.notify_all();
     }
 
     /// Terminally fence this recording and return jobs which never crossed the
     /// dispatch gate. Accepted jobs finish normally and keep their replies.
     pub fn cancel(&self, recording: u64) {
         let mut state = self.shared.lock();
-        state.cancelled.insert(recording);
-        for lane in 0..2 {
-            let key = Key { recording, lane };
-            if state
-                .pending
-                .get(&key)
-                .is_some_and(|pending| !pending.dispatched)
-            {
-                if let Some(task) = state.remove_pending(key) {
-                    reject(
-                        task,
-                        "inference job cancelled before dispatch".into(),
-                        state.queue_jobs(lane),
-                    );
-                }
-            }
+        if state.stopping {
+            return;
         }
+        let result = (|| -> rusqlite::Result<()> {
+            state.db().cancel(recording)?;
+            while let Some(slot) = state.db().remove_unaccepted(recording)? {
+                let task = state.tasks[slot]
+                    .take()
+                    .expect("cancelled private inference task");
+                let queue_jobs = state.queue_jobs(task.request.pass);
+                reject(
+                    task,
+                    "inference job cancelled before dispatch".into(),
+                    queue_jobs,
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            state.fail_queue(error);
+        }
+        self.shared.changed.notify_all();
     }
 }
 
@@ -310,9 +381,13 @@ impl Drop for InferenceScheduler {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
         state.stopping = true;
-        let pending = std::mem::take(&mut state.pending);
-        for (_, pending) in pending {
-            reject(pending.task, "inference scheduler stopped".into(), 0);
+        if let Some(db) = &state.db {
+            if let Err(error) = db.clear_pending() {
+                state.fail_queue(error);
+            }
+        }
+        for task in state.tasks.iter_mut().filter_map(Option::take) {
+            reject(task, "inference scheduler stopped".into(), 0);
         }
         drop(state);
         self.shared.changed.notify_all();
@@ -334,10 +409,12 @@ fn worker_loop(shared: Arc<Shared>, worker: u8) {
                     return;
                 }
                 if let Some(task) = state.take(worker) {
-                    // Wake refinement workers after the live worker claims
-                    // its reserved slot. They may now use the second slot.
+                    // Wake other idle workers to use any remaining backend budget.
                     shared.changed.notify_all();
                     break task;
+                } else if state.stopping {
+                    shared.changed.notify_all();
+                    return;
                 }
                 state = shared
                     .changed
@@ -357,7 +434,9 @@ fn elapsed_ms(origin: Instant, time: Instant) -> u64 {
 }
 
 fn backlog(captured: &AtomicU64, consumed_end: u64) -> u64 {
-    captured.load(Ordering::Acquire).saturating_sub(consumed_end)
+    captured
+        .load(Ordering::Acquire)
+        .saturating_sub(consumed_end)
 }
 
 fn execute(shared: &Shared, task: InferenceTask, worker: u8, queue_jobs: u32) {
@@ -382,13 +461,15 @@ fn execute(shared: &Shared, task: InferenceTask, worker: u8, queue_jobs: u32) {
     });
     let inference_start = Instant::now();
     let queue_size_start = backlog(&captured, consumed_end);
-    let result = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<Vec<TranscriptOut>> {
-        let mut output = engine.feed_chunks(&chunks)?;
-        if request.finishing {
-            output.extend(engine.finish()?);
-        }
-        Ok(output)
-    }));
+    let result = catch_unwind(AssertUnwindSafe(
+        || -> anyhow::Result<Vec<TranscriptOut>> {
+            let mut output = engine.feed_chunks(&chunks)?;
+            if request.finishing {
+                output.extend(engine.finish()?);
+            }
+            Ok(output)
+        },
+    ));
     let inference_end = Instant::now();
     let transcription = TranscriptionMetrics {
         start_ms: elapsed_ms(origin, inference_start),
@@ -397,17 +478,23 @@ fn execute(shared: &Shared, task: InferenceTask, worker: u8, queue_jobs: u32) {
         queue_size_start,
         queue_size_end: backlog(&captured, consumed_end),
     };
-    let (engine, output) = match result {
+    let (engine, mut output) = match result {
         Ok(Ok(output)) => (Some(engine), Ok(output)),
         Ok(Err(error)) => (Some(engine), Err(format!("{error:#}"))),
         Err(panic) => (
             None,
-            Err(format!("transcription worker panicked: {}", panic_message(panic.as_ref()))),
+            Err(format!(
+                "transcription worker panicked: {}",
+                panic_message(panic.as_ref())
+            )),
         ),
     };
     let mut state = shared.lock();
-    state.complete(&request, worker);
-    let queue_jobs = state.queue_jobs(Key::for_request(&request).lane);
+    if let Err(error) = state.complete(&request, worker) {
+        output = Err(format!("completing inference queue job: {error}"));
+        state.fail_queue(error);
+    }
+    let queue_jobs = state.queue_jobs(request.pass);
     match &output {
         Ok(_) => tx.publish(AppEvent::TranscriptionFinished {
             request,
@@ -552,10 +639,14 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_limits(InferenceLimits::for_system(6, 16 * 1024 * 1024 * 1024))
+        }
+
+        fn with_limits(limits: InferenceLimits) -> Self {
             let (replies, results) = mpsc::channel();
             Self {
                 scheduler: InferenceScheduler {
-                    shared: Arc::new(Shared::default()),
+                    shared: Arc::new(Shared::new(limits)),
                     workers: Vec::new(),
                 },
                 bus: EventBus::new(),
@@ -605,27 +696,50 @@ mod tests {
     }
 
     #[test]
-    fn live_has_dispatch_priority_and_the_shared_backend_limit_is_two() {
+    fn every_worker_prioritizes_live_and_respects_the_recording_budget() {
         let h = Harness::new();
         h.queue(request(10, 1, TranscriptPass::Live));
         h.queue(request(20, 1, TranscriptPass::Refined));
         h.queue(request(30, 1, TranscriptPass::Refined));
-        assert!(h.take(2).is_none(), "idle live worker has priority");
-        let live = h.take(1).expect("live reserves the first backend slot");
-        let refine = h.take(2).expect("refinement uses the second slot");
-        assert!(h.take(3).is_none(), "two backends already running");
+        let live = h.take(2).expect("any worker takes queued live first");
+        assert_eq!(live.0.request.pass, TranscriptPass::Live);
+        let refine = h.take(1).expect("any other worker takes refinement");
+        assert_eq!(refine.0.request.pass, TranscriptPass::Refined);
+        assert!(h.take(3).is_none(), "recording concurrency budget is full");
         h.queue(request(10, 2, TranscriptPass::Live));
-        h.finish(1, live);
-        assert!(h.take(3).is_none(), "next free slot belongs to queued live");
-        let next_live = h.take(1).expect("next live job");
-        h.finish(2, refine);
-        let next_refine = h.take(3).expect("other refinement worker can run");
-        h.finish(1, next_live);
-        h.finish(3, next_refine);
+        h.finish(2, live);
+        let next_live = h
+            .take(3)
+            .expect("next available worker prioritizes queued live");
+        assert_eq!(next_live.0.request.pass, TranscriptPass::Live);
+        h.finish(1, refine);
+        let next_refine = h.take(2).expect("released worker handles refinement");
+        assert_eq!(next_refine.0.request.pass, TranscriptPass::Refined);
+        h.finish(3, next_live);
+        h.finish(2, next_refine);
     }
 
     #[test]
-    fn shutdown_borrows_idle_lanes_without_overlapping_decoder_state() {
+    fn multiple_recordings_run_live_jobs_concurrently_without_lane_affinity() {
+        let h = Harness::new();
+        h.queue(request(10, 1, TranscriptPass::Live));
+        h.queue(request(20, 1, TranscriptPass::Live));
+        h.queue(request(30, 1, TranscriptPass::Refined));
+        let first = h.take(3).expect("third worker serves live");
+        let second = h.take(2).expect("second live recording runs concurrently");
+        assert_eq!(first.0.request.recording, 10);
+        assert_eq!(second.0.request.recording, 20);
+        assert_eq!(second.0.request.pass, TranscriptPass::Live);
+        assert!(h.take(1).is_none(), "both recording slots are occupied");
+        h.finish(3, first);
+        let refined = h.take(3).expect("the same worker can switch passes");
+        assert_eq!(refined.0.request.pass, TranscriptPass::Refined);
+        h.finish(2, second);
+        h.finish(3, refined);
+    }
+
+    #[test]
+    fn shutdown_uses_its_budget_without_overlapping_decoder_state() {
         let h = Harness::new();
         for recording in [10, 20, 30, 40] {
             h.queue(request(recording, 1, TranscriptPass::Live));
@@ -633,23 +747,67 @@ mod tests {
         h.queue(request(50, 1, TranscriptPass::Refined));
         h.scheduler.begin_shutdown();
         let first = h.take(1).unwrap();
-        let second = h.take(2).expect("refinement worker drains live");
+        let second = h.take(2).expect("second worker drains live");
         let third = h.take(3).expect("third existing worker also drains live");
         assert!(h.take(1).is_none(), "all three workers are busy");
         h.queue(request(10, 2, TranscriptPass::Live));
         h.finish(2, second);
         let fourth = h.take(2).unwrap();
-        assert_eq!(fourth.0.request.recording, 40, "active decoder key cannot overlap");
+        assert_eq!(
+            fourth.0.request.recording, 40,
+            "active decoder key cannot overlap"
+        );
         h.finish(3, third);
-        let refinement = h.take(3).expect("unavailable live keys leave room for refinement");
+        let refinement = h
+            .take(3)
+            .expect("unavailable live keys leave room for refinement");
         assert_eq!(refinement.0.request.pass, TranscriptPass::Refined);
         h.finish(3, refinement);
-        assert!(h.take(3).is_none(), "pending state for recording 10 is still exclusive");
+        assert!(
+            h.take(3).is_none(),
+            "pending state for recording 10 is still exclusive"
+        );
         h.finish(1, first);
-        let next = h.take(3).expect("released state can migrate to an idle worker");
+        let next = h
+            .take(3)
+            .expect("released state can migrate to an idle worker");
         assert_eq!(next.0.request.recording, 10);
         h.finish(2, fourth);
         h.finish(3, next);
+    }
+
+    #[test]
+    fn hardware_budgets_bound_recording_and_shutdown_admission() {
+        for (cpus, memory_gib) in [(1, 8), (6, 16), (16, 64), (32, 8), (32, 0)] {
+            let limits = InferenceLimits::for_system(cpus, memory_gib * 1024 * 1024 * 1024);
+            let h = Harness::with_limits(limits);
+            for recording in 1..=limits.workers() as u64 + 1 {
+                h.queue(request(recording, 1, TranscriptPass::Live));
+            }
+            let mut active = Vec::new();
+            for worker in 1..=limits.workers() as u8 {
+                if let Some(taken) = h.take(worker) {
+                    active.push((worker, taken));
+                }
+            }
+            assert_eq!(active.len(), limits.recording());
+            assert!(h.take(limits.workers() as u8 + 1).is_none());
+            h.scheduler.begin_shutdown();
+            for worker in 1..=limits.workers() as u8 {
+                if let Some(taken) = h.take(worker) {
+                    active.push((worker, taken));
+                }
+            }
+            assert_eq!(active.len(), limits.shutdown());
+            for (worker, taken) in active {
+                h.finish(worker, taken);
+            }
+            let next = h
+                .take(1)
+                .expect("completion releases capacity for queued work");
+            assert_eq!(next.0.request.recording, limits.shutdown() as u64 + 1);
+            h.finish(1, next);
+        }
     }
 
     #[test]
@@ -747,13 +905,19 @@ mod tests {
             .bus
             .drain()
             .filter_map(|event| match event {
-                AppEvent::TranscriptionFailed { request, worker, transcription, .. } => {
-                    Some((request, worker, transcription))
-                }
+                AppEvent::TranscriptionFailed {
+                    request,
+                    worker,
+                    transcription,
+                    ..
+                } => Some((request, worker, transcription)),
                 _ => None,
             })
             .collect();
-        assert_eq!(failures, vec![(live, None, None), (refine, None, None), (late, None, None)]);
+        assert_eq!(
+            failures,
+            vec![(live, None, None), (refine, None, None), (late, None, None)]
+        );
     }
 
     #[test]
@@ -768,7 +932,6 @@ mod tests {
         scheduler.prepare(first);
         assert!(scheduler.dispatch(&live));
         let first = results.recv_timeout(DEADLINE).expect("initial live result");
-        assert_eq!(first.worker, 1);
         assert_eq!(first.output.unwrap(), Vec::<TranscriptOut>::new());
         let mut jobs = vec![
             (request(10, 2, TranscriptPass::Live), 3.0, first.engine),
@@ -785,19 +948,20 @@ mod tests {
             scheduler.prepare(next);
             assert!(scheduler.dispatch(&request));
         }
-        let mut output = HashMap::new();
+        let mut output = Vec::new();
         for _ in 0..3 {
-            let result = results.recv_timeout(DEADLINE).expect("independent decoder result");
-            let worker = result.worker;
-            match result.request.pass {
-                TranscriptPass::Live => assert_eq!(worker, 1),
-                TranscriptPass::Refined => assert!([2, 3].contains(&worker)),
-            }
-            output.insert(result.request.job, result.output.unwrap());
+            let result = results
+                .recv_timeout(DEADLINE)
+                .expect("independent decoder result");
+            output.push((result.request.job, result.output.unwrap()));
         }
-        for (job, sum, samples) in [(2, 6, 3), (3, 10, 1), (4, 100, 1)] {
+        output.sort_by_key(|(job, _)| *job);
+        for ((actual_job, actual), (job, sum, samples)) in
+            output.into_iter().zip([(2, 6, 3), (3, 10, 1), (4, 100, 1)])
+        {
+            assert_eq!(actual_job, job);
             assert_eq!(
-                output.remove(&job).unwrap(),
+                actual,
                 vec![TranscriptOut::Committed {
                     t_start_ms: 0,
                     t_end_ms: samples,
@@ -807,13 +971,24 @@ mod tests {
         }
         let events: Vec<_> = bus.drain().collect();
         for job in 1..=4 {
-            let lifecycle: Vec<_> = events.iter().filter_map(|event| match event {
-                AppEvent::TranscriptionRequested { request } if request.job == job => Some("queued"),
-                AppEvent::TranscriptionStarted { request, .. } if request.job == job => Some("running"),
-                AppEvent::TranscriptionFinished { request, .. } if request.job == job => Some("finished"),
-                AppEvent::TranscriptionFailed { request, .. } if request.job == job => Some("failed"),
-                _ => None,
-            }).collect();
+            let lifecycle: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AppEvent::TranscriptionRequested { request } if request.job == job => {
+                        Some("queued")
+                    }
+                    AppEvent::TranscriptionStarted { request, .. } if request.job == job => {
+                        Some("running")
+                    }
+                    AppEvent::TranscriptionFinished { request, .. } if request.job == job => {
+                        Some("finished")
+                    }
+                    AppEvent::TranscriptionFailed { request, .. } if request.job == job => {
+                        Some("failed")
+                    }
+                    _ => None,
+                })
+                .collect();
             assert_eq!(lifecycle, ["queued", "running", "finished"]);
         }
     }
@@ -851,7 +1026,12 @@ mod tests {
         let (replies, results) = mpsc::channel();
         for (job, failure, expected, state_returned) in [
             (1, Failure::Feed, "decoder rejected input", true),
-            (2, Failure::Panic, "transcription worker panicked: decoder panic", false),
+            (
+                2,
+                Failure::Panic,
+                "transcription worker panicked: decoder panic",
+                false,
+            ),
             (3, Failure::Finish, "decoder could not flush", true),
         ] {
             let mut request = request(10, job, TranscriptPass::Refined);
@@ -860,15 +1040,24 @@ mod tests {
             next.engine = Box::new(FailingEngine(failure));
             scheduler.prepare(next);
             assert!(scheduler.dispatch(&request));
-            let result = results.recv_timeout(DEADLINE).expect("failed decoder reply");
+            let result = results
+                .recv_timeout(DEADLINE)
+                .expect("failed decoder reply");
             assert_eq!(result.output.unwrap_err(), expected);
             assert_eq!(result.engine.is_some(), state_returned);
-            let lifecycle: Vec<_> = bus.drain().filter_map(|event| match event {
-                AppEvent::TranscriptionRequested { .. } => Some("queued"),
-                AppEvent::TranscriptionStarted { .. } => Some("running"),
-                AppEvent::TranscriptionFailed { worker: Some(_), transcription: Some(_), .. } => Some("failed"),
-                _ => None,
-            }).collect();
+            let lifecycle: Vec<_> = bus
+                .drain()
+                .filter_map(|event| match event {
+                    AppEvent::TranscriptionRequested { .. } => Some("queued"),
+                    AppEvent::TranscriptionStarted { .. } => Some("running"),
+                    AppEvent::TranscriptionFailed {
+                        worker: Some(_),
+                        transcription: Some(_),
+                        ..
+                    } => Some("failed"),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(lifecycle, ["queued", "running", "failed"]);
         }
     }
@@ -906,10 +1095,15 @@ mod tests {
         let captured = Arc::new(AtomicU64::new(10));
         next.captured = captured.clone();
         next.consumed_end = 4;
-        next.engine = Box::new(GatedEngine { entered: entered_tx, release: release_rx });
+        next.engine = Box::new(GatedEngine {
+            entered: entered_tx,
+            release: release_rx,
+        });
         scheduler.prepare(next);
         assert!(scheduler.dispatch(&request));
-        entered_rx.recv_timeout(DEADLINE).expect("inference started");
+        entered_rx
+            .recv_timeout(DEADLINE)
+            .expect("inference started");
         captured.store(25, Ordering::Release);
         release_tx.send(()).expect("release inference");
         let result = results.recv_timeout(DEADLINE).expect("inference result");
@@ -933,7 +1127,10 @@ mod tests {
         assert_eq!(result.worker, 0);
         assert_eq!(result.output.unwrap_err(), "inference scheduler stopped");
         assert!(result.engine.is_some());
-        assert!(shared.upgrade().is_none(), "workers released their shared state");
+        assert!(
+            shared.upgrade().is_none(),
+            "workers released their shared state"
+        );
     }
 
     #[test]
@@ -942,14 +1139,50 @@ mod tests {
         {
             let mut state = h.scheduler.shared.lock();
             state.stopping = true;
-            state.initialization_error = Some("starting inference worker 2: unavailable".into());
+            state.terminal_error = Some("starting inference worker 2: unavailable".into());
         }
         let request = request(10, 1, TranscriptPass::Live);
         h.prepare(request);
         let result = h.result();
-        assert_eq!(result.output.unwrap_err(), "starting inference worker 2: unavailable");
+        assert_eq!(
+            result.output.unwrap_err(),
+            "starting inference worker 2: unavailable"
+        );
         assert_eq!(result.worker, 0);
         assert!(result.engine.is_some());
         assert!(!h.scheduler.dispatch(&request));
+    }
+
+    #[test]
+    fn failed_queue_write_returns_all_pending_decoders_without_execution() {
+        let mut h = Harness::new();
+        let accepted = request(10, 1, TranscriptPass::Live);
+        h.queue(accepted);
+        h.scheduler
+            .shared
+            .lock()
+            .db()
+            .abort_inserts_for_test()
+            .unwrap();
+        let failed = request(20, 2, TranscriptPass::Refined);
+        h.prepare(failed);
+        for expected in [accepted, failed] {
+            let result = h.result();
+            assert_eq!(result.request, expected);
+            assert_eq!(result.worker, 0);
+            assert!(result.engine.is_some());
+            assert!(result.output.unwrap_err().contains("inference queue"));
+        }
+        for worker in 1..=h.scheduler.limits().workers() as u8 {
+            assert!(h.take(worker).is_none());
+        }
+        let late = request(30, 3, TranscriptPass::Live);
+        h.prepare(late);
+        assert_eq!(h.result().request, late);
+        assert!(!h.scheduler.dispatch(&late));
+        assert!(!h
+            .bus
+            .drain()
+            .any(|event| matches!(event, AppEvent::TranscriptionStarted { .. })));
     }
 }

@@ -56,6 +56,7 @@ Desktop.ini
 # Test outputs
 test-output/
 recording_*
+!/next/src/db/recording_workers.rs
 transcript_*
 !/next/tests/snapshots/recording_*.txt
 logs/

@@ -1,102 +1,97 @@
-//! Reconcile desired recording blocks with the producer's worker registry.
+//! Translate desired recording blocks into identity-scoped bus commands.
 use std::sync::Arc;
 
 use crate::audio::CaptureSource;
-use crate::bus::{AppEvent, EventSender};
+use crate::bus::{next_monotonic_id, AppEvent, EventSender, RecordingRequest};
 use crate::consumer::ui_view::{BlockState, UiView};
-use crate::producer::recording::{
-    next_recording_id, RecordingProducer, RecordingRequest, RecordingServices,
-};
+use crate::db::{recordings, Database};
 use crate::transcription_models::ModelStore;
 
 pub struct RecordingConsumer {
-    pub producer: RecordingProducer,
     model_store: Arc<dyn ModelStore>,
 }
 
 impl RecordingConsumer {
-    pub fn new(services: RecordingServices, model_store: Arc<dyn ModelStore>) -> Self {
-        Self {
-            producer: RecordingProducer::new(services),
-            model_store,
-        }
+    pub fn new(model_store: Arc<dyn ModelStore>) -> Self {
+        Self { model_store }
     }
 
-    pub fn consume(&mut self, event: &AppEvent, view: &mut UiView, tx: &EventSender) {
-        match event {
-            AppEvent::TranscriptionRequested { request } => {
-                self.producer.dispatch(request);
+    pub fn consume(
+        &self,
+        view: &mut UiView,
+        db: &mut Database,
+        tx: &EventSender,
+    ) -> rusqlite::Result<()> {
+        // Snapshot before mutating request rows; SQLite owns the lifecycle,
+        // including commands queued for the next bus pass.
+        let requests = recordings::requests(db)?;
+        for request in &requests {
+            let wanted = !view.should_quit
+                && view.blocks.iter().any(|candidate| {
+                    candidate.id == request.block
+                        && matches!(candidate.state, BlockState::Recording { .. })
+                });
+            if request.ended {
+                if !wanted || request.stopping || request.failed {
+                    recordings::release_ended(db, request.block, request.recording)?;
+                }
+            } else if !wanted
+                && !request.stopping
+                && recordings::reserve_stop(db, request.block, request.recording)?
+                && !request.stop_admitted
+            {
+                tx.publish(AppEvent::RecordingStopRequested {
+                    block: request.block,
+                    recording: request.recording,
+                });
             }
-            AppEvent::RecordingStopped { block, recording } => {
-                self.producer.complete(*block, *recording, false);
-            }
-            AppEvent::RecordingFailed {
-                block, recording, ..
-            } => {
-                self.producer.complete(*block, *recording, true);
-            }
-            _ => {}
         }
-        self.reconcile(view, tx);
-    }
-
-    pub fn reconcile(&mut self, view: &mut UiView, tx: &EventSender) {
-        for block in self.producer.blocks() {
-            if view.should_quit
-                || !view.blocks.iter().any(|candidate| {
-                    candidate.id == block && matches!(candidate.state, BlockState::Recording { .. })
+        if view.should_quit {
+            return Ok(());
+        }
+        for index in 0..view.blocks.len() {
+            let block = &view.blocks[index];
+            let BlockState::Recording {
+                language,
+                recording,
+                ..
+            } = block.state
+            else {
+                continue;
+            };
+            if recording.is_some()
+                || requests.iter().any(|request| {
+                    request.block == block.id
+                        && (!request.ended || (!request.stopping && !request.failed))
                 })
             {
-                self.producer.stop(block);
+                continue;
             }
-        }
-        self.producer.reap_stopped();
-        if view.should_quit {
-            return;
-        }
-        let requests: Vec<_> = view
-            .blocks
-            .iter()
-            .filter_map(|block| {
-                let BlockState::Recording {
-                    language,
-                    recording,
-                    ..
-                } = block.state
-                else {
-                    return None;
-                };
-                if self.producer.contains(block.id) || recording.is_some() {
-                    return None;
-                }
-                Some((
-                    block.id,
-                    language,
-                    CaptureSource::from_selection(block.source.as_ref()),
-                ))
-            })
-            .collect();
-        for (block, language, source) in requests {
-            let recording = next_recording_id();
-            view.begin_session(block, recording);
+            let id = block.id;
+            let recording = next_monotonic_id();
+            if !recordings::reserve_start(db, id, recording)? {
+                continue;
+            }
+            view.begin_session(id, recording);
+            let source = CaptureSource::from_selection(view.blocks[index].source.as_ref());
             match source {
-                Ok(source) => self.producer.start(
-                    RecordingRequest {
-                        block,
+                Ok(source) => tx.publish(AppEvent::RecordingRequested {
+                    request: Arc::new(RecordingRequest {
+                        block: id,
                         recording,
                         source,
                         language,
                         live_model: self.model_store.installed_path(language.live),
                         refine_model: self.model_store.installed_path(language.refine),
-                    },
-                    tx,
-                ),
+                    }),
+                }),
                 Err(error) => tx.publish(AppEvent::RecordingFailed {
-                    block,
+                    block: id,
                     recording,
                     error: format!("{error:#}"),
                 }),
             }
         }
+        Ok(())
     }
 }

@@ -87,7 +87,10 @@ fn decode_path(bytes: Vec<u8>) -> rusqlite::Result<PathBuf> {
 #[cfg(windows)]
 fn encode_path(path: PathBuf) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().flat_map(u16::to_le_bytes).collect()
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
 #[cfg(windows)]
@@ -97,10 +100,16 @@ fn decode_path(bytes: Vec<u8>) -> rusqlite::Result<PathBuf> {
         return Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Blob,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-16 staging path")),
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid UTF-16 staging path",
+            )),
         ));
     }
-    let wide: Vec<_> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    let wide: Vec<_> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
     Ok(PathBuf::from(OsString::from_wide(&wide)))
 }
 
@@ -109,15 +118,17 @@ mod tests {
     use super::*;
     use crate::bus::EventBus;
     use crate::db::downloads::CancelCheck;
+    use crate::download::DownloadError;
     use crate::picker::CATALOG;
     use crate::testing::FixtureStore;
-    use crate::download::DownloadError;
     use std::path::Path;
 
     struct PreparationStore;
 
     impl ModelStore for PreparationStore {
-        fn is_available(&self, _: &ModelEntry) -> bool { false }
+        fn is_available(&self, _: &ModelEntry) -> bool {
+            false
+        }
 
         fn installed_path(&self, entry: &ModelEntry) -> PathBuf {
             PathBuf::from(format!("custom/{}.gguf", entry.id))
@@ -127,11 +138,19 @@ mod tests {
             if attempt == 1 {
                 Err(DownloadError::Io("cache directory is read-only".into()))
             } else {
-                Ok(PathBuf::from(format!("custom/{}.{}.archive", entry.id, attempt)))
+                Ok(PathBuf::from(format!(
+                    "custom/{}.{}.archive",
+                    entry.id, attempt
+                )))
             }
         }
 
-        fn install(&self, _: &ModelEntry, _: &Path, _: &mut dyn CancelCheck) -> Result<(), DownloadError> {
+        fn install(
+            &self,
+            _: &ModelEntry,
+            _: &Path,
+            _: &mut dyn CancelCheck,
+        ) -> Result<(), DownloadError> {
             unreachable!("metadata observation must not install")
         }
 
@@ -177,7 +196,10 @@ mod tests {
         let second = get(&db, model.id, 2).unwrap();
         let store = FixtureStore::new(dir.path().to_path_buf(), &[]);
         observe(&mut db, &store, model, 1).unwrap();
-        assert_eq!(get(&db, model.id, 1).unwrap(), Some(Ok(dir.path().join(format!("{}.1.part", model.id)))));
+        assert_eq!(
+            get(&db, model.id, 1).unwrap(),
+            Some(Ok(dir.path().join(format!("{}.1.part", model.id))))
+        );
         assert_eq!(get(&db, model.id, 2).unwrap(), second);
     }
 

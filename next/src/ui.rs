@@ -16,9 +16,9 @@ use ratatui::{
 };
 
 use crate::audio_sources::DeviceKind;
+use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView};
 use crate::language::{LanguageProfile, LANGUAGES};
 use crate::picker::ListPicker;
-use crate::consumer::ui_view::{BlockState, DownloadPhase, DownloadState, UiView};
 
 /// Draw one frame: outer window with `ui_view.title` in its top border,
 /// then `ui_view.blocks` evenly-distributed columns inside.
@@ -71,7 +71,8 @@ pub fn render(f: &mut Frame, ui_view: &UiView) {
     // enforced in the reducer's `show_block`, so the renderer never
     // has to clamp. If no block is visible (e.g. nothing has been
     // created yet), skip the layout entirely.
-    let visible: Vec<&crate::consumer::ui_view::Block> = ui_view.blocks.iter().filter(|b| b.visible).collect();
+    let visible: Vec<&crate::consumer::ui_view::Block> =
+        ui_view.blocks.iter().filter(|b| b.visible).collect();
     if !visible.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
@@ -116,7 +117,12 @@ fn render_block(
         BlockState::Waiting { language, pending } => {
             render_waiting(f, language, pending, ui_view, inner);
         }
-        BlockState::Recording { lines, tentative, session_dir, .. } => {
+        BlockState::Recording {
+            lines,
+            tentative,
+            session_dir,
+            ..
+        } => {
             render_recording(f, lines, tentative, session_dir.as_deref(), inner);
         }
         _ => {
@@ -172,7 +178,12 @@ fn block_title(block: &crate::consumer::ui_view::Block) -> String {
     title
 }
 
-fn render_source_picker(f: &mut Frame, block: &crate::consumer::ui_view::Block, selected: usize, area: Rect) {
+fn render_source_picker(
+    f: &mut Frame,
+    block: &crate::consumer::ui_view::Block,
+    selected: usize,
+    area: Rect,
+) {
     let Some(source) = &block.source else { return };
     let picking_device = matches!(block.state, BlockState::PickingDevice(_));
     let total = if picking_device {
@@ -334,7 +345,13 @@ fn transcript_rows(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-fn render_recording(f: &mut Frame, committed: &[String], tentative: &str, session_dir: Option<&str>, area: Rect) {
+fn render_recording(
+    f: &mut Frame,
+    committed: &[String],
+    tentative: &str,
+    session_dir: Option<&str>,
+    area: Rect,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -345,7 +362,10 @@ fn render_recording(f: &mut Frame, committed: &[String], tentative: &str, sessio
     let pending = transcript_rows(tentative, usize::from(area.width));
     let pending_count = pending.len().min(available.div_ceil(2));
     let committed_count = available - pending_count;
-    let rows: Vec<_> = committed.iter().flat_map(|line| transcript_rows(line, usize::from(area.width))).collect();
+    let rows: Vec<_> = committed
+        .iter()
+        .flat_map(|line| transcript_rows(line, usize::from(area.width)))
+        .collect();
     let committed_start = rows.len().saturating_sub(committed_count);
     let pending_start = pending.len().saturating_sub(pending_count);
     let mut lines = Vec::with_capacity(height);
@@ -353,12 +373,20 @@ fn render_recording(f: &mut Frame, committed: &[String], tentative: &str, sessio
         lines.push(Line::from("● recording"));
     }
     lines.extend(rows.into_iter().skip(committed_start).map(Line::from));
-    lines.extend(pending.into_iter().skip(pending_start).map(|line| Line::from(line).dim()));
+    lines.extend(
+        pending
+            .into_iter()
+            .skip(pending_start)
+            .map(|line| Line::from(line).dim()),
+    );
     if show_path {
         while lines.len() < height - 1 {
             lines.push(Line::from(""));
         }
-        let name = session_dir.and_then(|path| std::path::Path::new(path).file_name()).map(|name| name.to_string_lossy()).unwrap_or_default();
+        let name = session_dir
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
         lines.push(Line::from(format!("sessions/{name}")).dim());
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -374,7 +402,9 @@ fn render_waiting(
     let models = language.models();
     let rows = Layout::new(
         Direction::Vertical,
-        models.iter().map(|_| Constraint::Ratio(1, models.len() as u32)),
+        models
+            .iter()
+            .map(|_| Constraint::Ratio(1, models.len() as u32)),
     )
     .split(area);
     for (&model, row) in models.iter().zip(rows.iter()) {
@@ -487,8 +517,8 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language::LANGUAGES;
     use crate::consumer::ui_view::Block;
+    use crate::language::LANGUAGES;
     use crate::testing::render_to_string;
 
     #[test]
@@ -681,7 +711,6 @@ mod tests {
         assert!(out.contains("live"), "{out}");
         assert!(out.contains("refine · ready"), "{out}");
     }
-
 
     #[test]
     fn waiting_block_without_content_length_uses_model_rate() {

@@ -134,18 +134,29 @@ mod tests {
     }
 
     fn row(db: &Database, request: TranscriptionJob) -> JobRow {
-        db.conn_ref().query_row(
-            "SELECT status, worker, start_ms, end_ms, duration_ms, queue_wait_ms, \
+        db.conn_ref()
+            .query_row(
+                "SELECT status, worker, start_ms, end_ms, duration_ms, queue_wait_ms, \
              queue_jobs_start, queue_jobs_end, queue_size_start, queue_size_end, error \
              FROM transcription_jobs WHERE recording_id = ?1 AND pass = ?2 AND job_id = ?3",
-            params![request.recording, pass_name(request.pass), request.job],
-            |r| Ok(JobRow {
-                status: r.get(0)?, worker: r.get(1)?, start_ms: r.get(2)?,
-                end_ms: r.get(3)?, duration_ms: r.get(4)?, queue_wait_ms: r.get(5)?,
-                queue_jobs_start: r.get(6)?, queue_jobs_end: r.get(7)?,
-                queue_size_start: r.get(8)?, queue_size_end: r.get(9)?, error: r.get(10)?,
-            }),
-        ).unwrap()
+                params![request.recording, pass_name(request.pass), request.job],
+                |r| {
+                    Ok(JobRow {
+                        status: r.get(0)?,
+                        worker: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        duration_ms: r.get(4)?,
+                        queue_wait_ms: r.get(5)?,
+                        queue_jobs_start: r.get(6)?,
+                        queue_jobs_end: r.get(7)?,
+                        queue_size_start: r.get(8)?,
+                        queue_size_end: r.get(9)?,
+                        error: r.get(10)?,
+                    })
+                },
+            )
+            .unwrap()
     }
 
     fn database() -> (tempfile::TempDir, Database) {
@@ -155,18 +166,33 @@ mod tests {
     }
 
     fn start(db: &mut Database, block: u8, recording: u64) {
-        assert!(super::super::apply(db, &AppEvent::RecordingStarted {
-            block, recording, session_dir: format!("/sessions/{recording}"),
-            source: CaptureSource::Mic { device_name: "Mic".into() },
-            language: "en".into(), started_at: "2026-10-08T10:00:00Z".into(),
-        }).unwrap());
+        assert!(super::super::apply(
+            db,
+            &AppEvent::RecordingStarted {
+                block,
+                recording,
+                session_dir: format!("/sessions/{recording}"),
+                source: CaptureSource::Mic {
+                    device_name: "Mic".into()
+                },
+                language: "en".into(),
+                started_at: "2026-10-08T10:00:00Z".into(),
+            }
+        )
+        .unwrap());
     }
 
     fn request(job: u64) -> TranscriptionJob {
         TranscriptionJob {
-            block: 1, recording: 100, job, pass: TranscriptPass::Live,
-            t_start_ms: 500, t_end_ms: 1500, sample_count: 16_000,
-            queued_at_ms: 1000, finishing: false,
+            block: 1,
+            recording: 100,
+            job,
+            pass: TranscriptPass::Live,
+            t_start_ms: 500,
+            t_end_ms: 1500,
+            sample_count: 16_000,
+            queued_at_ms: 1000,
+            finishing: false,
         }
     }
 
@@ -176,27 +202,42 @@ mod tests {
 
     fn running(request: TranscriptionJob, worker: u8) -> AppEvent {
         AppEvent::TranscriptionStarted {
-            request, worker, start_ms: 1020, queue_jobs: 3, queue_size_start: 32_000,
+            request,
+            worker,
+            start_ms: 1020,
+            queue_jobs: 3,
+            queue_size_start: 32_000,
         }
     }
 
     fn metrics() -> TranscriptionMetrics {
         TranscriptionMetrics {
-            start_ms: 1020, end_ms: 1090, duration_ms: 70,
-            queue_size_start: 32_000, queue_size_end: 48_000,
+            start_ms: 1020,
+            end_ms: 1090,
+            duration_ms: 70,
+            queue_size_start: 32_000,
+            queue_size_end: 48_000,
         }
     }
 
     fn finished(request: TranscriptionJob, worker: u8) -> AppEvent {
         AppEvent::TranscriptionFinished {
-            request, worker, transcription: metrics(), queue_wait_ms: 20, queue_jobs: 2,
+            request,
+            worker,
+            transcription: metrics(),
+            queue_wait_ms: 20,
+            queue_jobs: 2,
         }
     }
 
     fn failed(request: TranscriptionJob, worker: Option<u8>) -> AppEvent {
         AppEvent::TranscriptionFailed {
-            request, worker, transcription: worker.map(|_| metrics()),
-            queue_wait_ms: 20, queue_jobs: 2, error: "decoder unavailable".into(),
+            request,
+            worker,
+            transcription: worker.map(|_| metrics()),
+            queue_wait_ms: 20,
+            queue_jobs: 2,
+            error: "decoder unavailable".into(),
         }
     }
 
@@ -217,10 +258,17 @@ mod tests {
         assert!(!gate(&mut db, running(request, 1)));
         assert!(gate(&mut db, finished(request, 1)));
         let expected = JobRow {
-            status: "finished".into(), worker: Some(1), start_ms: Some(1020),
-            end_ms: Some(1090), duration_ms: Some(70), queue_wait_ms: Some(20),
-            queue_jobs_start: Some(3), queue_jobs_end: Some(2),
-            queue_size_start: Some(32_000), queue_size_end: Some(48_000), error: None,
+            status: "finished".into(),
+            worker: Some(1),
+            start_ms: Some(1020),
+            end_ms: Some(1090),
+            duration_ms: Some(70),
+            queue_wait_ms: Some(20),
+            queue_jobs_start: Some(3),
+            queue_jobs_end: Some(2),
+            queue_size_start: Some(32_000),
+            queue_size_end: Some(48_000),
+            error: None,
         };
         assert_eq!(row(&db, request), expected);
         assert!(!gate(&mut db, finished(request, 1)));
@@ -228,9 +276,12 @@ mod tests {
         assert!(!gate(&mut db, queued(request)));
         assert!(!gate(&mut db, running(request, 1)));
         assert_eq!(row(&db, request), expected);
-        let transcript_count: u64 = db.conn_ref().query_row(
-            "SELECT count(*) FROM transcription_metrics", [], |r| r.get(0),
-        ).unwrap();
+        let transcript_count: u64 = db
+            .conn_ref()
+            .query_row("SELECT count(*) FROM transcription_metrics", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(transcript_count, 0);
     }
 
@@ -240,19 +291,46 @@ mod tests {
         let request = request(1);
         assert!(!gate(&mut db, queued(request)));
         start(&mut db, 1, 100);
-        assert!(!gate(&mut db, queued(TranscriptionJob { block: 2, ..request })));
+        assert!(!gate(
+            &mut db,
+            queued(TranscriptionJob {
+                block: 2,
+                ..request
+            })
+        ));
         assert!(gate(&mut db, AppEvent::BlockClosed { block: 1 }));
         start(&mut db, 1, 101);
         assert!(gate(&mut db, queued(request)));
-        assert!(gate(&mut db, AppEvent::RecordingStopped { block: 1, recording: 100 }));
-        assert!(!gate(&mut db, queued(TranscriptionJob { job: 2, ..request })));
+        assert!(gate(
+            &mut db,
+            AppEvent::RecordingStopped {
+                block: 1,
+                recording: 100
+            }
+        ));
+        assert!(!gate(
+            &mut db,
+            queued(TranscriptionJob { job: 2, ..request })
+        ));
         assert!(gate(&mut db, running(request, 1)));
         assert!(gate(&mut db, finished(request, 1)));
         assert_eq!(row(&db, request).status, "finished");
-        assert!(gate(&mut db, AppEvent::RecordingFailed {
-            block: 1, recording: 101, error: "capture failed".into(),
-        }));
-        assert!(!gate(&mut db, queued(TranscriptionJob { recording: 101, job: 3, ..request })));
+        assert!(gate(
+            &mut db,
+            AppEvent::RecordingFailed {
+                block: 1,
+                recording: 101,
+                error: "capture failed".into(),
+            }
+        ));
+        assert!(!gate(
+            &mut db,
+            queued(TranscriptionJob {
+                recording: 101,
+                job: 3,
+                ..request
+            })
+        ));
     }
 
     #[test]
@@ -262,15 +340,39 @@ mod tests {
         let request = request(1);
         assert!(gate(&mut db, queued(request)));
         let stale_requests = [
-            TranscriptionJob { block: 2, ..request },
-            TranscriptionJob { recording: 101, ..request },
+            TranscriptionJob {
+                block: 2,
+                ..request
+            },
+            TranscriptionJob {
+                recording: 101,
+                ..request
+            },
             TranscriptionJob { job: 2, ..request },
-            TranscriptionJob { pass: TranscriptPass::Refined, ..request },
-            TranscriptionJob { t_start_ms: 0, ..request },
-            TranscriptionJob { t_end_ms: 2000, ..request },
-            TranscriptionJob { sample_count: 32_000, ..request },
-            TranscriptionJob { queued_at_ms: 999, ..request },
-            TranscriptionJob { finishing: true, ..request },
+            TranscriptionJob {
+                pass: TranscriptPass::Refined,
+                ..request
+            },
+            TranscriptionJob {
+                t_start_ms: 0,
+                ..request
+            },
+            TranscriptionJob {
+                t_end_ms: 2000,
+                ..request
+            },
+            TranscriptionJob {
+                sample_count: 32_000,
+                ..request
+            },
+            TranscriptionJob {
+                queued_at_ms: 999,
+                ..request
+            },
+            TranscriptionJob {
+                finishing: true,
+                ..request
+            },
         ];
         for stale in stale_requests {
             assert!(!gate(&mut db, running(stale, 1)));
@@ -308,7 +410,11 @@ mod tests {
         assert!(!gate(&mut db, failed(queued_request, None)));
         assert!(!gate(&mut db, running(queued_request, 1)));
         assert_eq!(row(&db, queued_request), cancelled);
-        let running_request = TranscriptionJob { job: 2, pass: TranscriptPass::Refined, ..queued_request };
+        let running_request = TranscriptionJob {
+            job: 2,
+            pass: TranscriptPass::Refined,
+            ..queued_request
+        };
         assert!(gate(&mut db, queued(running_request)));
         assert!(gate(&mut db, running(running_request, 3)));
         assert!(gate(&mut db, failed(running_request, Some(3))));
@@ -336,7 +442,8 @@ mod tests {
         assert!(gate(&mut db, failed(requests[3], None)));
         let terminal = [row(&db, requests[2]), row(&db, requests[3])];
         drop(db);
-        let mut db = Database::open(&dir.path().join("jobs.sqlite"), EventBus::new().sender()).unwrap();
+        let mut db =
+            Database::open(&dir.path().join("jobs.sqlite"), EventBus::new().sender()).unwrap();
         let queued_row = row(&db, requests[0]);
         let running_row = row(&db, requests[1]);
         assert_eq!(queued_row.status, "failed");
@@ -351,7 +458,10 @@ mod tests {
         assert_eq!(running_row.end_ms, None);
         assert_eq!(running_row.duration_ms, None);
         for request in &requests[..2] {
-            assert_eq!(row(&db, *request).error.as_deref(), Some("interrupted by process shutdown"));
+            assert_eq!(
+                row(&db, *request).error.as_deref(),
+                Some("interrupted by process shutdown")
+            );
             assert!(!gate(&mut db, finished(*request, 1)));
         }
         assert_eq!([row(&db, requests[2]), row(&db, requests[3])], terminal);

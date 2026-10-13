@@ -1,21 +1,22 @@
 //! Per-recording coordinators drain native capture independently of inference.
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::task::JoinHandle;
 
-use crate::audio::buffer::CaptureBuffer;
-use crate::audio::{AudioCapture, CaptureChunk, CaptureSource};
-use crate::bus::{AppEvent, EventSender, TranscriptionJob, TranscriptPass};
-use crate::language::LanguageProfile;
-use crate::session_store::SessionWriter;
-use crate::transcribe::{Transcriber, TranscriberFactory, TranscriptOut};
 use super::inference::{InferenceScheduler, InferenceTask};
+use crate::audio::buffer::CaptureBuffer;
+use crate::audio::{AudioCapture, CaptureChunk};
+use crate::bus::{
+    next_monotonic_id, AppEvent, EventSender, RecordingRequest, TranscriptPass, TranscriptionJob,
+};
+use crate::db::{recording_workers, Database};
+use crate::session_write::SessionWriter;
+use crate::transcribe::{Transcriber, TranscriberFactory, TranscriptOut};
 
 pub struct RecordingServices {
     pub capture: Arc<dyn AudioCapture>,
@@ -31,53 +32,65 @@ struct Handle {
 
 pub struct RecordingProducer {
     services: RecordingServices,
-    registry: HashMap<u8, Handle>,
+    handles: Vec<Option<Handle>>,
     scheduler: Arc<InferenceScheduler>,
-}
-
-pub struct RecordingRequest {
-    pub block: u8,
-    pub recording: u64,
-    pub source: CaptureSource,
-    pub language: &'static LanguageProfile,
-    pub live_model: PathBuf,
-    pub refine_model: PathBuf,
-}
-
-pub fn next_recording_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock precedes Unix epoch")
-        .as_micros() as u64;
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
-        Some(now.max(previous + 1))
-    })
-    .unwrap()
-    .max(now - 1)
-        + 1
+    shutting_down: bool,
 }
 
 impl RecordingProducer {
     pub fn new(services: RecordingServices) -> Self {
         Self {
             services,
-            registry: HashMap::new(),
+            handles: Vec::new(),
             scheduler: InferenceScheduler::new(),
+            shutting_down: false,
         }
     }
 
-    pub fn contains(&self, block: u8) -> bool {
-        self.registry.contains_key(&block)
+    pub fn produce(
+        &mut self,
+        event: &AppEvent,
+        db: &mut Database,
+        tx: &EventSender,
+    ) -> rusqlite::Result<()> {
+        match event {
+            AppEvent::RecordingRequested { request } => self.start(request.clone(), db, tx)?,
+            AppEvent::RecordingStopRequested { block, recording } => {
+                self.stop(*block, *recording, db)?;
+            }
+            AppEvent::TranscriptionRequested { request } => {
+                self.scheduler.dispatch(request);
+            }
+            AppEvent::RecordingStopped { block, recording }
+            | AppEvent::RecordingFailed {
+                block, recording, ..
+            } => self.complete(*block, *recording, db)?,
+            _ => {}
+        }
+        Ok(())
     }
 
-    pub fn blocks(&self) -> Vec<u8> {
-        self.registry.keys().copied().collect()
-    }
-
-    pub fn start(&mut self, request: RecordingRequest, tx: &EventSender) {
-        if self.contains(request.block) {
-            return;
+    fn start(
+        &mut self,
+        request: Arc<RecordingRequest>,
+        db: &mut Database,
+        tx: &EventSender,
+    ) -> rusqlite::Result<()> {
+        if self.shutting_down {
+            tx.publish(AppEvent::RecordingFailed {
+                block: request.block,
+                recording: request.recording,
+                error: "recording request arrived during shutdown".into(),
+            });
+            return Ok(());
+        }
+        let slot = self
+            .handles
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.handles.len());
+        if !recording_workers::claim(db, request.block, request.recording, slot)? {
+            return Ok(());
         }
         let block = request.block;
         let recording = request.recording;
@@ -91,7 +104,15 @@ impl RecordingProducer {
         let task = tokio::spawn(async move {
             let worker_tx = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
-                worker(request, capture, engines, root, worker_stop, worker_tx, scheduler)
+                worker(
+                    request,
+                    capture,
+                    engines,
+                    root,
+                    worker_stop,
+                    worker_tx,
+                    scheduler,
+                )
             })
             .await;
             match result {
@@ -108,65 +129,69 @@ impl RecordingProducer {
                 }),
             }
         });
-        self.registry.insert(
-            block,
-            Handle {
-                recording,
-                stop,
-                task,
-            },
-        );
-    }
-
-    pub fn stop(&mut self, block: u8) {
-        if let Some(handle) = self.registry.get(&block) {
-            handle.stop.store(true, Ordering::Release);
-        }
-    }
-
-    /// Retain naturally ended sessions until the block leaves Recording; do not
-    /// reopen a disconnected source automatically. A requested stop permits resume.
-    pub fn complete(&mut self, block: u8, recording: u64, failed: bool) {
-        if self.registry.get(&block).is_some_and(|handle| {
-            handle.recording == recording && (failed || handle.stop.load(Ordering::Acquire))
-        }) {
-            self.registry.remove(&block);
-        }
-    }
-
-    pub fn reap_stopped(&mut self) {
-        self.registry.retain(|_, handle| {
-            !(handle.stop.load(Ordering::Acquire) && handle.task.is_finished())
+        let handle = Some(Handle {
+            recording,
+            stop,
+            task,
         });
+        if slot == self.handles.len() {
+            self.handles.push(handle);
+        } else {
+            self.handles[slot] = handle;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, block: u8, recording: u64, db: &Database) -> rusqlite::Result<()> {
+        if let Some(slot) = recording_workers::slot(db, block, recording)? {
+            if let Some(handle) = &self.handles[slot] {
+                handle.stop.store(true, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, block: u8, recording: u64, db: &mut Database) -> rusqlite::Result<()> {
+        if let Some(slot) = recording_workers::release(db, block, recording)? {
+            self.handles[slot] = None;
+        }
+        Ok(())
     }
 
     /// Job requests must keep traversing the event/database gate while stopping.
     pub fn begin_shutdown(&mut self) {
-        for handle in self.registry.values() {
+        self.shutting_down = true;
+        for handle in self.handles.iter().flatten() {
             handle.stop.store(true, Ordering::Release);
         }
         self.scheduler.begin_shutdown();
     }
 
     pub fn shutdown_finished(&self) -> bool {
-        self.registry.values().all(|handle| handle.task.is_finished())
+        self.handles
+            .iter()
+            .flatten()
+            .all(|handle| handle.task.is_finished())
     }
 
-    pub fn finish_shutdown(&mut self, tx: &EventSender) {
-        for (block, handle) in self.registry.drain() {
+    pub fn finish_shutdown(&mut self, db: &mut Database, tx: &EventSender) -> rusqlite::Result<()> {
+        for (slot, entry) in self.handles.iter_mut().enumerate() {
+            if entry.is_none() {
+                continue;
+            }
+            let identity = recording_workers::release_slot(db, slot)?;
+            let handle = entry.take().expect("occupied worker slot");
             if !handle.task.is_finished() {
                 self.scheduler.cancel(handle.recording);
+                let (block, recording) = identity.expect("occupied worker identity");
                 tx.publish(AppEvent::RecordingFailed {
                     block,
-                    recording: handle.recording,
+                    recording,
                     error: "recording finalization exceeded shutdown deadline".into(),
                 });
             }
         }
-    }
-
-    pub fn dispatch(&self, request: &TranscriptionJob) {
-        self.scheduler.dispatch(request);
+        Ok(())
     }
 
     pub fn reject_unaccepted(&self, request: &TranscriptionJob) {
@@ -176,7 +201,7 @@ impl RecordingProducer {
 
 impl Drop for RecordingProducer {
     fn drop(&mut self) {
-        for handle in self.registry.values() {
+        for handle in self.handles.iter().flatten() {
             handle.stop.store(true, Ordering::Release);
             self.scheduler.cancel(handle.recording);
         }
@@ -184,7 +209,7 @@ impl Drop for RecordingProducer {
 }
 
 fn worker(
-    request: RecordingRequest,
+    request: Arc<RecordingRequest>,
     capture: Arc<dyn AudioCapture>,
     engines: Arc<dyn TranscriberFactory>,
     root: PathBuf,
@@ -192,7 +217,7 @@ fn worker(
     tx: EventSender,
     scheduler: Arc<InferenceScheduler>,
 ) -> Result<()> {
-    let mut session = SessionWriter::create(
+    let mut writer = SessionWriter::create(
         &root,
         request.block,
         request.recording,
@@ -204,10 +229,10 @@ fn worker(
     tx.publish(AppEvent::RecordingStarted {
         block: request.block,
         recording: request.recording,
-        session_dir: session.path().to_string_lossy().into_owned(),
+        session_dir: writer.path().to_string_lossy().into_owned(),
         source: request.source.clone(),
         language: request.language.code.into(),
-        started_at: session.started_at().into(),
+        started_at: writer.started_at().into(),
     });
     let result = capture_and_transcribe(
         &request,
@@ -216,9 +241,9 @@ fn worker(
         stop,
         &tx,
         scheduler,
-        &mut session,
+        &mut writer,
     );
-    let finalization = session.finalize(if result.is_ok() { "stopped" } else { "failed" });
+    let finalization = writer.finalize(if result.is_ok() { "stopped" } else { "failed" });
     match (result, finalization) {
         (Err(error), Err(finalize)) => {
             Err(error.context(format!("session finalization: {finalize:#}")))
@@ -235,7 +260,7 @@ fn capture_and_transcribe(
     stop: Arc<AtomicBool>,
     tx: &EventSender,
     scheduler: Arc<InferenceScheduler>,
-    session: &mut SessionWriter,
+    writer: &mut SessionWriter,
 ) -> Result<()> {
     if stop.load(Ordering::Acquire) {
         return Ok(());
@@ -247,26 +272,27 @@ fn capture_and_transcribe(
     let capture_thread = std::thread::Builder::new()
         .name(format!("capture-{}", request.recording))
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                if capture_stop.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let mut stream = capture.open(&source)?;
-                capture_buffer.opened();
-                let capture_result = (|| -> Result<()> {
-                    while !capture_stop.load(Ordering::Acquire) {
-                        match stream.next_chunk(Duration::from_millis(100))? {
-                            CaptureChunk::Data(pcm) => capture_buffer.append(pcm)?,
-                            CaptureChunk::Timeout => {}
-                            CaptureChunk::End => break,
-                        }
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    if capture_stop.load(Ordering::Acquire) {
+                        return Ok(());
                     }
-                    Ok(())
-                })();
-                // Stop callbacks even after a buffer/read error; retain any usable tail.
-                let tail_result = stream.finish().and_then(|tail| capture_buffer.append(tail));
-                capture_result.and(tail_result)
-            }));
+                    let mut stream = capture.open(&source)?;
+                    capture_buffer.opened();
+                    let capture_result = (|| -> Result<()> {
+                        while !capture_stop.load(Ordering::Acquire) {
+                            match stream.next_chunk(Duration::from_millis(100))? {
+                                CaptureChunk::Data(pcm) => capture_buffer.append(pcm)?,
+                                CaptureChunk::Timeout => {}
+                                CaptureChunk::End => break,
+                            }
+                        }
+                        Ok(())
+                    })();
+                    // Stop callbacks even after a buffer/read error; retain any usable tail.
+                    let tail_result = stream.finish().and_then(|tail| capture_buffer.append(tail));
+                    capture_result.and(tail_result)
+                }));
             let error = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(format!("{error:#}")),
@@ -281,7 +307,9 @@ fn capture_and_transcribe(
                 break;
             }
             if pending.finished {
-                return buffer.take_error().map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
+                return buffer
+                    .take_error()
+                    .map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -289,14 +317,24 @@ fn capture_and_transcribe(
         // cannot leave an apparently recording session without queued audio.
         let live = engines.live(&request.live_model, request.language.code)?;
         let refine = engines.refine(&request.refine_model, request.language.code)?;
-        coordinate(request, [live, refine], &buffer, &stop, tx, &scheduler, session)
+        coordinate(
+            request,
+            [live, refine],
+            &buffer,
+            &stop,
+            tx,
+            &scheduler,
+            writer,
+        )
     }))
     .unwrap_or_else(|_| Err(anyhow::anyhow!("recording coordinator panicked")));
     stop.store(true, Ordering::Release);
     if result.is_err() {
         scheduler.cancel(request.recording);
     }
-    let joined = capture_thread.join().map_err(|_| anyhow::anyhow!("audio capture worker panicked"));
+    let joined = capture_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("audio capture worker panicked"));
     result.and(joined)
 }
 
@@ -314,12 +352,22 @@ fn coordinate(
     stop: &AtomicBool,
     tx: &EventSender,
     scheduler: &InferenceScheduler,
-    session: &mut SessionWriter,
+    writer: &mut SessionWriter,
 ) -> Result<()> {
     let [live, refine] = engines;
     let mut passes = [
-        PassState { engine: Some(live), active: None, done: false, next_sample: 16_000 },
-        PassState { engine: Some(refine), active: None, done: false, next_sample: 80_000 },
+        PassState {
+            engine: Some(live),
+            active: None,
+            done: false,
+            next_sample: 16_000,
+        },
+        PassState {
+            engine: Some(refine),
+            active: None,
+            done: false,
+            next_sample: 80_000,
+        },
     ];
     let (replies, results) = mpsc::channel();
     let mut tentative = String::new();
@@ -336,9 +384,9 @@ fn coordinate(
             let pending = buffer.pending(index);
             let Some(origin) = pending.origin else {
                 if pending.finished {
-                    return Err(anyhow::anyhow!(
-                        buffer.take_error().unwrap_or_else(|| "capture ended before opening".into())
-                    ));
+                    return Err(anyhow::anyhow!(buffer
+                        .take_error()
+                        .unwrap_or_else(|| "capture ended before opening".into())));
                 }
                 continue;
             };
@@ -351,12 +399,16 @@ fn coordinate(
                 pending.end.min(pending.start + 80_000)
             };
             let finishing = pending.finished && end == pending.end;
-            let job = next_recording_id();
+            let job = next_monotonic_id();
             let job_request = TranscriptionJob {
                 block: request.block,
                 recording: request.recording,
                 job,
-                pass: if index == 0 { TranscriptPass::Live } else { TranscriptPass::Refined },
+                pass: if index == 0 {
+                    TranscriptPass::Live
+                } else {
+                    TranscriptPass::Refined
+                },
                 t_start_ms: pending.start * 1000 / 16_000,
                 t_end_ms: end * 1000 / 16_000,
                 sample_count: end - pending.start,
@@ -379,7 +431,9 @@ fn coordinate(
         }
         if passes.iter().all(|pass| pass.done) {
             let capture_error = buffer.take_error();
-            return first_error.or(capture_error).map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
+            return first_error
+                .or(capture_error)
+                .map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
         }
         match results.recv_timeout(Duration::from_millis(20)) {
             Ok(result) => {
@@ -392,8 +446,15 @@ fn coordinate(
                 pass.engine = result.engine;
                 match result.output {
                     Ok(output) => {
-                        emit(&result.request, result.worker, result.transcription,
-                            output, session, tx, &mut tentative)?;
+                        emit(
+                            &result.request,
+                            result.worker,
+                            result.transcription,
+                            output,
+                            writer,
+                            tx,
+                            &mut tentative,
+                        )?;
                         pass.done = result.request.finishing;
                     }
                     Err(error) => {
@@ -416,7 +477,7 @@ fn emit(
     worker: u8,
     transcription: crate::bus::TranscriptionMetrics,
     output: Vec<TranscriptOut>,
-    session: &mut SessionWriter,
+    writer: &mut SessionWriter,
     tx: &EventSender,
     tentative: &mut String,
 ) -> Result<()> {
@@ -435,8 +496,12 @@ fn emit(
                     transcription,
                 });
             }
-            TranscriptOut::Committed { t_start_ms, t_end_ms, text } => {
-                session.append(job.pass, t_start_ms, t_end_ms, &text)?;
+            TranscriptOut::Committed {
+                t_start_ms,
+                t_end_ms,
+                text,
+            } => {
+                writer.append(job.pass, t_start_ms, t_end_ms, &text)?;
                 tx.publish(AppEvent::TranscriptCommitted {
                     block: job.block,
                     recording: job.recording,
@@ -453,4 +518,49 @@ fn emit(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::CaptureSource;
+    use crate::bus::EventBus;
+    use crate::language::LANGUAGES;
+    use crate::testing::{FixtureCapture, FixtureTranscriberFactory};
+
+    #[tokio::test]
+    async fn failed_sqlite_claim_cannot_open_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut db = Database::open(&tmp.path().join("index.sqlite"), bus.sender()).unwrap();
+        db.conn_mut()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_worker BEFORE INSERT ON recording_workers \
+                 BEGIN SELECT RAISE(ABORT, 'worker claim failed'); END",
+            )
+            .unwrap();
+        let capture = Arc::new(FixtureCapture::new(Vec::new()));
+        let mut producer = RecordingProducer::new(RecordingServices {
+            capture: capture.clone(),
+            engines: Arc::new(FixtureTranscriberFactory::default()),
+            sessions_root: tmp.path().join("sessions"),
+        });
+        let event = AppEvent::RecordingRequested {
+            request: Arc::new(RecordingRequest {
+                block: 1,
+                recording: next_monotonic_id(),
+                source: CaptureSource::Mic {
+                    device_name: "test input".into(),
+                },
+                language: &LANGUAGES[0],
+                live_model: "live.gguf".into(),
+                refine_model: "refine.gguf".into(),
+            }),
+        };
+        assert!(producer.produce(&event, &mut db, &bus.sender()).is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(capture.calls.load(Ordering::SeqCst), 0);
+        assert!(producer.shutdown_finished());
+        assert!(!tmp.path().join("sessions").exists());
+    }
 }

@@ -401,7 +401,10 @@ mod tests {
 
     fn chunk(pcm: Vec<f32>) -> PcmSlice {
         let end = pcm.len();
-        PcmSlice { pcm: Arc::new(pcm), range: 0..end }
+        PcmSlice {
+            pcm: Arc::new(pcm),
+            range: 0..end,
+        }
     }
 
     #[test]
@@ -413,7 +416,8 @@ mod tests {
         live.feed_chunks(&[
             chunk(vec![2.0; RATE * 10]),
             chunk(vec![3.0; RATE * 24 + RATE / 2]),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(*calls.lock(), [(LIVE_CAP, 5000)]);
         assert_eq!(live.buffer.len(), LIVE_CAP);
         assert_eq!(live.buffer[0], 2.0);
@@ -427,10 +431,7 @@ mod tests {
     fn live_batch_agreement_keeps_committed_tail_and_finish_skips_repeat_decode() {
         let first = token(" first", 0, 500);
         let tail = token(" tail", 1500, 1900);
-        let (decoder, calls) = script(vec![
-            vec![first.clone()],
-            vec![first, tail],
-        ]);
+        let (decoder, calls) = script(vec![vec![first.clone()], vec![first, tail]]);
         let mut live = Live::new(decoder);
         live.feed_chunks(&[chunk(vec![0.0; RATE])]).unwrap();
         let output = live.feed_chunks(&[chunk(vec![0.0; RATE])]).unwrap();
@@ -448,12 +449,17 @@ mod tests {
             vec![token(" tail", 10100, 10300)],
         ]);
         let mut refine = Refine::new(decoder);
-        let output = refine.feed_chunks(&[
-            chunk(vec![0.0; RATE * 3]),
-            chunk(vec![0.0; RATE * 7 + RATE / 2]),
-        ]).unwrap();
+        let output = refine
+            .feed_chunks(&[
+                chunk(vec![0.0; RATE * 3]),
+                chunk(vec![0.0; RATE * 7 + RATE / 2]),
+            ])
+            .unwrap();
         assert_eq!(committed(&output), ["first", "second"]);
         assert_eq!(committed(&refine.finish().unwrap()), ["tail"]);
-        assert_eq!(*calls.lock(), [(RATE * 5, 0), (RATE * 6, 4000), (RATE * 3 / 2, 9000)]);
+        assert_eq!(
+            *calls.lock(),
+            [(RATE * 5, 0), (RATE * 6, 4000), (RATE * 3 / 2, 9000)]
+        );
     }
 }

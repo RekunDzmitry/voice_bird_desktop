@@ -15,7 +15,11 @@ fn installed_whisper_transcribes_bundled_speech_live_and_refined() {
     let store = CacheDirStore::new().expect("resolve installed model cache");
     let language = &LANGUAGES[0];
     for model in language.models() {
-        assert!(store.is_available(model), "install {} before this opt-in smoke", model.id);
+        assert!(
+            store.is_available(model),
+            "install {} before this opt-in smoke",
+            model.id
+        );
     }
     let wav = hound::WavReader::new(Cursor::new(include_bytes!(
         "../../tests/fixtures/hello_world_16k.wav"

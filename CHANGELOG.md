@@ -44,6 +44,36 @@
 - Commit installation success and model availability in one SQLite transaction.
   Roll back both on write/commit failure and publish lifecycle success only
   after commit, preventing partially persisted success and false ready notifications.
+- Decouple recording decisions from the runtime producer. Route capture start/stop
+  commands through the bus and SQLite identity gate; dispatch admitted inference
+  jobs and retire completed workers independently of consumers. Preserve
+  finalization-before-resume and natural-end behavior, reject duplicate/stale
+  commands, and prevent queued starts from opening capture during shutdown.
+- Rename the shared session/job ID generator to `next_monotonic_id`; retain its
+  timestamp-seeded, process-wide monotonic behavior.
+- Move recording-consumer lifecycle bookkeeping into SQLite request rows. Preserve
+  queued commands, finalization-before-resume, and natural-end suppression across
+  consumer reconstruction; remove the in-memory session map.
+- Remove the legacy transcription-metrics schema upgrade. Fresh databases include
+  job and worker identity directly; databases with the older schema are unsupported.
+- Rename `RecordingProducer::consume` to `produce` and update runtime and test callers.
+- Replace the recording producer's in-memory registry with the connection-local
+  `recording_workers` SQLite table. Keep only Rust task/stop handles in indexed
+  slots; preserve duplicate suppression, identity-scoped stops, and shutdown cleanup.
+- Rename `session_store` to `session_write` and use `writer` for recording
+  `SessionWriter` bindings and parameters, distinguishing writing from model stores.
+- Replace inference scheduler maps and sets with pool-local SQLite queue rows,
+  cancellation fences, and round-robin cursors. Keep PCM/decoders in indexed Rust
+  slots; preserve duplicate fencing, exclusive decoder execution, and shutdown drain.
+- Size inference workers and recording/shutdown call budgets from available CPU
+  threads and RAM at startup. Let every worker serve either pass with live priority,
+  removing the single-live-worker bottleneck. Share the decoder thread count with
+  CPU sizing and bound unknown/undersized system profiles conservatively.
+- Use `TranscriptPass` throughout inference scheduler and queue APIs, keeping numeric
+  encoding inside SQLite. Cancel undispatched jobs by recording rows rather than a
+  hardcoded pass range, and create round-robin cursors on first use.
+- Clarify inference failure ownership: rename pool-wide handling to `fail_queue`
+  and its startup/runtime failure state to `terminal_error`; behavior is unchanged.
 
 ## 0.5.0 (2026-08-05)
 

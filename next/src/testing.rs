@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::consumer::UiView;
-use crate::db::downloads::CancelCheck;
-use crate::download::{DownloadError, Downloader};
 use crate::audio_sources::{
     AppTarget, AudioDevice, AudioSourceSnapshot, AudioSourcesCatalog, DeviceKind,
 };
+use crate::consumer::UiView;
+use crate::db::downloads::CancelCheck;
+use crate::download::{DownloadError, Downloader};
 use crate::picker::ModelEntry;
 use crate::transcription_models::ModelStore;
 use crate::ui;
@@ -298,7 +298,10 @@ impl FixtureCapture {
 }
 
 impl crate::audio::AudioCapture for FixtureCapture {
-    fn open(&self, source: &crate::audio::CaptureSource) -> anyhow::Result<Box<dyn crate::audio::CaptureStream>> {
+    fn open(
+        &self,
+        source: &crate::audio::CaptureSource,
+    ) -> anyhow::Result<Box<dyn crate::audio::CaptureStream>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.sources.lock().unwrap().push(source.clone());
         if let Some(error) = self.failures.lock().unwrap().pop_front() {
@@ -350,13 +353,15 @@ pub struct FixtureTranscriber {
 impl crate::transcribe::TranscriberFactory for FixtureTranscriberFactory {
     fn live(&self, _: &Path, _: &str) -> anyhow::Result<Box<dyn crate::transcribe::Transcriber>> {
         Ok(Box::new(FixtureTranscriber {
-            steps: self.live_steps.clone().into(), finish: self.live_finish.clone(),
+            steps: self.live_steps.clone().into(),
+            finish: self.live_finish.clone(),
         }))
     }
 
     fn refine(&self, _: &Path, _: &str) -> anyhow::Result<Box<dyn crate::transcribe::Transcriber>> {
         Ok(Box::new(FixtureTranscriber {
-            steps: self.refine_steps.clone().into(), finish: self.refine_finish.clone(),
+            steps: self.refine_steps.clone().into(),
+            finish: self.refine_finish.clone(),
         }))
     }
 }
@@ -366,7 +371,10 @@ impl crate::transcribe::Transcriber for FixtureTranscriber {
         Ok(self.steps.pop_front().unwrap_or_default())
     }
 
-    fn feed_chunks(&mut self, _: &[crate::audio::buffer::PcmSlice]) -> anyhow::Result<Vec<crate::transcribe::TranscriptOut>> {
+    fn feed_chunks(
+        &mut self,
+        _: &[crate::audio::buffer::PcmSlice],
+    ) -> anyhow::Result<Vec<crate::transcribe::TranscriptOut>> {
         Ok(self.steps.pop_front().unwrap_or_default())
     }
 
