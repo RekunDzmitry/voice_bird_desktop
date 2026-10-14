@@ -93,6 +93,12 @@ impl streaming::Decoder for Decoder {
             SamplingStrategy::Greedy { best_of: 1 }
         };
         let mut params = FullParams::new(strategy);
+        if !self.refined {
+            // The next live hop revises this provisional hypothesis. Avoid
+            // up to six temperature attempts on the same retained audio;
+            // refinement keeps beam search and native fallback recovery.
+            params.set_temperature_inc(0.0);
+        }
         params.set_n_threads(super::DECODER_THREADS as i32);
         params.set_no_context(true);
         params.set_print_progress(false);

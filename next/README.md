@@ -85,9 +85,11 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 - `net` (default) — `reqwest` + `rustls` for the live `HttpDownloader`.
 - `local-engine` (default) — native `whisper-rs`; macOS enables Metal and
   requires verified Core ML encoder loading. Both passes retain the full encoder
-  context, flash attention, and two CPU threads per call. Live uses greedy
-  decoding with LocalAgreement; refinement uses five-second beam-search
-  windows with one second of backward context.
+  context, flash attention, and two CPU threads per call. Live uses single-attempt
+  temperature-zero greedy decoding with LocalAgreement instead of retrying the
+  retained audio at higher temperatures. Provisional text can be less accurate on
+  difficult audio; refinement retains beam search, native fallback recovery,
+  five-second windows, and one second of backward context.
 - `--no-default-features` — native-free transcription fixtures and offline
   downloads exercise the full lifecycle without building whisper.cpp.
   The production factory reports `local engine disabled`; the binary still
@@ -130,6 +132,11 @@ Multiple recordings can run live jobs concurrently; jobs for the same
 recording/pass never overlap. Running refinement is not preempted.
 Live tasks consume all available audio and decode only the newest hypothesis;
 refinement processes ordered five-second windows without skipping audio.
+Live agreement keeps committed boundary tokens after PCM trimming so shifted
+overlap words do not block the next stable prefix. Its timestamp watermark never
+advances past the first still-uncommitted token, preserving revised words whose
+timestamps overlap an earlier word's end. Stable prefix progress releases retained
+audio instead of repeatedly decoding an ever-growing provisional transcript.
 At Quit the pool uses its separate shutdown budget; workers retain the same policy.
 The coordinator keeps at most one pending/in-flight task per recording/pass.
 Scheduler pending/active identities, dispatch readiness, cancellation fences, worker

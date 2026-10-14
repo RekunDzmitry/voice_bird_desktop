@@ -1,6 +1,6 @@
 use crate::audio::buffer::PcmSlice;
 
-use super::local_agreement::{pending, segments, step, uncommitted, Token};
+use super::local_agreement::{pending, segments, step, Token};
 use super::{
     Transcriber, TranscriptOut, LIVE_HOP_SAMPLES as HOP, REFINE_WINDOW_SAMPLES as REFINE_WINDOW,
 };
@@ -57,8 +57,9 @@ impl<D: Decoder> Live<D> {
         let current = self
             .decoder
             .decode(&self.buffer, milliseconds(self.offset))?;
-        let previous = uncommitted(&self.previous, milliseconds(self.offset));
-        let agreement = step(previous, &current, self.committed_upto);
+        // Keep committed boundary tokens for timestamp-drift deduplication
+        // even after their audio has been trimmed from the retained context.
+        let agreement = step(&self.previous, &current, self.committed_upto);
         self.committed_upto = agreement.committed_upto;
         output.extend(agreement.committed);
         self.publish_tentative(agreement.tentative, output);
@@ -321,6 +322,21 @@ mod tests {
         assert!(live.finish().unwrap().is_empty());
         assert!(live.feed(&[0.0]).is_err());
         assert_eq!(calls.lock()[2].1, 400);
+    }
+
+    #[test]
+    fn trimmed_boundary_context_allows_live_agreement_to_advance() {
+        let old = token(" old", 400, 650);
+        let (decoder, _) = script(vec![
+            vec![old.clone(), token(" draft", 800, 1000)],
+            vec![old, token(" new", 800, 1000)],
+            vec![token(" old", 650, 750), token(" new", 850, 1050)],
+        ]);
+        let mut live = Live::new(decoder);
+        live.feed(&vec![0.0; RATE]).unwrap();
+        assert_eq!(committed(&live.feed(&vec![0.0; HOP]).unwrap()), ["old"]);
+        assert_eq!(committed(&live.feed(&vec![0.0; HOP]).unwrap()), ["new"]);
+        assert!(committed(&live.finish().unwrap()).is_empty());
     }
 
     #[test]
