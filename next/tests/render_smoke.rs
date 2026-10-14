@@ -482,6 +482,82 @@ fn small_recording_view_keeps_wrapped_tail_and_tentative_visible() {
 }
 
 #[test]
+fn long_live_preview_keeps_each_columns_newest_suffix_on_resize() {
+    for prefix in [
+        "older words ".repeat(80),
+        "x".repeat(800),
+        "older line\n".repeat(80),
+    ] {
+        let markers = ["①", "②", "③", "④"];
+        let ui_view = UiView {
+            blocks: markers
+                .iter()
+                .enumerate()
+                .map(|(index, marker)| {
+                    let id = index as u8 + 1;
+                    let mut state = BlockState::recording(&LANGUAGES[0]);
+                    if let BlockState::Recording {
+                        lines,
+                        tentative,
+                        session_dir,
+                        ..
+                    } = &mut state
+                    {
+                        *lines = vec!["older committed words ".repeat(80), format!("C{id}")];
+                        *tentative = format!("LIVE-BEGIN{prefix}{marker}");
+                        *session_dir = Some(format!("/local/sessions/b{id}"));
+                    }
+                    Block {
+                        id,
+                        state,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for (width, height) in [(100, 30), (68, 14), (100, 30)] {
+            let out = render_to_string(&ui_view, width, height);
+            for (index, marker) in markers.iter().enumerate() {
+                let id = index + 1;
+                assert!(out.contains(marker), "{width}x{height}: {out}");
+                assert!(out.contains(&format!("C{id}")), "{width}x{height}: {out}");
+                assert!(
+                    out.contains(&format!("sessions/b{id}")),
+                    "{width}x{height}: {out}"
+                );
+            }
+            assert!(out.contains("● recording"), "{width}x{height}: {out}");
+            assert!(!out.contains("LIVE-BEGIN"), "{width}x{height}: {out}");
+        }
+    }
+}
+
+#[test]
+fn tiny_live_preview_keeps_the_newest_grapheme_whole() {
+    for (suffix, width, expected) in [
+        ("👩‍💻", 6, "👩‍💻"),
+        ("a🇺🇦", 6, "🇺🇦"),
+        ("👨‍👩‍👧‍👦", 6, "👨‍👩‍👧‍👦"),
+        ("e\u{301}", 5, "e\u{301}"),
+        ("界Z", 5, "Z"),
+    ] {
+        let mut state = BlockState::recording(&LANGUAGES[0]);
+        if let BlockState::Recording {
+            lines, tentative, ..
+        } = &mut state
+        {
+            *lines = vec!["old committed words".into()];
+            *tentative = format!("{}\n{suffix}", "old live words ".repeat(30));
+        }
+        // Outer and focused borders leave just one row and one or two cells.
+        let out = render_to_string(&source_block_view(state, Some(0), None), width, 5);
+        assert!(out.contains(expected), "suffix {suffix:?}: {out}");
+        assert!(!out.contains("old"), "{out}");
+    }
+}
+
+#[test]
 fn input_source_title_omits_app() {
     let ui_view = source_block_view(BlockState::recording(&LANGUAGES[0]), Some(0), None);
     let out = render_to_string(&ui_view, 100, 30);

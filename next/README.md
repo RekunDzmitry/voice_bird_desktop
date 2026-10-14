@@ -196,6 +196,10 @@ only after SQLite admits the exact recording/job. Rejected requests return their
 owned state without executing inference. Refined segments replace overlapping
 live text in the UI; later live text and dim tentative words remain visible.
 The UI retains only the newest 100 segments/lines.
+Committed text and the dim live preview show their newest wrapped rows when space
+is limited, clipping older text from the left. Wrapping preserves whole Unicode
+graphemes, including combining marks and joined emoji. Preview clipping is
+presentation-only; the full tentative text stays in `UiView`.
 
 Sessions are stored beneath the application data directory:
 

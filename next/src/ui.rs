@@ -204,7 +204,7 @@ fn block_body_lines(block: &crate::consumer::ui_view::Block) -> Vec<Line<'static
 }
 
 /// Wrap before choosing the tail, so long older lines cannot push new text
-/// below the viewport. Width follows terminal cells, not UTF-8 bytes.
+/// Width and boundaries follow the widget's terminal-cell graphemes.
 fn transcript_rows(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -213,15 +213,15 @@ fn transcript_rows(text: &str, width: usize) -> Vec<String> {
     for line in text.lines() {
         let mut row = String::new();
         let mut cells = 0;
-        for ch in line.chars() {
-            let mut bytes = [0; 4];
-            let ch_width = Span::raw(ch.encode_utf8(&mut bytes) as &str).width();
-            if cells + ch_width > width && !row.is_empty() {
+        let span = Span::raw(line);
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if cells + grapheme_width > width && !row.is_empty() {
                 rows.push(std::mem::take(&mut row));
                 cells = 0;
             }
-            row.push(ch);
-            cells += ch_width;
+            row.push_str(grapheme.symbol);
+            cells += grapheme_width;
         }
         rows.push(row);
     }
