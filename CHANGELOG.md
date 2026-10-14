@@ -1,7 +1,8 @@
 # Changelog
 
-## Next (unreleased)
+## Unreleased
 
+- Replaced the legacy TUI with the rewrite; removed npm/PyPI wrappers, xtask, whisperkit sidecar, Windows/cloud engines.
 - Keep inference teardown from extending Quit's three-second drain deadline.
   Reject queued jobs and detach ongoing decodes with their owned state until
   they return, including refinement orphaned by a recording write error.

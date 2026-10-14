@@ -1,0 +1,243 @@
+//! SQLite-backed local store.
+//!
+//! One file per machine, opened at the OS data directory (the same
+//! resolution [`crate::event_log`] uses). The module is kept small
+//! on purpose: every table implements [`Table`]. Application tables
+//! migrate in [`Database::open`]; the inference queue migrates its pool-local
+//! in-memory connection separately.
+//! Application table operations take `&mut Database`; [`apply`] composes their
+//! event gates before the consumer can observe an event.
+
+use std::path::{Path, PathBuf};
+
+use directories::ProjectDirs;
+use rusqlite::{Connection, TransactionBehavior};
+
+use crate::bus::{AppEvent, DownloadStatus, EventSender};
+
+/// A table in the local SQLite file. Implementing this trait is the
+/// only obligation: name + definition. New tables plug into
+/// [`migrate`] and `Database::open` without growing this module.
+pub trait Table {
+    /// SQL identifier for the table. Referenced by other tables'
+    /// definitions and by indexers.
+    const NAME: &'static str;
+    /// `CREATE TABLE IF NOT EXISTS …` statement, run verbatim on
+    /// every connection that opens the file. Keep it idempotent so
+    /// re-opening an existing file is a no-op.
+    const DEFINITION: &'static str;
+}
+
+/// Open (or create) the SQLite file at `path`. WAL mode lets a
+/// worker-thread read connection observe writes from the main
+/// thread without blocking; `synchronous=NORMAL` is the standard
+/// WAL durability trade-off (a power loss loses the last transaction
+/// but never corrupts the file); `busy_timeout` makes workers wait
+/// briefly when they hit a write lock instead of failing
+/// immediately. Returns an error if the file can't be created — the
+/// caller in `main` exits with code 2 on that path, mirroring how
+/// `CacheDirStore` failures are handled.
+pub fn open(path: &Path) -> rusqlite::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "create {parent:?}: {e}"
+            ))))
+        })?;
+    }
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
+}
+
+/// Run each table's idempotent `CREATE TABLE IF NOT EXISTS` definition.
+pub fn migrate<T: Table>(conn: &Connection, tables: &[T]) -> rusqlite::Result<()> {
+    for t in tables {
+        conn.execute_batch(t.definition())?;
+    }
+    Ok(())
+}
+
+/// Shared local data root for the session writer and SQLite index.
+/// Retains the established ProjectDirs identity and temp-directory fallback.
+pub fn data_dir() -> PathBuf {
+    ProjectDirs::from("com", "RekunDzmitry", "voice-bird-cli")
+        .map(|proj| proj.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("voice-bird-cli"))
+}
+
+/// Established database filename, kept stable for existing installations.
+pub fn db_path() -> Option<PathBuf> {
+    Some(data_dir().join("downloads.sqlite"))
+}
+
+/// Extension trait so each `Table` impl can hand its `DEFINITION` /
+/// `NAME` to `migrate` without re-typing the strings. Defined here
+/// rather than on `Table` because `Table` itself only describes
+/// what's constant.
+pub trait TableExt: Table {
+    fn definition(&self) -> &'static str {
+        Self::DEFINITION
+    }
+}
+impl<T: Table> TableExt for T {}
+
+/// The local SQLite database.
+///
+/// Owns one writer connection, the path it was opened from, and the
+/// cloneable [`EventSender`] used to publish status changes. Every
+/// per-table operation is a free function in its module that takes
+/// `&Database` / `&mut Database` so callers don't have to grow their
+/// signatures as new tables land: they pass the whole database and
+/// pull out the table they need (today [`downloads`]).
+///
+/// The connection is wrapped here rather than at each table call so
+/// `Database::open` can run migration once, recover leftover
+/// non-terminal rows once, and hand callers a handle that's ready to
+/// read or write. Application tables never construct their own connection;
+/// the inference queue owns a separate pool-local in-memory connection.
+pub struct Database {
+    conn: Connection,
+    path: PathBuf,
+    tx: EventSender,
+}
+
+impl Database {
+    /// Open (or create) the SQLite file at `path`, run the migration
+    /// for every known [`Table`], and recover any rows left in a
+    /// non-terminal state by a previous crashed session. The
+    /// recovery is logged per row — a Cancelling row at startup
+    /// means the previous Quit didn't reach `apply`, so the audit
+    /// log records the upgrade.
+    ///
+    /// Adding a new table is one line in the [`migrate`] call below.
+    pub fn open(path: &Path, tx: EventSender) -> rusqlite::Result<Self> {
+        let conn = open(path)?;
+        migrate(&conn, &[downloads::DownloadsTable])?;
+        migrate(&conn, &[block_steps::BlockStepsTable])?;
+        migrate(&conn, &[models::ModelsTable])?;
+        migrate(&conn, &[model_staging::ModelStagingTable])?;
+        migrate(&conn, &[recordings::RecordingsTable])?;
+        migrate(&conn, &[recording_workers::RecordingWorkersTable])?;
+        migrate(&conn, &[transcription_metrics::TranscriptionMetricsTable])?;
+        migrate(&conn, &[transcription_jobs::TranscriptionJobsTable])?;
+        let mut db = Self {
+            conn,
+            path: path.to_path_buf(),
+            tx,
+        };
+        downloads::recover_interrupted(&mut db)?;
+        transcription_jobs::recover_interrupted(&mut db)?;
+        recordings::recover_interrupted(&mut db)?;
+        Ok(db)
+    }
+
+    /// Borrow the writer connection. Exposed only to per-table
+    /// modules; callers outside `db/` use the table free functions.
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
+    /// Borrow the writer connection read-only. Exposed only to
+    /// per-table modules.
+    pub(crate) fn conn_ref(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Reference to the event sender. Per-table transitions publish
+    /// status changes through this.
+    pub(crate) fn tx(&self) -> &EventSender {
+        &self.tx
+    }
+
+    /// Open a worker-side read-only connection bound to the same
+    /// file. Probes poll cancellation between fetch chunks. The
+    /// fallback to an in-memory connection is intentional: a probe
+    /// failure must NOT crash the worker, and the attempt gate on
+    /// the main thread still discards stale publishes if the probe
+    /// returns `false` on every call.
+    pub(crate) fn open_probe_connection(&self) -> Connection {
+        let conn = Connection::open(self.path.as_path()).unwrap_or_else(|e| {
+            eprintln!("downloads: probe open failed: {e}");
+            Connection::open_in_memory().expect("in-memory sqlite")
+        });
+        let _ = conn.pragma_update(None, "busy_timeout", 5_000);
+        conn
+    }
+}
+#[cfg(test)]
+impl Database {
+    /// Build a `Database` from a caller-supplied connection.
+    /// Used by `consumer::downloads::tests::*` to drive `downloads::start`
+    /// failure paths (e.g. a read-only connection whose writes
+    /// return `SQLITE_READONLY`).
+    pub fn from_connection_for_test(conn: Connection, path: PathBuf, tx: EventSender) -> Self {
+        Self { conn, path, tx }
+    }
+}
+
+pub mod block_steps;
+pub mod downloads;
+pub(crate) mod inference_queue;
+pub mod model_staging;
+pub mod models;
+pub mod recording_workers;
+pub mod recordings;
+pub mod transcription_jobs;
+pub mod transcription_metrics;
+
+/// Apply every table's event gate. Only a `true` result may reach
+/// the consumer: a rejected source-language command
+/// must never start model downloads.
+pub fn apply(db: &mut Database, ev: &AppEvent) -> rusqlite::Result<bool> {
+    if let AppEvent::ModelAvailabilityChanged { model, available } = ev {
+        return Ok(models::is_available(db, model.id)? == *available);
+    }
+    if !block_steps::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !recordings::apply(db, ev)? {
+        return Ok(false);
+    }
+    if !transcription_jobs::apply(db, ev)? {
+        return Ok(false);
+    }
+    downloads::apply(db, ev)
+}
+
+/// Commit installation success and availability together before publishing.
+fn complete_installation(
+    db: &mut Database,
+    event: &AppEvent,
+    model: &str,
+    attempt: u32,
+) -> rusqlite::Result<bool> {
+    let transaction = db
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !downloads::set_status_on(
+        &transaction,
+        model,
+        attempt,
+        DownloadStatus::Succeeded,
+        None,
+    )? {
+        transaction.rollback()?;
+        downloads::reject(db, event, attempt);
+        return Ok(false);
+    }
+    models::set_available_on(&transaction, model, true)?;
+    transaction.commit()?;
+    downloads::publish_status(
+        db,
+        model,
+        attempt,
+        Some(DownloadStatus::Installing),
+        DownloadStatus::Succeeded,
+        None,
+    );
+    Ok(true)
+}

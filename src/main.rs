@@ -1,2309 +1,344 @@
-mod app;
-mod logger;
-mod platform;
-mod ui;
+//! Binary entry point: the only file that touches a real terminal.
 
-use std::io;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use anyhow::Result;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
-    },
+    cursor,
+    event::{Event, EventStream, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::StreamExt;
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::time::Duration;
 
-use ratatui::prelude::*;
-use app::{App, AppMode, RecordingStatus};
+use voice_bird_cli::bus::{AppEvent, EventBus, EventSender};
+use voice_bird_cli::consumer::{Consumer, Consumers, UiView};
+use voice_bird_cli::db::{downloads, Database};
+use voice_bird_cli::download::Downloader;
+#[cfg(feature = "net")]
+use voice_bird_cli::download::HttpDownloader;
+use voice_bird_cli::producer::model_watch::ModelWatcher;
+use voice_bird_cli::producer::recording::{RecordingProducer, RecordingServices};
+use voice_bird_cli::transcription_models::{CacheDirStore, ModelStore};
+use voice_bird_cli::{input, producer};
+/// Runs `restore` on drop.
+struct RestoreGuard<F: FnMut()> {
+    restore: F,
+}
 
-/// When launched via macOS `open --args --tty <path>`, the process gets
-/// stdin from `open` which doesn't properly forward terminal input.
-/// We detect the `--tty` flag, reopen the real TTY, and dup2 it onto
-/// stdin so crossterm gets proper raw-mode keyboard events.
-#[cfg(target_os = "macos")]
-fn reconnect_tty_from_args() {
-    let args: Vec<String> = std::env::args().collect();
-    let tty_idx = match args.iter().position(|a| a == "--tty") {
-        Some(idx) => idx,
-        None => return,
-    };
-    let tty_path = match args.get(tty_idx + 1) {
-        Some(p) => p.clone(),
-        None => return,
-    };
-    let c_path = match std::ffi::CString::new(tty_path) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+impl<F: FnMut()> Drop for RestoreGuard<F> {
+    fn drop(&mut self) {
+        (self.restore)();
+    }
+}
 
-    unsafe {
-        extern "C" {
-            fn open(path: *const std::ffi::c_char, oflag: i32) -> i32;
-            fn dup2(oldfd: i32, newfd: i32) -> i32;
-            fn close(fd: i32) -> i32;
-        }
-        const O_RDWR: i32 = 2;
+fn enter_terminal<F: FnMut()>(
+    enable_raw: impl FnOnce() -> io::Result<()>,
+    enter_alt: impl FnOnce() -> io::Result<()>,
+    restore: F,
+) -> io::Result<RestoreGuard<F>> {
+    enable_raw()?;
+    let guard = RestoreGuard { restore };
+    enter_alt()?;
+    Ok(guard)
+}
 
-        let fd = open(c_path.as_ptr(), O_RDWR);
-        if fd < 0 {
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        if voice_bird_cli::audio_sources::source_query_panicking() {
             return;
         }
-        // Reconnect stdin to the real TTY for keyboard input
-        dup2(fd, 0);
-        if fd > 2 {
-            close(fd);
+        if std::thread::current().id() == ui_thread {
+            restore_terminal();
         }
-    }
+        default_hook(info);
+    }));
 }
 
-/// On macOS, when launched via `open` as an .app bundle, macOS expects
-/// the process to initialize NSApplication and process Apple Events.
-/// Without this, Finder shows "application is not responding" dialogs.
-/// We spin up a background thread to satisfy macOS while the TUI runs
-/// on the main thread.
-#[cfg(target_os = "macos")]
-fn init_macos_app_event_handler() {
-    use std::ffi::CString;
-
-    #[link(name = "AppKit", kind = "framework")]
-    extern "C" {
-        fn NSApplicationLoad() -> bool;
-    }
-
-    #[link(name = "objc", kind = "dylib")]
-    extern "C" {
-        fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        fn objc_msgSend(
-            obj: *mut std::ffi::c_void,
-            sel: *mut std::ffi::c_void,
-            ...
-        ) -> *mut std::ffi::c_void;
-    }
-
-    std::thread::spawn(|| {
-        unsafe {
-            // Initialize the NSApplication shared instance
-            NSApplicationLoad();
-
-            let cls_name = CString::new("NSApplication").unwrap();
-            let cls = objc_getClass(cls_name.as_ptr());
-            if cls.is_null() {
-                return;
-            }
-
-            let sel_shared = CString::new("sharedApplication").unwrap();
-            let app = objc_msgSend(cls, sel_registerName(sel_shared.as_ptr()));
-            if app.is_null() {
-                return;
-            }
-
-            // Tell macOS we've finished launching — suppresses "not responding"
-            let sel_finish = CString::new("finishLaunching").unwrap();
-            objc_msgSend(app, sel_registerName(sel_finish.as_ptr()));
-        }
-    });
-
-    // Give the background thread a moment to initialize
-    std::thread::sleep(Duration::from_millis(50));
-}
-
-fn main() -> Result<()> {
-    // `--mcp-server` and `--register` were the MCP-server and
-    // agent-runtime registration entry points. Both removed in §8
-    // along with `src/agent/mcp_server.rs` and
-    // `src/agent/register.rs`; the `omp` integration no longer
-    // exists. Users who need an LLM-backed Agent run the
-    // desktop, pick a Agent at voicebird.app, and press `g`
-    // (§11).
-    let args: Vec<String> = std::env::args().collect();
-    // Handle `--recover <dir>` before any TTY/terminal setup so it works
-    // from non-TTY shells (e.g., piped or macOS `open` invocations).
-    if let Some(pos) = args.iter().position(|a| a == "--recover") {
-        let dir = args
-            .get(pos + 1)
-            .ok_or_else(|| anyhow::anyhow!("--recover requires a path"))?;
-        voice_bird_cli::session::recover::recover(std::path::Path::new(dir))?;
-        println!("Recovered transcripts in {}", dir);
-        return Ok(());
-    }
-    // `--debug-state-snapshot <path>` opts into a JSONL file where every
-    // key press appends a serialized App-state snapshot. Used by the
-    // e2e_human test harness to drive the TUI without relying on
-    // screenshot OCR. No-op when the flag is absent.
-    let debug_snapshot_path: Option<PathBuf> = args
-        .iter()
-        .position(|a| a == "--debug-state-snapshot")
-        .and_then(|pos| args.get(pos + 1))
-        .map(PathBuf::from);
-
-    // When launched via macOS `open`, reconnect stdin to the real TTY
-    // so crossterm gets proper keyboard input. Must happen before anything
-    // reads from stdin.
-    #[cfg(target_os = "macos")]
-    reconnect_tty_from_args();
-
-    // On macOS, satisfy Apple Event expectations to prevent "not responding" dialogs
-    #[cfg(target_os = "macos")]
-    init_macos_app_event_handler();
-
-    // Initialize file logger before TUI takes over the screen
-    let log_path = match logger::init() {
-        Ok(path) => Some(path),
-        Err(e) => {
-            eprintln!("Warning: failed to initialize logger: {}", e);
-            None
-        }
-    };
-
-    // Sentinel line: version + exe path + compile time so we can tell at
-    // a glance which binary was launched. If you don't see this with a
-    // fresh timestamp, you're running a stale build.
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".into());
-    log::info!(
-        "Voice Bird v{} starting — ui=inline-devices-panel exe={} built_at={}",
-        env!("CARGO_PKG_VERSION"),
-        exe,
-        env!("VOICE_BIRD_BUILD_TS"),
-    );
-
-    // Route whisper.cpp + ggml logs (including Metal init) through the
-    // `log` crate so they land in our file log and don't scribble over
-    // the TUI on stderr. No whisper.cpp on cloud-only Windows.
-    #[cfg(not(windows))]
-    whisper_rs::install_whisper_log_trampoline();
-
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create app and run
-    let mut app = App::new();
-    app.log_path = log_path;
-    app.refresh_inventory();
-
-    // Seed Devices-pane cursor to the saved device. Many devices (USB
-    // headsets like EPOS) appear twice — once as Input (mic) and once
-    // as Output (for loopback capture). Prefer matching on BOTH name
-    // and saved kind so a user who picked the loopback variant gets the
-    // loopback variant back. Falls back to name-only match for old
-    // configs that did not store input_device_kind.
-    if let Some(saved) = app.config.input_device.clone() {
-        let saved_kind = app.config.input_device_kind;
-        let by_name_and_kind = saved_kind.and_then(|k| {
-            app.devices
-                .iter()
-                .position(|d| d.name == saved && d.kind == k)
-        });
-        let i = by_name_and_kind.or_else(|| app.devices.iter().position(|d| d.name == saved));
-        if let Some(i) = i {
-            app.selected_device_index = i;
-        }
-    }
-    // Seed Apps-pane cursor to the last-used app id, if it still exists.
-    if let Some(last_id) = app.config.last_app_id.clone() {
-        app.selected_app_index = app.apps.iter().position(|a| a.id == last_id);
-    }
-
-    log::info!(
-        "Found {} devices, {} apps",
-        app.devices.len(),
-        app.apps.len()
-    );
-    for (i, d) in app.devices.iter().enumerate() {
-        log::info!("  device[{}] = {:?} kind={:?}", i, d.name, d.kind);
-    }
-    log::info!(
-        "config.input_device = {:?}, cursor selected_device_index = {}, selected_app_index = {:?}",
-        app.config.input_device,
-        app.selected_device_index,
-        app.selected_app_index,
-    );
-
-    if let Some(p) = &debug_snapshot_path {
-        log::info!("debug state snapshots → {}", p.display());
-        // Truncate any prior file so each run is fresh.
-        let _ = std::fs::write(p, "");
-        // Emit one initial snapshot so the e2e harness can read the
-        // device list before sending its first keystroke.
-        write_state_snapshot(&app, "<startup>", p);
-    }
-
-    let result = run_app(&mut terminal, &mut app, debug_snapshot_path.as_deref());
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+fn main() -> io::Result<()> {
+    install_panic_hook();
+    let _guard = enter_terminal(
+        enable_raw_mode,
+        || execute!(io::stdout(), EnterAlternateScreen),
+        restore_terminal,
     )?;
-    terminal.show_cursor()?;
-
-    if let Err(e) = result {
-        log::error!("Application error: {}", e);
-        eprintln!("Error: {}", e);
-    }
-
-    log::info!("Voice Bird CLI exiting");
-
-    Ok(())
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run(&mut terminal));
+    // A stalled native query or transfer must never delay restoring the TUI.
+    rt.shutdown_background();
+    result
 }
 
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-    debug_snapshot_path: Option<&Path>,
-) -> Result<()> {
-    let mut consecutive_poll_errors: u32 = 0;
-    // Periodic snapshot: while recording, the snapshot file should
-    // also reflect transcript events that arrive between key presses.
-    // Throttled to once per second to keep file growth bounded.
-    let mut last_periodic_snapshot = std::time::Instant::now();
+/// Resolve keys into events without mutating the UI projection.
+fn handle_key(key: KeyEvent, view: &UiView, db: &mut Database, tx: &EventSender) {
+    if let Some(intent) = input::map_key(key) {
+        producer::input::resolve_intent(intent, view, db, tx);
+    }
+}
 
-    loop {
-        // Detect revoked stdin (e.g., TTY closed while app bundle still running).
-        // On Unix, isatty(0) returns false when stdin fd is revoked, which would
-        // cause event::poll to return instantly and spin the CPU at 100%.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            if unsafe { libc::isatty(stdin_fd) } == 0 {
-                log::warn!("stdin is no longer a TTY, exiting gracefully");
-                stop_all_sessions(app);
-                return Ok(());
-            }
+/// Keep SQLite on this task while Tokio schedules input and producer work.
+async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    const TICK: Duration = Duration::from_millis(100);
+
+    let mut bus = EventBus::new();
+    let tx = bus.sender();
+    let mut log = voice_bird_cli::event_log::EventLog::open();
+
+    let model_store: Arc<dyn ModelStore> = match CacheDirStore::new() {
+        Ok(s) => {
+            let _ = s.sweep_staging();
+            Arc::new(s)
         }
-
-        // Update duration if recording
-        app.update_duration();
-
-        // Check for errors from recording threads
-        app.check_error();
-
-        // Drain any error the engine's consumer task posted — sets the
-        // banner + flips status to Error, so the user sees the message
-        // and can press `r` to retry.
-        app.check_engine_error();
-
-        // If the model picker has a completed download, commit config &
-        // return to Normal mode.
-        app.poll_picker_download();
-
-        // Draw UI
-        terminal.draw(|f| ui::render(f, app))?;
-
-        // Handle events with timeout for smooth updates
-        match event::poll(Duration::from_millis(50)) {
-            Ok(true) => {
-                consecutive_poll_errors = 0;
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        match &app.mode {
-                            AppMode::Normal => handle_normal_mode(app, key.code),
-                            AppMode::ModelPicker => handle_picker_mode(app, key.code),
-                            AppMode::Help => handle_help_mode(app, key.code),
-                            AppMode::Status => handle_status_mode(app, key.code),
-                            AppMode::ApiKeyModal => handle_api_key_modal(app, &key),
-                            AppMode::PathModal => handle_path_modal(app, key.code),
-                         }
-                        if let Some(path) = debug_snapshot_path {
-                            write_state_snapshot(app, &format!("{:?}", key.code), path);
-                        }
-                    }
-                    Event::Mouse(mouse) if app.mode == AppMode::Normal => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_transcript_down(3),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-            Ok(false) => {
-                consecutive_poll_errors = 0;
-            }
+        Err(e) => {
+            eprintln!("voice-bird-cli: cannot resolve cache dir: {e}");
+            std::process::exit(2);
+        }
+    };
+    let mut db = match voice_bird_cli::db::db_path() {
+        Some(path) => match Database::open(&path, tx.clone()) {
+            Ok(d) => d,
             Err(e) => {
-                consecutive_poll_errors += 1;
-                log::warn!("event::poll error ({}/5): {}", consecutive_poll_errors, e);
-                if consecutive_poll_errors >= 5 {
-                    log::error!("Too many consecutive poll errors, exiting");
-                    stop_all_sessions(app);
-                    return Ok(());
-                }
-            }
-        }
-
-        if app.should_quit {
-            // Stop all sessions before quitting
-            stop_all_sessions(app);
-            break;
-        }
-
-        // Periodic state snapshot — once per second, regardless of
-        // keys, so the e2e harness can observe transcripts arriving.
-        if let Some(path) = debug_snapshot_path {
-            if last_periodic_snapshot.elapsed() >= Duration::from_secs(1) {
-                write_state_snapshot(app, "<periodic>", path);
-                last_periodic_snapshot = std::time::Instant::now();
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_normal_mode(app: &mut App, key: KeyCode) {
-    // Funnel wizard gets the first chance at Esc/q/Enter so the
-    // wizard keys never fall through to picker/section
-    // navigation. The wizard is a modal that owns the
-    // workspace; nothing else should respond while it's open.
-    if app.room_funnel.is_some() {
-        match key {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                handle_funnel_cancel(app);
-                return;
-            }
-            KeyCode::Enter => {
-                handle_funnel_enter(app);
-                return;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let max = {
-                    let snapshot = app.room_funnel.clone();
-                    match snapshot.as_ref() {
-                        Some(s) => funnel_visible_options(app, s).len(),
-                        None => 0,
-                    }
-                };
-                // Compute visible names in a tight scope so the
-                // borrow on `app.devices`/`app.apps` ends before
-                // we mutably borrow `app.room_funnel`. The borrow
-                // checker rejects holding both because `funnel`
-                // lives on `app`.
-                let visible: Vec<String> = {
-                    let snapshot = app.room_funnel.clone();
-                    match snapshot.as_ref() {
-                        Some(s) => funnel_visible_options(app, s)
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect(),
-                        None => Vec::new(),
-                    }
-                };
-                let visible_refs: Vec<&str> =
-                    visible.iter().map(String::as_str).collect();
-                if let Some(f) = app.room_funnel.as_mut() {
-                    f.cursor_up();
-                    f.record_selected_name(&visible_refs);
-                }
-                return;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = {
-                    let snapshot = app.room_funnel.clone();
-                    match snapshot.as_ref() {
-                        Some(s) => funnel_visible_options(app, s).len(),
-                        None => 0,
-                    }
-                };
-                let visible: Vec<String> = {
-                    let snapshot = app.room_funnel.clone();
-                    match snapshot.as_ref() {
-                        Some(s) => funnel_visible_options(app, s)
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect(),
-                        None => Vec::new(),
-                    }
-                };
-                let visible_refs: Vec<&str> =
-                    visible.iter().map(String::as_str).collect();
-                if let Some(g) = app.room_funnel.as_mut() {
-                    g.cursor_down(max);
-                    g.record_selected_name(&visible_refs);
-                }
-                return;
-            }
-            _ => {}
-        }
-    }
-    // Transcript scroll keys — always available, no mode conflict.
-    match key {
-        KeyCode::PageUp => {
-            app.scroll_transcript_up(10);
-            return;
-        }
-        KeyCode::PageDown => {
-            app.scroll_transcript_down(10);
-            return;
-        }
-        KeyCode::Home => {
-            app.scroll_transcript_home();
-            return;
-        }
-        KeyCode::End => {
-            app.scroll_transcript_end();
-            return;
-        }
-        _ => {}
-    }
-    match key {
-        KeyCode::Char('q') => app.should_quit = true,
-        // `?` is help-only (D7 resolved in #33): status lives on
-        // its own key so a status event can never race the help
-        // modal.
-        KeyCode::Char('?') => app.toggle_help(),
-        KeyCode::Char('t') => app.toggle_status(),
-        // Tab cycles which section the c/l/m/s/PgUp keys target.
-        KeyCode::Tab => {
-            app.focus_next();
-            log::info!(
-                "keys: Tab → focused_slot = {} (sections active = {})",
-                app.focused_slot,
-                app.active_section_count()
-            );
-        }
-        KeyCode::BackTab => {
-            app.focus_prev();
-            log::info!(
-                "keys: BackTab → focused_slot = {} (sections active = {})",
-                app.focused_slot,
-                app.active_section_count()
-            );
-        }
-        // ↑/↓/k/j navigate the picker. Outside the funnel only
-        // Rooms is visible, so the dispatcher sends the event
-        // through `arrow_*_in_visible_picker`, which redirects
-        // to the Rooms pane when the (legacy) Devices focus
-        // would otherwise steer into a hidden list.
-        KeyCode::Up | KeyCode::Char('k') => app.arrow_previous_in_visible_picker(),
-        KeyCode::Down | KeyCode::Char('j') => app.arrow_next_in_visible_picker(),
-        // ←/→ cycle picker pane focus. `h` is aliased to `←` for
-        // vim-style users. `l` is deliberately not bound: it cycles
-        // cloud language already, and we don't want the picker
-        // focus to drift while the user is in cloud mode.
-        KeyCode::Left | KeyCode::Char('h') => {
-            use crate::app::PickerFocus::*;
-            let next = match app.picker_focus {
-                Devices => Devices,
-                Apps => Devices,
-                Agents => Apps,
-            };
-            app.picker_focus = next;
-            log::info!("keys: Left → picker_focus = {:?}", next);
-        }
-        KeyCode::Right => {
-            use crate::app::PickerFocus::*;
-            let next = match app.picker_focus {
-                Devices => Apps,
-                Apps => Rooms,
-                Rooms => Rooms,
-            };
-            app.picker_focus = next;
-            log::info!("keys: Right → picker_focus = {:?}", next);
-        }
-        // Space clears the Apps cursor → starts the section with the
-        // device alone. Only meaningful with the Apps pane focused; in
-        // the Devices pane it's a no-op (avoids surprising behaviour).
-        KeyCode::Char(' ') => {
-            if app.picker_focus == crate::app::PickerFocus::Apps {
-                app.clear_app_selection();
-                log::info!("keys: Space → cleared app selection");
-            }
-        }
-        // `+` / `-` grow or shrink the slot workspace. `+` is
-        // disabled when at `MAX_SECTIONS` slots (workspace cap);
-        // `-` is disabled on a single-slot workspace or when the
-        // focused slot is recording (the user must `s`top it
-        // first — keeps the runtime cleanly disposed).
-        KeyCode::Char('+') | KeyCode::Char('=') => match app.add_slot() {
-            Some(id) => {
-                log::info!("keys: + → added slot {id}");
-            }
-            None => {
-                app.banner = Some(format!(
-                    "Already at the max of {} slots — remove one with [-] first",
-                    crate::app::MAX_SECTIONS
-                ));
-                log::info!(
-                    "keys: + → refused (at MAX_SECTIONS = {})",
-                    crate::app::MAX_SECTIONS
-                );
+                eprintln!("voice-bird-cli: cannot open downloads table at {path:?}: {e}");
+                std::process::exit(2);
             }
         },
-        KeyCode::Char('-') | KeyCode::Char('_') => {
-            if app.remove_focused_slot() {
-                log::info!(
-                    "keys: - → removed focused slot; now {} slot(s)",
-                    app.slots.len()
-                );
-            } else {
-                // Either only one slot left, or the focused one is
-                // recording. Surface a banner so the user knows
-                // which (and what to do).
-                let recording = app
-                    .slot_index(app.focused_slot)
-                    .map(|i| matches!(app.slots[i].kind, crate::app::SlotKind::Recording { .. }))
-                    .unwrap_or(false);
-                let msg = if recording {
-                    "Stop the recording with [s] before removing the slot".into()
-                } else {
-                    "At least one slot must remain — no slot to remove".into()
-                };
-                app.banner = Some(msg);
-                log::info!(
-                    "keys: - → refused ({})",
-                    app.banner.as_deref().unwrap_or("?")
-                );
-            }
+        None => {
+            eprintln!("voice-bird-cli: cannot resolve downloads table path");
+            std::process::exit(2);
         }
-        // `a`/`e`/`d` agent CRUD keys removed in §8 — see plan §8.1.
-        // Their handler functions and `AppMode` variants are gone in §8.3.
-        KeyCode::Enter => {
-            // When the Rooms pane is focused, Enter first activates
-            // the picked room (provisions the slot set). The
-            // activate_room call is the only Enter-specific UI
-            // concern for the rooms pane; everything else (slot
-            // pick, source resolution, config persist,
-            // start_section) is shared and lives in the App method
-            // so it can be unit-tested.
-            if app.picker_focus == crate::app::PickerFocus::Rooms {
-                let idx = app.selected_room_index;
-                if let Err(msg) = app.activate_room(idx) {
-                    log::warn!("keys: Enter in Rooms pane → activate_room FAILED: {msg}");
-                    app.banner = Some(msg);
-                } else {
-                    log::info!(
-                        "keys: Enter in Rooms pane → activated room index {idx} ({})",
-                        app.active_room().slug
-                    );
-                }
-                return;
-            }
-            match app.try_start_new_section() {
-                Ok(()) => {
-                    log::info!(
-                        "keys: Enter → start_section OK; sections active = {}",
-                        app.active_section_count()
-                    );
-                }
-                Err(msg) => {
-                    log::warn!("keys: Enter → start_section FAILED: {msg}");
-                    app.banner = Some(msg.clone());
-                    app.status = RecordingStatus::Error(msg);
-                }
-            }
-        }
-        // 'r' refreshes both inventories: local audio (devices + apps)
-        // and the cloud Rooms list. Local refresh preserves cursor
-        // positions by name; cloud refresh replaces `self.rooms`
-        // (preserving the Free Room at index 0) with whatever
-        // `GET /api/rooms` returns (or clears it + sets a banner
-        // on error). Pre-this-commit, `r` only refreshed local
-        // audio, so newly-created custom Rooms on voicebird.app
-        // never appeared in the picker until process restart / `c`
-        // toggle / API-key re-save.
-        KeyCode::Char('r') => {
-            let before_d = app.devices.len();
-            let before_a = app.apps.len();
-            let before_r = app.rooms.len();
-            app.refresh_inventory();
-            app.refresh_rooms();
-            log::info!(
-                "keys: r refresh: devices {} → {}, apps {} → {}, rooms {} → {}",
-                before_d,
-                app.devices.len(),
-                before_a,
-                app.apps.len(),
-                before_r,
-                app.rooms.len()
-            );
-        }
-        // 'g' is the manual agent-run shortcut (D5.3). It
-        // asks the active room's agent for one fresh run
-        // right now — bypassing the 65 s debounce floor
-        // (D4.4: RunTrigger::Manual). For Free Room (no
-        // agent), `g` is a no-op with a banner so the
-        // key never feels dead.
-        KeyCode::Char('g') => {
-            if !app.active_room().has_agent() {
-                app.banner = Some(
-                    "g runs the active room's agent — Free Room has no agent"
-                        .into(),
-                );
-                log::info!("keys: g → no-op (Free Room has no agent)");
-                return;
-            }
-            let transcript = merged_timeline_text(app);
-            log::info!(
-                "keys: g → trigger_agent_run (Manual, {} lines)",
-                app.merged_timeline().len()
-            );
-            app.trigger_agent_run(
-                voice_bird_cli::cloud::RunTrigger::Manual,
-                transcript,
-            );
-        }
-        // 's' stops the focused section (no-op if its slot is empty).
-        KeyCode::Char('s') => {
-            let slot = app.focused_slot;
-            let pos = app.slot_index(slot);
-            let is_recording = pos
-                .and_then(|i| app.slots.get(i))
-                .map(|s| matches!(s.kind, crate::app::SlotKind::Recording { .. }))
-                .unwrap_or(false);
-            if is_recording {
-                log::info!("keys: s → stop_section[{}]", slot);
-                app.stop_section(slot);
-            } else {
-                log::info!("keys: s → no-op (slot {slot} empty)");
-            }
-        }
-        // 'x' clears the transcript for the focused slot (both live and
-        // saved/preserved).
-        KeyCode::Char('x') => {
-            let slot = app.focused_slot;
-            let had_text = app.focused_committed().lock().len() > 0
-                || app
-                    .slot_index(slot)
-                    .and_then(|i| app.slots.get(i))
-                    .map(|s| matches!(s.kind, crate::app::SlotKind::Saved { .. }))
-                    .unwrap_or(false);
-            app.clear_slot_transcript(slot);
-            if had_text {
-                log::info!("keys: x → cleared transcript for slot {slot}");
-            }
-        }
-
-        // 'R' (Shift+r) resumes capture in the focused slot. The
-        // lowercase `r` is taken by refresh, so resume lives on the
-        // shifted variant of the same letter — discoverable as
-        // "uppercase R for resume". A no-op (with a banner) when
-        // there is nothing to resume, so the key is never silently
-        // dead.
-        KeyCode::Char('R') => {
-            let slot = app.focused_slot;
-            match app.resume_section(slot) {
-                Ok(()) => {
-                    log::info!("keys: R → resume_section[{slot}]");
-                }
-                Err(msg) => {
-                    log::info!("keys: R → resume_section[{slot}] no-op: {msg}");
-                    app.banner = Some(msg);
-                }
-            }
-        }
-
-
-        // 'K' (Shift+k) opens the API-key modal from any normal-mode
-        // state (idle or recording). The lowercase 'k' is unbound
-        // (we don't steal it for modal-only access because it could
-        // collide with future text-input features). The user reported
-        // needing to manage their key while a recording was already
-        // running; in that state 'c' toggles cloud_on on the focused
-        // section, so a dedicated K shortcut gives them a reliable
-        // discoverable path to the modal. Pairs with the existing
-        // capital-letter shortcuts: 'R' resume, 'S' stop all, 'T'
-        // status.
-        KeyCode::Char('K') => {
-            log::info!("keys: K -> open_api_key_modal");
-            // `false`: K is a peek/edit shortcut. The user opens the
-            // modal to read the saved key (the modal's "Current key:"
-            // row) or to type a new one. Esc must close the modal
-            // silently without touching cloud — the cloud-enable
-            // flow is its own funnel (the `c` toggle's
-            // "Cloud ON, no key" branch sets `reverts_cloud = true`).
-            app.open_api_key_modal();
-        }
-        KeyCode::Char('m') => {
-            // Manual model override. Seeds the picker at the current
-            // displayed model (focused section's if running, else the
-            // global default) so the user sees what's already chosen.
-            let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
-            let current = app.display_model();
-            let current_idx = catalog
-                .all()
-                .iter()
-                .position(|m| m.id == current.as_str())
-                .unwrap_or(0);
-            app.picker = Some(crate::app::PickerState {
-                index: current_idx,
-                downloading: None,
-            });
-            app.mode = AppMode::ModelPicker;
-        }
-        #[cfg(windows)]
-        KeyCode::Char('m') => {
-            // No local models on cloud-only Windows; keep the key from
-            // being silently dead.
-            app.banner = Some("Windows is cloud-only — no local models".into());
-        }
-        // Windows is cloud-only: 'c' never toggles the mode, it only
-        // opens the API-key modal (the one cloud setting that matters).
-        #[cfg(windows)]
-        KeyCode::Char('c') => {
-            // `false`: there's no cloud toggle to revert on Windows;
-            // Cloud is always on. Esc just closes the modal.
-            app.open_api_key_modal();
-        }
-        // Toggle cloud transcription. When idle, mutates the global
-        // config so the next-start defaults flip (and the mode panel
-        // updates). When a section is focused, mutates that section's
-        // settings AND persists a per-source override. The running
-        // engine itself is untouched until the user stops & restarts —
-        // mid-flight engine rebuild is Stage 3+.
-        #[cfg(not(windows))]
-        KeyCode::Char('c') => {
-            if let Some(section) = app.focused_mut() {
-                section.settings.cloud_on = !section.settings.cloud_on;
-                let on = section.settings.cloud_on;
-                // Mirror the live toggle into the slot's
-                // customization so the next start sees the
-                // same value. `Slot.config` is the single
-                // source of truth for what the slot will use
-                // when starting a new section.
-                if let Some(slot) = app
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.id == app.focused_slot)
-                {
-                    slot.config.cloud_on = Some(on);
-                }
-                app.refresh_rooms();
-                app.banner = Some(if on {
-                    "Cloud: ON for focused section (applies on next start)".into()
-                } else {
-                    "Cloud: OFF for focused section (applies on next start)".into()
-                });
-            } else {
-                // Idle: no section is focused. The press of `c`
-                // writes ONLY to the focused slot's
-                // `slot.config.cloud_on`. Other slots are
-                // untouched. The slot is the single source of
-                // truth for per-slot cloud ON/OFF.
-                //
-                // Pre-fix logic wrote to a per-source override
-                // map AND the global `cloud_broadcast_enabled`
-                // flag, which leaked into every other slot
-                // whose display fell back to the global. That's
-                // the bug we're eliminating.
-                if let Some(slot) = app
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.id == app.focused_slot)
-                {
-                    let current = slot
-                        .config
-                        .cloud_on
-                        .unwrap_or(app.default_slot_config.cloud_on);
-                    slot.config.cloud_on = Some(!current);
-                }
-                app.refresh_rooms();
-                if app.display_cloud_on() && app.config.voicebird_api_key.is_empty() {
-                    // Cloud-enable gate. The modal opens with
-                    // the new (ON) cloud state visible. Esc
-                    // closes the modal — the slot already
-                    // records the OFF→ON flip; the user can
-                    // press `c` again to revert. No more
-                    // `pending_c_revert` bookkeeping.
-                    app.open_api_key_modal();
-                } else {
-                    app.banner = Some(if app.display_cloud_on() {
-                        "Cloud: ON (next recording streams to voicebird.app)".into()
-                    } else {
-                        "Cloud: OFF (next recording is local-only)".into()
-                    });
-                }
-            }
-        }
-        // Cycle the cloud language. When idle, mutates the
-        // focused slot's `slot.config.language` (and is
-        // hidden when cloud is off). When focused-section
-        // recording, cycles that section's language and
-        // persists the override.
-        KeyCode::Char('l') => {
-            let langs = crate::app::CLOUD_LANGUAGES;
-            if let Some(section) = app.focused_mut() {
-                if !section.settings.cloud_on {
-                    return;
-                }
-                let i = langs
-                    .iter()
-                    .position(|&l| l == section.settings.language)
-                    .unwrap_or(0);
-                let next = (i + 1) % langs.len();
-                section.settings.language = langs[next].into();
-                // Mirror to slot.config for next start.
-                if let Some(slot) = app
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.id == app.focused_slot)
-                {
-                    slot.config.language = Some(langs[next].into());
-                }
-            } else if app.display_cloud_on() {
-                if let Some(slot) = app
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.id == app.focused_slot)
-                {
-                    let current = slot
-                        .config
-                        .language
-                        .clone()
-                        .unwrap_or_else(|| app.default_slot_config.language.clone());
-                    let i = langs.iter().position(|&l| l == current).unwrap_or(0);
-                    let next = (i + 1) % langs.len();
-                    slot.config.language = Some(langs[next].into());
-                }
-            }
-        }
-        // Export the most recent local transcript to the cloud.
-        // Idempotent — second press is a no-op once .uploaded exists.
-        // Local-only concept: gated off cloud-only Windows.
-        #[cfg(not(windows))]
-        KeyCode::Char('e') if app.active_section_count() == 0 => {
-            app.export_transcript();
-        }
-        // Open the output-path modal. Only when idle (can't change
-        // paths mid-recording — sessions have already landed).
-        // Local-only concept: gated off cloud-only Windows.
-        #[cfg(not(windows))]
-        KeyCode::Char('p') if app.active_section_count() == 0 => {
-            app.open_path_modal();
-        }
-        // The O / S / A target-cycle keys have been replaced by the
-        // Agents picker pane — the user picks a target with the
-        // same arrow / Enter pattern as Devices and Apps. The change
-        // is queued in `pending_target_overrides` by the Enter
-        // handler when the Agents pane is focused.
-        _ => {}
-    }
-}
-
-/// Format the merged role-labeled timeline as plain
-/// text for the agent-run POST body. The role
-/// prefixes the line so the LLM sees who said what
-/// (e.g. "[Patient] Hello doctor"). The wall-clock
-/// timestamp is dropped — the agent doesn't need
-/// absolute times, only the order of statements.
-/// `truncate_transcript` (D4.4) handles the 180k
-/// cap.
-fn merged_timeline_text(app: &App) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    for entry in app.merged_timeline() {
-        let role = entry
-            .role
-            .as_deref()
-            .unwrap_or("Speaker");
-        let _ = writeln!(out, "[{role}] {}", entry.text);
-    }
-    out
-}
-
-fn handle_path_modal(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Esc => {
-            app.path_buf = None;
-            app.mode = AppMode::Normal;
-        }
-        KeyCode::Enter => {
-            if let Some(buf) = app.path_buf.take() {
-                let trimmed = buf.trim().to_string();
-                // Per-slot path: write to the focused slot's
-                // `slot.config.path`. Other slots are
-                // untouched. The slot is the single source
-                // of truth for per-slot output path.
-                if let Some(slot) = app
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.id == app.focused_slot)
-                {
-                    slot.config.path = Some(trimmed.clone());
-                }
-                app.banner = Some(format!("Output path → {trimmed}"));
-            }
-            app.mode = AppMode::Normal;
-        }
-        KeyCode::Backspace => {
-            if let Some(buf) = app.path_buf.as_mut() {
-                buf.pop();
-            }
-        }
-        KeyCode::Char(ch) => {
-            if let Some(buf) = app.path_buf.as_mut() {
-                buf.push(ch);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_api_key_modal(app: &mut App, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            // Cancel: close the modal silently. The slot's
-            // per-slot cloud toggle (or the default) keeps
-            // the user's last flip — they can re-press `c`
-            // to revert manually. No more bookkeeping
-            // around a per-source override + global flag.
-            app.api_key_buf = None;
-            app.mode = AppMode::Normal;
-        }
-        KeyCode::Enter => {
-            if let Some(buf) = app.api_key_buf.take() {
-                // Distinguish "user saved a new key" from "user
-                // wiped the buffer (Ctrl+U or Backspace × N) and
-                // committed an empty key". The first case sets
-                // `voicebird_api_key` to a non-empty string and
-                // the existing 'API key saved' banner is fine.
-                // The second case CLEARS the saved key on disk
-                // — `voicebird_api_key` becomes `""` and the
-                // old "API key saved" banner is actively
-                // misleading. The cloud-enable gate (if this
-                // modal was opened as one) will re-trigger on
-                // the next recording because `key.is_empty()`
-                let trimmed = buf.trim();
-                app.config.voicebird_api_key = trimmed.to_string();
-                if let Err(e) = app.config.save() {
-                    log::error!("config save (modal save): {e}");
-                    app.banner = Some(format!("Save failed: {e}"));
-                } else if trimmed.is_empty() {
-                    app.banner = Some("API key cleared".into());
-                    // Empty key: clear any stale agents list so the
-                    // picker doesn't keep showing entries from a
-                    // prior fetch.
-                    app.refresh_rooms();
-                } else {
-                    app.banner =
-                        Some("API key saved — start a recording to verify".into());
-                    // New key just landed: re-fetch the Agents list
-                    // so the picker reflects what this key is
-                    // authorized to see. Without this the picker
-                    // stays empty until the next `App::new()`
-                    // (i.e. process restart).
-                    app.refresh_rooms();
-                }
-            }
-            app.mode = AppMode::Normal;
-        }
-        KeyCode::Backspace => {
-            if let Some(buf) = app.api_key_buf.as_mut() {
-                buf.pop();
-            }
-        }
-        // Ctrl+U clears the buffer so the user can retype from scratch
-        // (standard text-editor kill-line). crossterm encodes this as
-        // `KeyCode::Char('u')` with the CONTROL modifier set; the guard
-        // is mandatory - a plain `u` keystroke (no modifier) must still
-        // type into the buffer normally. Saving an empty buffer (Enter
-        // with the empty buf) clears the saved key on disk, which gives
-        // the user a way to remove a corrupted key without editing
-        // config.toml by hand.
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(buf) = app.api_key_buf.as_mut() {
-                buf.clear();
-            }
-        }
-        KeyCode::Char(ch) => {
-            if let Some(buf) = app.api_key_buf.as_mut() {
-                buf.push(ch);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_picker_mode(app: &mut App, key: KeyCode) {
-    // Ignore input while a download is in progress (no error yet).
-    let download_in_flight = app
-        .picker
-        .as_ref()
-        .and_then(|p| p.downloading.as_ref())
-        .map(|arc| arc.lock().error.is_none())
-        .unwrap_or(false);
-    if download_in_flight {
-        return;
-    }
-
-    let catalog = voice_bird_cli::transcription::models::Catalog::builtin();
-    let total = catalog.all().len();
-
-    match key {
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.index = picker.index.saturating_sub(1);
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(picker) = app.picker.as_mut() {
-                if picker.index + 1 < total {
-                    picker.index += 1;
-                }
-            }
-        }
-        KeyCode::Enter => {
-            let idx = app.picker.as_ref().map(|p| p.index).unwrap_or(0);
-            if let Some(entry) = catalog.all().get(idx).cloned() {
-                app.begin_model_download(&entry);
-            }
-        }
-        KeyCode::Esc => {
-            if app.config_was_loaded_from_disk {
-                app.mode = AppMode::Normal;
-                app.picker = None;
-            }
-            // First run: Esc is ignored — user must pick a model.
-        }
-        _ => {}
-    }
-}
-
-fn handle_help_mode(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
-            app.toggle_help();
-        }
-        _ => {}
-    }
-}
-
-/// Status overlay (`t`): any of the usual dismiss keys close it.
-fn handle_status_mode(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-            app.toggle_status();
-        }
-        _ => {}
-    }
-}
-
-fn stop_all_sessions(app: &mut App) {
-    log::info!("Stopping all sessions");
-    app.stop_all_sections();
-}
-
-/// Append one JSON-line snapshot of relevant App state to `path`.
-/// Used by the e2e_human harness to drive the TUI without relying on
-/// screenshot OCR. Errors are intentionally swallowed — debug-only feature
-/// must never crash the TUI.
-fn write_state_snapshot(app: &App, last_key: &str, path: &Path) {
-    use std::io::Write;
-
-    let status = match &app.status {
-        RecordingStatus::Idle => "Idle".to_string(),
-        RecordingStatus::Error(s) => format!("Error: {s}"),
     };
-
-    let device_names: Vec<String> = app.devices.iter().map(|d| d.name.clone()).collect();
-    let selected_device_name = app
-        .devices
-        .get(app.selected_device_index)
-        .map(|d| d.name.clone())
-        .unwrap_or_default();
-    let app_names: Vec<String> = app.apps.iter().map(|a| a.name.clone()).collect();
-    let selected_app_name = app
-        .selected_app_index
-        .and_then(|i| app.apps.get(i))
-        .map(|a| a.name.clone())
-        .unwrap_or_default();
-
-    let committed_arc = app.focused_committed();
-    let committed = committed_arc.lock();
-    let committed_count = committed.len();
-    let last_committed_text = committed.last().map(|c| c.text.clone()).unwrap_or_default();
-    drop(committed);
-    let tentative_text = app.focused_tentative().lock().clone();
-
-    // Mask the API key so the snapshot file is safe to ship in test
-    // artifacts. The e2e harness only needs to know whether a key is
-    // present (length > 0), not what it is.
-    let api_key_masked = if app.config.voicebird_api_key.is_empty() {
-        String::new()
-    } else {
-        let n = app.config.voicebird_api_key.len();
-        format!("•••{n}")
-    };
-    let api_key_buf_len = app.api_key_buf.as_ref().map(|s| s.len()).unwrap_or(0);
-
-    let snap = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "last_key": last_key,
-        "status": status,
-        "cloud_broadcast_active": app.focused_cloud_active(),
-        "cloud_broadcast_enabled": app.default_slot_config.cloud_on,
-        "language": app.default_slot_config.language,
-        "default_model": app.default_slot_config.model,
-        "engine_kind": app.focused_engine_kind(),
-        "duration_secs": app.duration,
-        "banner": app.banner,
-        "status_message": app.status_message,
-        "device_names": device_names,
-        "selected_device_index": app.selected_device_index,
-        "selected_device_name": selected_device_name,
-        "app_names": app_names,
-        "selected_app_index": app.selected_app_index,
-        "selected_app_name": selected_app_name,
-        "picker_focus": format!("{:?}", app.picker_focus),
-        "voicebird_api_key_masked": api_key_masked,
-        "api_key_buf_len": api_key_buf_len,
-        "committed_count": committed_count,
-        "last_committed_text": last_committed_text,
-        "tentative_text": tentative_text,
+    let downloader: Arc<dyn Downloader> = cfg_build_downloader();
+    let mut consumer = Consumer::new(Consumers::new(
+        downloader,
+        model_store.clone(),
+        voice_bird_cli::audio_sources::system_sources(),
+    ));
+    let mut recording = RecordingProducer::new(RecordingServices {
+        capture: voice_bird_cli::audio::system_capture(),
+        engines: voice_bird_cli::transcribe::system_engines(),
+        sessions_root: voice_bird_cli::db::data_dir().join("sessions"),
     });
-
-    let line = match serde_json::to_string(&snap) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-/// Regression tests for the cloud toggle (PR #48 review item 8):
-/// toggling Cloud while the focused slot is empty must also write
-/// to the per-source override so the next start agrees with what
-/// the toggle just advertised. The previous `funnel_dispatch_tests`
-/// module that drove the agent-funnel key path is removed with
-/// `--mcp-server` / `--register` / the funnel in §8.
-
-// Bug: toggling Cloud (`c`) while the focused slot is empty
-// only updates the global `cloud_broadcast_enabled` default,
-// not the per-source override. The next start uses the
-// per-source override (when present, it wins over the
-// global), so the banner/display say "Cloud: ON" but the
-// session starts with `cloud_on = false`. Reproduces the
-// screenshot from #48 review: user toggled Cloud ON, hit
-// Enter, the Mode panel flipped to OFF during the
-// recording.
-//
-// The fix must also write to the per-source override for
-// the source the picker would resolve to on Enter, so the
-// next start agrees with what the toggle just advertised.
-#[cfg(test)]
-mod cloud_toggle_dispatch_tests {
-    use super::*;
-    use crate::platform::{AppSession, AudioDevice};
-    use voice_bird_cli::config::AudioSessionKind;
-    use voice_bird_cli::session::layout::SessionSource;
-
-    /// `c` toggled while no section is focused must update the
-    /// per-source override for the source the picker resolves
-    /// to on Enter. Today (pre-fix) the `else` branch in
-    /// `handle_normal_mode` only flips the global
-    /// `cloud_broadcast_enabled`, leaving a stale per-source
-    /// override `cloud_on = false` in place. The next start
-    /// reads the per-source override first, so the section
-    /// starts with `cloud_on = false` even though the user
-    #[test]
-    fn c_toggle_when_no_section_focused_updates_focused_slot() {
-        // Three slots created. Focused slot has customized
-        // cloud_on = false. Default cloud_on = false. Press `c`
-        // — the focused slot's cloud_on must flip to ON.
-        let mut app = App::new();
-        app.add_slot();
-        app.add_slot();
-        app.config.voicebird_api_key = "sk-test".into();
-        app.default_slot_config.cloud_on = false;
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(false);
-
-        // Sanity: no Recording/Saved section is focused, so the
-        // toggle must take the `else` branch in main.rs.
-        assert!(app.focused().is_none(), "setup must have no focused section");
-
-        // The user presses `c`.
-        #[cfg(not(windows))]
-        {
-            handle_normal_mode(&mut app, KeyCode::Char('c'));
-
-            // Assert 1: the focused slot's cloud_on was flipped.
-            let slot = app
-                .slot_by_id(app.focused_slot)
-                .expect("focused slot must exist");
-            assert_eq!(
-                slot.config.cloud_on,
-                Some(true),
-                "toggling Cloud ON while no section is focused must \
-                 update the focused slot's cloud_on; otherwise the next \
-                 start silently uses the stale cloud_on=false."
-            );
-            // Assert 2: the default flag must stay OFF — idle
-            // `c` is per-slot and must NOT leak into the
-            // default. Other slots that read the default as a
-            // fallback would otherwise see this toggle.
-            assert!(
-                !app.default_slot_config.cloud_on,
-                "idle `c` toggle must NOT flip the default flag — \
-                 slot independence: other slots' display reads the \
-                 default as a fallback and would otherwise leak this \
-                 toggle."
-            );
+    let watcher = ModelWatcher::new(model_store);
+    watcher.check(&mut db, &tx).map_err(io::Error::other)?;
+    let mut input = EventStream::new();
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dirty = true;
+    let result: io::Result<()> = async {
+    loop {
+        if dirty {
+            terminal.draw(|f| voice_bird_cli::ui::render(f, &consumer.consumers.ui_view))?;
+            dirty = false;
         }
-    }
-
-    /// Regression guard for the follow-up display-helper change: when the
-    /// idle Mode panel reads from a per-source override, `c` must flip that
-    /// displayed value, not the global default. Otherwise a source showing
-    #[test]
-    fn idle_c_toggle_flips_focused_slot_cloud_on() {
-        // Setup: focused slot customized to OFF, default ON.
-        // The displayed cloud state = OFF (the per-slot
-        // override wins). Pressing `c` must flip the slot's
-        // customization to ON.
-        let mut app = App::new();
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-        app.default_slot_config.cloud_on = true;
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(false);
-
-        assert!(
-            !app.display_cloud_on(),
-            "setup must show the per-slot Cloud OFF state"
-        );
-
-        #[cfg(not(windows))]
-        {
-            handle_normal_mode(&mut app, KeyCode::Char('c'));
-
-            let slot = app
-                .slot_by_id(app.focused_slot)
-                .expect("focused slot must exist");
-            assert_eq!(
-                slot.config.cloud_on,
-                Some(true),
-                "pressing `c` while the idle UI displays per-slot Cloud OFF \
-                 must toggle that customized value to ON"
-            );
-            assert!(
-                app.display_cloud_on(),
-                "the Mode panel must show Cloud ON after toggling from the \
-                 displayed per-slot OFF state"
-            );
-        }
-    }
-
-    /// Pre-fix bug: the idle `c` toggle wrote to BOTH the
-    /// per-source override AND the global \`cloud_broadcast_enabled\`
-    /// flag. With two idle slots routed to different sources, the
-    /// global flip leaked into slot 2's display — even though slot
-    /// 2's per-source override was untouched, \`display_cloud_on\`
-    /// for slot 2 fell back to the (just-changed) global and
-    /// showed the slot 1 flip.
-    ///
-    /// Post-fix: the idle `c` toggle writes ONLY to the focused
-    /// slot's per-source override. The global flag stays as the
-    /// fallback default — slot 2's display reads its per-source
-    /// override (untouched), falls back to the unchanged global.
-    #[test]
-    fn idle_c_toggle_does_not_flip_default_flag() {
-        // Pre-fix bug: the idle `c` toggle wrote to a
-        // per-source override map AND the global
-        // `cloud_broadcast_enabled` flag. The global flip
-        // leaked into every other slot whose display fell
-        // back to the global — every slot silently mirrored
-        // the toggle.
-        //
-        // Post-fix: the idle `c` toggle writes ONLY to the
-        // focused slot's `slot.config.cloud_on`. Other slots
-        // are untouched. The default stays as the fallback
-        // for slots without a customization.
-        let mut app = App::new();
-
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        app.apps.clear();
-        app.selected_app_index = None;
-        app.default_slot_config.cloud_on = true;
-
-        // User presses `c` while idle (no section focused).
-        #[cfg(not(windows))]
-        handle_normal_mode(&mut app, KeyCode::Char('c'));
-
-        // Focused slot's cloud_on must be customized to OFF.
-        let slot = app
-            .slot_by_id(app.focused_slot)
-            .expect("focused slot must exist");
-        assert_eq!(
-            slot.config.cloud_on,
-            Some(false),
-            "focused slot cloud_on must be customized to OFF; got {:?}",
-            slot.config.cloud_on
-        );
-
-        // Default cloud ON must stay ON — the toggle was
-        // per-slot. Flipping the default would leak into every
-        // other slot whose slot.config has no override.
-        assert!(
-            app.default_slot_config.cloud_on,
-            "idle `c` toggle must NOT flip the default flag — \
-             slot independence: any other slot whose slot.config has \
-             no override would inherit the default change. \
-             default was true, must remain true"
-        );
-    }
-    /// Post-fix: each slot owns a `SlotConfig`; the idle `c`
-    /// toggle writes to the focused slot's `config.cloud_on`,
-    /// not to a global. Tab to another slot and the new slot
-    /// still uses its default (untouched). Tab back, the
-    /// previous slot's customized OFF is still in effect.
-    #[test]
-    fn idle_c_toggle_is_per_slot_not_global() {
-        let mut app = App::new();
-        app.add_slot();
-        app.add_slot();
-        app.config.voicebird_api_key = "sk-test".into();
-
-        // Three slots; default cloud ON.
-        app.default_slot_config.cloud_on = true;
-        app.default_slot_config.language = "en".into();
-        app.default_slot_config.model = "distil-small.en".into();
-
-        // Slot 1 focused.
-        app.focused_slot = crate::app::SlotId(1);
-        assert!(app.display_cloud_on(), "slot 1 default cloud ON");
-
-        // Press c on slot 1 — only slot 1 should flip.
-        #[cfg(not(windows))]
-        handle_normal_mode(&mut app, KeyCode::Char('c'));
-        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
-        assert_eq!(
-            slot1.config.cloud_on,
-            Some(false),
-            "slot 1 cloud must be customized OFF"
-        );
-        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
-        assert_eq!(
-            slot2.config.cloud_on, None,
-            "slot 2 cloud must remain default (None)"
-        );
-        let slot3 = app.slot_by_id(crate::app::SlotId(3)).unwrap();
-        assert_eq!(
-            slot3.config.cloud_on, None,
-            "slot 3 cloud must remain default (None)"
-        );
-        assert!(
-            app.default_slot_config.cloud_on,
-            "default cloud ON must not be flipped"
-        );
-
-        // Tab to slot 2 — its effective cloud must still be ON
-        // (defaulting through).
-        app.focus_next();
-        assert_eq!(app.focused_slot, crate::app::SlotId(2));
-        assert!(
-            app.display_cloud_on(),
-            "slot 2 effective cloud must be ON (defaulting through)"
-        );
-
-        // Press c on slot 2 — only slot 2 flips.
-        #[cfg(not(windows))]
-        handle_normal_mode(&mut app, KeyCode::Char('c'));
-        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
-        assert_eq!(
-            slot2.config.cloud_on,
-            Some(false),
-            "slot 2 cloud must be customized OFF"
-        );
-        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
-        assert_eq!(
-            slot1.config.cloud_on,
-            Some(false),
-            "slot 1 cloud must remain its customized OFF"
-        );
-        let slot3 = app.slot_by_id(crate::app::SlotId(3)).unwrap();
-        assert_eq!(
-            slot3.config.cloud_on, None,
-            "slot 3 cloud must remain default"
-        );
-
-        // Tab to slot 3 — default ON.
-        app.focus_next();
-        assert_eq!(app.focused_slot, crate::app::SlotId(3));
-        assert!(app.display_cloud_on(), "slot 3 cloud ON");
-
-        // Tab to slot 1 — its customized OFF is still in effect.
-        app.focus_next();
-        assert_eq!(app.focused_slot, crate::app::SlotId(1));
-        assert!(!app.display_cloud_on(), "slot 1 cloud OFF (customized)");
-    }
-
-    /// Post-fix: idle `l` cycles the cloud language on the
-    /// focused slot only. Slot 2/3 are untouched. Tab back to
-    /// slot 1, the customized language is still in effect.
-    #[cfg(not(windows))]
-    #[test]
-    fn idle_l_toggle_is_per_slot_not_global() {
-        let mut app = App::new();
-        app.add_slot();
-        app.default_slot_config.cloud_on = true;
-        app.default_slot_config.language = "en".into();
-        app.config.voicebird_api_key = "sk-test".into();
-        app.focused_slot = crate::app::SlotId(1);
-
-        handle_normal_mode(&mut app, KeyCode::Char('l'));
-        let slot1 = app.slot_by_id(crate::app::SlotId(1)).unwrap();
-        let slot2 = app.slot_by_id(crate::app::SlotId(2)).unwrap();
-        assert!(
-            slot1.config.language.is_some(),
-            "slot 1 language must be customized; got {:?}",
-            slot1.config.language
-        );
-        assert_eq!(
-            slot2.config.language, None,
-            "slot 2 language must remain default (None)"
-        );
-        // Default must NOT change.
-        assert_eq!(
-            app.default_slot_config.language, "en",
-            "default language must stay unchanged"
-        );
-    }
-}
-
-/// `handle_api_key_modal` must clear the in-progress paste buffer when
-/// the user presses Ctrl+U. The same keypress saves with an empty
-/// buffer, which deletes the previously-saved key (the user wants a
-/// fresh start — e.g. after spotting `sk-test` test-pollution in
-/// their existing saved key, they want to retype from scratch). The
-/// Char('u') WITHOUT control must still type into the buffer like
-/// any other printable char.
-#[cfg(test)]
-mod api_key_modal_ctrl_u_tests {
-    use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    #[test]
-    fn ctrl_u_clears_the_in_progress_api_key_buffer() {
-        let mut app = App::new();
-        app.mode = AppMode::ApiKeyModal;
-        app.api_key_buf = Some("vb_partial_paste".into());
-
-        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        handle_api_key_modal(&mut app, &evt);
-
-        assert_eq!(
-            app.api_key_buf.as_deref(),
-            Some(""),
-            "Ctrl+U must clear the in-progress buffer to an empty string"
-        );
-        // Mode stays in the modal so the user can keep typing.
-        assert_eq!(app.mode, AppMode::ApiKeyModal);
-    }
-
-    #[test]
-    fn plain_u_typing_into_api_key_buffer_works_when_control_held_is_false() {
-        // Regression sentinel: Ctrl+U must NOT eat the printable 'u'
-        // keystroke when no modifier is held. The handler still has a
-        // normal-agent typing path.
-        let mut app = App::new();
-        app.mode = AppMode::ApiKeyModal;
-        app.api_key_buf = Some(String::new());
-
-        let evt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
-        handle_api_key_modal(&mut app, &evt);
-
-        assert_eq!(
-            app.api_key_buf.as_deref(),
-            Some("u"),
-            "a plain 'u' keystroke (no modifiers) must append to the buffer"
-        );
-    }
-
-    /// Ctrl+U + Enter (with the empty buffer) must surface a
-    /// "cleared" banner, not the misleading "API key saved —
-    /// start a recording to verify". The user explicitly
-    /// removed the key; the banner should reflect that.
-    #[test]
-    fn enter_with_empty_buf_after_ctrl_u_shows_cleared_banner() {
-        let mut app = App::new();
-        app.mode = AppMode::ApiKeyModal;
-        app.api_key_buf = Some("vb_partial_paste".into());
-
-        // Ctrl+U clears the buffer…
-        let ctrl_u =
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        handle_api_key_modal(&mut app, &ctrl_u);
-        // …Enter commits the empty buf.
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_api_key_modal(&mut app, &enter);
-
-        assert!(
-            app.banner.as_deref()
-                == Some("API key cleared"),
-            "Ctrl+U + Enter must surface an 'API key cleared' banner \
-             so the user sees the key was removed, not saved. \
-             Got: {:?}",
-            app.banner,
-        );
-        // The saved key is now empty.
-        assert!(
-            app.config.voicebird_api_key.is_empty(),
-            "saving an empty buffer must clear the saved key on disk"
-        );
-        // And the modal is dismissed.
-        assert_eq!(app.mode, AppMode::Normal);
-    }
-}
-
-/// `K` (uppercase) opens the API-key modal from Normal mode, regardless
-/// of whether a section is focused. The lowercase `k` keystroke must
-/// still be a regular agent typed into nothing (we don't bind it),
-/// because crossterm encodes Ctrl+K the same as a plain 'k' - the
-/// uppercase letter is the discoverable, conflict-free shortcut.
-#[cfg(test)]
-mod api_key_dispatcher_uppercase_k_tests {
-    use super::*;
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn uppercase_K_opens_the_api_key_modal_from_normal_mode() {
-        let mut app = App::new();
-        app.mode = AppMode::Normal;
-        let evt = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE);
-        handle_normal_mode(&mut app, evt.code);
-        assert_eq!(
-            app.mode,
-            AppMode::ApiKeyModal,
-            "uppercase K must open the API-key modal; mode = {:?}",
-            app.mode,
-        );
-        assert!(
-            app.api_key_buf.is_some(),
-            "opening the modal must seed api_key_buf so the user sees what's saved"
-        );
-    }
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn lowercase_k_is_NOT_an_api_key_shortcut_only_uppercase_K_is() {
-        let mut app = App::new();
-        let evt = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
-        handle_normal_mode(&mut app, evt.code);
-        // We do not assert a specific behaviour for lowercase 'k'
-        // (it's not bound to anything), only that it does NOT open
-        // the API-key modal. If a future feature binds 'k' to
-        // something else, this test continues to assert what we
-        // explicitly want - no overlap with the K shortcut.
-        assert_ne!(
-            app.mode,
-            AppMode::ApiKeyModal,
-            "lowercase k must not open the API-key modal",
-        );
-    }
-}
-
-// PR #48 review — regression guards. These started life as RED
-// tests pinning contracts the code violated; the fixes landed in
-// 992ae64 (item 1, Esc-from-K), a608402 (item 2, config-path
-// injection), and 25ae726 (item 8, c-toggle seed). They stay as
-// permanent guards against re-regression.
-#[cfg(test)]
-#[cfg(not(windows))]
-mod pr48_review_regression_tests {
-    use super::*;
-    use crate::platform::AudioDevice;
-    use voice_bird_cli::config::AudioSessionKind;
-    use voice_bird_cli::session::layout::SessionSource;
-
-    /// Snapshot of the developer's real `config.toml`, restored on
-    /// drop (including panic unwind). With config-path injection in
-    /// place the handlers under test write to the tempdir, so this
-    /// guard should never observe a change — it stays as the safety
-    /// net that lets `key_handlers_in_tests_must_not_write_real_user_config`
-    /// fail loudly (without lasting damage) if the injection ever
-    /// regresses.
-    struct RealConfigGuard {
-        path: std::path::PathBuf,
-        before: Option<Vec<u8>>,
-        _serial: std::sync::MutexGuard<'static, ()>,
-    }
-    impl RealConfigGuard {
-        fn snapshot() -> Self {
-            // Serialize the tests in this module: they all read,
-            // mutate, and restore the same real file, so running
-            // them in parallel would interleave snapshots and
-            // restores nondeterministically.
-            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let serial = SERIAL
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Use the *real* config path, not the env-var-overridden
-            // `AppConfig::config_path()`. These tests verify that
-            // the production code does NOT touch the developer's
-            // real config — the guard's snapshot/restore has to
-            // refer to that real path, otherwise it would point
-            // at the test tempdir and miss any real-config
-            // pollution.
-            let path = voice_bird_cli::test_utils::real_config_path();
-            let before = std::fs::read(&path).ok();
-            Self {
-                path,
-                before,
-                _serial: serial,
-            }
-        }
-    }
-    impl Drop for RealConfigGuard {
-        fn drop(&mut self) {
-            match &self.before {
-                Some(bytes) => {
-                    let _ = std::fs::write(&self.path, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(&self.path);
+        tokio::select! {
+            event = input.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => handle_key(key, &consumer.consumers.ui_view, &mut db, &tx),
+                    Some(Ok(Event::Resize(_, _))) => dirty = true,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => break,
                 }
             }
-        }
-    }
-
-    /// Regression guard (review item 2; was RED, fixed in a608402).
-    /// `AppConfig::save()` used to write straight to the machine's
-    /// real config path, so tests driving real key handlers
-    /// persisted flipped flags and synthetic `sk-test` keys over
-    /// the developer's real `config.toml` on every `cargo test`
-    /// run. `App::new()` now installs a process-local tempdir
-    /// (via `test_utils::INSTALL_TEST_CONFIG` +
-    /// `VOICE_BIRD_TEST_CONFIG_PATH`) under cfg(test), so the
-    /// real file must stay byte-identical across any handler run.
-    #[test]
-    fn key_handlers_in_tests_must_not_write_real_user_config() {
-        let guard = RealConfigGuard::snapshot();
-        let before = guard.before.clone();
-
-        // Drive the idle `c` toggle — its else-branch calls
-        // `app.config.save()` unconditionally.
-        let mut app = App::new();
-        handle_normal_mode(&mut app, KeyCode::Char('c'));
-
-        let after = std::fs::read(&guard.path).ok();
-        assert_eq!(
-            before, after,
-            "driving a key handler in a unit test must not rewrite the \
-             developer's real config.toml at {} — inject the config path \
-             (env override or App::with_config) so tests run against a \
-             tempdir",
-            guard.path.display()
-        );
-    }
-
-    /// Regression guard (review item 8).
-    ///
-    /// The idle Mode panel now reads the per-source override
-    /// (post the display-helper fix). The idle `c` toggle must
-    /// flip whatever the panel actually shows — not the bare
-    /// global flag and not the override's raw value in
-    /// isolation. One press must always invert the displayed
-    /// state, otherwise the first keypress is a visible no-op.
-    #[test]
-    fn idle_c_toggle_must_flip_the_displayed_cloud_state_v2() {
-        let _guard = RealConfigGuard::snapshot();
-        let mut app = App::new();
-
-        // Panel reads the focused slot's customization. The
-        // user sees "Cloud: OFF"…
-        app.devices = vec![AudioDevice {
-            name: "MacBook Pro Microphone".into(),
-            kind: AudioSessionKind::Input,
-        }];
-        app.selected_device_index = 0;
-        // …while the default is ON (stale — a prior session
-        // left the slot's customization OFF). The toggle must
-        // flip the displayed (OFF) state, NOT seed from the
-        // default (ON) — otherwise one press would land back
-        // on OFF and the user would see no change.
-        app.default_slot_config.cloud_on = true;
-        let slot = app
-            .slots
-            .iter_mut()
-            .find(|s| s.id == app.focused_slot)
-            .unwrap();
-        slot.config.cloud_on = Some(false);
-
-        // Sanity: the panel is showing OFF right now.
-        assert!(
-            !app.display_cloud_on(),
-            "setup must show per-slot OFF (panel) with default ON underneath"
-        );
-
-        // The user presses `c` to flip OFF → ON.
-        handle_normal_mode(&mut app, KeyCode::Char('c'));
-
-        assert!(
-            app.display_cloud_on(),
-            "one press of `c` must flip the DISPLAYED state from OFF to ON"
-        );
-        let slot = app
-            .slot_by_id(app.focused_slot)
-            .expect("focused slot must exist");
-        assert_eq!(
-            slot.config.cloud_on,
-            Some(true),
-            "the slot's customization must agree with the newly displayed \
-             state (ON) after the toggle"
-        );
-    }
-}
-
-/// Return the names of devices or apps the funnel should
-/// navigate on the current step, in the order the picker
-/// will render them. Single source of truth for what "row 0"
-/// means — the cursor bounds, the picker renderer, and the
-/// cursor→name recorder all consume this list. When they
-/// drift, the cursor walks past the visible end and the
-/// commit picks a phantom row that wasn't on screen.
-///
-/// `DeviceInput` → Input devices only (mics).
-/// `DeviceOutput` → Output devices only (speakers).
-/// `AppLoopback` → per-app capture targets.
-///
-/// The prompt step and the commit sentinel return an empty
-/// list — the wizard's `cursor_*` methods are no-ops there.
-fn funnel_visible_options<'a>(
-    app: &'a App,
-    funnel: &voice_bird_cli::funnel::RoomFunnelState,
-) -> Vec<&'a str> {
-    use voice_bird_cli::room::SourceKind;
-    use voice_bird_cli::config::AudioSessionKind;
-    let Some(binding) = funnel.role_bindings.get(funnel.current_step) else {
-        return Vec::new();
-    };
-    match binding.source_kind {
-        SourceKind::DeviceInput => app
-            .devices
-            .iter()
-            .filter(|d| matches!(d.kind, AudioSessionKind::Input))
-            .map(|d| d.name.as_str())
-            .collect(),
-        SourceKind::DeviceOutput => app
-            .devices
-            .iter()
-            .filter(|d| matches!(d.kind, AudioSessionKind::Output))
-            .map(|d| d.name.as_str())
-            .collect(),
-        SourceKind::AppLoopback => {
-            app.apps.iter().map(|a| a.name.as_str()).collect()
-        }
-    }
-}
-
-/// Convenience wrapper that returns the count of visible
-/// rows for the funnel cursor-bounds check. Equivalent to
-/// `funnel_visible_options(...).len()`.
-fn funnel_visible_rows(
-    app: &App,
-    funnel: &voice_bird_cli::funnel::RoomFunnelState,
-) -> usize {
-    funnel_visible_options(app, funnel).len()
-}
-#[cfg(test)]
-mod funnel_visible_rows_tests {
-    //! Pin the cursor-bounds contract of `funnel_visible_rows`:
-    //! the function returns the count of rows the funnel will
-    //! actually render, so cursor_down cannot walk the cursor
-    //! past the last visible row. Before the fix the function
-    //! returned `app.devices.len()` for DeviceInput roles,
-    //! which on a duplex USB headset (1 Input + 1 Output leg)
-    //! and a Mac mini speaker (1 Output) returned 3 while the
-    //! renderer showed 5 — every `↓` after the visible last
-    //! row would silently drop the cursor onto a phantom
-    //! Output entry the renderer was actually showing.
-
-    use super::*;
-    use voice_bird_cli::config::AudioSessionKind;
-    use voice_bird_cli::room::{RoleConstraint, SourceKind};
-    use voice_bird_cli::funnel::RoomFunnelState;
-
-    fn device(name: &str, kind: AudioSessionKind) -> crate::platform::AudioDevice {
-        crate::platform::AudioDevice {
-            name: name.into(),
-            kind,
-        }
-    }
-
-    fn app_with(devices: Vec<crate::platform::AudioDevice>) -> App {
-        let mut app = App::new();
-        app.devices = devices;
-        app
-    }
-
-    fn funnel_with(source_kind: SourceKind) -> RoomFunnelState {
-        let room = voice_bird_cli::room::Room {
-            slug: "x".into(),
-            name: "X".into(),
-            icon: None,
-            roles: vec![],
-            agent: None,
-            requires_pro: false,
-            requires_cloud: true,
-            prompt_template: String::new(),
-            role_constraints: vec![RoleConstraint {
-                role_slug: "interviewer".into(),
-                source_kind,
-                required_app_slug: None,
-                device_required: matches!(source_kind, SourceKind::DeviceInput),
-            }],
-        };
-        RoomFunnelState::new(&room)
-    }
-
-    #[test]
-    fn device_input_role_counts_only_input_kind() {
-        let app = app_with(vec![
-            device("EPOS PC 8 USB", AudioSessionKind::Input),
-            device("HD Pro Webcam C920", AudioSessionKind::Input),
-            device("EPOS PC 8 USB", AudioSessionKind::Output),
-            device("Smart M70D", AudioSessionKind::Output),
-            device("Mac mini Speakers", AudioSessionKind::Output),
-        ]);
-        let funnel = funnel_with(SourceKind::DeviceInput);
-        assert_eq!(
-            funnel_visible_rows(&app, &funnel),
-            2,
-            "DeviceInput funnel must count only Input devices — the renderer shows the same two"
-        );
-    }
-
-    #[test]
-    fn device_output_role_counts_only_output_kind() {
-        let app = app_with(vec![
-            device("EPOS PC 8 USB", AudioSessionKind::Input),
-            device("HD Pro Webcam C920", AudioSessionKind::Input),
-            device("EPOS PC 8 USB", AudioSessionKind::Output),
-            device("Smart M70D", AudioSessionKind::Output),
-            device("Mac mini Speakers", AudioSessionKind::Output),
-        ]);
-        let funnel = funnel_with(SourceKind::DeviceOutput);
-        assert_eq!(
-            funnel_visible_rows(&app, &funnel),
-            3,
-            "DeviceOutput funnel must count only Output devices"
-        );
-    }
-
-    #[test]
-    fn app_loopback_role_counts_apps() {
-        let mut app = App::new();
-        app.apps = vec![
-            crate::platform::AppSession {
-                id: "us.zoom.xos".into(),
-                name: "Zoom".into(),
-                process_id: 0,
-            },
-            crate::platform::AppSession {
-                id: "com.google.Chrome".into(),
-                name: "Chrome".into(),
-                process_id: 0,
-            },
-        ];
-        let funnel = funnel_with(SourceKind::AppLoopback);
-        assert_eq!(funnel_visible_rows(&app, &funnel), 2);
-    }
-
-    #[test]
-    fn cursor_bounds_match_rendered_rows_on_device_input_step() {
-        // Drives the bug end-to-end: take the same device list
-        // from the screenshot, run cursor_down up to the bound
-        // the function reports, and assert the selected_index
-        // saturates at `visible_rows - 1` (not at `devices.len()
-        // - 1`).
-        let app = app_with(vec![
-            device("EPOS PC 8 USB", AudioSessionKind::Input),
-            device("HD Pro Webcam C920", AudioSessionKind::Input),
-            device("EPOS PC 8 USB", AudioSessionKind::Output),
-            device("Smart M70D", AudioSessionKind::Output),
-            device("Mac mini Speakers", AudioSessionKind::Output),
-        ]);
-        let mut funnel = funnel_with(SourceKind::DeviceInput);
-        let visible = funnel_visible_rows(&app, &funnel);
-        for _ in 0..10 {
-            funnel.cursor_down(visible);
-        }
-        assert_eq!(
-            funnel.role_bindings[0].selected_index,
-            Some(visible - 1),
-            "cursor must saturate at the last visible row, not the last inventory row"
-        );
-    }
-
-    #[test]
-    fn empty_inventory_returns_zero_rows() {
-        let app = app_with(vec![]);
-        let funnel = funnel_with(SourceKind::DeviceInput);
-        assert_eq!(funnel_visible_rows(&app, &funnel), 0);
-    }
-}
-
-/// Cancel the funnel wizard: clear `room_funnel` and roll the
-/// the rollback is to Free Room (slot 0); a future iteration
-/// could remember the previous room via
-/// `previous_active_room`, but the funnel contract is "Esc
-/// means cancel" — landing on Free Room is the conservative
-/// choice.
-fn handle_funnel_cancel(app: &mut App) {
-    if app.room_funnel.is_none() {
-        return;
-    }
-    app.room_funnel = None;
-    // Revert to Free Room (always at index 0).
-    let _ = app.activate_room(0);
-    app.banner = Some("Funnel cancelled — back to Free Room.".to_string());
-    log::info!("funnel: Esc/q → reverted to Free Room");
-}
-
-/// Advance the funnel by one step. At the prompt step, "Enter"
-/// commits the draft (or falls back to the room's built-in
-/// `prompt_template` when the draft is empty), then closes
-/// the funnel and leaves the user in the activated room.
-fn handle_funnel_enter(app: &mut App) {
-    let Some(mut funnel) = app.room_funnel.clone() else {
-        return;
-    };
-    funnel.advance();
-    if funnel.at_commit_step() {
-        // We've advanced past the prompt step — time to commit.
-        // First, persist the funnel's per-role picks into
-        // `slot_picker_memo` so the slots provisioned for this
-        // room actually record from the device/app the user
-        // chose. Without this, the wizard's selections are
-        // displayed and silently discarded.
-        app.commit_funnel_bindings(&funnel);
-        // The activated room is already in place. Use the draft
-        // if non-empty, otherwise the room's built-in
-        // `prompt_template`.
-        let room = app.active_room().clone();
-        let prompt = if !funnel.prompt_draft.is_empty() {
-            funnel.prompt_draft.clone()
-        } else {
-            room.prompt_template.clone()
-        };
-        app.banner = Some(format!(
-            "Funnel committed for '{}'. Prompt: {} chars.",
-            room.name,
-            prompt.len()
-        ));
-        log::info!(
-            "funnel: Enter → committed for room={} prompt_len={}",
-            room.slug,
-            prompt.len()
-        );
-        // Close the funnel. Without this, the modal stays
-        // open across Enter presses and the user sees the
-        // same banner re-appear without the wizard ever
-        // going away — Enter "doesn't work" from their
-        // perspective even though the commit logic ran.
-        // The funnel commit is the user's "I'm ready to be
-        // assisted now" signal. If the activated room has
-        // an agent, kick off one manual run so the AI
-        // assistant streams its opening response (e.g.
-        // "no transcript yet — start the conversation")
-        // immediately, instead of waiting for the user to
-        // press `g` or to record a full line of audio. The
-        // server's transcript schema requires ≥1 char, so
-        // an empty merged timeline becomes a sentinel
-        // string the prompt template can recognize.
-        if room.has_agent() {
-            let mut transcript = merged_timeline_text(app);
-            if transcript.trim().is_empty() {
-                transcript =
-                    "[Conversation starting — no transcript yet]".into();
+            event = bus.recv() => {
+                let Some(event) = event else { break };
+                let events = std::iter::once(event).chain(bus.drain()).collect();
+                consume_logged(events, &mut log, &mut consumer, &mut recording, &mut db, &tx);
+                dirty = true;
             }
-            log::info!(
-                "funnel: auto-triggering agent run for room={} \
-                 transcript_chars={}",
-                room.slug,
-                transcript.len()
-            );
-            app.trigger_agent_run(
-                voice_bird_cli::cloud::RunTrigger::Manual,
-                transcript,
-            );
+            _ = tick.tick() => {
+                watcher.check(&mut db, &tx).map_err(io::Error::other)?;
+            }
         }
+        if consumer.consumers.ui_view.should_quit {
+            break;
+        }
+    }
+        Ok(())
+    }.await;
+    // All exit paths finalize recordings, including input/terminal failures.
+    if !consumer.consumers.ui_view.should_quit {
+        consume_logged(
+            vec![AppEvent::Quit],
+            &mut log,
+            &mut consumer,
+            &mut recording,
+            &mut db,
+            &tx,
+        );
+    }
+    recording.begin_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !recording.shutdown_finished() {
+        match tokio::time::timeout_at(deadline, bus.recv()).await {
+            Ok(Some(event)) => {
+                let events = std::iter::once(event).chain(bus.drain()).collect();
+                consume_logged(
+                    events,
+                    &mut log,
+                    &mut consumer,
+                    &mut recording,
+                    &mut db,
+                    &tx,
+                );
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    if let Err(error) = recording.finish_shutdown(&mut db, &tx) {
+        eprintln!("voice-bird-cli: recording shutdown failed: {error}");
+    }
+    cleanup_inflight(&mut db, &mut bus, &mut consumer, &mut recording, &mut log);
+    result
+}
 
-
-        app.room_funnel = None;
-    } else {
-        // Either landed on the next role, or landed on the
-        // prompt step (depending on which Enter this is). Park
-        // there and wait for the next Enter.
-        app.room_funnel = Some(funnel);
+/// Log before the database gate; only accepted events reach the consumer.
+fn consume_logged(
+    events: Vec<AppEvent>,
+    log: &mut Option<voice_bird_cli::event_log::EventLog>,
+    consumer: &mut Consumer,
+    recording: &mut RecordingProducer,
+    db: &mut Database,
+    tx: &EventSender,
+) {
+    let mut accepted = Vec::with_capacity(events.len());
+    for event in events {
+        if let Some(log) = log.as_mut() {
+            log.append(&event);
+        }
+        let admitted = match voice_bird_cli::db::apply(db, &event) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                eprintln!("voice-bird-cli: event gate failed for {event:?}: {error}");
+                false
+            }
+        };
+        if admitted {
+            accepted.push(event);
+        } else if let AppEvent::TranscriptionRequested { request } = event {
+            recording.reject_unaccepted(&request);
+        }
+    }
+    for event in &accepted {
+        if let Err(error) = recording.produce(event, db, tx) {
+            eprintln!("voice-bird-cli: recording producer failed: {error}");
+            consumer.consumers.ui_view.warning = Some(format!("recording workers table: {error}"));
+            if let AppEvent::RecordingRequested { request } = event {
+                tx.publish(AppEvent::RecordingFailed {
+                    block: request.block,
+                    recording: request.recording,
+                    error: format!("recording worker claim: {error}"),
+                });
+            }
+        }
+    }
+    consumer.consume(&accepted, db, tx);
+}
+/// Drop staged archives and unpack scratch directories for every
+/// model with an active claim. Called at Quit so the cache dir is
+/// left clean for the next session — without this, a half-written
+/// `<id>.tmp/` from a killed worker would survive and the next
+/// session's first pick on the same model would attempt to unpack
+/// from it (the `install: unpack: failed to unpack ...tmp/...`
+/// error the user observed on 2026-09-16).
+///
+/// The active rows flip to `Cancelling` synchronously here; the
+/// worker probes will see the change and stop. Process exit then
+/// kills any workers still running.
+///
+/// `DiscardInflight { model }` is published for each active
+/// claim instead of reaching into the model store directly. The
+/// model-store consumer answers it by sweeping staging on the next drain.
+fn cleanup_inflight(
+    db: &mut Database,
+    bus: &mut EventBus,
+    consumer: &mut Consumer,
+    recording: &mut RecordingProducer,
+    log: &mut Option<voice_bird_cli::event_log::EventLog>,
+) {
+    let active = match downloads::active(db) {
+        Ok(a) => a,
+        Err(error) => {
+            eprintln!("voice-bird-cli: cannot query downloads during shutdown: {error}");
+            Vec::new()
+        }
+    };
+    for row in &active {
+        let _ = downloads::cancel(db, row.model.as_ref());
+    }
+    let models: Vec<std::sync::Arc<str>> = active.iter().map(|r| r.model.clone()).collect();
+    for model in models {
+        bus.sender().publish(AppEvent::DiscardInflight { model });
+    }
+    // Flush cleanup and lifecycle events through the same log/database gate.
+    let tx = bus.sender();
+    loop {
+        let events: Vec<_> = bus.drain().collect();
+        if events.is_empty() {
+            break;
+        }
+        consume_logged(events, log, consumer, recording, db, &tx);
     }
 }
 
+#[cfg(feature = "net")]
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
+    Arc::new(HttpDownloader)
+}
+
+#[cfg(not(feature = "net"))]
+fn cfg_build_downloader() -> Arc<dyn Downloader> {
+    // Without the `net` feature the binary can't download. Tests
+    // exercise the full flow through FixtureDownloader; the
+    // binary is the production switch and exits early here.
+    eprintln!("voice-bird-cli: built without the `net` feature, downloads are disabled");
+    std::process::exit(2);
+}
+
 #[cfg(test)]
-mod funnel_commit_tests {
-    //! Pin the post-commit state. `handle_funnel_enter` runs
-    //! the commit branch when the funnel is on the prompt
-    //! step (current_step == role_bindings.len()). The bug
-    //! that motivated this module: the commit branch set the
-    //! banner but forgot to clear `app.room_funnel`. The
-    //! modal stayed open across every Enter press, the
-    //! banner got re-overwritten with the same text, and
-    //! the user concluded "Enter doesn't work". These tests
-    //! pin both halves of the contract — the bindings land
-    //! in the slot memo AND the funnel is closed so the
-    //! next Enter falls through to the normal-mode start
-    //! path instead of re-entering the wizard.
+mod tests {
     use super::*;
-    use voice_bird_cli::room::{Room, RoleConstraint, RoleDef};
-    use voice_bird_cli::funnel::RoomFunnelState;
+    use std::cell::Cell;
 
-    fn open_software_interview_funnel(app: &mut App) {
-        app.default_slot_config.cloud_on = true;
-        app.plan_is_pro = Some(true);
-        app.devices = vec![crate::platform::AudioDevice {
-            name: "EPOS PC 8 USB".into(),
-            kind: voice_bird_cli::config::AudioSessionKind::Input,
-        }];
-        let mut room = voice_bird_cli::room::Room {
-            slug: "si".into(),
-            name: "Software Interview".into(),
-            icon: None,
-            roles: vec![RoleDef {
-                slug: "interviewee".into(),
-                name: "Interviewee".into(),
-            }],
-            agent: None,
-            requires_pro: false,
-            requires_cloud: true,
-            prompt_template: "default".into(),
-            role_constraints: vec![RoleConstraint {
-                role_slug: "interviewee".into(),
-                source_kind: voice_bird_cli::room::SourceKind::DeviceInput,
-                required_app_slug: None,
-                device_required: true,
-            }],
-        };
-        app.rooms = vec![Room::free_room(), room];
-        let _ = app.activate_room(1);
+    fn fail() -> io::Result<()> {
+        Err(io::Error::other("boom"))
     }
 
-    /// The headline bug: Enter on the prompt step must close
-    /// the funnel. Without `app.room_funnel = None` in the
-    /// commit branch, the modal stays open and every
-    /// subsequent Enter replays the same commit logic.
     #[test]
-    fn enter_on_prompt_step_closes_the_funnel() {
-        let mut app = App::new();
-        open_software_interview_funnel(&mut app);
-        // Walk to the prompt step.
-        let mut funnel = app.room_funnel.clone().unwrap();
-        funnel.cursor_down(1);
-        funnel.record_selected_name(&["EPOS PC 8 USB"]);
-        funnel.advance(); // role 0 → prompt step
-        assert!(funnel.at_prompt_step(),
-            "test setup must put the funnel on the prompt step");
-        app.room_funnel = Some(funnel);
-        // Now press Enter — should commit AND close.
-        handle_funnel_enter(&mut app);
-        assert!(app.room_funnel.is_none(),
-            "Enter on the prompt step must close the funnel; \
-             otherwise the modal stays open and the user sees \
-             'Enter doesn't work' even though commit ran");
-        assert!(app.banner.as_deref().unwrap_or("").starts_with("Funnel committed"),
-            "commit banner must still be set");
+    fn alt_screen_failure_still_restores_raw_mode() {
+        let restored = Cell::new(0);
+        let result = enter_terminal(|| Ok(()), fail, || restored.set(restored.get() + 1));
+        assert!(result.is_err());
+        assert_eq!(restored.get(), 1, "raw mode was not rolled back");
     }
 
-    /// Repeated Enter presses after commit must be no-ops on
-    /// the funnel — the dispatcher reads `app.room_funnel`
-    /// and short-circuits the wizard branch when it's None.
-    /// Without the close, every Enter replays the commit
-    /// branch and the banner keeps re-overwriting itself.
     #[test]
-    fn repeated_enter_after_commit_is_safe() {
-        let mut app = App::new();
-        open_software_interview_funnel(&mut app);
-        let mut funnel = app.room_funnel.clone().unwrap();
-        funnel.cursor_down(1);
-        funnel.record_selected_name(&["EPOS PC 8 USB"]);
-        funnel.advance(); // → prompt step
-        app.room_funnel = Some(funnel);
-        handle_funnel_enter(&mut app); // commits + closes
-        let banner_after_first = app.banner.clone();
-        // Second Enter — funnel is None, must be a no-op.
-        handle_funnel_enter(&mut app);
-        assert_eq!(app.banner, banner_after_first,
-            "second Enter after commit must not mutate the banner");
-        // Third for good measure.
-        handle_funnel_enter(&mut app);
-        assert_eq!(app.banner, banner_after_first);
+    fn raw_mode_failure_has_nothing_to_restore() {
+        let restored = Cell::new(0);
+        let result = enter_terminal(fail, || Ok(()), || restored.set(restored.get() + 1));
+        assert!(result.is_err());
+        assert_eq!(restored.get(), 0, "restore ran though nothing was enabled");
     }
 
-    /// Pre-commit (still on a role step), Enter must NOT
-    /// close the funnel — it must just advance to the next
-    /// role or the prompt step. The funnel is parked and
-    /// stays Some(…) so the next Enter on the prompt step
-    /// is what commits.
     #[test]
-    fn enter_on_role_step_keeps_funnel_open() {
-        let mut app = App::new();
-        open_software_interview_funnel(&mut app);
-        // Stay on role 0 (no advance yet). Press Enter.
-        assert!(app.room_funnel.is_some());
-        handle_funnel_enter(&mut app);
-        // Not the commit branch — the funnel is parked on
-        // the prompt step, ready for the user's next Enter.
-        assert!(app.room_funnel.is_some(),
-            "Enter on a role step must advance, NOT close the funnel");
-        let funnel = app.room_funnel.as_ref().unwrap();
-        assert!(funnel.at_prompt_step(),
-            "advancing from role 0 must land on the prompt step");
-    }
-
-    // ---- auto-trigger after funnel commit ---------------------
-
-    /// Variant of `open_software_interview_funnel` for the
-    /// agent-run tests: the room has an `agent`, mirroring
-    /// the real `Software Interview` room on voicebird.app.
-    /// Without `agent = Some(...)`, `start_agent_run` early-
-    /// returns and no worker is spawned.
-    fn open_agent_room_funnel(
-        app: &mut App,
-    ) {
-        open_software_interview_funnel(app);
-        // Splice an agent onto the active room so the
-        // auto-trigger path actually fires.
-        if let Some(r) = app.rooms.get_mut(1) {
-            r.agent = Some(voice_bird_cli::room::AgentRef {
-                id: "ai-interview-assistant".into(),
-                name: "AI Interview Assistant".into(),
-                icon: None,
-            });
+    fn success_restores_exactly_once_on_drop() {
+        let restored = Cell::new(0);
+        {
+            let _guard = enter_terminal(|| Ok(()), || Ok(()), || restored.set(restored.get() + 1))
+                .expect("enter");
+            assert_eq!(restored.get(), 0, "restore ran before drop");
         }
+        assert_eq!(restored.get(), 1);
     }
-
-    /// The headline "I don't see that anything is streamed"
-    /// bug: completing the funnel for an agent room must
-    /// spawn an agent run so the assistant's opening
-    /// response starts streaming in the Context pane. Pre-
-    /// fix, `handle_funnel_enter` committed and closed the
-    /// funnel but never called `trigger_agent_run`, so the
-    /// user had to press `g` (or start recording + wait for
-    /// the 65 s floor) to see any output — and on an empty
-    /// timeline the server rejected the run with 400.
-    /// This test pins that the spawn happens.
-    #[test]
-    fn funnel_commit_auto_triggers_agent_run() {
-        let mut app = App::new();
-        open_agent_room_funnel(&mut app);
-        let mut funnel = app.room_funnel.clone().unwrap();
-        funnel.cursor_down(1);
-        funnel.record_selected_name(&["EPOS PC 8 USB"]);
-        funnel.advance(); // role 0 → prompt step
-        app.room_funnel = Some(funnel);
-        assert!(app.agent_run_worker.is_none(),
-            "precondition: no in-flight agent run");
-        handle_funnel_enter(&mut app);
-        assert!(app.agent_run_worker.is_some(),
-            "completing the funnel for an agent room must \
-             spawn an agent run so the user sees streaming; \
-             otherwise the Context pane stays empty until \
-             they press `g` or hit the 65 s auto debounce");
-        // Drain a tick so the test's spawned worker
-        // doesn't outlive the test process.
-        app.drain_agent_run_state();
-        if let Some((handle, _)) = app.agent_run_worker.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Empty transcript on commit must use a sentinel, not
-    /// an empty string. The server's `/api/agent-runs`
-    /// schema enforces `transcript.min(1)` and returns 400
-    /// for empty bodies — the run would `StartFailed`
-    /// with "agent-runs returned 400" before any SSE
-    /// frames, leaving the user with the same "nothing
-    /// streamed" UX. Pre-fix `trigger_agent_run` received
-    /// an empty transcript and failed. This test pins
-    /// that the sentinel keeps the run alive.
-    #[test]
-    fn funnel_commit_with_empty_timeline_uses_sentinel() {
-        let mut app = App::new();
-        open_agent_room_funnel(&mut app);
-        // Precondition: no committed lines yet, the
-        // merged timeline is empty.
-        assert!(app.merged_timeline().is_empty());
-        let mut funnel = app.room_funnel.clone().unwrap();
-        funnel.cursor_down(1);
-        funnel.record_selected_name(&["EPOS PC 8 USB"]);
-        funnel.advance(); // → prompt step
-        app.room_funnel = Some(funnel);
-        handle_funnel_enter(&mut app);
-        // We can't see the exact transcript the worker
-        // shipped (it's already moved into the spawned
-        // thread), but we CAN verify the run actually
-        // fired and that `start_agent_run` accepted it —
-        // which proves a non-empty transcript went in,
-        // because an empty one would have been rejected
-        // by the server's 400 before any worker-side
-        // spawn could be observable here. The
-        // strongest unit-level signal we have is that
-        // the worker is `Some` and the state moved
-        // out of the default.
-        assert_eq!(app.agent_run_state.status, "starting",
-            "agent_run_state must transition out of idle \
-             on commit when the room has an agent");
-        // Drain + join so we don't leak the worker.
-        app.drain_agent_run_state();
-        if let Some((handle, _)) = app.agent_run_worker.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Auto-trigger must NOT fire for rooms without an
-    /// agent. Free Room's funnel path (if we ever
-    /// activate it directly without a catalog) must
-    /// remain silent — `g` and the auto path already
-    /// no-op for Free Room; the post-commit hook must
-    /// follow the same rule.
-    #[test]
-    fn funnel_commit_skips_trigger_when_no_agent() {
-        let mut app = App::new();
-        open_software_interview_funnel(&mut app); // agent: None
-        let mut funnel = app.room_funnel.clone().unwrap();
-        funnel.cursor_down(1);
-        funnel.record_selected_name(&["EPOS PC 8 USB"]);
-        funnel.advance();
-        app.room_funnel = Some(funnel);
-        assert!(app.agent_run_worker.is_none());
-        handle_funnel_enter(&mut app);
-        assert!(app.agent_run_worker.is_none(),
-            "funnel commit on a no-agent room must not \
-             spawn a worker; `trigger_agent_run` no-ops \
-             on Free Room and the commit hook must too");
-    }
-
 }
