@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use voice_bird_next::bus::{AppEvent, EventBus, TranscriptPass};
+use voice_bird_next::bus::{AppEvent, EventBus, FocusMove, TranscriptPass};
 use voice_bird_next::consumer::recording::RecordingConsumer;
 use voice_bird_next::consumer::ui_view::BlockState;
 use voice_bird_next::consumer::{Consumer, Consumers};
@@ -226,7 +226,9 @@ async fn cached_models_capture_live_text_and_close_flushes_refinement_and_metada
     assert!(dir.join("transcript.jsonl").is_file());
     assert_eq!(h.capture.calls.load(Ordering::SeqCst), 1);
     // Repeated reconciliation must not open another source.
-    h.process(vec![AppEvent::MenuOpened, AppEvent::MenuClosed]);
+    h.process(vec![AppEvent::FocusMoved {
+        direction: FocusMove::Next,
+    }]);
     assert_eq!(h.capture.calls.load(Ordering::SeqCst), 1);
     h.process(vec![AppEvent::BlockClosed { block: 1 }]);
     h.settle(|h| {
@@ -449,20 +451,21 @@ async fn capture_failure_is_persisted_and_explicit_retry_recovers() {
 }
 
 #[tokio::test]
-async fn quit_finalizes_visible_and_hidden_blocks() {
+async fn quit_finalizes_all_four_sessions() {
     let mut h = Harness::new();
     h.start();
-    h.process(vec![
-        AppEvent::AddBlock,
-        AppEvent::BeginLanguage {
-            block: 2,
-            language: &LANGUAGES[0],
-            source_rev: None,
-        },
-    ]);
-    h.drain();
-    h.consumer.consumers.ui_view.blocks[0].visible = false;
-    h.settle(|h| h.sessions().len() == 2 && h.capture.calls.load(Ordering::SeqCst) == 2)
+    for block in 2..=4 {
+        h.process(vec![
+            AppEvent::AddBlock,
+            AppEvent::BeginLanguage {
+                block,
+                language: &LANGUAGES[0],
+                source_rev: None,
+            },
+        ]);
+        h.drain();
+    }
+    h.settle(|h| h.sessions().len() == 4 && h.capture.calls.load(Ordering::SeqCst) == 4)
         .await;
     h.quit().await;
     for (id, dir) in h.sessions() {
@@ -474,6 +477,78 @@ async fn quit_finalizes_visible_and_hidden_blocks() {
             std::fs::read_to_string(dir.join("transcript.txt")).unwrap(),
             "Hello, world. Next words.\n"
         );
+    }
+}
+
+#[tokio::test]
+async fn fifth_add_block_cannot_start_another_recording() {
+    for snapshot in [None, Some(sample_source_snapshot())] {
+        let mut h = Harness::new();
+        h.consumer.consumers.audio_sources =
+            voice_bird_next::consumer::audio_sources::AudioSourcesConsumer::new(Arc::new(
+                FixtureSources(snapshot),
+            ));
+        h.start();
+        for block in 2..=4 {
+            h.process(vec![
+                AppEvent::AddBlock,
+                AppEvent::BeginLanguage {
+                    block,
+                    language: &LANGUAGES[0],
+                    source_rev: None,
+                },
+            ]);
+            h.drain();
+        }
+        h.settle(|h| h.sessions().len() == 4 && h.capture.calls.load(Ordering::SeqCst) == 4)
+            .await;
+        let focus = h.consumer.consumers.ui_view.focus;
+        let identities: Vec<_> = h
+            .consumer
+            .consumers
+            .ui_view
+            .blocks
+            .iter()
+            .map(|block| match &block.state {
+                BlockState::Recording {
+                    recording: Some(recording),
+                    ..
+                } => (block.id, *recording),
+                state => panic!("session must be recording: {state:?}"),
+            })
+            .collect();
+        let sessions = h.sessions();
+
+        // Both enumeration outcomes return to the same authoritative reducer gate.
+        h.key(Intent::AddBlock);
+        h.settle(|h| h.consumer.consumers.ui_view.warning.is_some())
+            .await;
+        let view = &h.consumer.consumers.ui_view;
+        assert_eq!(view.blocks.len(), 4);
+        assert_eq!(
+            view.warning.as_deref(),
+            Some("session limit (4) reached; close a session to make room")
+        );
+        assert_eq!(view.focus, focus);
+        for (block, (id, recording)) in view.blocks.iter().zip(&identities) {
+            assert_eq!(block.id, *id);
+            assert!(matches!(
+                &block.state,
+                BlockState::Recording {
+                    recording: Some(current),
+                    ..
+                } if current == recording
+            ));
+        }
+        assert_eq!(h.sessions(), sessions);
+        assert_eq!(h.capture.calls.load(Ordering::SeqCst), 4);
+        let conn = rusqlite::Connection::open(h._tmp.path().join("index.sqlite")).unwrap();
+        let rows: u64 = conn
+            .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 4);
+        h.quit().await;
+        assert_eq!(h.capture.calls.load(Ordering::SeqCst), 4);
     }
 }
 
@@ -528,7 +603,9 @@ async fn queued_start_and_stop_in_one_batch_finalize_without_reopening_capture()
         })
     })
     .await;
-    h.process(vec![AppEvent::MenuOpened, AppEvent::MenuClosed]);
+    h.process(vec![AppEvent::FocusMoved {
+        direction: FocusMove::Next,
+    }]);
     h.drain();
     assert!(matches!(
         h.consumer.consumers.ui_view.blocks[0].state,
@@ -603,7 +680,12 @@ async fn natural_capture_end_survives_consumer_rebuild_until_explicit_resume() {
         "Naturally finalized.\n"
     );
     h.consumer.consumers.recording = RecordingConsumer::new(h.store.clone());
-    h.process(vec![request, AppEvent::MenuOpened, AppEvent::MenuClosed]);
+    h.process(vec![
+        request,
+        AppEvent::FocusMoved {
+            direction: FocusMove::Next,
+        },
+    ]);
     h.drain();
     assert!(matches!(
         h.consumer.consumers.ui_view.blocks[0].state,

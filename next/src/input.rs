@@ -24,10 +24,6 @@ pub enum Intent {
     StepBack,
     Retry,
     BlockClosed,
-    /// `Tab`: open the session menu (or close it if already open).
-    /// The resolver decides which side of the toggle to land on
-    /// based on `ui_view.menu`.
-    ToggleMenu,
     Quit,
 }
 
@@ -57,7 +53,6 @@ pub fn map_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Enter => Some(Intent::Confirm),
         KeyCode::Backspace => Some(Intent::StepBack),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Intent::Retry),
-        KeyCode::Tab => Some(Intent::ToggleMenu),
         _ => None,
     }
 }
@@ -117,22 +112,6 @@ mod tests {
     fn other_keys_are_ignored() {
         assert_eq!(map_key(press(KeyCode::Char('x'))), None);
         assert_eq!(map_key(press(KeyCode::Char('c'))), None); // plain `c`, no ctrl
-    }
-
-    #[test]
-    fn tab_maps_to_toggle_menu() {
-        assert_eq!(map_key(press(KeyCode::Tab)), Some(Intent::ToggleMenu));
-    }
-
-    #[test]
-    fn arrows_unchanged_with_tab_added() {
-        // Sanity: Tab only adds a binding; nothing else moves.
-        assert_eq!(map_key(press(KeyCode::Left)), Some(Intent::FocusPrev));
-        assert_eq!(map_key(press(KeyCode::Right)), Some(Intent::FocusNext));
-        assert_eq!(map_key(press(KeyCode::Up)), Some(Intent::PickerPrev));
-        assert_eq!(map_key(press(KeyCode::Down)), Some(Intent::PickerNext));
-        assert_eq!(map_key(press(KeyCode::Enter)), Some(Intent::Confirm));
-        assert_eq!(map_key(press(KeyCode::Esc)), Some(Intent::BlockClosed));
     }
 
     #[test]

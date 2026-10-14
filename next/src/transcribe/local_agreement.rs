@@ -19,14 +19,17 @@ pub(super) struct AgreementOutput {
 /// Compare only uncommitted tokens, accounting for timestamp drift in overlap.
 pub(super) fn step(prev: &[Token], curr: &[Token], committed_upto: u64) -> AgreementOutput {
     let remaining = pending(prev, curr, committed_upto);
+    // Compare with the original boundary. A repeated word's end can shift
+    // beyond the next word's start; it must not erase that word from prev.
+    let prev = uncommitted(prev, committed_upto);
     let committed_upto = curr[..curr.len() - remaining.len()]
         .iter()
         .map(|token| token.t_end_ms)
         .max()
         .unwrap_or(committed_upto)
+        .min(remaining.first().map_or(u64::MAX, |token| token.t_start_ms))
         .max(committed_upto);
     let curr = remaining;
-    let prev = uncommitted(prev, committed_upto);
     let prefix = prev
         .iter()
         .zip(curr)
@@ -41,6 +44,11 @@ pub(super) fn step(prev: &[Token], curr: &[Token], committed_upto: u64) -> Agree
             .map(|t| t.t_end_ms)
             .max()
             .unwrap_or(committed_upto)
+            .min(
+                curr[prefix..]
+                    .first()
+                    .map_or(u64::MAX, |token| token.t_start_ms),
+            )
             .max(committed_upto),
     }
 }
@@ -66,7 +74,10 @@ pub(super) fn pending<'a>(prev: &[Token], curr: &'a [Token], watermark: u64) -> 
                     .take_while(|old| {
                         old.t_end_ms.saturating_add(TIMESTAMP_TOLERANCE_MS) >= token.t_start_ms
                     })
-                    .any(|old| old.t_end_ms <= watermark && agree(old, token))
+                    .any(|old| {
+                        (old.t_end_ms <= watermark || old.t_start_ms < watermark)
+                            && agree(old, token)
+                    })
         })
         .unwrap_or(curr.len());
     &curr[first..]
@@ -209,6 +220,60 @@ mod tests {
         assert_eq!(output.tentative, "");
         assert_eq!(output.committed_upto, 650);
         assert!(segments(uncommitted(&current, output.committed_upto)).is_empty());
+    }
+
+    #[test]
+    fn shifted_committed_end_does_not_block_the_next_stable_token() {
+        let previous = [token(" old", 400, 500), token(" new", 600, 900)];
+        let current = [token(" old", 650, 750), token(" new", 700, 1000)];
+        let output = step(&previous, &current, 500);
+        assert_eq!(
+            output.committed,
+            vec![TranscriptOut::Committed {
+                t_start_ms: 700,
+                t_end_ms: 1000,
+                text: "new".into(),
+            }]
+        );
+        assert!(output.tentative.is_empty());
+    }
+
+    #[test]
+    fn shifted_overlap_preserves_a_revised_word_for_the_next_hypothesis() {
+        let previous = [token(" old", 400, 500), token(" draft", 600, 900)];
+        let current = [token(" old", 650, 750), token(" new", 700, 1000)];
+        let revised = step(&previous, &current, 500);
+        assert!(revised.committed.is_empty());
+        assert_eq!(revised.tentative, "new");
+        let next = [token(" old", 730, 850), token(" new", 750, 1050)];
+        let stable = step(&current, &next, revised.committed_upto);
+        assert_eq!(
+            stable.committed,
+            vec![TranscriptOut::Committed {
+                t_start_ms: 750,
+                t_end_ms: 1050,
+                text: "new".into(),
+            }]
+        );
+        assert!(stable.tentative.is_empty());
+    }
+
+    #[test]
+    fn stable_prefix_does_not_discard_its_overlapping_revised_tail() {
+        let previous = [token(" first", 0, 1000), token(" draft", 950, 1500)];
+        let current = [token(" first", 0, 1000), token(" new", 950, 1500)];
+        let first = step(&previous, &current, 0);
+        assert_eq!(first.tentative, "new");
+        let next = step(&current, &current, first.committed_upto);
+        assert_eq!(
+            next.committed,
+            vec![TranscriptOut::Committed {
+                t_start_ms: 950,
+                t_end_ms: 1500,
+                text: "new".into(),
+            }]
+        );
+        assert!(next.tentative.is_empty());
     }
 
     #[test]

@@ -29,6 +29,14 @@ titles show only selections before the current picker step; active blocks use
 `id · device · app · language` (app omitted for inputs). Recording captures
 real audio on macOS and shows committed and tentative text inside the block.
 
+At most four sessions can be open, including source/language pickers and blocks
+waiting for models. Each recording owns decoder state, capture, and audio buffers;
+the cap bounds per-session memory for laptop stability. A fifth `+` leaves the
+sessions and focus unchanged and shows
+`session limit (4) reached; close a session to make room` in the red title bar.
+Closing a session with Esc clears that warning and allows another session.
+Every session remains visible; there is no hidden-session menu, and Tab does nothing.
+
 The registry currently maps `en` to `distil-small.en` for live
 transcription and `large-v3-turbo` for refinement. macOS also requires their
 compiled Core ML encoders; the distilled model uses its frozen small.en teacher
@@ -77,9 +85,11 @@ the same package-scoped Clippy commands provides pull-request enforcement.
 - `net` (default) — `reqwest` + `rustls` for the live `HttpDownloader`.
 - `local-engine` (default) — native `whisper-rs`; macOS enables Metal and
   requires verified Core ML encoder loading. Both passes retain the full encoder
-  context, flash attention, and two CPU threads per call. Live uses greedy
-  decoding with LocalAgreement; refinement uses five-second beam-search
-  windows with one second of backward context.
+  context, flash attention, and two CPU threads per call. Live uses single-attempt
+  temperature-zero greedy decoding with LocalAgreement instead of retrying the
+  retained audio at higher temperatures. Provisional text can be less accurate on
+  difficult audio; refinement retains beam search, native fallback recovery,
+  five-second windows, and one second of backward context.
 - `--no-default-features` — native-free transcription fixtures and offline
   downloads exercise the full lifecycle without building whisper.cpp.
   The production factory reports `local engine disabled`; the binary still
@@ -113,11 +123,20 @@ overruns still fail the block rather than silently dropping speech.
 The engine factory caches model weights by canonical path. Each recording/pass
 has an exclusive mutable decoder state. A persistent inference pool sizes itself
 from available CPU parallelism and total RAM at startup. Every worker serves either
-pass, choosing runnable live work before refinement, round-robin across recordings
-within each pass. Multiple recordings can run live jobs concurrently; jobs for the
-same recording/pass never overlap. Running refinement is not preempted.
+pass. Each pass offers its next runnable recording in round-robin order; the worker
+chooses the candidate with the earlier audio-time deadline: capture origin plus
+the job's audio end plus 750 ms for live or five seconds for refinement. Live wins
+ties, but overdue refinement is not starved by newly queued live work. Deadlines
+follow audio age, not enqueue time, so startup backlog is prioritized too.
+Multiple recordings can run live jobs concurrently; jobs for the same
+recording/pass never overlap. Running refinement is not preempted.
 Live tasks consume all available audio and decode only the newest hypothesis;
 refinement processes ordered five-second windows without skipping audio.
+Live agreement keeps committed boundary tokens after PCM trimming so shifted
+overlap words do not block the next stable prefix. Its timestamp watermark never
+advances past the first still-uncommitted token, preserving revised words whose
+timestamps overlap an earlier word's end. Stable prefix progress releases retained
+audio instead of repeatedly decoding an ever-growing provisional transcript.
 At Quit the pool uses its separate shutdown budget; workers retain the same policy.
 The coordinator keeps at most one pending/in-flight task per recording/pass.
 Scheduler pending/active identities, dispatch readiness, cancellation fences, worker
@@ -177,6 +196,10 @@ only after SQLite admits the exact recording/job. Rejected requests return their
 owned state without executing inference. Refined segments replace overlapping
 live text in the UI; later live text and dim tentative words remain visible.
 The UI retains only the newest 100 segments/lines.
+Committed text and the dim live preview show their newest wrapped rows when space
+is limited, clipping older text from the left. Wrapping preserves whole Unicode
+graphemes, including combining marks and joined emoji. Preview clipping is
+presentation-only; the full tentative text stays in `UiView`.
 
 Sessions are stored beneath the application data directory:
 
@@ -272,7 +295,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 
 | key | intent |
 |---|---|
-| `+` | add a block at the device picker on macOS, otherwise language picker |
+| `+` | add a block (maximum four) at the device picker on macOS, otherwise language picker |
 | `←` / `→` | move focus between blocks |
 | `↑` / `↓` | move picker highlight in the focused block |
 | `Enter` | select device/app, or resolve language and prepare all required assets |
@@ -287,7 +310,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 |---|---|
 | `src/language.rs` | language registry mapping codes to live/refine models and required assets |
 | `src/audio_sources.rs` | shared source types, `AudioSourcesCatalog`, and native macOS catalog |
-| `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; session menu and model download catalog |
+| `src/picker.rs` | shared `ListPicker` selection state for device, app, and language lists; model download catalog |
 | `src/bus.rs` | `AppEvent` commands/UI events + Tokio unbounded `EventBus` / synchronous `EventSender` |
 | `src/consumer/ui_view.rs` | `UiView` + `BlockState` + pure reducer |
 | `src/producer/model_watch.rs` | startup/tick disk checks for the entire catalog, persisted in SQLite |
@@ -311,7 +334,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 | `src/producer/model_store.rs` | blocking installation workers and install-result events |
 | `src/producer/input.rs` | intent-to-command resolution and last-waiter cancellation |
 | `src/producer/recording.rs` | capture threads, per-recording coordinators, stop flags, and bounded shutdown |
-| `src/producer/inference.rs` | private tasks, shared live-priority workers, hardware-derived concurrency, and lifecycle events |
+| `src/producer/inference.rs` | private tasks, shared audio-deadline workers, hardware-derived concurrency, and lifecycle events |
 | `src/producer/inference_limits.rs` | CPU/RAM-derived startup worker, recording, and shutdown budgets |
 | `src/producer/mod.rs` | external input and background worker services |
 | `src/consumer/mod.rs` | `Consumer` routes accepted events to its independent `Consumers` |
@@ -319,7 +342,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
 | `src/consumer/language.rs` | stateless SQLite availability/attempt queries and follow-up model requests |
 | `src/consumer/downloads.rs` | attempt-aware SQLite claims, request reconciliation, and fetch handoff |
 | `src/consumer/model_store.rs` | staging preparation, installation eligibility/handoff, and quit-time staging sweep |
-| `src/consumer/recording.rs` | reconcile visible/hidden blocks against SQLite lifecycle state and publish identity-scoped start/stop commands |
+| `src/consumer/recording.rs` | reconcile all sessions against SQLite lifecycle state and publish identity-scoped start/stop commands |
 | `src/event_log.rs` | append-only JSONL of every event |
 | `src/testing.rs` | render/download/store fixtures used by integration tests |
 | `src/main.rs` | terminal guard and Tokio `select!` over input, bus events, and 100 ms ticks |
@@ -412,7 +435,7 @@ cargo test -p voice-bird-next --test engine_smoke -- --ignored --nocapture
    table, then download history only for missing models. Accepted installation
    successes update availability before consumption; rejected stale successes
    cannot change it. A missing ready model sends every affected block, including
-   hidden sessions and the ready subset of Waiting blocks, back to Waiting and
+   the ready subset of Waiting blocks, back to Waiting and
    re-claims a shared download; pending, picker, and Failed sessions launch no
    automatic work. Duplicate notifications and observations after Quit do not
    launch work. Success resumes Recording automatically; failure enters Failed,

@@ -32,8 +32,7 @@ pub fn render(f: &mut Frame, ui_view: &UiView) {
     // When the reducer sets a transient warning (e.g. "session
     // limit reached; close a session to make room"), append it to
     // the title bar so the user actually sees it. The title bar
-    // is the one place we *know* is on screen, regardless of cap,
-    // menu state, or focused block.
+    // is always on screen, regardless of the focused block.
     let title = match ui_view.warning.as_deref() {
         Some(w) => format!("{} — ! {w}", ui_view.title),
         None => ui_view.title.clone(),
@@ -50,49 +49,15 @@ pub fn render(f: &mut Frame, ui_view: &UiView) {
 
     let inner = window.inner(f.area());
 
-    // The session menu is a left-side panel. When open, it claims
-    // `MENU_WIDTH` columns off the inner rect; when closed, the
-    // blocks take the full width — no empty reserved space. The
-    // split lives inside the outer window border, so the menu never
-    // overlaps the title.
-    let (menu_area, blocks_area) = match ui_view.menu.as_ref() {
-        Some(_) => {
-            let chunks = Layout::new(
-                Direction::Horizontal,
-                vec![Constraint::Length(MENU_WIDTH), Constraint::Fill(1)],
-            )
-            .split(inner);
-            (Some(chunks[0]), chunks[1])
-        }
-        None => (None, inner),
-    };
-
-    // Column layout uses the *visible* blocks only — the cap is
-    // enforced in the reducer's `show_block`, so the renderer never
-    // has to clamp. If no block is visible (e.g. nothing has been
-    // created yet), skip the layout entirely.
-    let visible: Vec<&crate::consumer::ui_view::Block> =
-        ui_view.blocks.iter().filter(|b| b.visible).collect();
-    if !visible.is_empty() {
+    // The reducer caps sessions; every block gets a full-width column.
+    if !ui_view.blocks.is_empty() {
         let columns = Layout::new(
             Direction::Horizontal,
-            vec![Constraint::Fill(1); visible.len()],
+            vec![Constraint::Fill(1); ui_view.blocks.len()],
         )
-        .split(blocks_area);
-        for (block, column) in visible.iter().zip(columns.iter()) {
-            // `ui_view.focus` is an index into `blocks`, not the visible
-            // list, so the focused check is "is this block's id the
-            // focused one?". Comparing the index directly would mark
-            // the wrong column focused once the cap has reordered
-            // anything.
-            let focused = Some(block.id) == ui_view.focused().map(|b| b.id);
-            render_block(f, block, focused, *column, ui_view);
-        }
-    }
-
-    if let Some(menu) = ui_view.menu.as_ref() {
-        if let Some(area) = menu_area {
-            render_menu(f, ui_view, menu, area);
+        .split(inner);
+        for (index, (block, column)) in ui_view.blocks.iter().zip(columns.iter()).enumerate() {
+            render_block(f, block, index == ui_view.focus, *column, ui_view);
         }
     }
 }
@@ -131,13 +96,6 @@ fn render_block(
         }
     }
 }
-
-/// Width of the left-hand session menu panel, in columns. Sized
-/// to fit `▶ session 999` (13 chars) on a single line — the
-/// session id is a `u8` that wraps after 255, so 999 covers every
-/// realistic lifetime of the app. The outer window border and the
-/// menu's own borders are not included in this width.
-const MENU_WIDTH: u16 = 15;
 
 fn block_border(focused: bool) -> Block<'static> {
     if focused {
@@ -192,7 +150,12 @@ fn render_source_picker(
         source.snapshot.apps.len()
     };
     let height = area.height.saturating_sub(2) as usize;
-    let (start, end) = menu_window(total, selected, height);
+    // Keep the selected source centered while fitting the available rows.
+    let rows = height.min(total);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(total.saturating_sub(rows));
+    let end = start + rows;
     let mut lines = Vec::with_capacity(end - start + 2);
     if total == 0 && !picking_device {
         lines.push(Line::from("no running apps"));
@@ -220,86 +183,6 @@ fn render_source_picker(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Compute the half-open `[start, end)` window of session indices
-/// to render, so that `selected` is visible and recentered as
-/// much as possible. Returns `(0, 0)` when there are no rows.
-///
-/// The window never extends past `total` rows, and `start` clamps
-/// to `0` so a terminal resize cannot make the menu "scroll past
-/// the top". This is the carousel's pure data shape — the
-/// renderer just iterates `ui_view.blocks[start..end]` and draws
-/// one line per row.
-fn menu_window(total: usize, selected: usize, height: usize) -> (usize, usize) {
-    if total == 0 || height == 0 {
-        return (0, 0);
-    }
-    // Clamp the panel to fit: the window can never be longer than
-    // either the terminal height or the session count.
-    let window = height.min(total);
-    if window >= total {
-        // Everything fits — no scroll needed.
-        return (0, total);
-    }
-    // Anchor `selected` near the middle of the window. `start =
-    // selected - height/2` puts the highlight one row above center
-    // when the window is longer than the remaining rows below —
-    // pressing Down on the last visible row moves the window by
-    // exactly one row, which makes the carousel feel balanced.
-    let mut start = selected.saturating_sub(window / 2);
-    if start + window > total {
-        start = total - window;
-    }
-    let end = start + window;
-    (start, end)
-}
-
-/// Render the left-hand session menu as a scrolling carousel.
-/// Rows are plain `▶ session N` labels — the menu is a
-/// navigation list, not a status panel, so model names and
-/// picker state stay out of here. Hidden sessions are drawn
-/// dimmed via `Stylize::dim()` so the user can see at a glance
-/// which four are on screen.
-///
-/// When the panel is shorter than the session count, only a
-/// window of rows is rendered — recentered on `menu.index` so
-/// the highlighted row is always visible, and rebalanced on
-/// every keystroke. This makes the menu responsive to terminal
-/// resizes (the window follows `inner.height`) without needing
-/// a separate scroll state on the menu itself.
-fn render_menu(f: &mut Frame, ui_view: &UiView, menu: &crate::picker::SessionMenu, area: Rect) {
-    let border = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().bold());
-    let inner = border.inner(area);
-    f.render_widget(border, area);
-
-    let total = ui_view.blocks.len();
-    let (start, end) = menu_window(total, menu.index, inner.height as usize);
-    if start >= end {
-        // Nothing to render (e.g. zero blocks, zero-height panel).
-        return;
-    }
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
-    for (idx, block) in ui_view.blocks[start..end].iter().enumerate() {
-        let absolute = start + idx;
-        let marker = if absolute == menu.index {
-            "\u{25b6}"
-        } else {
-            "  "
-        };
-        // Sketch contract: plain `session N` per row — the menu is
-        // a navigation list, not a status readout. Model names,
-        // picker state, and progress live in the column strip on
-        // the right.
-        let mut line = Line::from(format!("{marker} session {}", block.id));
-        if !block.visible {
-            line = line.dim();
-        }
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
 fn block_body_lines(block: &crate::consumer::ui_view::Block) -> Vec<Line<'static>> {
     match &block.state {
         BlockState::PickingLanguage(picker) => {
@@ -321,7 +204,7 @@ fn block_body_lines(block: &crate::consumer::ui_view::Block) -> Vec<Line<'static
 }
 
 /// Wrap before choosing the tail, so long older lines cannot push new text
-/// below the viewport. Width follows terminal cells, not UTF-8 bytes.
+/// Width and boundaries follow the widget's terminal-cell graphemes.
 fn transcript_rows(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -330,15 +213,15 @@ fn transcript_rows(text: &str, width: usize) -> Vec<String> {
     for line in text.lines() {
         let mut row = String::new();
         let mut cells = 0;
-        for ch in line.chars() {
-            let mut bytes = [0; 4];
-            let ch_width = Span::raw(ch.encode_utf8(&mut bytes) as &str).width();
-            if cells + ch_width > width && !row.is_empty() {
+        let span = Span::raw(line);
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if cells + grapheme_width > width && !row.is_empty() {
                 rows.push(std::mem::take(&mut row));
                 cells = 0;
             }
-            row.push(ch);
-            cells += ch_width;
+            row.push_str(grapheme.symbol);
+            cells += grapheme_width;
         }
         rows.push(row);
     }
@@ -771,127 +654,5 @@ mod tests {
         assert_eq!(human_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(human_bytes(75 * 1024 * 1024), "75.0 MB");
         assert_eq!(human_bytes(1024u64.pow(3)), "1.00 GB");
-    }
-
-    #[test]
-    fn five_blocks_ui_view_renders_exactly_four_column_titles() {
-        // After 5 AddBlocks the cap is reached: 4 columns visible,
-        // 1 hidden. The hidden block does not contribute a column
-        // title. The menu is closed so no panel steals width.
-        let mut s = UiView::default();
-        for _ in 0..5 {
-            s.apply(&crate::bus::AppEvent::AddBlock);
-        }
-        let out = render_to_string(&s, 100, 30);
-        for label in [
-            "2 · pick a language",
-            "3 · pick a language",
-            "4 · pick a language",
-            "5 · pick a language",
-        ] {
-            assert!(out.contains(label), "missing {label} in:\n{out}");
-        }
-        // Block 1 is hidden — its title must not appear in the
-        // column-strip portion of the layout.
-        assert!(
-            !out.contains("1 · pick a language"),
-            "hidden block 1 leaked into columns; got:\n{out}"
-        );
-        // The menu is closed, so the panel rows must NOT be drawn.
-        // (`session 1` lives only in the menu; the column strip
-        // for the visible blocks starts at `session 2`.)
-        assert!(
-            !out.contains("session 1"),
-            "menu panel rendered while closed; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn menu_open_lists_every_session_in_creation_order() {
-        // Five sessions with the menu open. The panel lists each
-        // session as a plain "session N" row — model names and
-        // picker state are deliberately absent (the column strip
-        // on the right owns those).
-        let mut s = UiView::default();
-        for _ in 0..5 {
-            s.apply(&crate::bus::AppEvent::AddBlock);
-        }
-        s.menu = Some(crate::picker::SessionMenu::open_at(0));
-        let out = render_to_string(&s, 100, 30);
-        for n in 1..=5 {
-            let needle = format!("session {n}");
-            assert!(
-                out.contains(&needle),
-                "menu missing session {n}; got:\n{out}"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_window_returns_full_list_when_everything_fits() {
-        // 5 rows in a 28-row panel: nothing to scroll.
-        assert_eq!(menu_window(5, 0, 28), (0, 5));
-        assert_eq!(menu_window(5, 4, 28), (0, 5));
-    }
-
-    #[test]
-    fn menu_window_returns_empty_when_no_rows() {
-        assert_eq!(menu_window(0, 0, 28), (0, 0));
-        assert_eq!(menu_window(5, 0, 0), (0, 0));
-    }
-
-    #[test]
-    fn menu_window_recenters_on_selected_row() {
-        // 31 sessions, 28-row panel, selection at row 15 (middle).
-        // Window starts at selected - height/2 = 15 - 14 = 1, end = 1 + 28 = 29.
-        assert_eq!(menu_window(31, 15, 28), (1, 29));
-        // Selection near top: window anchored at 0.
-        assert_eq!(menu_window(31, 0, 28), (0, 28));
-        // Selection near bottom: window anchored to fit.
-        assert_eq!(menu_window(31, 26, 28), (3, 31));
-        // Selection at very bottom: same anchor.
-        assert_eq!(menu_window(31, 30, 28), (3, 31));
-    }
-
-    #[test]
-    fn menu_window_clamps_when_panel_shrinks() {
-        // Terminal resized from 28 rows to 10 — window must follow.
-        assert_eq!(menu_window(31, 15, 10), (10, 20));
-        // Resize larger (40 rows still doesn't fit 100 rows).
-        assert_eq!(menu_window(100, 50, 40), (30, 70));
-    }
-
-    #[test]
-    fn menu_window_always_includes_the_selected_row() {
-        // Across a sweep of selections and heights, the window must
-        // contain `selected`. This is the carousel's core invariant:
-        // if it ever fails, the highlighted row is offscreen.
-        for total in [10usize, 31, 100] {
-            for height in [5usize, 14, 28, 40, 80] {
-                for selected in 0..total {
-                    let (start, end) = menu_window(total, selected, height);
-                    assert!(
-                        start <= selected && selected < end,
-                        "total={total} sel={selected} h={height}: window [{start},{end}) does not contain selected"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn menu_window_returns_a_window_no_longer_than_height_or_total() {
-        for total in [0usize, 1, 5, 31, 100] {
-            for height in [0usize, 1, 28, 80] {
-                for selected in 0..total.max(1) {
-                    let sel = selected.min(total.saturating_sub(1));
-                    let (start, end) = menu_window(total, sel, height);
-                    let window = end - start;
-                    assert!(window <= height, "window {window} > height {height}");
-                    assert!(window <= total, "window {window} > total {total}");
-                    assert!(start <= end, "start {start} > end {end}");
-                }
-            }
-        }
     }
 }
