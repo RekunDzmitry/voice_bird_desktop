@@ -54,6 +54,10 @@ cargo fmt --check                    # enforce formatting and line wrapping
 cargo clippy --all-targets -- -D warnings
 ```
 
+The empty `[workspace]` table makes this single-package crate its own workspace
+root, so these commands also work in nested Git worktrees without inheriting an
+enclosing checkout's workspace.
+
 ## Linting
 
 The optional `hooks/pre-commit` hook checks rustfmt before strict Clippy with

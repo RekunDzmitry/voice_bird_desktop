@@ -8,6 +8,9 @@ repository = "https://github.com/RekunDzmitry/voice_bird_desktop"
 readme = "README.md"
 publish = false
 
+# Keep this single-package crate independent of enclosing worktree workspaces.
+[workspace]
+
 [lib]
 name = "voice_bird_cli"
 path = "src/lib.rs"
