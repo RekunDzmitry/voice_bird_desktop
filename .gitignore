@@ -50,6 +50,7 @@ Desktop.ini
 .env
 .env.local
 .env.release
+.npmrc.publish
 *.local
 
 # Test outputs
@@ -66,6 +67,11 @@ debug.log
 errors.log
 dbg.log
 screenshots/
+
+# Legacy packaging artifacts may remain locally after the app cutover.
+/gen/
+npm/@voice-bird/
+*.egg-info/
 
 # Personal agent/editor state
 .claude/
