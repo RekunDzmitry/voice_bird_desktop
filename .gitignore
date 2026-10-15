@@ -56,9 +56,9 @@ Desktop.ini
 # Test outputs
 test-output/
 recording_*
-!/next/src/db/recording_workers.rs
+!/src/db/recording_workers.rs
 transcript_*
-!/next/tests/snapshots/recording_*.txt
+!/tests/snapshots/recording_*.txt
 logs/
 
 # Build artifacts
@@ -68,23 +68,15 @@ errors.log
 dbg.log
 screenshots/
 
+# Legacy packaging artifacts may remain locally after the app cutover.
+/gen/
+npm/@voice-bird/
+*.egg-info/
+
 # Personal agent/editor state
 .claude/
 .obsidian/
 .serena/
-/gen/
-
-# macOS code-signing resources for the packaged CLI app
-npm/@voice-bird/cli-darwin-arm64/VoiceBirdCLI.app/Contents/_CodeSignature/
-
-# npm wrapper scratch space
-npm/@voice-bird/
-npm/voice-bird-cli/downloaded/
-npm/voice-bird-cli/.npm-install-tmp/
-
-# Python build artifacts
-*.whl
-*.egg-info/
 __pycache__/
 # Design-review packet - generated locally, uploaded as a release asset, not tracked.
 docs/review/

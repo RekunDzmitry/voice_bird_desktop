@@ -1,120 +1,80 @@
-// Local whisper engines don't exist on cloud-only Windows.
-#![cfg(all(feature = "engine-smoke", not(windows)))]
+#![cfg(feature = "local-engine")]
 
-use std::time::Duration;
-use voice_bird_cli::transcription::{
-    whisper_rs_engine::WhisperRsEngine, EngineConfig, EngineEvent, TranscriptionEngine,
-};
+use std::io::Cursor;
 
+use voice_bird_cli::language::LANGUAGES;
+use voice_bird_cli::transcribe::{system_engines, TranscriptOut};
+use voice_bird_cli::transcription_models::{CacheDirStore, ModelStore};
+
+/// Opt in with:
+/// cargo test --test engine_smoke -- --ignored --nocapture
+/// Requires previously installed English models and encoder assets; never downloads.
 #[test]
-fn whisper_rs_produces_non_empty_transcript_for_fixture() {
-    // Downloads tiny.en on demand. Path is cached; test is slow first time.
-    let tiny = voice_bird_cli::transcription::models::Catalog::builtin()
-        .get("tiny.en")
-        .unwrap()
-        .clone();
-    let cache = voice_bird_cli::transcription::models::gguf_path("tiny.en").unwrap();
-    if !cache.exists() {
-        voice_bird_cli::transcription::models::download_model_with_verify(&tiny, &mut |_, _| {})
-            .unwrap();
-    }
-
-    let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();
-    let samples: Vec<f32> = spec
-        .into_samples::<i16>()
-        .map(|s| s.unwrap() as f32 / i16::MAX as f32)
-        .collect();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut engine = WhisperRsEngine::default();
-        let handle = engine
-            .start(EngineConfig::Local {
-                model_path: cache,
-                language: Some("en".into()),
-                sample_rate: 16_000,
-                hop_ms: 750,
-                min_window_ms: 1000,
-            })
-            .unwrap();
-
-        // Feed in 500ms chunks
-        for chunk in samples.chunks(8_000) {
-            handle.pcm_tx.send(chunk.to_vec()).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        drop(handle.pcm_tx);
-
-        let mut transcript = String::new();
-        let mut rx = handle.events_rx;
-        while let Ok(Ok(evt)) = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
-            if let EngineEvent::Committed(seg) = evt {
-                transcript.push_str(&seg.text);
-                transcript.push(' ');
-            }
-        }
+#[ignore = "requires installed English models/encoder assets and native whisper inference"]
+fn installed_whisper_transcribes_bundled_speech_live_and_refined() {
+    let store = CacheDirStore::new().expect("resolve installed model cache");
+    let language = &LANGUAGES[0];
+    for model in language.models() {
         assert!(
-            transcript.to_lowercase().contains("hello"),
-            "transcript = {:?}",
-            transcript
+            store.is_available(model),
+            "install {} before this opt-in smoke",
+            model.id
         );
-    });
-}
-
-#[cfg(feature = "engine-smoke-voicebird")]
-#[test]
-fn voicebird_produces_committed_event_for_fixture() {
-    use std::time::Duration;
-    use voice_bird_cli::transcription::{
-        voicebird_engine::VoiceBirdEngine, EngineConfig, EngineEvent, TranscriptionEngine,
-    };
-
-    let key = std::env::var("VOICEBIRD_API_KEY")
-        .expect("VOICEBIRD_API_KEY must be set for this smoke test");
-    let url = std::env::var("VOICEBIRD_WS_URL")
-        .expect("VOICEBIRD_WS_URL must be set (e.g. wss://voicebird.app/api/audio/stream)");
-
-    let spec = hound::WavReader::open("tests/fixtures/hello_world_16k.wav").unwrap();
-    let samples: Vec<f32> = spec
+    }
+    let wav = hound::WavReader::new(Cursor::new(include_bytes!("fixtures/hello_world_16k.wav")))
+        .expect("bundled WAV");
+    let spec = wav.spec();
+    assert_eq!(
+        (spec.sample_rate, spec.channels, spec.bits_per_sample),
+        (16_000, 1, 16)
+    );
+    let samples: Vec<f32> = wav
         .into_samples::<i16>()
-        .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+        .map(|sample| sample.expect("valid PCM") as f32 / 32768.0)
         .collect();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut engine = VoiceBirdEngine::new(key.clone(), url.clone());
-        let handle = engine
-            .start(EngineConfig::Cloud {
-                api_key: key,
-                language: Some("en".into()),
-                sample_rate: 16_000,
-                server_url: url,
-                device_name: "smoke-test".into(),
-                app_name: String::new(),
-            })
-            .unwrap();
-
-        for chunk in samples.chunks(8_000) {
-            handle.pcm_tx.send(chunk.to_vec()).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let duration_ms = samples.len() as u64 * 1000 / 16_000;
+    let factory = system_engines();
+    for (model, refined) in [(language.live, false), (language.refine, true)] {
+        let path = store.installed_path(model);
+        let mut engine = if refined {
+            factory.refine(&path, language.code)
+        } else {
+            factory.live(&path, language.code)
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = handle.shutdown.send(());
-
-        let mut rx = handle.events_rx;
-        let mut saw_committed = false;
-        while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-            if matches!(ev, EngineEvent::Committed(_)) {
-                saw_committed = true;
-                break;
+        .expect("load real whisper context");
+        let mut output = Vec::new();
+        for chunk in samples.chunks(8_000) {
+            output.extend(engine.feed(chunk).expect("decode speech"));
+        }
+        output.extend(engine.finish().expect("flush speech tail"));
+        let mut text = String::new();
+        for event in output {
+            if let TranscriptOut::Committed {
+                t_start_ms,
+                t_end_ms,
+                text: segment,
+            } = event
+            {
+                assert!(
+                    t_start_ms <= t_end_ms && t_end_ms <= duration_ms,
+                    "invalid absolute timestamps: {t_start_ms}..{t_end_ms} / {duration_ms}"
+                );
+                text.push_str(&segment);
+                text.push(' ');
             }
         }
-        assert!(saw_committed, "did not receive a Committed event");
-    });
+        println!(
+            "{}: {}",
+            if refined { "refined" } else { "live" },
+            text.trim()
+        );
+        assert!(
+            text.to_lowercase().contains("hello"),
+            "expected fixture speech, got {text:?}"
+        );
+        assert!(
+            engine.finish().expect("repeat finish").is_empty(),
+            "finish duplicated committed speech"
+        );
+    }
 }

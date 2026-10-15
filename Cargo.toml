@@ -1,169 +1,84 @@
 [package]
 name = "voice-bird-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Voice Bird CLI - local-first voice transcription TUI"
 license-file = "LICENSE"
 repository = "https://github.com/RekunDzmitry/voice_bird_desktop"
 readme = "README.md"
-keywords = ["transcription", "whisper", "tui", "audio", "cli"]
-categories = ["command-line-utilities", "multimedia::audio"]
+publish = false
 
-[[bin]]
-name = "voice-bird-cli"
-path = "src/main.rs"
+# Keep this single-package crate independent of enclosing worktree workspaces.
+[workspace]
 
 [lib]
 name = "voice_bird_cli"
 path = "src/lib.rs"
 
-[workspace]
-members = [".", "xtask", "next"]
-
-[lints.rust]
-# The pinned `objc` 0.2 macros (msg_send!/class! via screencapturekit 0.3.6)
-# expand `cfg(feature = "cargo-clippy")` into this crate, which trips
-# `unexpected_cfgs`. Declare the value as known instead of silencing the
-# lint; drop this once the macOS audio stack moves to the objc2 ecosystem.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
-
-[dependencies]
-# TUI
-ratatui = "0.29"
-crossterm = "0.28"
-
-# Audio
-cpal = "0.15"
-hound = "3.5"
-rubato = "0.14"
-
-# Async
-tokio = { version = "1.0", features = ["full"] }
-
-# WebSocket client for the Voice Bird Web cloud engine. Uses rustls
-# (consistent with reqwest already in-tree) rather than native-tls to
-# keep a single TLS backend across the crate.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-url = "2"
-
-# Logging
-log = "0.4"
-fern = "0.7"
-
-# Clipboard
-arboard = "3"
-
-# Utilities
-anyhow = "1.0"
-async-trait = "0.1"
-thiserror = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
-dirs = "5.0"
-chrono = { version = "0.4", features = ["serde"] }
-ureq = { version = "2.10", features = ["json"] }
-uuid = { version = "1.0", features = ["v4"] }
-parking_lot = "0.12"
-# Kafka client for user-configured Agent targets. `cmake-build` compiles
-# librdkafka from the vendored source and links it STATICALLY, so the
-# distributed binary has no runtime dependency on a system/Homebrew
-# librdkafka (the previous `dynamic-linking` feature made the macOS
-# binary dlopen the Homebrew dylib path it was linked against, which
-# fails on end-user machines). Build-time cost: cmake + a C toolchain.
-# rdkafka-sys selects dynamic vs. source build via these cargo features
-# only — there is no RDKAFKA_DYNAMIC_LINKING env-var fallback.
-# `ssl-vendored` compiles OpenSSL from source and links it statically
-# (same self-contained-binary rationale as `cmake-build`), enabling the
-# ssl / sasl_ssl security protocols; SASL PLAIN and SCRAM-SHA-* are
-# built into librdkafka and need no extra system libs (GSSAPI would,
-# and is deliberately not offered).
-rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl-vendored", "tokio"] }
-
-# Model download + verification
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream", "json"] }
-bytes = "1"
-sha2 = "0.10"
-hex = "0.4"
-
-# WhisperKit sidecar IPC (length-prefixed binary samples over stdio)
-bytemuck = "1"
-
-flate2 = "1"
-tar = "0.4"
-# CoreML encoder packages ship as .mlmodelc.zip (whisper.cpp format).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+[[bin]]
+name = "voice-bird-cli"
+path = "src/main.rs"
 
 [features]
-engine-smoke = []
-# Requires VOICEBIRD_API_KEY + VOICEBIRD_WS_URL env vars at test time;
-# hits a real voice_bird_web deployment.
-engine-smoke-voicebird = []
+# Native Whisper is optional so no-default-feature checks do not build whisper.cpp.
+default = ["net", "local-engine"]
+net = ["dep:reqwest"]
+local-engine = ["dep:whisper-rs"]
 
-[dev-dependencies]
-proptest = "1"
-tempfile = "3"
-pretty_assertions = "1"
-futures-util = "0.3"
-serial_test = "3.4.0"
+[dependencies]
+anyhow = "1"
+rubato = "0.14"
+parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+directories = "5"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+futures = "0.3"
+async-trait = "0.1"
+# Format-specific unpack for the Nemotron tarball. Always-on: a
+# verified staging file is meaningless if we can't actually install it.
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+log = "0.4"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+[dependencies.reqwest]
+version = "0.12"
+optional = true
+default-features = false
+features = ["stream", "rustls-tls"]
 
-[target.'cfg(not(windows))'.dependencies]
-# Local transcription engines. Windows is CLOUD-ONLY since 0.4.0: whisper-rs
-# pulls in whisper.cpp (CMake + a C/C++ toolchain + bindgen/libclang), which
-# repeatedly broke Windows installs (wrong link.exe, libclang 19+ bindgen bug —
-# see docs/windows-install.md). Gating the local engines off Windows lets the
-# crate build there with just the stock Rust MSVC toolchain.
-# Base features apply to every cfg(not(windows)) target; Apple-only backends
-# (`metal`, `coreml`) live in the macOS table below — Cargo unions features
-# across tables, so macOS gets whisper-cpp-log + coreml + metal.
-whisper-rs = { version = "0.13", features = ["whisper-cpp-log"] }
-parakeet-rs = "0.3.6"
-# System introspection for auto-picking the local model on first launch
-# (RAM and CPU architecture); only used by transcription::auto_select.
-sysinfo = "0.32"
+[dependencies.sha2]
+version = "0.10"
+
+[dependencies.hex]
+version = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Apple-only whisper.cpp backends. Cargo UNIONS features across dependency
-# tables for the same crate, so on macOS whisper-rs resolves to whisper-cpp-log
-# (from the cfg(not(windows)) table above) PLUS metal + coreml (here); Linux
-# sees only the base entry, so neither Metal nor CoreML is requested there.
-#  - `metal`:  Metal GPU backend (~5–10× CPU speedup). MUST stay macOS-only —
-#    ggml's CMake does find_library(Foundation), which fails off-Apple.
-#  - `coreml`: ANE encoder acceleration (WHISPER_COREML=ON +
-#    WHISPER_COREML_ALLOW_FALLBACK=1), so models without a
-#    `<model>-encoder.mlmodelc` still init via Metal/CPU.
-whisper-rs = { version = "0.13", features = ["coreml", "metal"] }
-# System-audio loopback on macOS via ScreenCaptureKit.
-# Pinned to 0.3.x because 0.3.6 uses the `objc` 0.2 ecosystem with no Swift
-# build-script bridge, and the trait-based API here is significantly smaller
-# than hand-rolling `SCStreamOutput` through `objc2-screen-capture-kit`.
-screencapturekit = "0.3.6"
-core-foundation = "0.10"
-core-media-rs = "0.3"
-core-audio-types-rs = "0.3"
-# Used by `platform::enumerate_app_sessions` to walk
-# `NSWorkspace.runningApplications` directly (no Screen Recording
-# permission required, unlike SCShareableContent). Pinned to the same
-# `objc` 0.2 ecosystem `screencapturekit` 0.3.6 already depends on.
-objc = "0.2"
+cpal = "0.15"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSError", "NSObject", "NSProcessInfo", "NSString"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "libc", "objc2-core-media"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGWindow"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+whisper-rs = { version = "0.13", optional = true, features = ["metal", "coreml", "whisper-cpp-log", "raw-api"] }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_Media_Audio",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Threading",
-    "Win32_Foundation",
-    "Win32_System_ProcessStatus",
-    "Win32_UI_Shell_PropertiesSystem",
-    "Win32_Devices_FunctionDiscovery",
-    "Win32_System_SystemInformation",
-    "implement",
-] }
-windows-core = "0.58"
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.13", optional = true, features = ["whisper-cpp-log"] }
 
-# (No macOS-specific dependencies in Project A — see plan scope amendment.)
+[dev-dependencies]
+hound = "3"
+pretty_assertions = "1"
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
